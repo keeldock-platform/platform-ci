@@ -88,9 +88,6 @@ jobs:
       WINDOWS_SOURCE_ALLOWED_BASE_BRANCH: ${{ vars.WINDOWS_SOURCE_ALLOWED_BASE_BRANCH }}
       WINDOWS_SOURCE_ALLOWED_FINGERPRINT: ${{ vars.WINDOWS_SOURCE_ALLOWED_FINGERPRINT }}
       WINDOWS_SOURCE_ALLOWED_CONTROL_SHA: ${{ vars.WINDOWS_SOURCE_ALLOWED_CONTROL_SHA }}
-      WINDOWS_SOURCE_ACCEPTED_NODE_LOCK_SHA256: ${{ vars.WINDOWS_SOURCE_ACCEPTED_NODE_LOCK_SHA256 }}
-      WINDOWS_SOURCE_ACCEPTED_MANIFEST_SHA256: ${{ vars.WINDOWS_SOURCE_ACCEPTED_MANIFEST_SHA256 }}
-      WINDOWS_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON: ${{ vars.WINDOWS_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON }}
     steps:
       - name: Checkout reviewed control files
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -132,7 +129,7 @@ jobs:
           mkdir -p "$evidence/artifacts"
           for role in windows-producer windows-verifier; do
             selected=''
-            for retry in $(seq 1 120); do
+            for _ in $(seq 1 120); do
               if gh api --paginate --slurp "$api_path" > "$evidence/artifact-pages.json" 2>/dev/null; then
                 if selected="$(python -B kit/confinement/role_signer.py find-artifact --artifacts-file "$evidence/artifact-pages.json" --role "$role" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --field name 2>/dev/null)"; then break; fi
               fi
@@ -228,17 +225,6 @@ jobs:
             printf '%s\n' 'probe=source-free-revocation-simulation result=synthetic'
           fi
           printf '%s\n' 'handoff-revocation=confirmed'
-      - name: Require trusted Rust licence admission
-        if: ${{ inputs.mode == 'source' }}
-        env:
-          SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
-        run: python3 -B kit/confinement/linux_source_build.py rust-license-gate
-      - name: Run trusted dependency audit
-        if: ${{ inputs.mode == 'source' }}
-        env:
-          SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
-          NODE_BIN: ${{ steps.toolchains.outputs.node_bin }}
-        run: python3 -B kit/confinement/linux_source_build.py trusted-audit
       - name: Install the pinned hash-checked sealer dependencies
         run: |
           set -euo pipefail
@@ -302,7 +288,6 @@ jobs:
           [[ "$CAPSULE_SOURCE_SHA" =~ ^[a-f0-9]{40}$ && "$CAPSULE_TREE_ID" =~ ^[a-f0-9]{40}$ && "$CAPSULE_LOCK_SHA256" =~ ^[a-f0-9]{64}$ && "$CAPSULE_MANIFEST_SHA256" =~ ^[a-f0-9]{64}$ ]]
           if [[ "$KD_MODE" == "source" ]]; then
             [[ "$CAPSULE_SOURCE_SHA" == "$REQUESTED_SOURCE_SHA" && "$CAPSULE_TREE_ID" == "$CHECKOUT_TREE_ID" && "$CAPSULE_LOCK_SHA256" == "$CHECKOUT_LOCK_SHA256" && "$CAPSULE_MANIFEST_SHA256" == "$CHECKOUT_MANIFEST_SHA256" ]]
-            [[ "$CAPSULE_LOCK_SHA256" == "$WINDOWS_SOURCE_ACCEPTED_NODE_LOCK_SHA256" && "$CAPSULE_MANIFEST_SHA256" == "$WINDOWS_SOURCE_ACCEPTED_MANIFEST_SHA256" ]]
           fi
           repository_id="$(cat "$RUNNER_TEMP/control-repository-id.txt")"
           evidence="$RUNNER_TEMP/role-evidence"

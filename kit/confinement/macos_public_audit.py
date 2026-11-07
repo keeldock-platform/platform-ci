@@ -167,6 +167,13 @@ CONTROL_SHA_RE = re.compile(r"[a-f0-9]{40}\Z")
 TOKEN_RE = re.compile(r"[!-~]{1,4096}\Z")
 DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
 HEX_DIGEST_RE = re.compile(r"[a-f0-9]{64}\Z")
+MAX_CACHE_BASELINE_BYTES = 32 + MAX_CACHE_ITEMS * 40
+RUST_CACHE_KEY_RE = re.compile(
+    r"kd-rust-v5-(?:Linux|macOS|Windows)-(?:x64|arm64)-"
+    r"(?:rust|runtime-workspace|linux-source-admission|linux-source-verifier)-"
+    r"(?:primary|independent-verifier)-[a-f0-9]{40}-[a-f0-9]{40}-"
+    r"[a-f0-9]{64}-[a-f0-9]{64}-[a-f0-9]{64}\Z"
+)
 CACHE_PROOF_CLIENT_MARKER_RE = re.compile(
     rb"macos-cache-client=(read|write)-denied schema=1 action-sha="
     + CACHE_PROOF_ACTION_SHA.encode("ascii")
@@ -214,7 +221,7 @@ RULES_BOOTSTRAP_PREFLIGHT_MARKER_RE = re.compile(
     rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
     + rb"macos-rules-bootstrap=preflight-passed schema=1 control-sha=([a-f0-9]{40}) "
     rb"run-id=([1-9][0-9]{0,18}) run-attempt=([1-9][0-9]{0,18}) "
-    rb"source-sha=([a-f0-9]{40}) base-sha=([a-f0-9]{40}) base-branch=(main|develop|uat) "
+    rb"source-sha=([a-f0-9]{40}) base-sha=([a-f0-9]{40}) base-branch=(main) "
     rb"dash-version=0\.5\.13\.5 dash-bottle-sha256=0e104457d0d188129596ee04e4f88ab6039baf9a03e183820caf0aa333d581d0 "
     rb"dash-binary-sha256=([a-f0-9]{64}) reviewed-diff-sha256=([a-f0-9]{64})"
     rb"(?=\r?(?:\n|$))"
@@ -223,9 +230,9 @@ RULES_BOOTSTRAP_SUCCESS_MARKER_RE = re.compile(
     rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
     + rb"macos-rules-bootstrap=passed schema=1 control-sha=([a-f0-9]{40}) "
     rb"run-id=([1-9][0-9]{0,18}) run-attempt=([1-9][0-9]{0,18}) "
-    rb"source-sha=([a-f0-9]{40}) base-sha=([a-f0-9]{40}) base-branch=(main|develop|uat) "
-    rb"candidate-class=(permanent-tip|signed-descendant) "
-    rb"suites=rules\.hooks,rules\.sync,rules\.static,rules\.public,plan-ids "
+    rb"source-sha=([a-f0-9]{40}) base-sha=([a-f0-9]{40}) base-branch=(main) "
+    rb"candidate-class=(permanent-tip) "
+    rb"suites=rules\.hooks "
     rb"token-revocation=confirmed-before-execution lease-cleanup=complete "
     rb"process-cleanup=complete identity-cleanup=complete "
     rb"summary-guard=append-sibling-create-readback-restore source-tree=uid-read-only "
@@ -262,8 +269,6 @@ RULES_BOOTSTRAP_EARLY_SOURCE_REASONS = (
     "source_fetch_unavailable",
     "revocation_unconfirmed",
     "base_invalid",
-    "signature_invalid",
-    "revocation_policy_invalid",
     "bootstrap_snapshot_invalid",
     "bootstrap_not_approved",
     "internal_error",
@@ -299,8 +304,6 @@ CORE_BOOTSTRAP_SUCCESS_MARKER_RE = re.compile(
     rb"source-repository-id=([1-9][0-9]{0,18}) source-sha=([a-f0-9]{40}) "
     rb"base-branch=main base-sha=([a-f0-9]{40}) concern=core-bootstrap "
     rb"source-signature=verified token-revocation=confirmed-before-execution "
-    rb"rules-lock=present rules-lock-signature=declared-verified "
-    rb"lock-format=3 manifest=matched signers-hash=well-formed fragment-hash=well-formed "
     rb"source-execution=not-run app-build=not-run worker-access=not-applicable cleanup=complete "
     rb"summary-control=append-denied summary-sibling=create-denied "
     rb"summary-standin=write-denied summary-sentinel=written(?=\r?(?:\n|$))"
@@ -366,7 +369,7 @@ CORE_CONTRACT_REFUSAL_STAGES = frozenset((
     "format", "clippy", "workspace_tests", "api_tests", "api_feature_clippy",
     "api_feature_tests", "mock_tests", "conformance_tests", "parser_format", "parser_clippy",
     "parser_replay", "runtime_format", "runtime_clippy", "runtime_tests",
-    "node_dependency_prepare", "node_dependency_audit", "typescript_typecheck", "typescript_tests",
+    "node_dependency_prepare", "typescript_typecheck", "typescript_tests",
     "cleanup", "receipt", "internal",
 ))
 CORE_CONTRACT_RUNTIME_REASONS = frozenset((
@@ -387,8 +390,8 @@ CORE_CONTRACT_FETCH_CLASSES = frozenset((
     "exit_nonzero", "stderr_present", "process_failure", "unexpected_exception",
 ))
 CORE_CONTRACT_BOOTSTRAP_CHECKS = frozenset((
-    "tree_entries", "required_files", "path_mode", "base_policy", "rules_manifest",
-    "rules_inventory", "rules_hash", "workspace_decode", "workspace_members",
+    "tree_entries", "required_files", "path_mode", "base_policy",
+    "workspace_decode", "workspace_members",
     "cargo_lock_decode", "cargo_lock_shape", "toolchain", "package_decode",
     "package_build", "source_inventory", "checkout", "lease_paths", "lease_acl",
     "lease_access", "lease_census",
@@ -421,6 +424,7 @@ CORE_CONTRACT_GATE_STAGES = frozenset((
     "format", "clippy", "workspace_tests", "api_tests", "api_feature_clippy", "api_feature_tests",
     "mock_tests", "conformance_tests", "parser_format", "parser_clippy", "parser_replay",
     "runtime_format", "runtime_clippy", "runtime_tests",
+    "node_dependency_prepare", "typescript_typecheck", "typescript_tests",
 ))
 CORE_CONTRACT_BASE_GATE_NAMES = (
     "format", "clippy", "workspace_tests", "api_tests", "api_feature_clippy", "api_feature_tests",
@@ -446,129 +450,9 @@ CORE_CONTRACT_SOURCE_GATES_CLEANUP_DIAGNOSTICS = frozenset(
     "source_gates_cleanup_unclassified", "source_gates_wait_uncertain",
     "source_gates_audit_request",
 ))
-CORE_CONTRACT_SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE = (
-    ("none", (
-        "invalid_input", "tool_unavailable", "accepted_provenance_invalid", "lock_missing",
-        "lock_already_present", "manifest_invalid", "limit_exceeded", "deadline_exceeded",
-        "capture_invalid", "contract_refused",
-    )),
-    ("runtime_version", (
-        "toolchain_mismatch", "command_failed", "capture_invalid", "tool_unavailable",
-        "deadline_exceeded",
-    )),
-    ("npm_version", (
-        "toolchain_mismatch", "command_failed", "capture_invalid", "tool_unavailable",
-        "deadline_exceeded",
-    )),
-    ("lock_generation", (
-        "command_failed", "capture_invalid", "tool_unavailable", "deadline_exceeded",
-    )),
-    ("lock_validation", ("accepted_provenance_invalid",)),
-    ("bulk_audit", (
-        "limit_exceeded", "manifest_invalid", "lock_missing", "accepted_provenance_invalid",
-        "audit_unavailable", "audit_response_invalid", "vulnerable_dependency",
-        "deadline_exceeded", "capture_invalid", "command_failed", "tool_unavailable",
-    )),
-    ("npm_ci", ("command_failed", "capture_invalid", "tool_unavailable", "deadline_exceeded")),
-    ("typecheck", ("command_failed", "capture_invalid", "tool_unavailable", "deadline_exceeded")),
-    ("tests", ("command_failed", "capture_invalid", "tool_unavailable", "deadline_exceeded")),
-)
-CORE_CONTRACT_SOURCE_GATES_NODE_COMMAND_SUBSTAGES = (
-    "runtime_version", "npm_version", "lock_generation", "bulk_audit", "npm_ci", "typecheck",
-    "tests",
-)
-CORE_CONTRACT_SOURCE_GATES_NODE_COMMAND_CHECKS = (
-    "spawn_failure", "nonzero_exit", "timeout", "capture_invalid", "capture_overflow",
-    "helper_failure",
-)
-CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS = {
-    **{
-        "source_gates_node_" + substage + "_" + reason:
-            "capture_invalid" if reason == "capture_invalid" else "runner_unavailable"
-        for substage, reasons in CORE_CONTRACT_SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE
-        for reason in reasons
-    },
-    **{
-        "source_gates_node_" + substage + "_command_" + check: "runner_unavailable"
-        for substage in CORE_CONTRACT_SOURCE_GATES_NODE_COMMAND_SUBSTAGES
-        for check in CORE_CONTRACT_SOURCE_GATES_NODE_COMMAND_CHECKS
-    },
-}
-CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS = frozenset(
-    CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS
-)
-CORE_CONTRACT_SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE = {
-    "runtime_version": "node_dependency_prepare", "npm_version": "node_dependency_prepare",
-    "lock_generation": "node_dependency_prepare", "lock_validation": "node_dependency_prepare",
-    "bulk_audit": "node_dependency_audit", "npm_ci": "node_dependency_audit",
-    "typecheck": "typescript_typecheck", "tests": "typescript_tests",
-}
-CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_STAGES = {
-    **{
-        "source_gates_node_" + substage + "_" + reason:
-            CORE_CONTRACT_SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE[substage]
-        for substage, reasons in CORE_CONTRACT_SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE
-        if substage in CORE_CONTRACT_SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE
-        for reason in reasons
-    },
-    **{
-        "source_gates_node_" + substage + "_command_" + check:
-            CORE_CONTRACT_SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE[substage]
-        for substage in CORE_CONTRACT_SOURCE_GATES_NODE_COMMAND_SUBSTAGES
-        for check in CORE_CONTRACT_SOURCE_GATES_NODE_COMMAND_CHECKS
-    },
-}
-CORE_CONTRACT_SOURCE_GATES_NODE_PROFILE_REASONS = (
-    "manifest_invalid", "command_failed", "capture_invalid", "output_unavailable",
-)
-CORE_CONTRACT_SOURCE_GATES_NODE_OUTCOME_CHECKS = (
-    "rust", "stage", "capture", "substage", "verification", "reviewed_files",
-)
-CORE_CONTRACT_SOURCE_GATES_NPM_RESOLVE_CODES = (
-    "eresolve", "ebadengine", "etarget", "enotfound", "etimedout", "econnreset", "e404",
-    "eintegrity", "enoversions", "other",
-)
-CORE_CONTRACT_SOURCE_GATES_NPM_RUNNER_KEYS = ("timeout", "spawn", "runner", "capture_invalid")
-CORE_CONTRACT_SOURCE_GATES_NPM_BUNDLE_REASONS = (
-    "npm_input_invalid", "npm_environment_refused", "npm_manifest_refused", "npm_request_refused",
-    "npm_request_mismatch", "npm_lock_refused", "npm_network_refused", "npm_integrity_mismatch",
-    "npm_package_too_young", "npm_package_deprecated", "npm_licence_refused", "npm_peer_refused",
-    "npm_archive_refused", "npm_advisory_blocked", "npm_advisory_invalid", "npm_evidence_invalid",
-    "npm_stale", "npm_payload_too_large", "npm_policy_refused",
-)
-CORE_CONTRACT_SOURCE_GATES_NPM_KEYS_BY_STEP = (
-    ("npm_inputs", (
-        "npm_input_invalid", "npm_manifest_refused", "npm_request_refused", "npm_request_mismatch",
-        "npm_policy_refused", "npm_stale", "manifest_invalid",
-    )),
-    ("npm_config", (
-        "npm_environment_refused", "npm_input_invalid", "manifest_invalid", "output_unavailable",
-        "tool_unavailable",
-    )),
-    ("npm_version", ("nonzero_exit", "mismatch") + CORE_CONTRACT_SOURCE_GATES_NPM_RUNNER_KEYS),
-    ("npm_resolve",
-     CORE_CONTRACT_SOURCE_GATES_NPM_RESOLVE_CODES + CORE_CONTRACT_SOURCE_GATES_NPM_RUNNER_KEYS),
-    ("npm_lock", ("npm_lock_refused", "npm_payload_too_large", "capture_invalid")),
-    ("npm_bundle", CORE_CONTRACT_SOURCE_GATES_NPM_BUNDLE_REASONS),
-)
 CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTIC_REASONS = {
     "source_gates_payload_invalid": "runner_unavailable",
     "source_gates_payload_capture_invalid": "capture_invalid",
-    **{
-        "source_gates_node_profile_" + reason:
-            "capture_invalid" if reason == "capture_invalid" else "runner_unavailable"
-        for reason in CORE_CONTRACT_SOURCE_GATES_NODE_PROFILE_REASONS
-    },
-    **{
-        "source_gates_node_outcome_" + check: "runner_unavailable"
-        for check in CORE_CONTRACT_SOURCE_GATES_NODE_OUTCOME_CHECKS
-    },
-    **{
-        "source_gates_" + step + "_" + key:
-            "capture_invalid" if key == "capture_invalid" else "runner_unavailable"
-        for step, keys in CORE_CONTRACT_SOURCE_GATES_NPM_KEYS_BY_STEP
-        for key in keys
-    },
 }
 CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTICS = frozenset(
     CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTIC_REASONS
@@ -584,10 +468,10 @@ CORE_CONTRACT_SUCCESS_RECEIPT_DIAGNOSTICS = frozenset(
     "success_receipt_" + detail for detail in (
         "payload_missing", "tool_path", "input_size", "spawn", "node_exit", "output_size",
         "output_shape", "output_directory", "output_write", "output_member",
-        "expected_manifest_invalid", "reviewed_paths_invalid", "encryptor_unavailable",
+        "reviewed_paths_invalid", "encryptor_unavailable",
         "node_credential_like_content", "node_envelope_rejected", "node_exception_expired",
-        "node_invalid_cargo_lock", "node_invalid_context", "node_invalid_expectation",
-        "node_invalid_input", "node_invalid_lock_manifest", "node_invalid_payload",
+        "node_invalid_context", "node_invalid_expectation",
+        "node_invalid_input", "node_invalid_payload",
         "node_invalid_payload_bom", "node_invalid_payload_c0", "node_invalid_payload_c1",
         "node_invalid_payload_cr", "node_invalid_payload_nul", "node_invalid_payload_utf8",
         "node_invalid_recipient", "node_invalid_rust_patch", "node_limit_exceeded",
@@ -624,7 +508,7 @@ CORE_CONTRACT_REFUSAL_DIAGNOSTICS = frozenset((
     CORE_CONTRACT_RUNTIME_DIAGNOSTICS | CORE_CONTRACT_FETCH_DIAGNOSTICS
     | CORE_CONTRACT_BOOTSTRAP_DIAGNOSTICS | CORE_CONTRACT_SOURCE_LEASE_OPEN_DIAGNOSTICS
     | CORE_CONTRACT_GATE_DIAGNOSTICS | CORE_CONTRACT_SOURCE_GATES_CLEANUP_DIAGNOSTICS
-    | CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS | CORE_CONTRACT_FOREIGN_CONTEXT_DIAGNOSTICS
+    | CORE_CONTRACT_FOREIGN_CONTEXT_DIAGNOSTICS
     | CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTICS | CORE_CONTRACT_SUCCESS_RECEIPT_DIAGNOSTICS
 )
 CORE_CONTRACT_PRIVILEGE_PROBE_DIAGNOSTICS = frozenset((
@@ -889,10 +773,83 @@ def cache_inventory_digest(entries):
                     and type(item["last_accessed_at"]) is not str)
                 or not _exact_int(item["size_in_bytes"], 0)):
             _fail("api_schema")
-        normalized.append({key: item[key] for key in sorted(required)})
+        normalized.append({key: item[key] for key in sorted(required - {"last_accessed_at"})})
     normalized.sort(key=lambda item: item["id"])
     canonical = json.dumps(normalized, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(canonical.encode("ascii")).hexdigest()
+
+
+def _cache_entry_fingerprint(item):
+    row = [item["id"], item["key"], item["ref"], item["version"],
+           item["size_in_bytes"], item["created_at"]]
+    return hashlib.sha256(
+        json.dumps(row, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    ).digest()
+
+
+def cache_inventory_baseline(entries):
+    cache_inventory_digest(entries)
+    fingerprints = bytearray()
+    for item in sorted(entries, key=lambda entry: entry["id"]):
+        try:
+            fingerprints.extend(item["id"].to_bytes(8, "big"))
+        except OverflowError:
+            _fail("api_schema")
+        fingerprints.extend(_cache_entry_fingerprint(item))
+    encoded = hashlib.sha256(fingerprints).digest() + fingerprints
+    if len(encoded) > MAX_CACHE_BASELINE_BYTES:
+        _fail("api_schema")
+    return base64.b64encode(encoded).decode("ascii")
+
+
+def _decode_cache_baseline(value):
+    maximum = ((MAX_CACHE_BASELINE_BYTES + 2) // 3) * 4
+    if type(value) is not str or not value or len(value) > maximum:
+        _fail("inventory_changed")
+    try:
+        encoded = base64.b64decode(value, validate=True)
+    except (ValueError, TypeError):
+        _fail("inventory_changed")
+    if (base64.b64encode(encoded).decode("ascii") != value or len(encoded) < 32
+            or (len(encoded) - 32) % 40 != 0
+            or hashlib.sha256(encoded[32:]).digest() != encoded[:32]):
+        _fail("inventory_changed")
+    result = {}
+    previous = 0
+    for offset in range(32, len(encoded), 40):
+        identifier = int.from_bytes(encoded[offset:offset + 8], "big")
+        if identifier <= previous:
+            _fail("inventory_changed")
+        result[identifier] = encoded[offset + 8:offset + 40]
+        previous = identifier
+    return result
+
+
+def cache_inventory_baseline_digest(value):
+    encoded = base64.b64decode(value, validate=True)
+    return encoded[:32].hex()
+
+
+def cache_inventory_matches(baseline_value, entries, allowed_keys=()):
+    """Allow cache eviction while rejecting mutations and unauthorized additions."""
+    baseline = _decode_cache_baseline(baseline_value)
+    cache_inventory_digest(entries)
+    if any(_cache_entry_fingerprint(item) != baseline[item["id"]]
+           for item in entries if item["id"] in baseline):
+        _fail("inventory_changed")
+    additions = [item for item in entries if item["id"] not in baseline]
+    for item in additions:
+        if (item["ref"] != "refs/heads/main" or item["size_in_bytes"] <= 0
+                or (item["key"] not in allowed_keys
+                    and RUST_CACHE_KEY_RE.fullmatch(item["key"]) is None
+                    and re.fullmatch(
+                        r"macos-public-cache-seed-v1-[1-9][0-9]{0,18}-[1-9][0-9]{0,18}",
+                        item["key"],
+                    ) is None)):
+            _fail("inventory_changed")
+    if len({item["key"] for item in additions}) != len(additions):
+        _fail("inventory_changed")
+    return True
 
 
 def validate_receipt(encoded, control_sha, run_id, run_attempt):
@@ -1765,13 +1722,6 @@ def _core_contract_runtime_failure_mapping(runtime_reason):
 
 def _core_contract_refusal_diagnostic_matches(value):
     diagnostic = value["diagnostic"]
-    if diagnostic in CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS:
-        return (
-            value["stage"] == CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_STAGES.get(
-                diagnostic, "worker_setup",
-            )
-            and value["reason"] == CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS[diagnostic]
-        )
     if diagnostic in CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTICS:
         return (
             value["stage"] == "worker_setup"
@@ -2314,10 +2264,9 @@ def _source_reader_audit(api, kind, control_sha, run_id, run_attempt, env):
     _scan_annotations(api, settings_job, settings_check_id, control_sha, reviewed=True)
     _scan_annotations(api, token_job, token_check_id, control_sha, reviewed=True)
     _fetch_artifacts(api, run_id)
-    cache_digest = _fetch_caches(api, control_sha, reviewed=True)
+    cache_entries = _fetch_cache_entries(api, control_sha, reviewed=True)
     baseline = env.get("MACOS_CACHE_SNAPSHOT", "")
-    if HEX_DIGEST_RE.fullmatch(baseline) is None or cache_digest != baseline:
-        _fail("inventory_changed")
+    cache_inventory_matches(baseline, cache_entries)
     settings_marker = _verify_source_reader_environment(
         api, kind, control_sha, run_id, run_attempt
     )
@@ -2416,7 +2365,7 @@ def _bootstrap_jobs(api, kind, run_id, run_attempt, control_sha):
             "Validate source-free control tree",
             "Seal exact control signer inventory",
             "Prepare pinned public dash before token mint",
-            "Preflight protected bootstrap and review binding",
+            "Preflight unsigned main-tip source tree",
             "Validate source-reader scope configuration",
             "Mint scoped source-reader token",
             "Verify selected installation identity",
@@ -2747,7 +2696,7 @@ def _inspect_rules_early_source_refusal(raw, producer_job, control_sha, run_id, 
         "Validate source-free control tree",
         "Seal exact control signer inventory",
         "Prepare pinned public dash before token mint",
-        "Preflight protected bootstrap and review binding",
+        "Preflight unsigned main-tip source tree",
         "Validate source-reader scope configuration",
         "Mint scoped source-reader token",
         "Verify selected installation identity",
@@ -2809,7 +2758,7 @@ def _bootstrap_audit(api, kind, control_sha, run_id, run_attempt, env):
     _scan_annotations(api, snapshot_job, snapshot_check_id, control_sha, reviewed=True)
     _scan_annotations(api, producer_job, producer_check_id, control_sha, reviewed=True)
     _fetch_artifacts(api, run_id)
-    cache_digest = _fetch_caches(api, control_sha, reviewed=True)
+    cache_entries = _fetch_cache_entries(api, control_sha, reviewed=True)
     if (snapshot_job.get("conclusion") != "success" or not snapshot_steps_success
             or producer_job.get("conclusion") != "success" or not producer_steps_success):
         if kind == "rules-bootstrap":
@@ -2835,8 +2784,7 @@ def _bootstrap_audit(api, kind, control_sha, run_id, run_attempt, env):
                 )
         _fail("native_job_failed")
     baseline = env.get("MACOS_CACHE_SNAPSHOT", "")
-    if HEX_DIGEST_RE.fullmatch(baseline) is None or cache_digest != baseline:
-        _fail("inventory_changed")
+    cache_inventory_matches(baseline, cache_entries)
     settings_marker = _verify_source_reader_environment(
         api, kind, control_sha, run_id, run_attempt
     )
@@ -2887,10 +2835,9 @@ def _core_contract_audit(api, control_sha, run_id, run_attempt, env):
     _scan_annotations(api, settings_job, settings_check_id, control_sha, reviewed=True)
     _scan_annotations(api, producer_job, producer_check_id, control_sha, reviewed=True)
     _fetch_artifacts(api, run_id)
-    cache_digest = _fetch_caches(api, control_sha, reviewed=True)
+    cache_entries = _fetch_cache_entries(api, control_sha, reviewed=True)
     baseline = env.get("MACOS_CACHE_SNAPSHOT", "")
-    if HEX_DIGEST_RE.fullmatch(baseline) is None or cache_digest != baseline:
-        _fail("inventory_changed")
+    cache_inventory_matches(baseline, cache_entries)
 
     settings_marker = _verify_source_reader_environment(
         api, "core-contract", control_sha, run_id, run_attempt
@@ -3101,12 +3048,12 @@ def _snapshot(phase, api, control_sha, run_id, run_attempt, env):
         seed_key, write_key = _cache_proof_keys(run_id, run_attempt)
         if any(item.get("key") in {seed_key, write_key} for item in caches):
             _fail("inventory_changed")
-    digest = cache_inventory_digest(caches)
+    baseline = cache_inventory_baseline(caches)
     if phase in {
         "snapshot", "reviewed-snapshot", "cache-proof-snapshot",
         "rules-bootstrap-snapshot", "core-bootstrap-snapshot", "rust-toolchain-snapshot",
     }:
-        _write_output("cache_snapshot", digest, env)
+        _write_output("cache_snapshot", baseline, env)
         if phase == "cache-proof-snapshot":
             print("macos-cache-proof=snapshot-ready")
         elif bootstrap_kind is not None:
@@ -3123,13 +3070,17 @@ def _snapshot(phase, api, control_sha, run_id, run_attempt, env):
             print("macos-public-surface-audit=snapshot-ready")
         return 0
     baseline = env.get("MACOS_CACHE_SNAPSHOT", "")
-    if HEX_DIGEST_RE.fullmatch(baseline) is None or digest != baseline:
+    if not cache_inventory_matches(baseline, caches):
         _fail("inventory_changed")
     return 0
 
 
 def _write_output(key, value, env):
-    if key != "cache_snapshot" or HEX_DIGEST_RE.fullmatch(value) is None:
+    if key != "cache_snapshot":
+        _fail("output_unavailable")
+    try:
+        _decode_cache_baseline(value)
+    except AuditRefusal:
         _fail("output_unavailable")
     output_path = env.get("GITHUB_OUTPUT", "")
     if not output_path or not os.path.isabs(output_path):
@@ -3201,8 +3152,9 @@ def run(phase, environ=None, api=None):
             )
             return 0
         if operation == "snapshot":
-            digest = _fetch_caches(api, control_sha, reviewed=True)
-            _write_output("cache_snapshot", digest, env)
+            caches = _fetch_cache_entries(api, control_sha, reviewed=True)
+            baseline = cache_inventory_baseline(caches)
+            _write_output("cache_snapshot", baseline, env)
             snapshot_name = (
                 "macos-source-reader-snapshot" if kind in {"core", "rules"}
                 else "macos-" + kind + "-snapshot"
@@ -3243,11 +3195,8 @@ def run(phase, environ=None, api=None):
                 or not seed_entries[0]["version"]
                 or seed_entries[0]["size_in_bytes"] <= 0):
             _fail("inventory_changed")
-        baseline_entries = [item for item in caches if item["key"] not in {seed_key, write_key}]
-        baseline_digest = env.get("MACOS_CACHE_SNAPSHOT", "")
-        if (HEX_DIGEST_RE.fullmatch(baseline_digest) is None
-                or cache_inventory_digest(baseline_entries) != baseline_digest):
-            _fail("inventory_changed")
+        baseline = env.get("MACOS_CACHE_SNAPSHOT", "")
+        cache_inventory_matches(baseline, caches, (seed_key,))
         expected_seed_line = (
             "macos-cache-seed=step-complete schema=1 run-id=" + run_id
             + " run-attempt=" + run_attempt
@@ -3321,10 +3270,9 @@ def run(phase, environ=None, api=None):
         _scan_annotations(api, snapshot[0], snapshot[1], control_sha, reviewed=True)
         _scan_annotations(api, smoke[0], smoke[1], control_sha, reviewed=True)
         _fetch_artifacts(api, run_id)
-        cache_digest = _fetch_caches(api, control_sha, reviewed=True)
+        cache_entries = _fetch_cache_entries(api, control_sha, reviewed=True)
         baseline = env.get("MACOS_CACHE_SNAPSHOT", "")
-        if HEX_DIGEST_RE.fullmatch(baseline) is None or cache_digest != baseline:
-            _fail("inventory_changed")
+        cache_inventory_matches(baseline, cache_entries)
         if (snapshot[0].get("conclusion") != "success" or not snapshot[2]
                 or smoke[0].get("conclusion") != "success" or not smoke[2]):
             _fail("native_job_failed")
@@ -3354,10 +3302,9 @@ def run(phase, environ=None, api=None):
             api, smoke_detail, smoke_check_id, control_sha, reviewed=True
         )
         _fetch_artifacts(api, run_id)
-        cache_digest = _fetch_caches(api, control_sha, reviewed=True)
+        cache_entries = _fetch_cache_entries(api, control_sha, reviewed=True)
         baseline = env.get("MACOS_CACHE_SNAPSHOT", "")
-        if HEX_DIGEST_RE.fullmatch(baseline) is None or cache_digest != baseline:
-            _fail("inventory_changed")
+        cache_inventory_matches(baseline, cache_entries)
         if (snapshot_detail.get("conclusion") != "success" or not snapshot_steps_success
                 or smoke_detail.get("conclusion") != "success" or not smoke_steps_success):
             if smoke_log and b"KD-RUST-REFUSAL" in smoke_log:
@@ -3385,10 +3332,9 @@ def run(phase, environ=None, api=None):
     inspect_public_bytes(log_bytes, control_sha)
     _scan_annotations(api, job, check_id, control_sha)
     _fetch_artifacts(api, run_id)
-    cache_digest = _fetch_caches(api, control_sha)
+    cache_entries = _fetch_cache_entries(api, control_sha)
     baseline = env.get("MACOS_CACHE_SNAPSHOT", "")
-    if HEX_DIGEST_RE.fullmatch(baseline) is None or cache_digest != baseline:
-        _fail("inventory_changed")
+    cache_inventory_matches(baseline, cache_entries)
     if job.get("conclusion") != "success" or not steps_success:
         _fail("native_job_failed")
     validate_receipt(env.get("MACOS_NATIVE_RECEIPT_B64URL", ""), control_sha, run_id, run_attempt)

@@ -72,9 +72,9 @@ PROFILE_ROLES = {
     "candidate": CANDIDATE_ROLES,
 }
 PINNED_WORKFLOW_SHA256 = {
-    ".github/workflows/windows-source-admission.yml": "118975166728aed8ee2ecc79c48fb5171f94fe5d4413ff05defaa556892c8273",
-    ".github/workflows/lane-h-windows-receiver.yml": "52c564f8b52db004f6e89202aff310a9d9b9b6f92e264814027a9e67f0edd772",
-    ".github/workflows/lane-h-linux-fetch-encrypt.yml": "a23f7cf71baba02cba9d20e49abb0536505930c40b3312d76a4e8fdf6b22f8b1",
+    ".github/workflows/windows-source-admission.yml": "ef10b21b69f841f6c2b69bc22497400e89e959fdfd6e24740a24e4b00139b5a8",
+    ".github/workflows/lane-h-windows-receiver.yml": "a6033b3c5dd1748bd4e55fa0dc4da82e40cd3ccfeee6b0fcc3ba3f88e165bde3",
+    ".github/workflows/lane-h-linux-fetch-encrypt.yml": "c173b2298dca7757b37a67669ad6ae4abf6eaf32cf1dea94b8b0a17a1c50d423",
     ".github/workflows/lane-h-capsule-attester.yml": "192d78328f8bf093a68bef0f1dd323a88772e2929d79c92b24a8864d17c1b48c",
 }
 API_JOB_NAME_PINS = {

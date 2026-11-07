@@ -282,6 +282,37 @@ class InventoryTests(unittest.TestCase):
         changed = dict(two, size_in_bytes=20)
         self.assertNotEqual(expected, audit.cache_inventory_digest([one, changed]))
 
+    def test_cache_digest_covers_managed_rust_and_cache_proof_namespaces(self):
+        stable = {
+            "id": 11, "ref": "refs/heads/main", "key": "ordinary-cache", "version": "v1",
+            "last_accessed_at": None, "created_at": "2026-10-25T00:00:00Z", "size_in_bytes": 19,
+        }
+        rust = dict(stable, id=12, key="kd-rust-v5-Linux-x64-rust-primary-" + "a" * 40)
+        proof = dict(stable, id=13, key="macos-public-cache-seed-v1-100-1")
+        baseline = audit.cache_inventory_digest([stable])
+        self.assertNotEqual(baseline, audit.cache_inventory_digest([stable, rust, proof]))
+        changed_stable = dict(stable, size_in_bytes=20)
+        self.assertNotEqual(baseline, audit.cache_inventory_digest([changed_stable, rust, proof]))
+
+    def test_cache_baseline_allows_eviction_and_rejects_mutation_or_unproven_additions(self):
+        stable = {
+            "id": 11, "ref": "refs/heads/main", "key": "ordinary-cache", "version": "v1",
+            "last_accessed_at": None, "created_at": "2026-10-25T00:00:00Z", "size_in_bytes": 19,
+        }
+        evicted = dict(stable, id=12, key="second-cache")
+        baseline = audit.cache_inventory_baseline([stable, evicted])
+        self.assertTrue(audit.cache_inventory_matches(baseline, [stable]))
+        with self.assertRaises(audit.AuditRefusal):
+            audit.cache_inventory_matches(baseline, [dict(stable, size_in_bytes=20)])
+        injected = dict(stable, id=13, key="kd-rust-v999-exfil")
+        with self.assertRaises(audit.AuditRefusal):
+            audit.cache_inventory_matches(baseline, [stable, injected])
+        untrusted = dict(stable, id=13, key="kd-rust-v5-Linux-x64-rust-primary-"
+                         + "a" * 40 + "-" + "b" * 40 + "-" + "c" * 64
+                         + "-" + "d" * 64 + "-" + "e" * 64, ref="refs/pull/8/merge")
+        with self.assertRaises(audit.AuditRefusal):
+            audit.cache_inventory_matches(baseline, [stable, untrusted])
+
     def test_cache_digest_rejects_duplicate_ids_and_unexpected_fields(self):
         item = {
             "id": 11,
@@ -583,7 +614,7 @@ def audit_fixture():
         "GITHUB_RUN_ATTEMPT": RUN_ATTEMPT,
         "CI_SHA": CONTROL_SHA,
         "GITHUB_TOKEN": "t" * 32,
-        "MACOS_CACHE_SNAPSHOT": audit.cache_inventory_digest([]),
+        "MACOS_CACHE_SNAPSHOT": audit.cache_inventory_baseline([]),
         "MACOS_NATIVE_RECEIPT_B64URL": encode_receipt(receipt_value()),
     }
     return pages, env, native_job, native_detail
@@ -748,7 +779,7 @@ def reviewed_audit_fixture():
         "GITHUB_RUN_ATTEMPT": RUN_ATTEMPT,
         "CI_SHA": CONTROL_SHA,
         "GITHUB_TOKEN": "t" * 32,
-        "MACOS_CACHE_SNAPSHOT": audit.cache_inventory_digest([]),
+        "MACOS_CACHE_SNAPSHOT": audit.cache_inventory_baseline([]),
     }
     logs = {
         202: b"macos-public-surface-audit=snapshot-ready\n",
@@ -984,7 +1015,7 @@ def cache_proof_audit_fixture():
         "GITHUB_RUN_ATTEMPT": RUN_ATTEMPT,
         "CI_SHA": CONTROL_SHA,
         "GITHUB_TOKEN": "t" * 32,
-        "MACOS_CACHE_SNAPSHOT": audit.cache_inventory_digest([]),
+        "MACOS_CACHE_SNAPSHOT": audit.cache_inventory_baseline([]),
     }
     return pages, env, logs, cache_items
 
@@ -1175,7 +1206,7 @@ def source_reader_audit_fixture(kind):
         "GITHUB_RUN_ATTEMPT": RUN_ATTEMPT,
         "CI_SHA": CONTROL_SHA,
         "GITHUB_TOKEN": "t" * 32,
-        "MACOS_CACHE_SNAPSHOT": audit.cache_inventory_digest([]),
+        "MACOS_CACHE_SNAPSHOT": audit.cache_inventory_baseline([]),
     }
     return pages, env, logs
 
@@ -1193,8 +1224,8 @@ def bootstrap_audit_fixture(kind):
     )
     cache_path = "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1"
     source_sha = "b" * 40
-    base_sha = "c" * 40
-    reviewed_diff = "d" * 64
+    base_sha = source_sha if kind == "rules-bootstrap" else "c" * 40
+    reviewed_diff = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     if kind == "rules-bootstrap":
         snapshot_name = audit.RULES_BOOTSTRAP_SETTINGS_JOB_NAME
         producer_name = audit.RULES_BOOTSTRAP_PRODUCER_JOB_NAME
@@ -1210,7 +1241,7 @@ def bootstrap_audit_fixture(kind):
         producer_steps = (
             "Fetch reviewed main control", "Validate source-free control tree",
             "Seal exact control signer inventory", "Prepare pinned public dash before token mint",
-            "Preflight protected bootstrap and review binding",
+            "Preflight unsigned main-tip source tree",
             "Validate source-reader scope configuration", "Mint scoped source-reader token",
             "Verify selected installation identity", "Run fixed rules bootstrap",
             "Revoke token if bootstrap did not confirm", "Clean prepared dash",
@@ -1220,7 +1251,7 @@ def bootstrap_audit_fixture(kind):
             "macos-rules-bootstrap=preflight-passed schema=1 control-sha=" + CONTROL_SHA
             + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
             + " source-sha=" + source_sha + " base-sha=" + base_sha
-            + " base-branch=develop dash-version=0.5.13.5"
+            + " base-branch=main dash-version=0.5.13.5"
             + " dash-bottle-sha256=0e104457d0d188129596ee04e4f88ab6039baf9a03e183820caf0aa333d581d0"
             + " dash-binary-sha256=" + "e" * 64 + " reviewed-diff-sha256=" + reviewed_diff
         ).encode("ascii")
@@ -1228,8 +1259,8 @@ def bootstrap_audit_fixture(kind):
             "macos-rules-bootstrap=passed schema=1 control-sha=" + CONTROL_SHA
             + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
             + " source-sha=" + source_sha + " base-sha=" + base_sha
-            + " base-branch=develop candidate-class=signed-descendant"
-            + " suites=rules.hooks,rules.sync,rules.static,rules.public,plan-ids"
+            + " base-branch=main candidate-class=permanent-tip"
+            + " suites=rules.hooks"
             + " token-revocation=confirmed-before-execution lease-cleanup=complete"
             + " process-cleanup=complete identity-cleanup=complete"
             + " summary-guard=append-sibling-create-readback-restore source-tree=uid-read-only"
@@ -1265,7 +1296,7 @@ def bootstrap_audit_fixture(kind):
         env = {
             "REQUESTED_SOURCE_SHA": source_sha,
             "REQUESTED_BASE_SHA": base_sha,
-            "REQUESTED_BASE_BRANCH": "develop",
+            "REQUESTED_BASE_BRANCH": "main",
             "REVIEWED_DIFF_SHA256": reviewed_diff,
         }
         skipped_step = "Revoke token if bootstrap did not confirm"
@@ -1316,8 +1347,6 @@ def bootstrap_audit_fixture(kind):
             + " source-repository-id=1430959909 source-sha=" + source_sha
             + " base-branch=main base-sha=" + source_sha + " concern=core-bootstrap"
             + " source-signature=verified token-revocation=confirmed-before-execution"
-            + " rules-lock=present rules-lock-signature=declared-verified"
-            + " lock-format=3 manifest=matched signers-hash=well-formed fragment-hash=well-formed"
             + " source-execution=not-run app-build=not-run worker-access=not-applicable cleanup=complete"
             + " summary-control=append-denied summary-sibling=create-denied"
             + " summary-standin=write-denied summary-sentinel=written"
@@ -1535,7 +1564,7 @@ def bootstrap_audit_fixture(kind):
         "GITHUB_RUN_ATTEMPT": RUN_ATTEMPT,
         "CI_SHA": CONTROL_SHA,
         "GITHUB_TOKEN": "t" * 32,
-        "MACOS_CACHE_SNAPSHOT": audit.cache_inventory_digest([]),
+        "MACOS_CACHE_SNAPSHOT": audit.cache_inventory_baseline([]),
     })
     return pages, env, logs
 
@@ -1969,84 +1998,7 @@ class CoreContractReceiptTests(unittest.TestCase):
             with self.subTest(unlisted=unlisted), self.assertRaises(audit.AuditRefusal):
                 audit.publish_core_contract_receipt(env, io.BytesIO(rejected), io.BytesIO())
 
-    def test_publisher_accepts_node_substage_diagnostics_only_with_their_bound_stage_and_reason(self):
-        import macos_core_contract as core_contract
-
-        self.assertEqual(
-            audit.CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS,
-            core_contract.SOURCE_GATES_NODE_DIAGNOSTIC_REASONS,
-        )
-        self.assertEqual(
-            audit.CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS,
-            core_contract.SOURCE_GATES_NODE_DIAGNOSTICS,
-        )
-        self.assertEqual(len(audit.CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS), 90)
-        self.assertEqual(
-            audit.CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_STAGES,
-            core_contract.SOURCE_GATES_NODE_DIAGNOSTIC_STAGES,
-        )
-        self.assertEqual(
-            audit.CORE_CONTRACT_SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE,
-            core_contract.SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE,
-        )
-        stage_by_substage = (
-            ("runtime_version", "node_dependency_prepare"), ("npm_version", "node_dependency_prepare"),
-            ("lock_generation", "node_dependency_prepare"), ("lock_validation", "node_dependency_prepare"),
-            ("bulk_audit", "node_dependency_audit"), ("npm_ci", "node_dependency_audit"),
-            ("typecheck", "typescript_typecheck"), ("tests", "typescript_tests"),
-        )
-        candidates = ("worker_setup", "node_dependency_prepare", "node_dependency_audit",
-                      "typescript_typecheck", "typescript_tests")
-        self.assertTrue(
-            audit.CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS <= audit.CORE_CONTRACT_REFUSAL_DIAGNOSTICS
-        )
-        env = core_contract_publish_environment("1")
-        base = {
-            "schema_version": 1, "status": "refused", "stage": "worker_setup",
-            "reason": "runner_unavailable", "diagnostic": "source_gates",
-        }
-        for diagnostic, reason in sorted(audit.CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS.items()):
-            stage = "worker_setup"
-            for substage, bound_stage in stage_by_substage:
-                if diagnostic.startswith("source_gates_node_" + substage + "_"):
-                    stage = bound_stage
-            accepted = core_contract_line(
-                {**base, "reason": reason, "diagnostic": diagnostic, "stage": stage},
-                b"KD-CORE-CONTRACT-REFUSAL ",
-            )
-            with self.subTest(diagnostic=diagnostic):
-                output = io.BytesIO()
-                self.assertEqual(
-                    audit.publish_core_contract_receipt(env, io.BytesIO(accepted), output), 0,
-                )
-                self.assertEqual(output.getvalue(), accepted)
-            other_reason = "capture_invalid" if reason == "runner_unavailable" else "runner_unavailable"
-            wrongs = [
-                {"reason": other_reason}, {"stage": "cleanup"}, {"stage": "toolchain_install"},
-                {"stage": "cleanup", "reason": "cleanup_incomplete"}, {"reason": "internal_error"},
-            ]
-            wrongs += [{"stage": other} for other in candidates if other != stage]
-            for wrong in wrongs:
-                rejected = core_contract_line(
-                    {**base, "reason": reason, "diagnostic": diagnostic, "stage": stage, **wrong},
-                    b"KD-CORE-CONTRACT-REFUSAL ",
-                )
-                with self.subTest(diagnostic=diagnostic, wrong=wrong):
-                    with self.assertRaises(audit.AuditRefusal):
-                        audit.publish_core_contract_receipt(env, io.BytesIO(rejected), io.BytesIO())
-        for unlisted in (
-            "source_gates_node_private_command_timeout", "source_gates_node_", "source_gates_node",
-            "source_gates_node_lock_validation_command_timeout",
-            "source_gates_node_lock_validation_contract_refused",
-            "source_gates_node_none_command_timeout",
-        ):
-            rejected = core_contract_line(
-                {**base, "diagnostic": unlisted}, b"KD-CORE-CONTRACT-REFUSAL ",
-            )
-            with self.subTest(unlisted=unlisted), self.assertRaises(audit.AuditRefusal):
-                audit.publish_core_contract_receipt(env, io.BytesIO(rejected), io.BytesIO())
-
-    def test_publisher_accepts_step_diagnostics_only_with_their_bound_stage_and_reason(self):
+    def test_publisher_accepts_payload_step_diagnostics_only_with_their_bound_stage_and_reason(self):
         import macos_core_contract as core_contract
 
         self.assertEqual(
@@ -2054,50 +2006,13 @@ class CoreContractReceiptTests(unittest.TestCase):
             core_contract.SOURCE_GATES_STEP_DIAGNOSTIC_REASONS,
         )
         self.assertEqual(
-            audit.CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTICS, core_contract.SOURCE_GATES_STEP_DIAGNOSTICS,
+            audit.CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTICS,
+            core_contract.SOURCE_GATES_STEP_DIAGNOSTICS,
         )
-        self.assertEqual(len(audit.CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTICS), 66)
-        self.assertEqual(
-            audit.CORE_CONTRACT_SOURCE_GATES_NPM_KEYS_BY_STEP, core_contract.SOURCE_GATES_NPM_KEYS_BY_STEP,
-        )
-        self.assertEqual(
-            audit.CORE_CONTRACT_SOURCE_GATES_NPM_RESOLVE_CODES, core_contract.SOURCE_GATES_NPM_RESOLVE_CODES,
-        )
-        self.assertEqual(
-            audit.CORE_CONTRACT_SOURCE_GATES_NPM_RUNNER_KEYS, core_contract.SOURCE_GATES_NPM_RUNNER_KEYS,
-        )
-        self.assertEqual(
-            audit.CORE_CONTRACT_SOURCE_GATES_NPM_BUNDLE_REASONS,
-            core_contract.SOURCE_GATES_NPM_BUNDLE_REASONS,
-        )
-        npm_diagnostics = frozenset(
-            diagnostic for diagnostic in audit.CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTICS
-            if diagnostic.startswith("source_gates_npm_")
-        )
-        self.assertEqual(len(npm_diagnostics), 54)
-        self.assertEqual(
-            npm_diagnostics,
-            frozenset(
-                "source_gates_" + step + "_" + key
-                for step, keys in core_contract.SOURCE_GATES_NPM_KEYS_BY_STEP for key in keys
-            ),
-        )
-        self.assertEqual(
-            {diagnostic for diagnostic, reason in audit.CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTIC_REASONS.items()
-             if diagnostic in npm_diagnostics and reason == "capture_invalid"},
-            {"source_gates_npm_version_capture_invalid", "source_gates_npm_resolve_capture_invalid",
-             "source_gates_npm_lock_capture_invalid"},
-        )
-        self.assertEqual(audit.CORE_CONTRACT_SOURCE_GATES_NODE_PROFILE_REASONS,
-                         core_contract.SOURCE_GATES_NODE_PROFILE_REASONS)
-        self.assertEqual(audit.CORE_CONTRACT_SOURCE_GATES_NODE_OUTCOME_CHECKS,
-                         core_contract.SOURCE_GATES_NODE_OUTCOME_CHECKS)
+        self.assertEqual(len(audit.CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTICS), 2)
         self.assertTrue(
-            audit.CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTICS <= audit.CORE_CONTRACT_REFUSAL_DIAGNOSTICS
-        )
-        self.assertFalse(
             audit.CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTICS
-            & audit.CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS
+            <= audit.CORE_CONTRACT_REFUSAL_DIAGNOSTICS
         )
         env = core_contract_publish_environment("1")
         base = {
@@ -2112,11 +2027,10 @@ class CoreContractReceiptTests(unittest.TestCase):
                 output = io.BytesIO()
                 self.assertEqual(audit.publish_core_contract_receipt(env, io.BytesIO(accepted), output), 0)
                 self.assertEqual(output.getvalue(), accepted)
-            other_reason = "capture_invalid" if reason == "runner_unavailable" else "runner_unavailable"
+            wrong_reason = "capture_invalid" if reason == "runner_unavailable" else "runner_unavailable"
             for wrong in (
-                {"reason": other_reason}, {"stage": "cleanup"}, {"stage": "toolchain_install"},
-                {"stage": "typescript_tests"}, {"stage": "cleanup", "reason": "cleanup_incomplete"},
-                {"reason": "internal_error"},
+                {"reason": wrong_reason}, {"stage": "cleanup"}, {"stage": "toolchain_install"},
+                {"reason": "cleanup_incomplete", "stage": "cleanup"}, {"reason": "internal_error"},
             ):
                 rejected = core_contract_line(
                     {**base, "reason": reason, "diagnostic": diagnostic, **wrong},
@@ -2125,42 +2039,13 @@ class CoreContractReceiptTests(unittest.TestCase):
                 with self.subTest(diagnostic=diagnostic, wrong=wrong), self.assertRaises(audit.AuditRefusal):
                     audit.publish_core_contract_receipt(env, io.BytesIO(rejected), io.BytesIO())
         for unlisted in (
-            "source_gates_payload_private", "source_gates_payload", "source_gates_node_profile",
-            "source_gates_node_outcome_", "source_gates_node_outcome_private",
-            "source_gates_npm_resolve_ERESOLVE", "source_gates_npm_resolve", "source_gates_npm_resolve_private",
-            "source_gates_npm_version_eresolve", "source_gates_npm_bundle_manifest_invalid",
+            "source_gates_payload_private", "source_gates_node_profile",
+            "source_gates_node_outcome_", "source_gates_npm_resolve_ERESOLVE",
+            "source_gates_npm_bundle_manifest_invalid",
         ):
             rejected = core_contract_line({**base, "diagnostic": unlisted}, b"KD-CORE-CONTRACT-REFUSAL ")
             with self.subTest(unlisted=unlisted), self.assertRaises(audit.AuditRefusal):
                 audit.publish_core_contract_receipt(env, io.BytesIO(rejected), io.BytesIO())
-
-    def test_node_gate_names_are_accepted_refusal_stages_without_widening_the_bound_diagnostics(self):
-        import macos_core_contract as core_contract
-
-        node_gates = {
-            "node_dependency_prepare", "node_dependency_audit", "typescript_typecheck", "typescript_tests",
-        }
-        self.assertTrue(node_gates <= audit.CORE_CONTRACT_REFUSAL_STAGES)
-        self.assertTrue(node_gates <= core_contract.STAGES)
-        self.assertFalse(node_gates & audit.CORE_CONTRACT_GATE_STAGES)
-        env = core_contract_publish_environment("1")
-        for stage in sorted(node_gates):
-            line = core_contract_line(
-                {"schema_version": 1, "status": "refused", "stage": stage,
-                 "reason": "runner_unavailable", "diagnostic": "source_gates"},
-                b"KD-CORE-CONTRACT-REFUSAL ",
-            )
-            with self.subTest(stage=stage):
-                output = io.BytesIO()
-                self.assertEqual(audit.publish_core_contract_receipt(env, io.BytesIO(line), output), 0)
-                self.assertEqual(output.getvalue(), line)
-            gate_line = core_contract_line(
-                {"schema_version": 1, "status": "refused", "stage": stage,
-                 "reason": "gate_failed", "diagnostic": "source_gate_nonzero_exit"},
-                b"KD-CORE-CONTRACT-REFUSAL ",
-            )
-            with self.subTest(stage=stage, gate_diagnostic=True), self.assertRaises(audit.AuditRefusal):
-                audit.publish_core_contract_receipt(env, io.BytesIO(gate_line), io.BytesIO())
 
     def test_encryptor_payload_class_details_are_in_the_success_receipt_vocabulary(self):
         for code in ("bom", "c0", "c1", "cr", "nul", "utf8"):
@@ -2758,7 +2643,7 @@ class BootstrapAuditTests(unittest.TestCase):
 
         mutations = (
             lambda pages, env, logs: logs.__setitem__(803, logs[803].replace(
-                b"reviewed-diff-sha256=" + b"d" * 64,
+                b"reviewed-diff-sha256=" + b"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
                 b"reviewed-diff-sha256=" + b"f" * 64,
                 1,
             )),
@@ -2975,8 +2860,8 @@ class BootstrapAuditTests(unittest.TestCase):
             {
                 "invalid_input", "context_unavailable", "configuration_unavailable",
                 "source_reader_unavailable", "repository_scope_invalid", "source_fetch_unavailable",
-                "revocation_unconfirmed", "base_invalid", "signature_invalid",
-                "revocation_policy_invalid", "bootstrap_snapshot_invalid", "bootstrap_not_approved",
+                "revocation_unconfirmed", "base_invalid", "bootstrap_snapshot_invalid",
+                "bootstrap_not_approved",
                 "internal_error",
             },
         )
@@ -3218,7 +3103,7 @@ class CacheProofAuditTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertEqual(
                 output_path.read_text(encoding="ascii"),
-                "cache_snapshot=" + audit.cache_inventory_digest([]) + "\n",
+                "cache_snapshot=" + audit.cache_inventory_baseline([]) + "\n",
             )
 
         pages, env, _, cache_items = cache_proof_audit_fixture()
@@ -4046,7 +3931,7 @@ class AuditRunTests(unittest.TestCase):
             "created_at": "2026-10-25T00:00:00Z",
             "size_in_bytes": 1,
         }
-        env["MACOS_CACHE_SNAPSHOT"] = audit.cache_inventory_digest([cache])
+        env["MACOS_CACHE_SNAPSHOT"] = audit.cache_inventory_baseline([cache])
         pages[
             "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1"
         ] = ({"total_count": 1, "actions_caches": [cache]}, {})
@@ -4088,7 +3973,7 @@ class AuditRunTests(unittest.TestCase):
             "created_at": "2026-10-25T00:00:00Z",
             "size_in_bytes": 1,
         }
-        env["MACOS_CACHE_SNAPSHOT"] = audit.cache_inventory_digest([cache])
+        env["MACOS_CACHE_SNAPSHOT"] = audit.cache_inventory_baseline([cache])
         pages[
             "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1"
         ] = ({"total_count": 1, "actions_caches": [cache]}, {})

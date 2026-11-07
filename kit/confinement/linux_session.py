@@ -49,8 +49,8 @@ RESULT_PREFIX = b"KD-SESSION "
 MAX_CAPTURE_BYTES = 65536
 MAX_RESULT_BYTES = 400000
 OUTER_SLACK_SECONDS = 40
-MAX_TIMEOUT_SECONDS = {"probe": 600, "fixture": 600, "project": 1800}
-LIMIT_PROFILE_NAMES = frozenset(("probe", "fixture", "project"))
+MAX_TIMEOUT_SECONDS = {"probe": 600, "fixture": 600, "project": 1800, "runtime": 5400}
+LIMIT_PROFILE_NAMES = frozenset(("probe", "fixture", "project", "runtime"))
 
 
 def _limit_profiles():
@@ -79,16 +79,26 @@ def _limit_profiles():
             (resource.RLIMIT_NOFILE, (4096, 4096)),
             (resource.RLIMIT_CORE, (0, 0)),
         ),
+        "runtime": (
+            (resource.RLIMIT_CPU, (3600, 3600)),
+            (resource.RLIMIT_FSIZE, (4294967296, 4294967296)),
+            (resource.RLIMIT_AS, (resource.RLIM_INFINITY, resource.RLIM_INFINITY)),
+            (resource.RLIMIT_NPROC, (1024, 1024)),
+            (resource.RLIMIT_NOFILE, (4096, 4096)),
+            (resource.RLIMIT_CORE, (0, 0)),
+        ),
     }
 
 
 PROBE_LIMITS = _LazyLimitProfile("probe")
 FIXTURE_LIMITS = _LazyLimitProfile("fixture")
 PROJECT_LIMITS = _LazyLimitProfile("project")
+RUNTIME_LIMITS = _LazyLimitProfile("runtime")
 LIMIT_PROFILES = {
     "probe": PROBE_LIMITS,
     "fixture": FIXTURE_LIMITS,
     "project": PROJECT_LIMITS,
+    "runtime": RUNTIME_LIMITS,
 }
 CONFINED_UNSHARE = tuple(harness.UNSHARE_ARGUMENTS)
 OPEN_UNSHARE = ("--mount", "--pid", "--fork", "--ipc", "--propagation", "private", "--kill-child=KILL")

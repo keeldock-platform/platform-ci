@@ -4,31 +4,32 @@ import hashlib
 import io
 import json
 import os
+import platform
 import re
+import shutil
 import signal
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import types
+import urllib.parse
 import unittest
 import zipfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import linux_source_build
+
 _LINUX_ONLY = not sys.platform.startswith("linux")
 if not _LINUX_ONLY:
-    import foundation_node_feedback
     import gate_table
     import confinement_public_audit
     import confinement_verdict
     import log_canary
-    import linux_source_build
     import macos_core_contract
-    import npm_admission_bootstrap
-else:
-    linux_source_build = types.SimpleNamespace(SourceBuildRefusal=Exception)
 
 
 _FIXTURE_BODY = base64.b64encode(b"\x30\x0b" + b"fixture-der").decode("ascii")
@@ -51,18 +52,836 @@ def _path_only_lock(count, prefix="member"):
 def _registry_lock():
     return _path_only_lock(1) + (
         '\n[[package]]\nname = "serde"\nversion = "1.0.1"\nsource = "'
-        + linux_source_build.rust_license_gate.cargo_lock_receipt.REGISTRY_SOURCE
+        + linux_source_build.cargo_lock_bootstrap.cargo.REGISTRY_SOURCE
         + '"\nchecksum = "' + "b" * 64 + '"\n'
     )
 
 
+class RuntimeDependencyWorkflowTests(unittest.TestCase):
+    def test_runtime_node_and_npm_are_pinned_and_staged_outside_the_hardened_runner_temp(self):
+        workflow = (Path(__file__).resolve().parents[2]
+                    / ".github/workflows/core-dependency-checks.yml").read_text(encoding="utf-8")
+        node_step = workflow.split("- name: Set up the committed runtime Node version\n", 1)[1].split(
+            "- name: Install the pinned runtime npm version\n", 1,
+        )[0]
+        npm_step = workflow.split("- name: Install the pinned runtime npm version\n", 1)[1].split(
+            "- name: Harden runner paths before confined runtime checks\n", 1,
+        )[0]
+        self.assertIn("id: runtime-node", node_step)
+        self.assertIn("NODE_VERSION: 24.22.2", node_step)
+        self.assertIn('node_root="/tmp/kd-toolchains/node/node-v${NODE_VERSION}-linux-x64"', node_step)
+        self.assertIn('"https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz"', node_step)
+        self.assertIn(
+            "48cc0e21e048790e54c0cf5749c2725005313d652651c40b7a21feb9697aaf75",
+            node_step,
+        )
+        self.assertIn('sha256sum --check --status', node_step)
+        self.assertIn('[[ "$("$node_bin/node" --version)" == "v${NODE_VERSION}" ]]', node_step)
+        self.assertIn('chmod -R a+rX,go-w "$node_root"', node_step)
+        self.assertIn("printf 'node_bin=%s\\n' \"$node_bin\" >> \"$GITHUB_OUTPUT\"", node_step)
+        self.assertIn("NODE_BIN: ${{ steps.runtime-node.outputs.node_bin }}", npm_step)
+        self.assertIn('npm_root="/tmp/kd-toolchains/runtime-npm12"', npm_step)
+        self.assertNotIn("$RUNNER_TEMP", npm_step)
+        self.assertIn('chmod -R a+rX,go-w "$npm_root"', npm_step)
+        self.assertIn('"$("$NODE_BIN/node" "$npm12" --version)" == "12.2.2"', npm_step)
+        self.assertIn('"$("$NODE_BIN/node" --version)" == "v24.22.2"', npm_step)
+        self.assertIn("KD_NODE_BIN: ${{ steps.runtime-node.outputs.node_bin }}", workflow)
+        harden_step = workflow.split("- name: Harden runner paths before confined runtime checks\n", 1)[1].split(
+            "- name: Prepare kernel restrictions and run the independent boundary self-test\n", 1,
+        )[0]
+        self.assertNotIn("NODE_BIN:", harden_step)
+        self.assertNotIn("--node-bin", harden_step)
+
+    def test_source_cache_writer_serializes_inventory_updates_without_cancelling_runs(self):
+        root = Path(__file__).resolve().parents[2] / ".github/workflows"
+        workflow = (root / "linux-source-admission.yml").read_text(encoding="utf-8")
+        group = (
+            "group: ${{ github.repository == 'keeldock-platform/platform-ci' && "
+            "'platform-rust-cache-inventory' || format('platform-ci-run-{0}-{1}-{2}', "
+            "github.workflow, github.run_id, github.run_attempt) }}"
+        )
+        self.assertIn(group, workflow)
+        self.assertIn("cancel-in-progress: false", workflow)
+        core_reusable = (root / "core-dependency-checks.yml").read_text(encoding="utf-8")
+        self.assertNotIn(group, core_reusable)
+
+
+class SourceReaderCallerValidationTests(unittest.TestCase):
+    def test_core_pull_request_source_reader_uses_only_the_job_token(self):
+        source_sha = "a" * 40
+        repository = linux_source_build.RUST_CACHE_CORE_REPOSITORY
+        for base_ref in ("develop", "uat", "main"):
+            env = {
+                "CI_REPOSITORY": repository,
+                "CI_EVENT_NAME": "pull_request",
+                "CI_REF": "refs/pull/42/merge",
+                "CI_BASE_REF": base_ref,
+                "GITHUB_REF": "refs/pull/42/merge",
+                "GITHUB_BASE_REF": base_ref,
+                "GITHUB_SHA": source_sha,
+                "GITHUB_TOKEN": "read-only-job-token",
+                "REQUESTED_SOURCE_SHA": source_sha,
+                "CONTROL_SHA": "b" * 40,
+                "CI_SHA": source_sha,
+            }
+            with self.subTest(base_ref=base_ref), patch.object(
+                linux_source_build, "_api_request", side_effect=[
+                    (200, {"private": True, "full_name": repository}),
+                    (200, {"sha": source_sha}),
+                ],
+            ) as api, contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertTrue(linux_source_build._source_reader_caller_allowed(env))
+                self.assertEqual(linux_source_build.verify_source_reader(env), 0)
+                self.assertEqual(api.call_count, 2)
+                self.assertIn("secret_reader=none", output.getvalue())
+                self.assertTrue(all(call.args[1] == "read-only-job-token" for call in api.call_args_list))
+
+        invalid = dict(env, CI_REF="refs/pull/0/merge", GITHUB_REF="refs/pull/0/merge")
+        with patch.object(linux_source_build, "_api_request") as api, self.assertRaises(
+            linux_source_build.SourceBuildRefusal,
+        ):
+            linux_source_build.verify_source_reader(invalid)
+        api.assert_not_called()
+
+        with patch.object(linux_source_build, "_api_request") as api, self.assertRaises(
+            linux_source_build.SourceBuildRefusal,
+        ):
+            linux_source_build.verify_source_reader(dict(env, SOURCE_READER_TOKEN=_SOURCE_TOKEN))
+        api.assert_not_called()
+
+    def test_reusable_workflow_is_secret_free_for_pr_source_read_and_cache_disabled_for_core(self):
+        workflow = (Path(__file__).resolve().parents[2]
+                    / ".github/workflows/core-dependency-checks.yml").read_text(encoding="utf-8")
+        self.assertEqual(workflow.count("Verify untrusted Core pull request source without App secrets"), 3)
+        self.assertEqual(workflow.count("Checkout the exact Core pull request commit with the job token"), 3)
+        self.assertEqual(workflow.count("'linux-source-read-untrusted'"), 4)
+        self.assertNotIn("github.event_name == 'push' && github.repository == format", workflow)
+        for match in re.finditer(
+            r"(?ms)^      - name: Verify untrusted Core pull request source without App secrets\n(.*?)(?=^      - name: )",
+            workflow,
+        ):
+            self.assertNotIn("secrets.", match.group(1))
+            self.assertIn("GITHUB_TOKEN: ${{ github.token }}", match.group(1))
+
+
 @unittest.skipIf(_LINUX_ONLY, "the Linux source build suite runs only on Linux")
 class LinuxSourceBuildTests(unittest.TestCase):
+    def _cache_identity(self, event="pull_request", ref="refs/pull/42/merge", trust_class="primary"):
+        control_sha = "b" * 40
+        return {
+            "CI_REPOSITORY": linux_source_build.REPOSITORY,
+            "SOURCE_REPOSITORY_ID": "123456789",
+            "REQUESTED_SOURCE_SHA": "a" * 40,
+            "CONTROL_SHA": control_sha,
+            "CI_SHA": control_sha,
+            "RUST_CACHE_TRUST_CLASS": trust_class,
+            "CI_REF": ref,
+            "CI_EVENT_NAME": event,
+        }
+
+    def test_reusable_dependency_preflight_accepts_protected_core_branches_and_pull_requests(self):
+        base = {
+            "CI_REUSABLE_CALL": "true",
+            "CI_REPOSITORY": ("Moh-Bakr/" + "keeldock" + "-core"),
+            "CI_SERVER_URL": "https://github.com",
+            "CI_EVENT_NAME": "push",
+            "CI_REF": "refs/heads/develop",
+            "CI_BASE_REF": "",
+            "CI_SHA": "a" * 40,
+            "GITHUB_SHA": "a" * 40,
+            "CONTROL_SHA": "b" * 40,
+            "REQUESTED_SOURCE_SHA": "a" * 40,
+            "CACHE_MODE": "none",
+            "GITHUB_TOKEN": "runner-token",
+        }
+        caller_workflow = (
+            "jobs:\n  dependencies:\n    uses: "
+            "keeldock-platform/platform-ci/.github/workflows/core-dependency-checks.yml@"
+            + base["CONTROL_SHA"] + "\n    secrets: inherit\n    with:\n"
+            "      source_sha: ${{ github.sha }}\n      control_sha: "
+            + base["CONTROL_SHA"] + "\n"
+        )
+        caller_payload = {
+            "path": ".github/workflows/dependency-checks.yml",
+            "encoding": "base64",
+            "content": base64.b64encode(caller_workflow.encode("utf-8")).decode("ascii"),
+        }
+        stream = io.StringIO()
+        with patch.object(linux_source_build, "_api_request", return_value=(200, caller_payload)), \
+                contextlib.redirect_stdout(stream):
+            result = linux_source_build.verify_dependency_preflight(base)
+        self.assertEqual(result, 0)
+        self.assertEqual(stream.getvalue(), "linux-dependency-preflight=verified cache=none mode=reusable\n")
+        self.assertNotIn("runner-token", stream.getvalue())
+
+        for branch in ("develop", "uat", "main"):
+            with self.subTest(push_branch=branch), patch.object(
+                linux_source_build, "_api_request", return_value=(200, caller_payload),
+            ), contextlib.redirect_stdout(io.StringIO()):
+                push = dict(base, CI_REF="refs/heads/" + branch)
+                self.assertEqual(linux_source_build.verify_dependency_preflight(push), 0)
+        for base_ref in ("develop", "uat", "main"):
+            with self.subTest(pull_request_base=base_ref), patch.object(
+                linux_source_build, "_api_request", return_value=(200, caller_payload),
+            ), contextlib.redirect_stdout(io.StringIO()):
+                pull_request = dict(
+                    base, CI_EVENT_NAME="pull_request", CI_REF="refs/pull/42/merge",
+                    CI_BASE_REF=base_ref,
+                )
+                self.assertEqual(linux_source_build.verify_dependency_preflight(pull_request), 0)
+        for changes in (
+            {"CI_REPOSITORY": "other/core"},
+            {"CI_REF": "refs/heads/feature"},
+            {"CI_EVENT_NAME": "pull_request", "CI_REF": "refs/pull/42/merge", "CI_BASE_REF": "feature"},
+            {"CI_EVENT_NAME": "pull_request", "CI_REF": "refs/pull/0/merge", "CI_BASE_REF": "develop"},
+            {"CI_EVENT_NAME": "push", "CI_REF": "refs/heads/feature"},
+            {"REQUESTED_SOURCE_SHA": "c" * 40},
+            {"CONTROL_SHA": "invalid"},
+            {"CACHE_MODE": "read"},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(linux_source_build.SourceBuildRefusal):
+                with patch.object(linux_source_build, "_api_request", return_value=(200, caller_payload)):
+                    linux_source_build.verify_dependency_preflight(dict(base, **changes))
+        bad_payload = dict(caller_payload, content=base64.b64encode(
+            caller_workflow.replace(base["CONTROL_SHA"], "c" * 40).encode("utf-8"),
+        ).decode("ascii"))
+        with patch.object(linux_source_build, "_api_request", return_value=(200, bad_payload)), \
+                self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "identity"):
+            linux_source_build.verify_dependency_preflight(base)
+
+    def test_source_reader_verifier_binds_core_branches_and_pr_refs_before_api_access(self):
+        core = linux_source_build.RUST_CACHE_CORE_REPOSITORY
+        source_sha = "a" * 40
+        repo = {"id": 123, "private": True, "full_name": "KeelDock/private-source"}
+        installation = {
+            "repositories": [{"id": 123, "full_name": "KeelDock/private-source"}],
+            "total_count": 1,
+        }
+        base = {
+            "SOURCE_READER_TOKEN": _SOURCE_TOKEN,
+            "SOURCE_REPOSITORY_ID": "123",
+            "SOURCE_REPOSITORY_OWNER": "KeelDock",
+            "SOURCE_REPOSITORY_NAME": "private-source",
+            "REQUESTED_SOURCE_SHA": source_sha,
+            "CI_REPOSITORY": core,
+        }
+        callers = [
+            dict(base, CI_EVENT_NAME="push", CI_REF="refs/heads/" + branch, CI_BASE_REF="")
+            for branch in ("develop", "uat", "main")
+        ] + [
+            dict(base, CI_REPOSITORY=linux_source_build.REPOSITORY,
+                 CI_EVENT_NAME="workflow_dispatch", CI_REF="refs/heads/main", CI_BASE_REF=""),
+            dict(base, CI_REPOSITORY=linux_source_build.REPOSITORY,
+                 CI_EVENT_NAME="workflow_dispatch", CI_REF="refs/heads/untrusted", CI_BASE_REF=""),
+        ]
+        for env in callers:
+            with self.subTest(event=env["CI_EVENT_NAME"], ref=env["CI_REF"], base=env["CI_BASE_REF"]), \
+                    patch.object(linux_source_build, "_api_request", side_effect=[(200, repo), (200, installation)]) as api, \
+                    patch.object(linux_source_build, "_reference_sha", return_value=source_sha), \
+                    patch.object(linux_source_build, "_comparison", return_value="identical"), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(linux_source_build.verify_source_reader(env), 0)
+                self.assertEqual(api.call_count, 2)
+
+        for branch in ("develop", "uat", "main"):
+            env = {
+                "CI_REPOSITORY": core,
+                "CI_EVENT_NAME": "pull_request",
+                "CI_REF": "refs/pull/42/merge",
+                "CI_BASE_REF": branch,
+                "GITHUB_REF": "refs/pull/42/merge",
+                "GITHUB_BASE_REF": branch,
+                "GITHUB_SHA": source_sha,
+                "GITHUB_TOKEN": "read-only-job-token",
+                "REQUESTED_SOURCE_SHA": source_sha,
+                "CONTROL_SHA": "b" * 40,
+                "CI_SHA": source_sha,
+            }
+            with self.subTest(untrusted_pull_request_base=branch), \
+                    patch.object(linux_source_build, "_api_request", side_effect=[
+                        (200, {"private": True, "full_name": core}),
+                        (200, {"sha": source_sha}),
+                    ]) as api, contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(linux_source_build.verify_source_reader(env), 0)
+                self.assertEqual(api.call_count, 2)
+                self.assertEqual(
+                    output.getvalue(),
+                    "linux-source-reader=verified repository=core pull_request=untrusted secret_reader=none\n",
+                )
+                for _, args, _ in api.mock_calls:
+                    self.assertEqual(args[1], "read-only-job-token")
+
+        pr_with_secret = {
+            "CI_REPOSITORY": core,
+            "CI_EVENT_NAME": "pull_request",
+            "CI_REF": "refs/pull/42/merge",
+            "CI_BASE_REF": "develop",
+            "GITHUB_REF": "refs/pull/42/merge",
+            "GITHUB_BASE_REF": "develop",
+            "GITHUB_SHA": source_sha,
+            "GITHUB_TOKEN": "read-only-job-token",
+            "REQUESTED_SOURCE_SHA": source_sha,
+            "CONTROL_SHA": "b" * 40,
+            "CI_SHA": source_sha,
+            "SOURCE_READER_TOKEN": _SOURCE_TOKEN,
+        }
+        with patch.object(linux_source_build, "_api_request") as api, \
+                self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "token"):
+            linux_source_build.verify_source_reader(pr_with_secret)
+        api.assert_not_called()
+
+        rejected = (
+            dict(base, CI_EVENT_NAME="push", CI_REF="refs/heads/feature", CI_BASE_REF=""),
+            dict(base, CI_EVENT_NAME="push", CI_REF="refs/heads/develop", CI_BASE_REF="main"),
+            dict(base, CI_EVENT_NAME="pull_request", CI_REF="refs/pull/0/merge", CI_BASE_REF="develop"),
+            dict(base, CI_EVENT_NAME="pull_request", CI_REF="refs/pull/42/merge", CI_BASE_REF="feature"),
+            dict(base, CI_EVENT_NAME="pull_request", CI_REF="refs/heads/develop", CI_BASE_REF="develop"),
+            dict(base, CI_REPOSITORY="other/core", CI_EVENT_NAME="push", CI_REF="refs/heads/main"),
+            dict(base, CI_REPOSITORY=linux_source_build.REPOSITORY,
+                 CI_EVENT_NAME="pull_request", CI_REF="refs/pull/42/merge", CI_BASE_REF="main"),
+        )
+        for env in rejected:
+            with self.subTest(rejected=env), patch.object(linux_source_build, "_api_request") as api, \
+                    self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "token"):
+                linux_source_build.verify_source_reader(env)
+            api.assert_not_called()
+
+    def test_core_dependency_workflow_is_reusable_and_pr_source_reads_have_no_app_secrets(self):
+        workflow = (Path(__file__).resolve().parents[2]
+                    / ".github/workflows/core-dependency-checks.yml").read_text(encoding="utf-8")
+        self.assertIn("  workflow_call:\n", workflow)
+        self.assertIn("github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core')", workflow)
+        self.assertIn("github.event_name == 'pull_request'", workflow)
+        self.assertIn("github.ref == 'refs/heads/uat'", workflow)
+        self.assertIn("github.ref == 'refs/heads/main'", workflow)
+        self.assertIn("github.base_ref == 'uat'", workflow)
+        self.assertIn("github.base_ref == 'main'", workflow)
+        self.assertIn("startsWith(github.ref, 'refs/pull/')", workflow)
+        self.assertIn("endsWith(github.ref, '/merge')", workflow)
+        self.assertEqual(workflow.count("Verify untrusted Core pull request source without App secrets"), 3)
+        self.assertEqual(workflow.count("Checkout the exact Core pull request commit with the job token"), 3)
+        app_token_steps = re.findall(
+            r"(?ms)^      - name: Mint a scoped source-reader token\n(.*?)(?=^      - name: )",
+            workflow,
+        )
+        self.assertEqual(len(app_token_steps), 3)
+        for step in app_token_steps:
+            self.assertIn("if: ${{ github.event_name != 'pull_request' }}", step)
+            self.assertIn("uses: actions/create-github-app-token@", step)
+            self.assertIn("SOURCE_READER_PRIVATE_KEY: ${{ secrets.SOURCE_READER_PRIVATE_KEY }}", step)
+        self.assertEqual(workflow.count("'linux-source-read-untrusted'"), 4)
+        self.assertEqual(workflow.count("uses: actions/cache/restore@"), 2)
+        self.assertEqual(workflow.count("uses: actions/cache/save@"), 2)
+        cache_enable_lines = re.findall(r"(?m)^\s+KD_RUST_CACHE_ENABLED: (.*)$", workflow)
+        self.assertEqual(cache_enable_lines, [
+            "${{ github.event_name == 'workflow_dispatch' && github.repository == 'keeldock-platform/platform-ci' && github.ref == 'refs/heads/main' }}",
+            "${{ github.event_name == 'workflow_dispatch' && github.repository == 'keeldock-platform/platform-ci' && github.ref == 'refs/heads/main' }}",
+        ])
+        self.assertNotIn("github.event_name == 'push' && github.repository == format", workflow)
+        for match in re.finditer(r"(?ms)^      - name: Verify untrusted Core pull request source without App secrets\n(.*?)(?=^      - name: )", workflow):
+            self.assertNotIn("secrets.", match.group(1))
+            self.assertIn("GITHUB_TOKEN: ${{ github.token }}", match.group(1))
+        for action in ("uses: actions/cache/restore@", "uses: actions/cache/save@"):
+            offset = 0
+            while True:
+                offset = workflow.find(action, offset)
+                if offset < 0:
+                    break
+                start = workflow.rfind("      - name:", 0, offset)
+                end = workflow.find("      - name:", offset)
+                if end < 0:
+                    end = len(workflow)
+                step = workflow[start:end]
+                self.assertIn("3edfce9056124e459a23f683a21433670d47daca", step)
+                self.assertIn("rust-cache.tar", step)
+                if "restore@" in action:
+                    self.assertIn("KD_RUST_CACHE_ENABLED == 'true'", step)
+                else:
+                    condition = step.split("        if:", 1)[1].split("\n", 1)[0]
+                    self.assertNotIn("pull_request", condition)
+                offset += len(action)
+        for name in (
+            "Derive the exact Rust cache key", "Prepare runner-local Rust cache staging",
+            "Restore the exact Rust build cache", "Import the validated Rust build cache",
+            "Prepare the Rust cache after confined work exits", "Package the Rust build cache",
+            "Save the Rust build cache for protected main",
+        ):
+            start = workflow.index("      - name: " + name + "\n")
+            end = workflow.find("\n      - name:", start + 1)
+            step = workflow[start:end if end >= 0 else None]
+            self.assertIn("continue-on-error: true", step, name)
+        self.assertIn("steps.rust-cache-import.outcome == 'success'", workflow)
+        self.assertIn("steps.runtime-cache-import.outcome == 'success'", workflow)
+
+    def test_cache_and_working_directory_policies_match_the_checkout_layout(self):
+        root = Path(__file__).resolve().parents[2]
+        admission = (root / ".github/workflows/linux-source-admission.yml").read_text(encoding="utf-8")
+        quick = (root / ".github/workflows/core-linux-quick-return.yml").read_text(encoding="utf-8")
+        reusable = (root / ".github/workflows/core-dependency-checks.yml").read_text(encoding="utf-8")
+        docs = (root / "docs/branch-promotion.md").read_text(encoding="utf-8")
+
+        self.assertIn("'linux-source-read-main'", admission)
+        self.assertIn("github.ref == 'refs/heads/main'", admission)
+        self.assertNotIn("working-directory: control", admission)
+        for name in (
+            "Derive Rust cache key", "Prepare runner-local Rust cache staging",
+            "Restore exact Rust build cache", "Import validated Rust build cache",
+            "Export validated Rust build cache after confined work", "Package the Rust build cache",
+            "Save the exact Rust build cache", "Derive independent verifier Rust cache key",
+            "Prepare independent verifier Rust cache staging", "Restore the independent verifier Rust build cache",
+            "Import the independent verifier Rust cache", "Export the independent verifier Rust cache after confined work",
+            "Package the independent verifier Rust cache", "Save the independent verifier Rust cache",
+        ):
+            start = admission.index("      - name: " + name + "\n")
+            end = admission.find("\n      - name:", start + 1)
+            step = admission[start:end if end >= 0 else None]
+            self.assertIn("continue-on-error: true", step, name)
+        self.assertNotIn("actions/cache/", quick)
+        self.assertNotIn("KD_RUST_CACHE_ENCRYPTION_KEY_B64", quick)
+        self.assertNotIn("working-directory: control", quick)
+
+        for workflow in (admission, quick, reusable):
+            declared_paths = set(re.findall(r"^\s+path: ([A-Za-z0-9._/-]+)\s*$", workflow, re.MULTILINE))
+            for directory in re.findall(r"^\s+working-directory: ([A-Za-z0-9._/-]+)\s*$", workflow, re.MULTILINE):
+                self.assertTrue(
+                    directory in declared_paths or any(directory.startswith(path + "/") for path in declared_paths),
+                    f"{directory} has no matching checkout path",
+                )
+
+        callee_jobs = {}
+        in_jobs = False
+        current = None
+        for line in reusable.splitlines():
+            if line == "jobs:":
+                in_jobs = True
+                continue
+            if not in_jobs:
+                continue
+            job_match = re.match(r"^  ([A-Za-z0-9_-]+):$", line)
+            if job_match:
+                current = job_match.group(1)
+                callee_jobs[current] = current
+                continue
+            name_match = re.match(r"^    name: ([A-Za-z0-9_.-]+)$", line)
+            if current and name_match:
+                callee_jobs[current] = name_match.group(1)
+        actual_contexts = {
+            "dependencies / " + callee_jobs[job]
+            for job in ("dependency-preflight", "rust", "runtime-workspace", "npm")
+        }
+        for context in actual_contexts:
+            self.assertIn(context, docs)
+
+    def test_optional_cache_validation_refuses_cache_without_failing_the_uncached_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            source.mkdir()
+            invalid = {
+                "KD_RUST_CACHE_MODE": "read",
+                "KD_RUST_CACHE_DIR": str(Path(temporary) / "missing-cache"),
+                "KD_RUST_CACHE_KEY": "missing-key",
+                "KD_RUST_CACHE_HIT": "true",
+                "RUST_CACHE_OS": "Linux-x64",
+                "RUST_CACHE_SCOPE": "rust",
+                "RUST_CACHE_TRUST_CLASS": "primary",
+            }
+            self.assertIsNone(linux_source_build._optional_rust_cache(invalid, source, "rust"))
+
+    def test_rust_cache_validator_accepts_only_an_exact_hash_keyed_read(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "fuzz").mkdir()
+            (source / "runtime").mkdir()
+            (source / "rust-toolchain.toml").write_text("[toolchain]\nchannel = '1.99.1'\n", encoding="ascii")
+            for relative in ("Cargo.lock", "fuzz/Cargo.lock", "runtime/Cargo.lock"):
+                (source / relative).write_text("version = 4\n", encoding="ascii")
+            runner_temp = root / "runner-temp"
+            runner_temp.mkdir()
+            cache_dir = runner_temp / "kd-rust-cache"
+            cache_dir.mkdir()
+            base = {
+                "KD_RUST_CACHE_MODE": "read", "KD_RUST_CACHE_DIR": str(cache_dir),
+                "KD_RUST_CACHE_HIT": "false", "RUST_CACHE_OS": "Linux-x64",
+                "RUST_CACHE_SCOPE": "rust", "RUNNER_TEMP": str(runner_temp),
+                **self._cache_identity(),
+            }
+            identity = linux_source_build._rust_cache_identity(base)
+            key = linux_source_build._rust_cache_key(source, "Linux-x64", "rust", **identity)
+            base["KD_RUST_CACHE_KEY"] = key
+            accepted = linux_source_build._validate_rust_cache(base, source, "rust")
+            self.assertEqual(accepted["key"], key)
+            self.assertFalse(accepted["hit"])
+            self.assertIsNone(linux_source_build._validate_rust_cache({"KD_RUST_CACHE_MODE": ""}, source))
+            self.assertTrue(linux_source_build._rust_cache_read_allowed(base))
+            self.assertFalse(linux_source_build._rust_cache_write_allowed(base))
+            changed_revision = dict(
+                base, REQUESTED_SOURCE_SHA="c" * 40, CONTROL_SHA="d" * 40, CI_SHA="e" * 40,
+            )
+            self.assertNotEqual(
+                linux_source_build._rust_cache_key(
+                    source, "Linux-x64", "rust", **linux_source_build._rust_cache_identity(changed_revision),
+                ),
+                key,
+            )
+            changed_control = dict(base, CONTROL_SHA="d" * 40, CI_SHA="d" * 40)
+            self.assertNotEqual(
+                linux_source_build._rust_cache_key(
+                    source, "Linux-x64", "rust", **linux_source_build._rust_cache_identity(changed_control),
+                ),
+                key,
+            )
+            primary = dict(
+                base, **self._cache_identity("push", "refs/heads/main", "primary"),
+            )
+            primary_identity = linux_source_build._rust_cache_identity(primary)
+            primary_key = linux_source_build._rust_cache_key(
+                source, "Linux-x64", "rust", **primary_identity,
+            )
+            self.assertEqual(primary_key, key)
+            primary["KD_RUST_CACHE_KEY"] = primary_key
+            self.assertEqual(
+                linux_source_build._validate_rust_cache(primary, source, "rust")["key"], primary_key,
+            )
+            verifier = dict(
+                base, **self._cache_identity("push", "refs/heads/main", "independent-verifier"),
+            )
+            verifier["CI_REPOSITORY"] = "keeldock-platform/platform-verifier"
+            verifier_identity = linux_source_build._rust_cache_identity(verifier)
+            verifier_key = linux_source_build._rust_cache_key(
+                source, "Linux-x64", "rust", **verifier_identity,
+            )
+            self.assertNotEqual(verifier_key, primary_key)
+            verifier["KD_RUST_CACHE_KEY"] = verifier_key
+            self.assertEqual(
+                linux_source_build._validate_rust_cache(verifier, source, "rust")["key"],
+                verifier_key,
+            )
+            for changes in (
+                {"KD_RUST_CACHE_MODE": "write"},
+                {"KD_RUST_CACHE_KEY": key + "x"},
+                {"KD_RUST_CACHE_HIT": ""},
+                {"RUST_CACHE_SCOPE": "runtime-workspace"},
+                {"KD_RUST_CACHE_DIR": str(root / "outside")},
+                {"CI_REF": "invalid-ref", "CI_EVENT_NAME": "pull_request"},
+                {"CI_REF": "refs/heads/main", "CI_EVENT_NAME": "schedule"},
+                {"SOURCE_REPOSITORY_ID": "987654321"},
+                {"CI_REPOSITORY": "another/platform-ci"},
+                {"RUST_CACHE_TRUST_CLASS": "untrusted"},
+                {"REQUESTED_SOURCE_SHA": "not-a-sha"},
+            ):
+                with self.subTest(changes=changes), self.assertRaises(linux_source_build.SourceBuildRefusal):
+                    linux_source_build._validate_rust_cache(dict(base, **changes), source, "rust")
+            (source / "runtime/Cargo.lock").write_text("version = 5\n", encoding="ascii")
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "cache"):
+                linux_source_build._validate_rust_cache(base, source, "rust")
+
+    def test_rust_cache_key_logs_only_a_sanitised_success_marker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "private-source-path"
+            source.mkdir()
+            (source / "rust-toolchain.toml").write_text("[toolchain]\nchannel = '1.99.1'\n", encoding="ascii")
+            (source / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
+            output = root / "output"
+            output.write_text("", encoding="ascii")
+            stream = io.StringIO()
+            with contextlib.redirect_stdout(stream):
+                result = linux_source_build.write_rust_cache_key({
+                    "SOURCE_PATH": str(source), "RUST_CACHE_OS": "Linux-x64",
+                    "RUST_CACHE_SCOPE": "rust", "GITHUB_OUTPUT": str(output),
+                    **self._cache_identity(),
+                })
+            logged = stream.getvalue()
+            self.assertEqual(result, 0)
+            self.assertEqual(logged, "linux-rust-cache-key=verified\n")
+            self.assertNotIn(str(source), logged)
+            self.assertNotIn("cache_key=", logged)
+            self.assertRegex(
+                output.read_text(encoding="ascii"),
+                r"^cache_key=kd-rust-v5-Linux-x64-rust-primary-[a-f0-9]{40}-[a-f0-9]{40}-"
+                r"[a-f0-9]{64}-[a-f0-9]{64}-[a-f0-9]{64}\n$",
+            )
+
+    def test_rust_cache_write_is_limited_by_trust_class_and_branch(self):
+        self.assertTrue(linux_source_build._rust_cache_write_allowed({
+            "CI_REPOSITORY": linux_source_build.REPOSITORY,
+            "RUST_CACHE_TRUST_CLASS": "primary",
+            "CI_EVENT_NAME": "push", "CI_REF": "refs/heads/main",
+        }))
+        self.assertTrue(linux_source_build._rust_cache_write_allowed({
+            "CI_REPOSITORY": "keeldock-platform/platform-verifier",
+            "RUST_CACHE_TRUST_CLASS": "independent-verifier",
+            "CI_EVENT_NAME": "push", "CI_REF": "refs/heads/main",
+        }))
+        self.assertFalse(linux_source_build._rust_cache_write_allowed({
+            "CI_REPOSITORY": linux_source_build.REPOSITORY,
+            "RUST_CACHE_TRUST_CLASS": "untrusted",
+            "CI_EVENT_NAME": "workflow_dispatch", "CI_REF": "refs/heads/untrusted",
+        }))
+        self.assertFalse(linux_source_build._rust_cache_write_allowed({
+            "CI_REPOSITORY": linux_source_build.REPOSITORY,
+            "RUST_CACHE_TRUST_CLASS": "primary",
+            "CI_EVENT_NAME": "pull_request", "CI_REF": "refs/pull/42/merge",
+        }))
+        for context in (
+            {"CI_REPOSITORY": linux_source_build.REPOSITORY, "RUST_CACHE_TRUST_CLASS": "untrusted", "CI_EVENT_NAME": "pull_request", "CI_REF": "refs/pull/42/merge"},
+            {"CI_REPOSITORY": linux_source_build.REPOSITORY, "RUST_CACHE_TRUST_CLASS": "untrusted", "CI_EVENT_NAME": "push", "CI_REF": "refs/heads/feature"},
+            {"CI_REPOSITORY": linux_source_build.REPOSITORY, "RUST_CACHE_TRUST_CLASS": "untrusted", "CI_EVENT_NAME": "push", "CI_REF": "refs/heads/main"},
+        ):
+            with self.subTest(context=context):
+                self.assertFalse(linux_source_build._rust_cache_write_allowed(context))
+
+    def test_rust_cache_copy_rejects_a_symlink_that_escapes_the_cache_tree(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "cache"
+            source.mkdir()
+            outside = root / "outside"
+            outside.write_text("not cache data", encoding="ascii")
+            (source / "escape").symlink_to(outside)
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "cache"):
+                linux_source_build._copy_validated_cache_tree(source, root / "copy")
+
+    def test_rust_cache_copy_breaks_internal_hardlinks_into_independent_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "cache"
+            source.mkdir()
+            original = source / "first.o"
+            original.write_text("compiled output", encoding="ascii")
+            os.link(original, source / "second.o")
+            destination = root / "copy"
+
+            linux_source_build._copy_validated_cache_tree(source, destination)
+
+            copied_first = destination / "first.o"
+            copied_second = destination / "second.o"
+            self.assertEqual(copied_first.read_text(encoding="ascii"), "compiled output")
+            self.assertEqual(copied_second.read_text(encoding="ascii"), "compiled output")
+            self.assertNotEqual(copied_first.stat().st_ino, copied_second.stat().st_ino)
+            self.assertEqual(copied_first.stat().st_nlink, 1)
+            self.assertEqual(copied_second.stat().st_nlink, 1)
+
+    def test_rust_cache_copy_rejects_a_hardlink_alias_outside_the_cache_tree(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "cache"
+            source.mkdir()
+            cached = source / "compiled.o"
+            cached.write_text("compiled output", encoding="ascii")
+            os.link(cached, root / "outside.o")
+
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "cache"):
+                linux_source_build._copy_validated_cache_tree(source, root / "copy")
+
+    def test_rust_cache_archive_import_accepts_only_bounded_tree_members(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive_path = root / "rust-cache.tar"
+            destination = root / "cache"
+            with tarfile.open(archive_path, "w") as archive:
+                for name in ("target", "cargo-home", "target/lib.rmeta"):
+                    info = tarfile.TarInfo(name)
+                    if name == "target/lib.rmeta":
+                        payload = b"cached object"
+                        info.size = len(payload)
+                        archive.addfile(info, io.BytesIO(payload))
+                    else:
+                        info.type = tarfile.DIRTYPE
+                        archive.addfile(info)
+            linux_source_build._extract_rust_cache_archive(archive_path, destination)
+            self.assertEqual((destination / "target/lib.rmeta").read_bytes(), b"cached object")
+            self.assertTrue((destination / "cargo-home").is_dir())
+
+    def test_rust_cache_archive_import_rejects_traversal_and_symlink_escape(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, member_type, linkname in (
+                ("../escaped", tarfile.REGTYPE, ""),
+                ("target/escape", tarfile.SYMTYPE, "../../outside"),
+            ):
+                archive_path = root / ("cache-" + str(len(name)) + ".tar")
+                with tarfile.open(archive_path, "w") as archive:
+                    for folder in ("target", "cargo-home"):
+                        info = tarfile.TarInfo(folder)
+                        info.type = tarfile.DIRTYPE
+                        archive.addfile(info)
+                    malicious = tarfile.TarInfo(name)
+                    malicious.type = member_type
+                    malicious.linkname = linkname
+                    archive.addfile(malicious, io.BytesIO(b"x") if member_type == tarfile.REGTYPE else None)
+                with self.subTest(member=name), self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "cache"):
+                    linux_source_build._extract_rust_cache_archive(archive_path, root / "destination")
+
+    def test_cargo_cache_staging_preserves_runner_ownership_and_worker_copy_can_set_owner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_home = root / "source-home"
+            registry = source_home / "registry" / "index"
+            registry.mkdir(parents=True)
+            (registry / "metadata").write_text("locked package index", encoding="ascii")
+            destination = root / "runner-fetch-home"
+            with patch.object(linux_source_build.os, "chown", side_effect=PermissionError("runner cannot chown")) as chown:
+                linux_source_build._copy_cargo_registry_cache(source_home, destination)
+            chown.assert_not_called()
+            self.assertEqual(
+                (destination / "registry/index/metadata").read_text(encoding="ascii"),
+                "locked package index",
+            )
+            worker_destination = root / "worker-cargo-home"
+            with patch.object(linux_source_build.os, "chown") as chown:
+                linux_source_build._copy_cargo_registry_cache(
+                    source_home, worker_destination, owner=(62000, 62000),
+                )
+            self.assertTrue(chown.called)
+            self.assertEqual(chown.call_args_list[0].args[1:], (62000, 62000))
+
+    def test_cold_rust_cache_export_uses_privileged_read_and_runner_owned_staging(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner_uid, runner_gid = os.getuid(), os.getgid()
+            control = root / "control"
+            control.mkdir()
+            worker = control / "source"
+            target = worker / "target"
+            target.mkdir(parents=True, mode=0o700)
+            (target / "lib.rmeta").write_text("compiled output", encoding="ascii")
+            cargo_home = worker / ".kd-cargo-home"
+            registry = cargo_home / "registry" / "src" / "locked-package"
+            registry.mkdir(parents=True)
+            (registry / "package.crate").write_text("locked source", encoding="ascii")
+            source = root / "source-checkout"
+            source.mkdir()
+            (source / "rust-toolchain.toml").write_text("[toolchain]\nchannel = '1.99.1'\n", encoding="ascii")
+            (source / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
+            runner_temp = root / "runner-temp"
+            cache_dir = runner_temp / "kd-rust-cache"
+            (cache_dir / "target").mkdir(parents=True)
+            (cache_dir / "cargo-home" / "registry").mkdir(parents=True)
+            (cache_dir / "cargo-home" / "git").mkdir(parents=True)
+            env = {
+                "SOURCE_PATH": str(source), "WORKER_PATH": str(worker), "CARGO_HOME": str(cargo_home),
+                "RUNNER_TEMP": str(runner_temp), "KD_RUST_CACHE_MODE": "read",
+                "KD_RUST_CACHE_DIR": str(cache_dir), "KD_RUST_CACHE_HIT": "false",
+                "RUST_CACHE_OS": "Linux-x64", "RUST_CACHE_SCOPE": "rust",
+                "RUST_CACHE_TRUST_CLASS": "primary", "CI_REPOSITORY": linux_source_build.REPOSITORY,
+                "SOURCE_REPOSITORY_ID": "123456789", "REQUESTED_SOURCE_SHA": "a" * 40,
+                "CONTROL_SHA": "b" * 40, "CI_SHA": "b" * 40,
+                "CI_REF": "refs/heads/main", "CI_EVENT_NAME": "push",
+                "SUDO_UID": str(runner_uid), "SUDO_GID": str(runner_gid),
+            }
+            env["KD_RUST_CACHE_KEY"] = linux_source_build._rust_cache_key(
+                source, "Linux-x64", "rust", **linux_source_build._rust_cache_identity(env),
+            )
+            stream = io.StringIO()
+            with patch.object(linux_source_build, "PROJECT_ROOT", control), \
+                    patch.object(linux_source_build.os, "geteuid", return_value=0), \
+                    patch.object(linux_source_build.linux_harness, "CHILD_UID", runner_uid), \
+                    patch.object(linux_source_build.linux_harness, "CHILD_GID", runner_gid), \
+                    contextlib.redirect_stdout(stream):
+                result = linux_source_build.export_rust_cache(env)
+            self.assertEqual(result, 0, stream.getvalue())
+            self.assertEqual(stream.getvalue(), "linux-rust-cache=prepared\n")
+            self.assertEqual((cache_dir / "target/lib.rmeta").read_text(encoding="ascii"), "compiled output")
+            self.assertEqual(
+                (cache_dir / "cargo-home/registry/src/locked-package/package.crate").read_text(encoding="ascii"),
+                "locked source",
+            )
+            self.assertEqual((target.stat().st_mode & 0o777), 0o700)
+            self.assertEqual((cache_dir / "target").stat().st_uid, runner_uid)
+            self.assertEqual((cache_dir / "target").stat().st_gid, runner_gid)
+
+    def test_public_platform_dependency_workflow_uses_read_only_hash_scoped_cache(self):
+        workflow = (Path(__file__).resolve().parents[2]
+                    / ".github/workflows/core-dependency-checks.yml").read_text(encoding="utf-8")
+        self.assertEqual(workflow.count("uses: actions/cache/restore@"), 2)
+        self.assertEqual(workflow.count("uses: actions/cache/save@"), 2)
+        self.assertEqual(workflow.count("restore-keys:"), 0)
+        self.assertEqual(workflow.count("timeout 10m sudo -n --preserve-env="), 2)
+        self.assertIn("actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca", workflow)
+        self.assertIn("actions/cache/save@3edfce9056124e459a23f683a21433670d47daca", workflow)
+        self.assertIn("github.event_name == 'pull_request'", workflow)
+        self.assertIn("KD_RUST_CACHE_ENABLED", workflow)
+        for action in ("uses: actions/cache/restore@", "uses: actions/cache/save@"):
+            offset = 0
+            while True:
+                offset = workflow.find(action, offset)
+                if offset < 0:
+                    break
+                step_start = workflow.rfind("      - name:", 0, offset)
+                condition = workflow[step_start:offset]
+                if "restore@" in action:
+                    self.assertIn("KD_RUST_CACHE_ENABLED == 'true'", condition)
+                else:
+                    self.assertIn("github.event_name == 'workflow_dispatch'", condition)
+                    self.assertIn("github.ref == 'refs/heads/main'", condition)
+                    self.assertNotIn("pull_request", condition)
+                offset += len(action)
+        self.assertIn("RUST_CACHE_TRUST_CLASS: primary", workflow)
+        self.assertEqual(workflow.count("$" + "{{ runner.temp }}/kd-rust-cache/rust-cache.tar"), 4)
+        key_expression = (
+            "KD_RUST_CACHE_ENCRYPTION_KEY_B64: ${{ github.repository == 'keeldock-platform/platform-ci' "
+            "&& github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' "
+            "&& secrets.RUST_CACHE_ENCRYPTION_KEY || '' }}"
+        )
+        self.assertEqual(workflow.count(key_expression), 4)
+        self.assertEqual(workflow.count("linux-source-read-main"), 3)
+        self.assertIn("github.event_name == 'pull_request' && (github.base_ref == 'develop' || github.base_ref == 'uat' || github.base_ref == 'main')", workflow)
+        self.assertIn("startsWith(github.ref, 'refs/pull/') && endsWith(github.ref, '/merge')", workflow)
+        self.assertIn("github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core')", workflow)
+        self.assertNotIn("pull_request' && github.repository == 'keeldock-platform/platform-ci'", workflow)
+        self.assertIn("linux_source_build.py rust-cache-import", workflow)
+        self.assertIn("linux_source_build.py rust-cache-package", workflow)
+        for action in ("uses: actions/cache/restore@", "uses: actions/cache/save@"):
+            offset = 0
+            while True:
+                offset = workflow.find(action, offset)
+                if offset < 0:
+                    break
+                step_start = workflow.rfind("      - name:", 0, offset)
+                step_end = workflow.find("      - name:", offset)
+                if step_end < 0:
+                    step_end = len(workflow)
+                cached_paths = workflow[step_start:step_end]
+                self.assertIn("rust-cache.tar", cached_paths)
+                self.assertNotIn("cargo-home/registry", cached_paths)
+                self.assertNotIn("cargo-home/git", cached_paths)
+                self.assertNotIn("/kd-rust-cache/target", cached_paths)
+                offset += len(action)
+
+    def test_public_rust_cache_encryption_is_required_and_round_trips(self):
+        self.assertTrue(linux_source_build._rust_cache_requires_encryption({
+            "CI_REPOSITORY": "keeldock-platform/platform-ci",
+        }))
+        self.assertFalse(linux_source_build._rust_cache_requires_encryption({
+            "CI_REPOSITORY": ("Moh-Bakr/" + "keeldock" + "-core"),
+        }))
+        key = base64.b64encode(b"k" * 32).decode("ascii")
+        self.assertEqual(
+            linux_source_build._rust_cache_encryption_key({"KD_RUST_CACHE_ENCRYPTION_KEY_B64": key}), key,
+        )
+        with self.assertRaises(linux_source_build.SourceBuildRefusal):
+            linux_source_build._rust_cache_encryption_key({"KD_RUST_CACHE_ENCRYPTION_KEY_B64": "invalid"})
+        if shutil.which("gpg") is None:
+            self.skipTest("gpg is unavailable")
+        with tempfile.TemporaryDirectory(prefix="kd-cache-encryption-test-") as directory:
+            root = Path(directory)
+            original = root / "cache.tar"
+            encrypted = root / "cache.tar.gpg"
+            decrypted = root / "cache-restored.tar"
+            original.write_bytes(b"private compiled cache fixture")
+            linux_source_build._run_rust_cache_gpg("encrypt", original, encrypted, key, root / "gpg-encrypt")
+            self.assertNotEqual(encrypted.read_bytes(), original.read_bytes())
+            linux_source_build._run_rust_cache_gpg("decrypt", encrypted, decrypted, key, root / "gpg-decrypt")
+            self.assertEqual(decrypted.read_bytes(), original.read_bytes())
+
     def test_gate_order_matches_the_shared_macos_contracts(self):
         expected = (
             macos_core_contract.GATE_NAMES
             + macos_core_contract.PARSER_GATE_NAMES
-            + foundation_node_feedback.NODE_GATE_NAMES
+            + gate_table.NODE_GATE_NAMES
         )
         self.assertEqual(linux_source_build.GATES, expected)
         self.assertEqual(len(linux_source_build.GATES), 15)
@@ -79,16 +898,21 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "Boundary self-test before source-reader mint",
                 "Mint scoped source-reader token",
                 "Verify selected installation identity",
-                "Fetch exact source and verify binding, tree, signatures and lock provenance",
+                "Fetch exact source and verify binding, tree, signatures and committed locks",
                 "Revoke source-reader token and verify rejection",
-                "Install pinned cargo-deny and prepare the RustSec database",
-                "Require trusted Rust licence admission",
+                "Derive Rust cache key",
+                "Prepare runner-local Rust cache staging",
+                "Restore exact Rust build cache",
+                "Import validated Rust build cache",
+                "Fetch Rust dependencies from the committed lockfiles",
                 "Fetch npm tarballs by committed lock integrity",
-                "Run trusted dependency audit",
                 "Prepare offline project inputs",
                 "Re-run positive controls immediately before the first project command",
                 "Run all offline project gates",
                 "Merge confinement phase records",
+                "Export validated Rust build cache after confined work",
+                "Package the Rust build cache",
+                "Save the exact Rust build cache",
                 "Forced faults must fail closed",
             ),
         )
@@ -99,14 +923,20 @@ class LinuxSourceBuildTests(unittest.TestCase):
             "Mint verifier scoped source-reader token",
             "Verify source independently against binding, tree, signatures and lock",
             "Revoke verifier token and verify rejection",
-            "Install independent pinned cargo-deny and prepare RustSec database",
-            "Require trusted Rust licence admission independently",
+            "Derive independent verifier Rust cache key",
+            "Prepare independent verifier Rust cache staging",
+            "Restore the independent verifier Rust build cache",
+            "Import the independent verifier Rust cache",
+            "Fetch verifier Rust dependencies from committed lockfiles",
             "Fetch independent npm tarballs by lock integrity",
-            "Run independent trusted dependency audit",
             "Prepare independent offline project inputs",
             "Re-run independent positive controls before project execution",
             "Run independent offline project gates",
-            "Merge independent confinement records", "Verify unprivileged proof handoff",
+            "Merge independent confinement records",
+            "Export the independent verifier Rust cache after confined work",
+            "Package the independent verifier Rust cache",
+            "Save the independent verifier Rust cache",
+            "Verify unprivileged proof handoff",
             "Publish confinement verdict",
         ))
         self.assertEqual(
@@ -114,14 +944,19 @@ class LinuxSourceBuildTests(unittest.TestCase):
             frozenset((
                 "Mint scoped source-reader token",
                 "Verify selected installation identity",
-                "Fetch exact source and verify binding, tree, signatures and lock provenance",
+                "Fetch exact source and verify binding, tree, signatures and committed locks",
                 "Revoke source-reader token and verify rejection",
-                "Install pinned cargo-deny and prepare the RustSec database",
-                "Require trusted Rust licence admission",
+                "Derive Rust cache key",
+                "Prepare runner-local Rust cache staging",
+                "Restore exact Rust build cache",
+                "Import validated Rust build cache",
+                "Fetch Rust dependencies from the committed lockfiles",
                 "Fetch npm tarballs by committed lock integrity",
-                "Run trusted dependency audit",
                 "Prepare offline project inputs",
                 "Run all offline project gates",
+                "Export validated Rust build cache after confined work",
+                "Package the Rust build cache",
+                "Save the exact Rust build cache",
                 "Forced faults must fail closed",
             )),
         )
@@ -134,19 +969,38 @@ class LinuxSourceBuildTests(unittest.TestCase):
             workflow,
         )
         self.assertIsNotNone(match)
-        actual_steps = tuple(re.findall(r"^      - name: (.+)$", match.group(1), re.MULTILINE))
+        producer = match.group(1)
+        self.assertIn("cache_key: ${{ steps.rust-cache-key.outputs.cache_key }}", producer)
+        self.assertIn("id: rust-cache-key", producer)
+        self.assertIn("RUST_CACHE_SCOPE: linux-source-admission", producer)
+        self.assertNotIn("steps.verifier-rust-cache-key.outputs.cache_key", producer)
+        actual_steps = tuple(re.findall(r"^      - name: (.+)$", producer, re.MULTILINE))
         self.assertEqual(actual_steps, linux_source_build.SOURCE_STEP_NAMES)
-        self.assertIn("Require trusted Rust licence admission", actual_steps)
+        self.assertIn("Fetch Rust dependencies from the committed lockfiles", actual_steps)
+        self.assertNotIn("Require trusted Rust licence admission", actual_steps)
         verdict_match = re.search(
             r"(?ms)^  linux-source-admission-verdict:\n(.*?)(?=^  linux-source-admission-audit:)",
             workflow,
         )
         self.assertIsNotNone(verdict_match)
+        verifier = verdict_match.group(1)
+        self.assertIn(
+            "cache_key: ${{ steps.verifier-rust-cache-key.outputs.cache_key }}", verifier,
+        )
+        self.assertIn("id: verifier-rust-cache-key", verifier)
+        self.assertIn("RUST_CACHE_SCOPE: linux-source-verifier", verifier)
+        self.assertNotIn("steps.rust-cache-key.outputs.cache_key", verifier)
+        audit_match = re.search(
+            r"(?ms)^  linux-source-admission-audit:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", workflow,
+        )
+        self.assertIsNotNone(audit_match)
+        self.assertIn("needs.linux-source-admission-source-read.outputs.cache_key", audit_match.group(1))
+        self.assertIn("needs.linux-source-admission-verdict.outputs.cache_key", audit_match.group(1))
+        self.assertNotIn("steps.verifier-rust-cache-key.outputs.cache_key", audit_match.group(1))
         verdict_steps = tuple(re.findall(r"^      - name: (.+)$", verdict_match.group(1), re.MULTILINE))
         self.assertEqual(verdict_steps, linux_source_build.VERDICT_STEP_NAMES)
-        self.assertIn("Require trusted Rust licence admission independently", verdict_steps)
-        self.assertIn("Require trusted Rust licence admission independently",
-                      linux_source_build.OPTIONAL_VERDICT_SYNTHETIC_STEPS)
+        self.assertIn("Fetch verifier Rust dependencies from committed lockfiles", verdict_steps)
+        self.assertNotIn("Require trusted Rust licence admission independently", verdict_steps)
         for mode in ("source", "synthetic"):
             expected = linux_source_build._expected_run(
                 {"CI_SHA": "a" * 40, "GITHUB_RUN_ID": "7", "GITHUB_RUN_ATTEMPT": "1",
@@ -159,56 +1013,80 @@ class LinuxSourceBuildTests(unittest.TestCase):
                     job["steps"],
                     ("Set up job",) + actual_steps + ("Post Mint scoped source-reader token", "Complete job"),
                 )
-                self.assertNotIn("Require trusted Rust licence admission", job["optional_steps"])
+                self.assertNotIn("Fetch Rust dependencies from the committed lockfiles", job["optional_steps"])
+                self.assertEqual(
+                    set(job["optional_steps"]),
+                    set(linux_source_build.CACHE_SOURCE_STEPS) | {"Forced faults must fail closed"},
+                )
+                self.assertTrue(set(linux_source_build.GATES).isdisjoint(job["optional_steps"]))
             else:
                 self.assertEqual(job["steps"], ("Set up job",) + actual_steps + ("Complete job",))
-                self.assertIn("Require trusted Rust licence admission", job["optional_steps"])
+                self.assertIn("Fetch Rust dependencies from the committed lockfiles", job["optional_steps"])
 
-    def test_producer_and_independent_verifier_bind_license_gates_before_preparation(self):
+    def test_producer_and_independent_verifier_fetch_committed_cargo_locks_before_preparation(self):
         workflow = (Path(__file__).resolve().parents[2]
                     / ".github/workflows/linux-source-admission.yml").read_text(encoding="utf-8")
-        blocks = {}
-        for name in (
-                "Require trusted Rust licence admission",
-                "Fetch npm tarballs by committed lock integrity",
-                "Prepare offline project inputs",
-                "Run all offline project gates",
-                "Require trusted Rust licence admission independently",
-                "Fetch independent npm tarballs by lock integrity",
-                "Prepare independent offline project inputs",
-                "Run independent offline project gates"):
-            match = re.search(
-                r"(?ms)^      - name: " + re.escape(name)
-                + r"\n(.*?)(?=^      - name: |^  linux-source-admission-)",
-                workflow,
-            )
-            if match:
-                blocks[name] = match.group(1)
-        self.assertIn("Require trusted Rust licence admission", blocks)
-        self.assertIn("REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}",
-                      blocks["Require trusted Rust licence admission"])
-        self.assertIn("REQUESTED_SOURCE_SHA", blocks["Run all offline project gates"])
-        independent_gate = workflow[
-            workflow.index("      - name: Revoke verifier token and verify rejection"):
-            workflow.index("      - name: Fetch independent npm tarballs by lock integrity")
-        ]
-        self.assertIn("Require trusted Rust licence admission independently", independent_gate)
-        self.assertIn("REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}", independent_gate)
-        self.assertLess(workflow.index("Require trusted Rust licence admission"),
-                        workflow.index("Fetch npm tarballs by committed lock integrity"))
-        self.assertLess(workflow.index("Require trusted Rust licence admission independently"),
-                        workflow.index("Fetch independent npm tarballs by lock integrity"))
-        self.assertLess(workflow.index("Require trusted Rust licence admission"),
-                        workflow.index("Prepare offline project inputs"))
-        self.assertLess(workflow.index("Require trusted Rust licence admission independently"),
+        rust_fetch = workflow.index("Fetch Rust dependencies from the committed lockfiles")
+        npm_fetch = workflow.index("Fetch npm tarballs by committed lock integrity")
+        prepare = workflow.index("Prepare offline project inputs")
+        self.assertLess(rust_fetch, prepare)
+        self.assertLess(npm_fetch, prepare)
+        self.assertNotIn("KD_STAGED_INVENTORY_RECEIPT", workflow)
+        self.assertNotIn("Require trusted Rust licence admission", workflow)
+        code = Path(linux_source_build.__file__).read_text(encoding="ascii")
+        self.assertIn('"fetch", "--locked", "--manifest-path"', code)
+        self.assertNotIn("_check_d145_runtime_profile(", code)
+        self.assertNotIn("_read_staged_inventory_receipt", code)
+        self.assertLess(workflow.index("Fetch verifier Rust dependencies from committed lockfiles"),
                         workflow.index("Prepare independent offline project inputs"))
-        verifier_gates = workflow[workflow.index("      - name: Run independent offline project gates"):]
-        verifier_gate_step = verifier_gates.split("\n      - name:", 1)[0]
-        self.assertIn("REQUESTED_SOURCE_SHA", verifier_gate_step)
-        self.assertIn("preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA",
-                      verifier_gates)
-        self.assertIn("preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA",
-                      blocks["Run all offline project gates"])
+
+    def test_dependency_build_jobs_harden_and_recheck_the_runner_before_project_code(self):
+        workflow = (Path(__file__).resolve().parents[2]
+                    / ".github/workflows/core-dependency-checks.yml").read_text(encoding="utf-8")
+        rust_match = re.search(r"(?ms)^  rust:\n(.*?)(?=^  runtime-workspace:)", workflow)
+        runtime_match = re.search(r"(?ms)^  runtime-workspace:\n(.*?)(?=^  npm:)", workflow)
+        self.assertIsNotNone(rust_match)
+        self.assertIsNotNone(runtime_match)
+        for job, command in (
+            (rust_match.group(1), "kit/confinement/linux_source_build.py dependency-locked-builds"),
+            (runtime_match.group(1), "kit/confinement/linux_source_build.py runtime-workspace"),
+        ):
+            names = tuple(re.findall(r"^      - name: (.+)$", job, re.MULTILINE))
+            harden = names.index("Harden runner paths before confined project checks") if "Harden runner paths before confined project checks" in names else names.index("Harden runner paths before confined runtime checks")
+            selftest = names.index("Prepare kernel restrictions and run the independent boundary self-test")
+            recheck = names.index("Re-run positive controls immediately before confined Rust checks") if "Re-run positive controls immediately before confined Rust checks" in names else names.index("Re-run positive controls immediately before runtime checks")
+            build = names.index("Build and test root and fuzz Rust workspaces with locks enforced") if "Build and test root and fuzz Rust workspaces with locks enforced" in names else names.index("Build and test the registered runtime workspace suite in confinement")
+            self.assertLess(harden, selftest)
+            self.assertLess(selftest, recheck)
+            self.assertLess(recheck, build)
+            recheck_start = job.index("Re-run positive controls immediately before")
+            build_start = job.index("- name: " + names[build])
+            self.assertIn("linux_boundary.py recheck", job[recheck_start:build_start])
+            build_block = job[build_start:]
+            self.assertIn(command, build_block)
+            self.assertIn("working-directory: control", build_block)
+        self.assertIn('if [[ -d "$registry_cache" && ! -L "$registry_cache" ]]; then', workflow)
+        self.assertIn('cp -R "$registry_cache" "$cargo_home/"', workflow)
+        runtime_job = runtime_match.group(1)
+        node_step = runtime_job.split("- name: Set up the committed runtime Node version\n", 1)[1].split(
+            "- name: Install the pinned runtime npm version\n", 1,
+        )[0]
+        self.assertIn('npm_root="/tmp/kd-toolchains/runtime-npm12"', runtime_job)
+        self.assertNotIn('$RUNNER_TEMP/kd-runtime-npm12', runtime_job)
+        self.assertIn('chmod -R a+rX,go-w "$npm_root"', runtime_job)
+        self.assertIn("id: runtime-node", node_step)
+        self.assertIn("NODE_VERSION: 24.22.2", node_step)
+        self.assertIn(
+            "48cc0e21e048790e54c0cf5749c2725005313d652651c40b7a21feb9697aaf75",
+            node_step,
+        )
+        self.assertIn('sha256sum --check --status', node_step)
+        self.assertIn('[[ "$("$node_bin/node" --version)" == "v${NODE_VERSION}" ]]', node_step)
+        self.assertIn('chmod -R a+rX,go-w "$node_root"', node_step)
+        self.assertIn("printf 'node_bin=%s\\n' \"$node_bin\" >> \"$GITHUB_OUTPUT\"", node_step)
+        self.assertIn("KD_NODE_BIN: ${{ steps.runtime-node.outputs.node_bin }}", runtime_job)
+        self.assertIn("NODE_BIN: ${{ steps.runtime-node.outputs.node_bin }}", runtime_job)
+        self.assertNotIn("steps.toolchains.outputs.node_bin", runtime_job)
 
     def test_expected_run_assigns_the_plain_verdict_job_and_action_post(self):
         base = {"CI_SHA": "a" * 40, "GITHUB_RUN_ID": "7", "GITHUB_RUN_ATTEMPT": "1"}
@@ -222,7 +1100,10 @@ class LinuxSourceBuildTests(unittest.TestCase):
             for name in ("settings", "unit"):
                 steps = run["jobs"]["linux-source-admission-" + name]["steps"]
                 self.assertEqual((steps[0], steps[-1]), ("Set up job", "Complete job"))
-        self.assertEqual(source["jobs"][source["verdict_job"]]["optional_steps"], ())
+        self.assertEqual(
+            source["jobs"][source["verdict_job"]]["optional_steps"],
+            linux_source_build.CACHE_VERDICT_STEPS,
+        )
         self.assertEqual(
             synthetic["jobs"][synthetic["verdict_job"]]["optional_steps"],
             linux_source_build.OPTIONAL_VERDICT_SYNTHETIC_STEPS,
@@ -264,7 +1145,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
         self.assertTrue(linux_source_build._safe_tar_link("../lib/node.js"))
         self.assertFalse(linux_source_build._safe_tar_link("/etc/passwd"))
 
-    def test_cargo_lock_rejects_any_registry_or_git_source(self):
+    def test_cargo_lock_accepts_the_official_registry_and_rejects_git_sources(self):
         with tempfile.TemporaryDirectory() as temporary:
             lock = Path(temporary) / "Cargo.lock"
             lock.write_text(
@@ -274,11 +1155,11 @@ class LinuxSourceBuildTests(unittest.TestCase):
             linux_source_build._validate_cargo_lock_sources(temporary)
             lock.write_text(
                 'version = 3\n\n[[package]]\nname = "example"\nversion = "1.0.0"\n'
-                'source = "registry+https://' + 'github.com/rust-lang/crates.io-index"\n',
+                'source = "registry+https://' + 'github.com/rust-lang/crates.io-index"\n'
+                'checksum = "' + "b" * 64 + '"\n',
                 encoding="utf-8",
             )
-            with self.assertRaises(linux_source_build.SourceBuildRefusal):
-                linux_source_build._validate_cargo_lock_sources(temporary)
+            self.assertIsNone(linux_source_build._validate_cargo_lock_sources(temporary))
             lock.write_text(
                 'version = 3\n\n[[package]]\nname = "example"\nversion = "1.0.0"\n'
                 'source = "git+https://example.invalid/repo"\n',
@@ -299,7 +1180,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             lock.write_bytes(b"x" * 17)
             descriptor = self._root_descriptor(root)
             candidate = linux_source_build._rust_lock_paths(descriptor)[0]
-            with patch.object(linux_source_build.rust_license_gate, "MAX_LOCK_BYTES", 16):
+            with patch.object(linux_source_build, "MAX_CARGO_LOCK_BYTES", 16):
                 with self.assertRaises(linux_source_build.SourceBuildRefusal):
                     linux_source_build._read_bounded_cargo_lock(descriptor, candidate)
 
@@ -469,7 +1350,93 @@ class LinuxSourceBuildTests(unittest.TestCase):
             with self.assertRaises(linux_source_build.SourceBuildRefusal):
                 linux_source_build._neutralize_config_files(root)
 
-    def test_inventory_authenticates_both_npm_roots_before_staging_sanitizes_them(self):
+    def test_cargo_fetch_uses_a_fresh_config_outside_candidate_config_discovery(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
+            base = Path(temporary)
+            source = base / "candidate"
+            runner_temp = base / "runner-temp"
+            source.mkdir()
+            runner_temp.mkdir()
+            (source / "Cargo.toml").write_text(
+                '[package]\nname = "fixture"\nversion = "0.1.0"\nedition = "2024"\n', encoding="ascii",
+            )
+            (source / "Cargo.lock").write_text(_registry_lock(), encoding="ascii")
+            candidate_config = source / ".cargo" / "config.toml"
+            candidate_config.parent.mkdir()
+            candidate_config.write_text(
+                '[source.crates-io]\nreplace-with = "attacker"\n[source.attacker]\nregistry = "https://example.invalid/index"\n',
+                encoding="ascii",
+            )
+            cargo = base / "rust" / "bin" / "cargo"
+            cargo.parent.mkdir(parents=True)
+            cargo.write_text("trusted cargo fixture\n", encoding="ascii")
+            fetch_home = runner_temp / "cargo-home"
+            output = runner_temp / "github-output"
+            environment = {
+                "SOURCE_PATH": str(source), "REQUESTED_SOURCE_SHA": "a" * 40,
+                "RUST_ROOT": str(cargo.parent.parent), "KD_CARGO_FETCH_HOME": str(fetch_home),
+                "RUNNER_TEMP": str(runner_temp), "GITHUB_OUTPUT": str(output),
+            }
+            result = subprocess.CompletedProcess([], 0, b"", b"")
+            root_flags = os.O_RDONLY | os.O_DIRECTORY
+            with patch.object(linux_source_build, "_open_source_root", side_effect=lambda unused: os.open(source, root_flags)), \
+                    patch.object(linux_source_build, "_require_source_root_identity"), \
+                    patch.object(linux_source_build, "_require_confined_manifests"), \
+                    patch.object(linux_source_build, "_rust_lock_paths", return_value=[(("Cargo.lock",), ())]), \
+                    patch.object(linux_source_build, "_read_bounded_cargo_lock", return_value=_registry_lock().encode("ascii")), \
+                    patch.object(linux_source_build, "_run", return_value=result) as run:
+                self.assertEqual(linux_source_build.fetch_cargo_locks(environment), 0)
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(Path(run.call_args.args[1]), fetch_home)
+            self.assertEqual(run.call_args.args[2]["HOME"], str(fetch_home))
+            self.assertEqual(run.call_args.args[2]["CARGO_HOME"], str(fetch_home))
+            self.assertEqual((fetch_home / "config.toml").read_text(encoding="ascii"), "\n")
+            self.assertEqual((fetch_home / "config.toml").stat().st_mode & 0o777, 0o600)
+            self.assertIn("attacker", candidate_config.read_text(encoding="ascii"))
+
+    def test_npm_tarball_fetch_includes_the_runtime_lock_for_confined_workspace_checks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = base / "candidate"
+            runner_temp = base / "runner-temp"
+            source.mkdir()
+            runner_temp.mkdir()
+            payloads = {
+                "https://registry.npmjs.org/root-fixture/-/root-fixture-1.0.0.tgz": b"root tarball",
+                "https://registry.npmjs.org/runtime-fixture/-/runtime-fixture-1.0.0.tgz": b"runtime tarball",
+            }
+            locks = {}
+            for relative, (url, payload) in zip(
+                ("package-lock.json", "runtime/package-lock.json"), payloads.items(), strict=True,
+            ):
+                integrity = "sha512-" + base64.b64encode(hashlib.sha512(payload).digest()).decode("ascii")
+                lock = {"name": relative, "lockfileVersion": 3, "packages": {"node_modules/fixture": {
+                    "version": "1.0.0", "resolved": url, "integrity": integrity,
+                }}}
+                lock_bytes = (json.dumps(lock) + "\n").encode("ascii")
+                target = source / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(lock_bytes)
+                locks[relative] = lock_bytes
+            env = {
+                "SOURCE_PATH": str(source), "REQUESTED_SOURCE_SHA": "a" * 40,
+                "KD_DEPENDENCY_ONLY": "true", "KD_INCLUDE_RUNTIME_NPM_LOCK": "true",
+                "EXPECTED_RUNTIME_NODE_LOCK_SHA256": hashlib.sha256(locks["runtime/package-lock.json"]).hexdigest(),
+                "RUNNER_TEMP": str(runner_temp), "GITHUB_OUTPUT": str(runner_temp / "github-output"),
+            }
+
+            def write_tarball(url, unused_integrity, destination):
+                Path(destination).write_bytes(payloads[url])
+                Path(destination).chmod(0o400)
+
+            with patch.object(linux_source_build, "_check_committed_node_lock", return_value=("b" * 64, "c" * 64)), \
+                    patch.object(linux_source_build, "_download_integrity", side_effect=write_tarball):
+                self.assertEqual(linux_source_build.fetch_npm_tarballs(env), 0)
+            index = json.loads((runner_temp / "kd-records" / "npm-tarballs.json").read_text(encoding="ascii"))
+            self.assertEqual(set(index), set(payloads))
+            self.assertEqual(len(list((runner_temp / "kd-npm-tarballs").glob("*.tgz"))), 2)
+
+    def test_inventory_authenticates_both_npm_roots_before_staging_sanitizes_them_without_receipts(self):
         bootstrap = linux_source_build.cargo_lock_bootstrap
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -502,13 +1469,12 @@ class LinuxSourceBuildTests(unittest.TestCase):
             inventory_path.parent.mkdir(parents=True)
             inventory_path.write_bytes(("schema_version = 1\n" + "".join(rows)).encode("ascii"))
             source_sha = "a" * 40
-            original_digest = bootstrap.validate_runtime_source_inventory(source, source_sha)
+            bootstrap.validate_runtime_source_inventory(source, source_sha)
             tarball_index = base / "tarball-index.json"
             tarball_index.write_text("{}\n", encoding="ascii")
             project_root = base / "worker-root"
             project_root.mkdir()
             worker = project_root / "source"
-            receipt_directory = base / "runner-temp"
 
             def open_project_root():
                 return os.open(project_root, os.O_RDONLY | os.O_DIRECTORY)
@@ -518,30 +1484,71 @@ class LinuxSourceBuildTests(unittest.TestCase):
                     patch.object(linux_source_build.linux_harness, "CHILD_UID", os.getuid()), \
                     patch.object(linux_source_build.linux_harness, "CHILD_GID", os.getgid()):
                 linux_source_build._prepare_worker_tree(source, tarball_index, {
-                    "REQUESTED_SOURCE_SHA": source_sha, "RUNNER_TEMP": str(receipt_directory),
+                    "REQUESTED_SOURCE_SHA": source_sha,
                 })
 
             self.assertFalse((worker / ".npmrc").exists())
             self.assertFalse((worker / "runtime/.npmrc").exists())
             self.assertTrue((worker / "package-lock.json").is_file())
             self.assertTrue((worker / "runtime/package-lock.json").is_file())
+            staged_inventory = (worker / bootstrap.SOURCE_INVENTORY_PATH).read_bytes()
+            rows, unused_digest = bootstrap.parse_runtime_source_inventory(staged_inventory, source_sha)
+            by_path = {row["path"]: row["sha256"] for row in rows}
+            self.assertNotIn(".npmrc", by_path)
+            self.assertNotIn("runtime/.npmrc", by_path)
             self.assertEqual(
-                bootstrap.validate_runtime_source_inventory_staged(
-                    worker, source_sha,
-                    (receipt_directory / "kd-records/runtime-inventory-stage.json").read_bytes(),
-                ),
-                hashlib.sha256((worker / bootstrap.SOURCE_INVENTORY_PATH).read_bytes()).hexdigest(),
+                by_path["package-lock.json"],
+                hashlib.sha256((worker / "package-lock.json").read_bytes()).hexdigest(),
             )
-            receipt = json.loads((receipt_directory / "kd-records/runtime-inventory-stage.json").read_text())
-            self.assertEqual(receipt["original_inventory_sha256"], original_digest)
-            self.assertEqual(receipt["deleted_paths"], [".npmrc", "runtime/.npmrc"])
-            self.assertEqual(receipt["modified_paths"], ["package-lock.json"])
-            (worker / "runtime/package-lock.json").write_text("{}\n", encoding="ascii")
-            with self.assertRaises(bootstrap.BootstrapRefusal):
-                bootstrap.validate_runtime_source_inventory_staged(
-                    worker, source_sha,
-                    (receipt_directory / "kd-records/runtime-inventory-stage.json").read_bytes(),
-                )
+            self.assertEqual(
+                by_path["runtime/package-lock.json"],
+                hashlib.sha256((worker / "runtime/package-lock.json").read_bytes()).hexdigest(),
+            )
+
+    def test_confined_worker_rewrites_both_npm_locks_to_verified_local_tarballs(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
+            base = Path(temporary)
+            source = base / "candidate"
+            source.mkdir()
+            payloads = {
+                "https://registry.npmjs.org/root-fixture/-/root-fixture-1.0.0.tgz": b"root tarball",
+                "https://registry.npmjs.org/runtime-fixture/-/runtime-fixture-1.0.0.tgz": b"runtime tarball",
+            }
+            mapping = {}
+            for index, (url, payload) in enumerate(payloads.items()):
+                integrity = "sha512-" + base64.b64encode(hashlib.sha512(payload).digest()).decode("ascii")
+                lock = {"lockfileVersion": 3, "packages": {"node_modules/fixture": {
+                    "version": "1.0.0", "resolved": url, "integrity": integrity,
+                }}}
+                relative = "package-lock.json" if index == 0 else "runtime/package-lock.json"
+                lock_path = source / relative
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                lock_path.write_text(json.dumps(lock) + "\n", encoding="ascii")
+                tarball = base / (str(index) + ".tgz")
+                tarball.write_bytes(payload)
+                mapping[url] = str(tarball)
+            index_path = base / "npm-index.json"
+            index_path.write_text(json.dumps(mapping), encoding="ascii")
+            project_root = base / "worker-root"
+            project_root.mkdir()
+            worker = project_root / "source"
+
+            def open_project_root():
+                return os.open(project_root, os.O_RDONLY | os.O_DIRECTORY)
+
+            with patch.object(linux_source_build, "PROJECT_ROOT", project_root), \
+                    patch.object(linux_source_build, "_open_project_root", side_effect=open_project_root), \
+                    patch.object(linux_source_build.linux_harness, "CHILD_UID", os.getuid()), \
+                    patch.object(linux_source_build.linux_harness, "CHILD_GID", os.getgid()):
+                linux_source_build._prepare_worker_tree(source, index_path, {
+                    "REQUESTED_SOURCE_SHA": "a" * 40, "KD_INCLUDE_RUNTIME_NPM_LOCK": "true",
+                })
+
+            for relative in ("package-lock.json", "runtime/package-lock.json"):
+                lock = json.loads((worker / relative).read_text(encoding="ascii"))
+                resolved = lock["packages"]["node_modules/fixture"]["resolved"]
+                self.assertTrue(resolved.startswith("file://"))
+                self.assertTrue(Path(urllib.parse.urlsplit(resolved).path).is_file())
 
     def test_gate_commands_are_offline_after_dependency_preparation(self):
         commands = linux_source_build._gate_commands(Path("/work"), "/rust", "/node")
@@ -586,6 +1593,88 @@ class LinuxSourceBuildTests(unittest.TestCase):
             (runtime / "Cargo.lock").unlink()
             with self.assertRaises(linux_source_build.SourceBuildRefusal):
                 linux_source_build._gate_commands(project, "/rust", "/node")
+
+    def test_locked_build_commands_cover_root_fuzz_and_runtime_workspaces(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            for manifest in ("Cargo.toml", "fuzz/Cargo.toml", "runtime/Cargo.toml"):
+                target = project / manifest
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("[package]\nname = 'fixture'\nversion = '0.1.0'\n", encoding="utf-8")
+            commands = linux_source_build._locked_build_commands(project, "/rust")
+        self.assertEqual(tuple(name for name, _ in commands), (
+            "root_build", "root_test", "fuzz_build", "fuzz_test", "runtime_build", "runtime_test",
+        ))
+        for name, argv in commands:
+            self.assertEqual(argv[0], "/rust/bin/cargo")
+            self.assertIn("--locked", argv)
+            self.assertIn("--offline", argv)
+            self.assertEqual(argv[1], "build" if name.endswith("build") else "test")
+        self.assertIn("--all-targets", commands[0][1])
+        self.assertIn("--all-targets", commands[1][1])
+
+    def test_locked_build_runner_uses_no_network_project_sandbox(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runner_temp = Path(temporary)
+            worker = runner_temp / "source"
+            worker.mkdir()
+            for manifest in ("Cargo.toml", "fuzz/Cargo.toml", "runtime/Cargo.toml"):
+                target = worker / manifest
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("[package]\nname = 'fixture'\nversion = '0.1.0'\n", encoding="utf-8")
+            environment = {
+                "WORKER_PATH": str(worker), "CARGO_HOME": str(worker / ".kd-cargo-home"),
+                "RUST_ROOT": "/rust", "RUNNER_TEMP": str(runner_temp),
+            }
+            session_result = types.SimpleNamespace(exit_code=0, timed_out=False, stdout=b"", stderr=b"")
+            with patch.object(linux_source_build, "_validate_cargo_lock_sources") as validate_locks, patch.object(
+                linux_source_build, "_project_gate_directories"
+            ) as validate_worker, patch.object(
+                linux_source_build.linux_session, "run_host", return_value=session_result
+            ) as run_host:
+                self.assertEqual(linux_source_build.run_locked_builds(environment), 0)
+            self.assertTrue(validate_locks.called)
+            self.assertTrue(validate_worker.called)
+            self.assertEqual(run_host.call_count, 6)
+            for call in run_host.call_args_list:
+                self.assertEqual(call.kwargs["limits"], linux_source_build.PROJECT_GATE_LIMITS)
+                self.assertEqual(call.kwargs["timeout"], linux_source_build.LOCKED_BUILD_TIMEOUT_SECONDS)
+                self.assertEqual(call.args[4], {})
+                self.assertIn("--offline", call.args[2])
+
+    def test_runtime_workspace_suite_uses_no_network_bounded_project_sandbox(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runner_temp = Path(temporary)
+            worker = runner_temp / "source"
+            (worker / "runtime" / "scripts").mkdir(parents=True)
+            (worker / "runtime" / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
+            (worker / "runtime" / "package-lock.json").write_text("{}\n", encoding="ascii")
+            (worker / "runtime" / "scripts" / "check-workspace.mjs").write_text("\n", encoding="ascii")
+            environment = {
+                "WORKER_PATH": str(worker), "CARGO_HOME": str(worker / ".kd-cargo-home"),
+                "RUST_ROOT": "/rust", "NODE_BIN": "/node/bin", "NPM_BIN": "/npm/bin",
+                "RUNNER_TEMP": str(runner_temp),
+            }
+            session_result = types.SimpleNamespace(exit_code=0, timed_out=False, stdout=b"", stderr=b"")
+            with patch.object(linux_source_build, "_validate_cargo_lock_sources") as validate_locks, \
+                    patch.object(linux_source_build, "_project_gate_directories") as validate_worker, \
+                    patch.object(linux_source_build.linux_session, "run_host", return_value=session_result) as run_host, \
+                    patch.object(linux_source_build.sys, "stdout", io.StringIO()) as output:
+                self.assertEqual(linux_source_build.run_runtime_workspace(environment), 0)
+            self.assertTrue(validate_locks.called)
+            self.assertTrue(validate_worker.called)
+            self.assertEqual(run_host.call_count, 1)
+            launch = run_host.call_args.args[2]
+            project_env = run_host.call_args.args[3]
+            self.assertEqual(launch[-2:], ("/node/bin/node", "runtime/scripts/check-workspace.mjs"))
+            self.assertEqual(project_env["CARGO_NET_OFFLINE"], "true")
+            self.assertEqual(project_env["NPM_CONFIG_OFFLINE"], "true")
+            self.assertNotIn("sudo", project_env.get("PATH", ""))
+            self.assertEqual(run_host.call_args.kwargs["limits"], linux_source_build.RUNTIME_GATE_LIMITS)
+            self.assertEqual(run_host.call_args.kwargs["timeout"], linux_source_build.RUNTIME_WORKSPACE_TIMEOUT_SECONDS)
+            self.assertEqual(run_host.call_args.kwargs["cwd"], str(worker))
+            self.assertEqual(run_host.call_args.args[4], {})
+            self.assertIn("linux-runtime-workspace=passed", output.getvalue())
 
     def test_project_root_refuses_a_hostile_symlink(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
@@ -652,25 +1741,19 @@ class LinuxSourceBuildTests(unittest.TestCase):
             "LINUX_SOURCE_ALLOWED_CONTROL_SHA": "d" * 40,
             "SOURCE_REPOSITORY_ID": "7", "SOURCE_REPOSITORY_OWNER": "owner",
             "SOURCE_REPOSITORY_NAME": "source", "SOURCE_READER_INSTALLATION_ID": "8",
-            "SOURCE_READER_CLIENT_ID": "client", "LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256": "f" * 64,
-            "LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256": "1" * 64,
-            "LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON": "{}",
+            "SOURCE_READER_CLIENT_ID": "client",
             "LINUX_SOURCE_ENVIRONMENT_NAME": "linux-source-read", "REQUESTED_ENVIRONMENT_NAME": "linux-source-read",
         }
-        with patch.object(linux_source_build, "_validate_provenance_binding") as provenance:
-            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
-                linux_source_build._source_inputs(env)
-            provenance.assert_not_called()
-            env["LINUX_SOURCE_ALLOWED_FINGERPRINT"] = fingerprint
-            self.assertEqual(linux_source_build._source_inputs(env)["reviewed_diff_sha256"], fingerprint)
-            self.assertEqual(env["LINUX_SOURCE_ENVIRONMENT_NAME"], linux_source_build.ENVIRONMENT_NAME)
-            provenance.assert_called_once()
-            for name, value in (("LINUX_SOURCE_ENVIRONMENT_NAME", "source-read"), ("REQUESTED_ENVIRONMENT_NAME", "source-read")):
-                with self.subTest(name=name):
-                    changed = dict(env, **{name: value})
-                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
-                        linux_source_build._source_inputs(changed)
-            provenance.assert_called_once()
+        with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+            linux_source_build._source_inputs(env)
+        env["LINUX_SOURCE_ALLOWED_FINGERPRINT"] = fingerprint
+        self.assertEqual(linux_source_build._source_inputs(env)["reviewed_diff_sha256"], fingerprint)
+        self.assertEqual(env["LINUX_SOURCE_ENVIRONMENT_NAME"], linux_source_build.ENVIRONMENT_NAME)
+        for name, value in (("LINUX_SOURCE_ENVIRONMENT_NAME", "source-read"), ("REQUESTED_ENVIRONMENT_NAME", "source-read")):
+            with self.subTest(name=name):
+                changed = dict(env, **{name: value})
+                with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                    linux_source_build._source_inputs(changed)
 
     def _environment_calls(self, environment_updates=None, branch_names=("main", "untrusted"),
                            listing_updates=None, status=200):
@@ -1110,10 +2193,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             commands = tuple(
                 (name, ("/usr/bin/true",)) for name in linux_source_build.GATES
             )
-            with patch.object(
-                linux_source_build.rust_license_gate, "require_lock_admission",
-                wraps=linux_source_build.rust_license_gate.require_lock_admission,
-            ) as admission, patch.object(linux_source_build, "_job_elapsed_seconds", return_value=0.0), patch.object(
+            with patch.object(linux_source_build, "_job_elapsed_seconds", return_value=0.0), patch.object(
                 linux_source_build, "_project_gate_directories",
             ) as directories, patch.object(
                 linux_source_build, "_gate_commands", return_value=commands,
@@ -1137,9 +2217,6 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 self.assertEqual(durations["schema_version"], 1)
                 self.assertEqual(set(durations["durations_ms"]), set(linux_source_build.GATES))
                 self.assertTrue(all(type(value) is int and value >= 0 for value in durations["durations_ms"].values()))
-                identity = admission.call_args_list[0].args[1]
-                self.assertEqual(identity.profile, ".")
-                self.assertEqual(identity.root, str(worker))
                 for invocation in session.call_args_list:
                     launch = invocation.args[2]
                     self.assertEqual(launch[:3], ("/usr/bin/python3", "-B", "-c"))
@@ -1391,22 +2468,17 @@ class LinuxSourceBuildTests(unittest.TestCase):
         self.assertIn(
             "if PROJECT_GATE_BUDGET_SECONDS - job_elapsed - (time.monotonic() - budget_started) < PROJECT_GATE_TIMEOUT_SECONDS:",
             source)
-        self.assertLess(body.index("run_rust_license_gate(license_environment)"), body.index("job_elapsed = _job_elapsed_seconds()"))
+        self.assertNotIn("run_rust_license_gate", source)
 
-    def test_d145_profile_runs_before_lock_license_admission(self):
-        source = Path(linux_source_build.__file__).read_text(encoding="ascii")
-        body = source[source.index("def run_rust_license_gate("):source.index("def prepare_project(")]
-        self.assertLess(body.index("_check_d145_runtime_profile("),
-                        body.index("for candidate in _rust_lock_paths(root_fd):"))
 
     @staticmethod
-    def _write_d145_fixture_file(root, relative, text):
+    def _write_runtime_gate_fixture_file(root, relative, text):
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="ascii")
 
     @staticmethod
-    def _d145_fixture_lock(dependencies):
+    def _runtime_fixture_lock(dependencies):
         text = "version = 4\n"
         for name in sorted(dependencies):
             text += '\n[[package]]\nname = "' + name + '"\nversion = "0.1.0"\n'
@@ -1417,7 +2489,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 ) + "]\n"
         return text
 
-    def _write_complete_d145_fixture(self, root):
+    def _write_runtime_gate_fixture(self, root):
         bootstrap = linux_source_build.cargo_lock_bootstrap
         contract_members = sorted(bootstrap.CONTRACT_MEMBERS)
         contract_listing = "".join('    "' + member + '",\n' for member in contract_members)
@@ -1429,7 +2501,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             + bootstrap.HOST_API_POLICY_API_PACKAGE + ' = { path = "crates/host/api" }\n'
             + host_mock_package + ' = { path = "crates/host/mock" }\n'
         )
-        self._write_d145_fixture_file(root, "Cargo.toml", contract_root)
+        self._write_runtime_gate_fixture_file(root, "Cargo.toml", contract_root)
         host_api_package = bootstrap.HOST_API_POLICY_API_PACKAGE
         host_conformance_package = "keeldock" + "-host-conformance"
         kernel_i18n_package = "keeldock" + "-kernel-i18n"
@@ -1459,9 +2531,9 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 text += "\n[dev-dependencies]\n" + "".join(
                     dependency + " = { workspace = true }\n" for dependency in development
                 )
-            self._write_d145_fixture_file(root, member + "/Cargo.toml", text)
-        self._write_d145_fixture_file(
-            root, "Cargo.lock", self._d145_fixture_lock(contract_dependencies),
+            self._write_runtime_gate_fixture_file(root, member + "/Cargo.toml", text)
+        self._write_runtime_gate_fixture_file(
+            root, "Cargo.lock", self._runtime_fixture_lock(contract_dependencies),
         )
 
         runtime_members = bootstrap.HOST_API_POLICY_RUNTIME_REQUIRED_MEMBER_ROOTS
@@ -1477,7 +2549,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             + bootstrap.HOST_API_POLICY_API_PACKAGE + ' = { path = "'
             + bootstrap.HOST_API_POLICY_API_PATH + '" }\n'
         )
-        self._write_d145_fixture_file(root, "runtime/Cargo.toml", runtime_root)
+        self._write_runtime_gate_fixture_file(root, "runtime/Cargo.toml", runtime_root)
         runtime_dependencies = {bootstrap.HOST_API_POLICY_API_PACKAGE: ()}
         for member in runtime_members:
             name = member.rsplit("/", 1)[-1]
@@ -1491,61 +2563,21 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 runtime_dependencies[name] = (bootstrap.HOST_API_POLICY_API_PACKAGE,)
             else:
                 runtime_dependencies[name] = ()
-            self._write_d145_fixture_file(root, member + "/Cargo.toml", text)
+            self._write_runtime_gate_fixture_file(root, member + "/Cargo.toml", text)
         for member in bootstrap.RUNTIME_BATCH_SEVEN_CRATE_ROOTS:
             crate_name = member.rsplit("/", 1)[-1]
-            self._write_d145_fixture_file(root, member + "/README.md", crate_name + " crate overview.\n")
-            self._write_d145_fixture_file(root, member + "/CONTRACT.md", "Contract for " + crate_name + ".\n")
-            self._write_d145_fixture_file(root, member + "/CHANGELOG.md", "Initial crate release.\n")
-            self._write_d145_fixture_file(root, member + "/src/lib.rs", "pub fn " + crate_name.replace("-", "_") + "() {}\n")
-            self._write_d145_fixture_file(root, member + "/src/modules/mod.rs", "pub fn module() {}\n")
-            self._write_d145_fixture_file(root, member + "/tests/runtime.rs", "fn works() {}\n")
-        self._write_d145_fixture_file(
-            root, "runtime/Cargo.lock", self._d145_fixture_lock(runtime_dependencies),
+            self._write_runtime_gate_fixture_file(root, member + "/README.md", crate_name + " crate overview.\n")
+            self._write_runtime_gate_fixture_file(root, member + "/CONTRACT.md", "Contract for " + crate_name + ".\n")
+            self._write_runtime_gate_fixture_file(root, member + "/CHANGELOG.md", "Initial crate release.\n")
+            self._write_runtime_gate_fixture_file(root, member + "/src/lib.rs", "pub fn " + crate_name.replace("-", "_") + "() {}\n")
+            self._write_runtime_gate_fixture_file(root, member + "/src/modules/mod.rs", "pub fn module() {}\n")
+            self._write_runtime_gate_fixture_file(root, member + "/tests/runtime.rs", "fn works() {}\n")
+        self._write_runtime_gate_fixture_file(
+            root, "runtime/Cargo.lock", self._runtime_fixture_lock(runtime_dependencies),
         )
-        self._write_d145_fixture_file(root, "crates/host/api/src/lib.rs", "pub fn api() {}\n")
+        self._write_runtime_gate_fixture_file(root, "crates/host/api/src/lib.rs", "pub fn api() {}\n")
 
-    def test_d145_profile_accepts_a_complete_runtime_and_paired_contract_lock(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        root = Path(temporary.name).resolve()
-        self._write_complete_d145_fixture(root)
-        descriptor = linux_source_build._open_source_root(root)
-        try:
-            self.assertTrue(linux_source_build._check_d145_runtime_profile(descriptor))
-        finally:
-            os.close(descriptor)
-        self.assertTrue(linux_source_build.cargo_lock_bootstrap.validate_runtime_profile_source_tree(root))
-        profile_output = io.StringIO()
-        with patch.object(linux_source_build.cargo_lock_bootstrap.sys, "stdout", profile_output):
-            self.assertEqual(
-                linux_source_build.cargo_lock_bootstrap._main(
-                    ["check-runtime_profile-source", str(root), "a" * 40],
-                ),
-                0,
-            )
-        self.assertEqual(profile_output.getvalue(), "runtime_profile=runtime\n")
 
-    def test_d145_batch_seven_tree_refuses_unlisted_paths_in_linux_and_windows_validators(self):
-        cases = (
-            ("runtime/crates/host/registry/build.rs", "fn build() {}\n"),
-            ("runtime/crates/services/palette/src/extra.json", "{}\n"),
-            ("runtime/crates/host/core/src/README.md", "Nested doc.\n"),
-            ("runtime/crates/services/other/README.md", "Unlisted service.\n"),
-        )
-        for relative, contents in cases:
-            with self.subTest(path=relative), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary).resolve()
-                self._write_complete_d145_fixture(root)
-                self._write_d145_fixture_file(root, relative, contents)
-                descriptor = linux_source_build._open_source_root(root)
-                try:
-                    with self.assertRaises(linux_source_build.SourceBuildRefusal):
-                        linux_source_build._check_d145_runtime_profile(descriptor)
-                finally:
-                    os.close(descriptor)
-                with self.assertRaises(linux_source_build.cargo_lock_bootstrap.BootstrapRefusal):
-                    linux_source_build.cargo_lock_bootstrap.validate_runtime_profile_source_tree(root)
 
     def test_time_already_spent_by_the_job_before_the_gates_shortens_the_budget(self):
         budget = linux_source_build.PROJECT_GATE_BUDGET_SECONDS
@@ -1562,167 +2594,28 @@ class LinuxSourceBuildTests(unittest.TestCase):
             self.assertEqual(line(2, 1, gate, cause), "linux-project-gates=refused completed=2 failed=1\n")
         self.assertEqual(linux_source_build.GATE_CAUSES, ("timeout", "limit", "signal", "exit", "launch", "deadline"))
 
-    def test_license_gate_refusal_precedes_preparation_and_command_construction(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            worker = root / "source"
-            worker.mkdir()
-            (worker / "Cargo.lock").write_text(_registry_lock(), encoding="ascii")
-            with patch.object(linux_source_build.rust_license_gate, "TRUSTED_PORTS", None), patch.object(
-                linux_source_build, "_project_gate_directories",
-            ) as prepare, patch.object(linux_source_build, "_gate_commands") as construct, patch.object(
-                linux_source_build.linux_session, "run_host",
-            ) as execute:
-                with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
-                    linux_source_build.run_project_gates({
-                        "RUNNER_TEMP": temporary, "WORKER_PATH": str(worker),
-                        "CARGO_HOME": str(worker / ".kd-cargo-home"),
-                        "RUST_ROOT": "/rust", "NODE_BIN": "/node",
-                        "REQUESTED_SOURCE_SHA": "a" * 40,
-                    })
-            self.assertEqual(refused.exception.reason, "gate")
-            prepare.assert_not_called()
-            construct.assert_not_called()
-            execute.assert_not_called()
 
-    def test_empty_lock_refuses_with_lock_before_preparation(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            worker = root / "source"
-            worker.mkdir()
-            (worker / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
-            with patch.object(
-                linux_source_build, "_project_gate_directories",
-            ) as prepare, patch.object(linux_source_build, "_gate_commands") as construct:
-                with self.assertRaises(linux_source_build.rust_license_gate.LicenseGateRefusal) as refused:
-                    linux_source_build.run_project_gates({
-                        "RUNNER_TEMP": temporary, "WORKER_PATH": str(worker),
-                        "CARGO_HOME": str(worker / ".kd-cargo-home"),
-                        "RUST_ROOT": "/rust", "NODE_BIN": "/node",
-                        "REQUESTED_SOURCE_SHA": "a" * 40,
-                    })
-            self.assertEqual(refused.exception.reason, "lock")
-            prepare.assert_not_called()
-            construct.assert_not_called()
 
-    def test_rust_lock_gate_keeps_its_empty_result_guard_reachable(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            with patch.object(linux_source_build, "_require_confined_manifests"), patch.object(
-                linux_source_build, "_rust_lock_paths", return_value=(),
-            ):
-                with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
-                    linux_source_build.run_rust_license_gate({
-                        "SOURCE_PATH": temporary, "REQUESTED_SOURCE_SHA": "a" * 40,
-                    })
-            self.assertEqual(refused.exception.reason, "lock")
 
-    def test_registry_free_license_gate_prints_one_counts_only_line(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "Cargo.lock").write_text(_path_only_lock(4), encoding="ascii")
-            (root / "fuzz").mkdir()
-            (root / "fuzz" / "Cargo.lock").write_text(
-                _path_only_lock(2, "fuzz"), encoding="ascii")
-            output = io.StringIO()
-            with patch.object(linux_source_build.sys, "stdout", output):
-                self.assertEqual(linux_source_build.run_rust_license_gate({
-                    "SOURCE_PATH": str(root), "REQUESTED_SOURCE_SHA": "a" * 40,
-                }), 0)
-            self.assertEqual(output.getvalue(), "linux-rust-licence=registry-free locks=2\n")
 
-    def test_registry_admission_separates_workspace_profiles_from_lock_paths(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            source = Path(temporary).resolve()
-            (source / "Cargo.toml").write_text("[package]\n", encoding="ascii")
-            (source / "Cargo.lock").write_text(_registry_lock(), encoding="ascii")
-            runtime = source / "runtime"
-            runtime.mkdir()
-            (runtime / "Cargo.toml").write_text("[workspace]\n", encoding="ascii")
-            (runtime / "Cargo.lock").write_text(_registry_lock(), encoding="ascii")
-            calls = []
 
-            def admit(*arguments):
-                calls.append(arguments)
-                return {"license_gate_receipt": object()}
 
-            with patch.object(linux_source_build, "_require_confined_manifests"), patch.object(
-                linux_source_build, "_check_d145_runtime_profile",
-            ), patch.object(
-                linux_source_build.cargo_rust_admission, "admit_authenticated_lock", side_effect=admit,
-            ):
-                self.assertEqual(linux_source_build.run_rust_license_gate({
-                    "SOURCE_PATH": str(source), "REQUESTED_SOURCE_SHA": "a" * 40,
-                }), 0)
-            self.assertEqual([(call[3], call[4]) for call in calls], [
-                (".", "Cargo.lock"), ("runtime", "runtime/Cargo.lock"),
-            ])
-
-            cargo_path = "/rust/bin/cargo"
-            commands = (
-                ("contract", (cargo_path, "check", "--manifest-path", str(source / "Cargo.toml"))),
-                ("runtime", (cargo_path, "check", "--manifest-path", str(runtime / "Cargo.toml"))),
-            )
-            admissions = {
-                "Cargo.lock": {
-                    "cargo_arguments": ["--config", "source.crates-io.replace-with=\"contract-vendor\""],
-                    "required_flags": ("--locked", "--offline"),
-                },
-                "runtime/Cargo.lock": {
-                    "cargo_arguments": ["--config", "source.crates-io.replace-with=\"runtime-vendor\""],
-                    "required_flags": ("--locked", "--offline"),
-                },
-            }
-            updated = linux_source_build._apply_vendor_arguments(
-                commands, admissions, source, cargo_path,
-            )
-        self.assertTrue(any("contract-vendor" in argument for argument in updated[0][1]))
-        self.assertTrue(any("runtime-vendor" in argument for argument in updated[1][1]))
-
-    def test_d145_profile_refuses_an_incomplete_runtime_workspace_before_license_processing(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            runtime = root / "runtime"
-            runtime.mkdir()
-            (runtime / "Cargo.toml").write_text(
-                '[workspace]\nresolver = "3"\nmembers = []\n', encoding="ascii",
-            )
-            (runtime / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
-            descriptor = linux_source_build._open_source_root(root)
-            try:
-                with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
-                    linux_source_build._check_d145_runtime_profile(descriptor)
-            finally:
-                os.close(descriptor)
-            self.assertEqual(refused.exception.reason, "lock")
-
-    def test_registry_lock_license_gate_refuses_without_the_counts_line(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "Cargo.lock").write_text(_registry_lock(), encoding="ascii")
-            output = io.StringIO()
-            with patch.object(linux_source_build.sys, "stdout", output):
-                with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
-                    linux_source_build.run_rust_license_gate({
-                        "SOURCE_PATH": str(root), "REQUESTED_SOURCE_SHA": "a" * 40,
-                    })
-            self.assertEqual(refused.exception.reason, "gate")
-            self.assertEqual(output.getvalue(), "")
 
     def _gate_over_tree(self, files, links=None):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve(strict=True)
             for name, text in files.items():
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(text, encoding="ascii")
             for name, target in (links or {}).items():
                 (root / name).symlink_to(target, target_is_directory=True)
-            output = io.StringIO()
-            with patch.object(linux_source_build.sys, "stdout", output):
-                code = linux_source_build.run_rust_license_gate({
-                    "SOURCE_PATH": str(root), "REQUESTED_SOURCE_SHA": "a" * 40,
-                })
-            return code, output.getvalue()
+            descriptor = linux_source_build._open_source_root(root)
+            try:
+                linux_source_build._require_confined_manifests(descriptor)
+            finally:
+                os.close(descriptor)
+            return 0, ""
 
     def _assert_tree_refused(self, files, links=None):
         with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
@@ -1762,7 +2655,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             self._gate_over_tree({
                 "Cargo.lock": _path_only_lock(1), "crates/inner/Cargo.toml": manifest,
             }),
-            (0, "linux-rust-licence=registry-free locks=1\n"),
+            (0, ""),
         )
 
     def test_paths_into_directories_the_walk_skips_are_refused(self):
@@ -1847,36 +2740,29 @@ class LinuxSourceBuildTests(unittest.TestCase):
         }
         self.assertEqual(
             self._gate_over_tree(files),
-            (0, "linux-rust-licence=registry-free locks=1\n"),
+            (0, ""),
         )
 
     def test_tree_without_any_lock_refuses_with_lock(self):
-        self._assert_tree_refused({"Cargo.toml": '[workspace]\nmembers = []\n'})
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "Cargo.toml").write_text('[workspace]\nmembers = []\n', encoding="ascii")
+            with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                linux_source_build._validate_cargo_lock_sources(root)
 
-    def test_registry_gate_receipt_prints_no_counts_line(self):
-        with patch.object(
-            linux_source_build.cargo_rust_admission,
-            "admit_authenticated_lock",
-            return_value={"license_gate_receipt": object()},
-        ):
-            self.assertEqual(self._gate_over_tree({"Cargo.lock": _registry_lock()}), (0, ""))
 
-    def test_runtime_gate_receipt_requires_every_selected_stage_to_complete(self):
+    def test_runtime_gate_receipt_records_every_selected_gate(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             worker = root / "source"
             worker.mkdir()
-            self._write_complete_d145_fixture(worker)
-            runtime = worker / "runtime"
+            self._write_runtime_gate_fixture(worker)
             source_sha = "a" * 40
             commands = tuple(
                 (name, ("/usr/bin/true",))
                 for name in linux_source_build.GATES + linux_source_build.RUNTIME_GATE_NAMES
             )
-            with patch.object(
-                linux_source_build.rust_license_gate, "require_lock_admission",
-                wraps=linux_source_build.rust_license_gate.require_lock_admission,
-            ) as admission, patch.object(linux_source_build, "_job_elapsed_seconds", return_value=0.0), patch.object(
+            with patch.object(linux_source_build, "_job_elapsed_seconds", return_value=0.0), patch.object(
                 linux_source_build, "_project_gate_directories"
             ), patch.object(
                 linux_source_build, "_gate_commands", return_value=commands
@@ -1893,14 +2779,8 @@ class LinuxSourceBuildTests(unittest.TestCase):
             self.assertEqual(receipt["selected_gates"], list(linux_source_build.GATES + linux_source_build.RUNTIME_GATE_NAMES))
             self.assertEqual(receipt["completed_gates"], receipt["selected_gates"])
             self.assertEqual(receipt["gate_count"], 18)
-            self.assertEqual(
-                sorted((call.args[1].source_sha, call.args[1].profile, call.args[1].root)
-                       for call in admission.call_args_list),
-                sorted([(source_sha, ".", str(worker)),
-                        (source_sha, "runtime", str(runtime))]),
-            )
 
-    @unittest.skipUnless(sys.platform.startswith("linux"), "the shared launcher stop uses Linux process facilities")
+    @unittest.skipUnless(sys.platform.startswith("linux") and platform.system() == "Linux", "the shared launcher stop uses Linux process facilities")
     def test_shared_launcher_stops_before_the_command_and_gives_it_eof_stdin(self):
         stdout_reader, stdout_writer = os.pipe()
         stderr_reader, stderr_writer = os.pipe()
@@ -2695,1001 +3575,6 @@ LOCKED = {
 }
 
 
-def _synthetic_receipt():
-    return {
-        "schema_version": 1, "record_type": "npm-admission-proposal-receipt",
-        "context": {
-            "repository": "owner/source", "filing": "filing-one", "source_sha": "a" * 40,
-            "base_sha": "b" * 40, "base_branch": "develop", "reviewed_diff_fingerprint": "c" * 64,
-            "control_sha": "d" * 40,
-        },
-        "inputs_sha256": "1" * 64, "request_doc_sha256": "2" * 64, "lock_sha256": LOCK_SHA,
-        "archive_set_sha256": "3" * 64, "package_set_sha256": "4" * 64,
-        "root_kind": "core", "node_version": npm_admission_bootstrap.NODE_VERSION,
-        "npm_version": npm_admission_bootstrap.NPM_VERSION, "members": [], "file_edges": [],
-        "packages": [{
-            "path": "node_modules/fixture-lib", "name": "fixture-lib", "version": "1.5.0",
-            "integrity": "sha512-" + "A" * 86 + "==", "sha256": "8" * 64,
-            "audit_record_id": "pending-review",
-        }],
-    }
-
-
-def _synthetic_evidence(now, finding_changes=None, **changes):
-    policy_epoch = (now - 7200) * 1000
-    finding = {
-        "advisory_id": "9000001", "allow_expires_at_ms": policy_epoch + 30 * 86400 * 1000,
-        "allow_justification_sha256": "6" * 64, "allow_removal_condition": "fixture-adopted-by-consumers",
-        "name": "fixture-lib", "range": "<2.0.0", "severity": "moderate", "version": "1.5.0",
-    }
-    finding.update(finding_changes or {})
-    evidence = {
-        "schema_version": 1, "receipt_sha256": "7" * 64, "lock_sha256": LOCK_SHA,
-        "inputs_sha256": "1" * 64, "run_id": "1234567890", "run_attempt": 1,
-        "generated_at": now - 600, "expiry": now + 3600, "policy_epoch_ms": policy_epoch,
-        "cutoff_epoch_ms": policy_epoch - 7 * 86400 * 1000, "minimum_age_seconds": 604800,
-        "registry_origin": "registry.npmjs.org", "resolver": dict(RESOLVER),
-        "attestation_verification": "not_performed",
-        "totals": {
-            "packages": 1, "distinct_names": 1, "compressed_bytes": 10, "unpacked_bytes": 20,
-            "file_count": 2, "install_script_packages": 0, "native_packages": 0,
-            "unattested_packages": 1, "peer_checks": 0, "optional_peers_missing": 0,
-        },
-        "advisory": {
-            "endpoint": "npm-bulk-advisory-v1", "fetched_at": now - 500, "valid_until": now + 85900,
-            "request_sha256": "9" * 64, "response_sha256": "e" * 64, "package_count": 1,
-            "finding_count": 1, "status": "allowed_findings", "findings": [finding],
-        },
-        "duplicates": [],
-        "packages": [{
-            "path": "node_modules/fixture-lib", "name": "fixture-lib", "version": "1.5.0",
-            "sha256": "8" * 64, "published": "2026-01-01T00:00:00.000Z", "age_days": 100,
-            "licence": "MIT", "licence_elected": "MIT", "licence_flags": [], "install_scripts": [],
-            "native_count": 0, "native_sample": [], "attested": False, "publisher": "someone",
-            "deprecated": False, "dev": True, "optional": False, "compressed_bytes": 10,
-            "unpacked_bytes": 20, "file_count": 2, "direct": False,
-        }],
-    }
-    evidence.update(changes)
-    return evidence
-
-
-def _project_provenance(receipt, evidence_bytes):
-    evidence = json.loads(evidence_bytes)
-    record = {
-        name: evidence[name] for name in (
-            "schema_version", "receipt_sha256", "lock_sha256", "resolver", "minimum_age_seconds",
-            "policy_epoch_ms", "cutoff_epoch_ms", "generated_at", "expiry", "advisory",
-        )
-    }
-    record["context"] = receipt["context"]
-    record["evidence_sha256"] = hashlib.sha256(evidence_bytes).hexdigest()
-    return record
-
-
-def _encode(record):
-    return json.dumps(record, sort_keys=True, separators=(",", ":"))
-
-
-def _allow(now_ms, **changes):
-    allow = {
-        "name": "fixture-lib", "version": "1.5.0", "severity": "moderate", "advisory_id": "9000001",
-        "range": "<2.0.0", "allow_justification_sha256": "6" * 64,
-        "allow_expires_at_ms": now_ms + 86400 * 1000,
-        "allow_removal_condition": "fixture-adopted-by-consumers",
-    }
-    allow.update(changes)
-    return allow
-
-
-def _vulnerability(name, severity="moderate", via=None, nodes=None):
-    return {
-        "name": name, "severity": severity, "isDirect": False, "via": via, "effects": [],
-        "range": "<2.0.0", "nodes": nodes, "fixAvailable": True,
-    }
-
-
-def _advisory_via(name="fixture-lib", source=9000001, severity="moderate", url=None):
-    return {
-        "source": source, "name": name, "dependency": name, "title": "fixture advisory",
-        "url": url or linux_source_build.ADVISORY_URL_PREFIX + "GHSA-aaaa-bbbb-cccc", "severity": severity,
-        "cwe": [], "cvss": {"score": 0, "vectorString": None}, "range": "<2.0.0",
-    }
-
-
-def _audit_json(vulnerabilities, **counts):
-    metadata = {"info": 0, "low": 0, "moderate": len(vulnerabilities), "high": 0, "critical": 0,
-                "total": len(vulnerabilities)}
-    metadata.update(counts)
-    return json.dumps({
-        "auditReportVersion": 2, "vulnerabilities": vulnerabilities,
-        "metadata": {"vulnerabilities": metadata, "dependencies": {"total": 4}},
-    }).encode("ascii")
-
-
-def _honoured_report():
-    return _audit_json({
-        "fixture-lib": _vulnerability(
-            "fixture-lib", via=[_advisory_via()],
-            nodes=["node_modules/fixture-lib", "node_modules/tool-a/node_modules/fixture-lib"],
-        ),
-        "tool-a": _vulnerability("tool-a", via=["fixture-lib"], nodes=["node_modules/tool-a"]),
-    })
-
-
-@unittest.skipIf(_LINUX_ONLY, "the Linux source build suite runs only on Linux")
-class LinuxNodeProvenanceAndAuditTests(unittest.TestCase):
-    def setUp(self):
-        self.now = int(time.time())
-        self.now_ms = self.now * 1000
-
-    def _environment(self, record):
-        return {
-            "LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON": record if type(record) is str else _encode(record),
-            "LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256": LOCK_SHA,
-        }
-
-    def _provenance(self, **evidence_changes):
-        evidence = _synthetic_evidence(self.now, **evidence_changes)
-        encoded = json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("ascii")
-        return _project_provenance(_synthetic_receipt(), encoded)
-
-    def _refused(self, record):
-        with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
-            linux_source_build._validate_provenance_binding(IDENTITY, self._environment(record))
-
-    def test_provenance_shape_matches_the_trusted_receipt_and_evidence_structure(self):
-        receipt = _synthetic_receipt()
-        evidence = _synthetic_evidence(self.now)
-        self.assertEqual(set(receipt), npm_admission_bootstrap.RECEIPT_FIELDS)
-        self.assertEqual(set(receipt["context"]), npm_admission_bootstrap.TRUSTED_CONTEXT_FIELDS)
-        self.assertEqual(set(evidence), npm_admission_bootstrap.EVIDENCE_FIELDS)
-        self.assertEqual(set(evidence["advisory"]), npm_admission_bootstrap.ADVISORY_FIELDS)
-        self.assertEqual(set(evidence["packages"][0]), npm_admission_bootstrap.EVIDENCE_PACKAGE_FIELDS)
-        provenance = self._provenance()
-        self.assertEqual(set(provenance), linux_source_build.PROVENANCE_FIELDS)
-        self.assertEqual(
-            linux_source_build.PROVENANCE_FIELDS - {"context", "evidence_sha256"},
-            linux_source_build.PROVENANCE_FIELDS & npm_admission_bootstrap.EVIDENCE_FIELDS,
-        )
-        self.assertEqual(
-            linux_source_build.PROVENANCE_CONTEXT_FIELDS, npm_admission_bootstrap.TRUSTED_CONTEXT_FIELDS,
-        )
-        self.assertEqual(
-            linux_source_build.PROVENANCE_ADVISORY_FIELDS, npm_admission_bootstrap.ADVISORY_FIELDS,
-        )
-        self.assertEqual(set(provenance["advisory"]["findings"][0]), linux_source_build.PROVENANCE_FINDING_FIELDS)
-        self.assertEqual(linux_source_build.PROVENANCE_RESOLVER_FIELDS, set(evidence["resolver"]))
-        self.assertEqual(linux_source_build.NODE_VERSION, evidence["resolver"]["node_version"])
-        self.assertEqual(linux_source_build.NPM_VERSION, evidence["resolver"]["npm_version"])
-        self.assertLess(
-            len(_encode(provenance)), linux_source_build.MAX_PROVENANCE_BYTES,
-        )
-        record = linux_source_build._validate_provenance_binding(IDENTITY, self._environment(provenance))
-        self.assertEqual(record["advisory"]["findings"][0]["advisory_id"], "9000001")
-
-    def test_provenance_accepts_a_clear_advisory_result(self):
-        record = self._provenance()
-        record["advisory"] = dict(record["advisory"], status="clear", finding_count=0, findings=[])
-        accepted = linux_source_build._validate_provenance_binding(IDENTITY, self._environment(record))
-        self.assertEqual(accepted["advisory"]["findings"], [])
-
-    def test_provenance_repository_is_bound_to_the_dispatch_identity(self):
-        record = self._provenance()
-        for repository in ("other/source", "owner/other", "owner", "owner/Other", "owner/source/x"):
-            with self.subTest(repository=repository), self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
-                linux_source_build._validate_provenance_binding(
-                    IDENTITY, self._environment(dict(record, context=dict(record["context"], repository=repository))),
-                )
-            self.assertEqual(refused.exception.reason, "binding")
-        with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
-            linux_source_build._validate_provenance_binding(
-                {"owner": "owner", "name": "other"}, self._environment(record),
-            )
-        self.assertEqual(refused.exception.reason, "binding")
-        for repository in ("Owner/source", "OWNER/SOURCE", "owner/Source"):
-            with self.subTest(accepted=repository):
-                cased = dict(record, context=dict(record["context"], repository=repository))
-                accepted = linux_source_build._validate_provenance_binding(IDENTITY, self._environment(cased))
-                self.assertEqual(accepted["context"]["repository"], repository)
-        with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
-            linux_source_build._validate_provenance_binding(
-                {"owner": "Owner", "name": "Other"}, self._environment(dict(
-                    record, context=dict(record["context"], repository="owner/source"),
-                )),
-            )
-        self.assertEqual(refused.exception.reason, "binding")
-        changed = dict(record, context=dict(record["context"], source_sha="e" * 40, base_sha="f" * 40, control_sha="0" * 40))
-        self.assertEqual(
-            linux_source_build._validate_provenance_binding(IDENTITY, self._environment(changed))["context"]["source_sha"],
-            "e" * 40,
-        )
-
-    def test_provenance_refuses_fields_the_trusted_run_cannot_supply(self):
-        for name in ("status", "age_status", "generation_attempts", "audit_status", "manifest_sha256"):
-            with self.subTest(extra=name):
-                self._refused(dict(self._provenance(), **{name: "passed"}))
-        for name in linux_source_build.PROVENANCE_FIELDS:
-            with self.subTest(missing=name):
-                record = self._provenance()
-                del record[name]
-                self._refused(record)
-
-    def test_provenance_refuses_a_changed_binding_or_stale_run(self):
-        changes = {
-            "lock": {"lock_sha256": "0" * 64},
-            "node": {"resolver": {"node_version": "24.0.0", "npm_version": "11.19.1"}},
-            "npm": {"resolver": {"node_version": "24.22.1", "npm_version": "10.0.0"}},
-            "age": {"minimum_age_seconds": 86400},
-            "cutoff": {"cutoff_epoch_ms": 1},
-            "expired": {"expiry": self.now - 1},
-            "future": {"generated_at": self.now + 3600},
-            "before_policy": {"generated_at": 1},
-            "receipt": {"receipt_sha256": "short"},
-            "schema": {"schema_version": 2},
-            "boolean": {"schema_version": True},
-        }
-        for label, change in changes.items():
-            with self.subTest(change=label):
-                self._refused(dict(self._provenance(), **change))
-        for label, text in (("empty", ""), ("array", "[]"), ("text", "not json"), ("big", " " * 40000)):
-            with self.subTest(text=label):
-                self._refused(text)
-        duplicate = _encode(self._provenance()).replace('"schema_version":1', '"schema_version":1,"schema_version":1')
-        self._refused(duplicate)
-        self._refused(_encode(self._provenance()).replace('"expiry":', '"expiry":NaN,"x":'))
-
-    def test_provenance_refuses_an_unsound_allowed_finding(self):
-        changes = {
-            "high": {"severity": "high"},
-            "critical": {"severity": "critical"},
-            "unknown_severity": {"severity": "urgent"},
-            "expired_at_fetch": {"allow_expires_at_ms": (self.now - 500) * 1000},
-            "beyond_ttl": {"allow_expires_at_ms": (self.now - 7200) * 1000 + 91 * 86400 * 1000},
-            "before_policy": {"allow_expires_at_ms": 1},
-            "version": {"version": ">=1"},
-            "name": {"name": "Not A Name"},
-            "justification": {"allow_justification_sha256": "abc"},
-            "identifier": {"advisory_id": "bad id"},
-            "range": {"range": ""},
-            "condition": {"allow_removal_condition": 5},
-        }
-        for label, change in changes.items():
-            with self.subTest(change=label):
-                evidence = _synthetic_evidence(self.now, finding_changes=change)
-                encoded = json.dumps(evidence).encode("ascii")
-                self._refused(_project_provenance(_synthetic_receipt(), encoded))
-        record = self._provenance()
-        advisory = record["advisory"]
-        for label, change in {
-            "count": {"finding_count": 2},
-            "clear_with_findings": {"status": "clear"},
-            "endpoint": {"endpoint": "other"},
-            "request": {"request_sha256": "x"},
-            "valid": {"valid_until": 1},
-            "duplicate": {"findings": advisory["findings"] * 2, "finding_count": 2},
-            "extra": {"findings": [dict(advisory["findings"][0], consumers=["a"])]},
-        }.items():
-            with self.subTest(advisory=label):
-                self._refused(dict(record, advisory=dict(advisory, **change)))
-        self._refused(dict(record, context=dict(record["context"], base_branch="feature")))
-        self._refused(dict(record, context=dict(record["context"], source_sha="abc")))
-
-    def test_audit_honours_exactly_the_recorded_findings(self):
-        allows = [_allow(self.now_ms)]
-        counts = linux_source_build._check_audit_report(_honoured_report(), allows, LOCKED, self.now_ms)
-        self.assertEqual(counts, (2, 1, 1))
-        github_form = [_allow(self.now_ms, advisory_id="GHSA-aaaa-bbbb-cccc")]
-        self.assertEqual(
-            linux_source_build._check_audit_report(_honoured_report(), github_form, LOCKED, self.now_ms), (2, 1, 1),
-        )
-        clean = _audit_json({})
-        self.assertEqual(linux_source_build._check_audit_report(clean, allows, LOCKED, self.now_ms), (0, 0, 0))
-
-    def _audit_refused(self, report, allows=None, packages=None, now_ms=None):
-        with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
-            linux_source_build._check_audit_report(
-                report, [_allow(self.now_ms)] if allows is None else allows,
-                LOCKED if packages is None else packages, self.now_ms if now_ms is None else now_ms,
-            )
-
-    def test_audit_refuses_an_extra_finding(self):
-        other = _audit_json({
-            "fixture-lib": _vulnerability(
-                "fixture-lib", via=[_advisory_via(), _advisory_via(source=9000002, url=linux_source_build.ADVISORY_URL_PREFIX + "GHSA-dddd-eeee-ffff")],
-                nodes=["node_modules/fixture-lib"],
-            ),
-        })
-        self._audit_refused(other)
-        runtime = _audit_json({
-            "runtime-lib": _vulnerability("runtime-lib", via=[_advisory_via("runtime-lib")], nodes=["node_modules/runtime-lib"]),
-        })
-        self._audit_refused(runtime)
-        self._audit_refused(_honoured_report(), allows=[])
-        self._audit_refused(_honoured_report(), allows=[_allow(self.now_ms, name="other-lib")])
-        self._audit_refused(_honoured_report(), allows=[_allow(self.now_ms, advisory_id="9000002")])
-        dangling = _audit_json({
-            "tool-a": _vulnerability("tool-a", via=["fixture-lib"], nodes=["node_modules/tool-a"]),
-        })
-        self._audit_refused(dangling)
-        selfish = _audit_json({
-            "fixture-lib": _vulnerability("fixture-lib", via=["fixture-lib"], nodes=["node_modules/fixture-lib"]),
-        })
-        self._audit_refused(selfish)
-
-    def test_audit_refuses_an_expired_allow(self):
-        self._audit_refused(_honoured_report(), allows=[_allow(self.now_ms, allow_expires_at_ms=self.now_ms - 1)])
-        self._audit_refused(_honoured_report(), now_ms=self.now_ms + 2 * 86400 * 1000)
-
-    def test_audit_refuses_a_severity_above_the_recorded_one(self):
-        high_via = _audit_json({
-            "fixture-lib": _vulnerability(
-                "fixture-lib", via=[_advisory_via(severity="high")], nodes=["node_modules/fixture-lib"],
-            ),
-        })
-        self._audit_refused(high_via)
-        high_entry = _audit_json({
-            "fixture-lib": _vulnerability(
-                "fixture-lib", severity="high", via=[_advisory_via()], nodes=["node_modules/fixture-lib"],
-            ),
-        })
-        self._audit_refused(high_entry)
-        critical = _audit_json({}, critical=1)
-        self._audit_refused(critical)
-        self._audit_refused(_audit_json({}, high=1))
-        self._audit_refused(_honoured_report(), allows=[_allow(self.now_ms, severity="low")])
-        self._audit_refused(_honoured_report(), allows=[_allow(self.now_ms, severity="high")])
-
-    def test_audit_refuses_a_finding_that_is_not_development_only(self):
-        runtime = dict(LOCKED, **{"node_modules/fixture-lib": {"version": "1.5.0"}})
-        self._audit_refused(_honoured_report(), packages=runtime)
-        nested = dict(LOCKED, **{"node_modules/tool-a/node_modules/fixture-lib": {"version": "1.5.0", "dev": False}})
-        self._audit_refused(_honoured_report(), packages=nested)
-        elsewhere = dict(LOCKED, **{"node_modules/other/node_modules/fixture-lib": {"version": "1.5.0"}})
-        self._audit_refused(_honoured_report(), packages=elsewhere)
-        newer = dict(LOCKED, **{"node_modules/fixture-lib": {"version": "1.6.0", "dev": True}})
-        self._audit_refused(_honoured_report(), packages=newer)
-        no_nodes = _audit_json({"fixture-lib": _vulnerability("fixture-lib", via=[_advisory_via()], nodes=[])})
-        self._audit_refused(no_nodes)
-        missing = _audit_json({"fixture-lib": _vulnerability("fixture-lib", via=[_advisory_via()], nodes=["node_modules/absent"])})
-        self._audit_refused(missing)
-        wrong_name = _audit_json({"fixture-lib": _vulnerability("fixture-lib", via=[_advisory_via()], nodes=["node_modules/runtime-lib"])})
-        self._audit_refused(wrong_name)
-        runtime_consumer = _audit_json({
-            "fixture-lib": _vulnerability("fixture-lib", via=[_advisory_via()], nodes=["node_modules/fixture-lib"]),
-            "runtime-lib": _vulnerability("runtime-lib", via=["fixture-lib"], nodes=["node_modules/runtime-lib"]),
-        })
-        self._audit_refused(runtime_consumer)
-
-    def test_audit_refuses_malformed_json_and_shapes(self):
-        good = json.loads(_honoured_report())
-        for label, payload in {
-            "empty": b"",
-            "text": b"not json",
-            "truncated": _honoured_report()[:-5],
-            "non_utf8": b"\xff\xfe",
-            "array": b"[]",
-            "constant": b'{"auditReportVersion":2,"vulnerabilities":NaN,"metadata":{}}',
-            "duplicate": b'{"auditReportVersion":2,"auditReportVersion":2,"vulnerabilities":{},"metadata":{}}',
-            "error": json.dumps({"error": {"code": "ENOAUDIT", "summary": "x", "detail": "y"}}).encode("ascii"),
-            "version": json.dumps(dict(good, auditReportVersion=1)).encode("ascii"),
-            "extra_key": json.dumps(dict(good, extra={})).encode("ascii"),
-            "vulnerabilities": json.dumps(dict(good, vulnerabilities=[])).encode("ascii"),
-            "metadata": json.dumps(dict(good, metadata=[])).encode("ascii"),
-            "counts": json.dumps(dict(good, metadata={"vulnerabilities": []})).encode("ascii"),
-            "entry": json.dumps(dict(good, vulnerabilities={"fixture-lib": []})).encode("ascii"),
-            "name": json.dumps(dict(good, vulnerabilities={"fixture-lib": _vulnerability("other", via=["x"], nodes=[])})).encode("ascii"),
-            "via": json.dumps(dict(good, vulnerabilities={"fixture-lib": _vulnerability("fixture-lib", via=[], nodes=["node_modules/fixture-lib"])})).encode("ascii"),
-            "via_type": json.dumps(dict(good, vulnerabilities={"fixture-lib": _vulnerability("fixture-lib", via=[5], nodes=["node_modules/fixture-lib"])})).encode("ascii"),
-            "source_type": json.dumps(dict(good, vulnerabilities={"fixture-lib": _vulnerability("fixture-lib", via=[_advisory_via(source=True)], nodes=["node_modules/fixture-lib"])})).encode("ascii"),
-            "nodes_type": json.dumps(dict(good, vulnerabilities={"fixture-lib": _vulnerability("fixture-lib", via=[_advisory_via()], nodes="node_modules/fixture-lib")})).encode("ascii"),
-            "severity_type": json.dumps(dict(good, vulnerabilities={"fixture-lib": _vulnerability("fixture-lib", severity=["moderate"], via=[_advisory_via()], nodes=["node_modules/fixture-lib"])})).encode("ascii"),
-            "key": json.dumps(dict(good, vulnerabilities={"Bad Name": _vulnerability("Bad Name", via=["x"], nodes=[])})).encode("ascii"),
-            "deep": b"[" * 100000,
-        }.items():
-            with self.subTest(payload=label):
-                self._audit_refused(payload)
-        many = {"pkg-" + str(index): _vulnerability("pkg-" + str(index), via=["pkg-0"], nodes=[]) for index in range(linux_source_build.MAX_AUDIT_VULNERABILITIES + 1)}
-        self._audit_refused(_audit_json(many))
-        wide = _vulnerability("fixture-lib", via=["tool-a"] * (linux_source_build.MAX_AUDIT_VIA + 1), nodes=["node_modules/fixture-lib"])
-        self._audit_refused(_audit_json({"fixture-lib": wide, "tool-a": _vulnerability("tool-a", via=["fixture-lib"], nodes=["node_modules/tool-a"])}))
-
-    def _run_audit(self, returncode, stdout, allows=None, valid_until=None, entry=None, missing_node=False,
-                   source_inputs=None, check_lock=None, run=None, stderr=b"", packages=LOCKED):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "source").mkdir()
-            (root / "source/package-lock.json").write_bytes(b"{}")
-            (root / "bin").mkdir()
-            if not missing_node:
-                (root / "bin/node").write_bytes(b"")
-            (root / "bin/npm").write_bytes(b"")
-            env = {"SOURCE_PATH": str(root / "source"), "NODE_BIN": str(root / "bin"), "RUNNER_TEMP": str(root)}
-            result = types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
-            record = {"advisory": {
-                "findings": [_allow(self.now_ms)] if allows is None else allows,
-                "valid_until": self.now + 3600 if valid_until is None else valid_until,
-            }}
-            output = io.StringIO()
-            command = linux_source_build.run_trusted_audit if entry is None else entry
-            with patch.object(linux_source_build, "_neutralize_config_files"), \
-                    patch.object(linux_source_build, "_source_inputs", return_value={}, side_effect=source_inputs), \
-                    patch.object(linux_source_build, "_check_lock_provenance", side_effect=check_lock), \
-                    patch.object(linux_source_build, "_validate_provenance_binding", return_value=record), \
-                    patch.object(linux_source_build, "_locked_packages", return_value=({"packages": packages}, {})), \
-                    patch.object(linux_source_build, "_run", return_value=result, side_effect=run), \
-                    patch("sys.stdout", output):
-                code = command(env)
-            return code, output.getvalue()
-
-    def test_trusted_audit_accepts_the_recorded_finding_with_counts_only(self):
-        code, output = self._run_audit(1, _honoured_report())
-        self.assertEqual(code, 0)
-        self.assertEqual(output, "linux-node-audit=verified phase=trusted findings=2 allowed=1\n")
-        code, output = self._run_audit(0, _audit_json({}))
-        self.assertEqual((code, output), (0, "linux-node-audit=verified phase=trusted findings=0 allowed=0\n"))
-
-    def test_trusted_audit_refuses_with_the_same_public_reason(self):
-        extra = _audit_json({
-            "runtime-lib": _vulnerability("runtime-lib", via=[_advisory_via("runtime-lib")], nodes=["node_modules/runtime-lib"]),
-        })
-        cases = (
-            (1, extra, None), (1, _honoured_report(), []), (1, b"not json", None), (2, _honoured_report(), None),
-            (1, _audit_json({}), None), (0, _honoured_report(), None), (1, b"", None),
-            (1, _honoured_report(), [_allow(self.now_ms, allow_expires_at_ms=self.now_ms - 1)]),
-        )
-        for index, (returncode, stdout, allows) in enumerate(cases):
-            with self.subTest(case=index), self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
-                self._run_audit(returncode, stdout, allows)
-
-
-def _dispatch_audit(env):
-    with patch.dict(os.environ, env):
-        return linux_source_build._dispatch("trusted-audit")
-
-
-def _lib(**changes):
-    entry = _vulnerability("fixture-lib", via=[_advisory_via()], nodes=["node_modules/fixture-lib"])
-    entry.update(changes)
-    return entry
-
-
-LINE_PATTERN = re.compile(
-    r"linux-source-build=refused phase=trusted-audit reason=[a-z_]+ detail=audit_[a-z_]+( count=[0-9]{1,2})?\n"
-)
-
-
-@unittest.skipIf(_LINUX_ONLY, "the Linux source build suite runs only on Linux")
-class LinuxAuditDetailTests(unittest.TestCase):
-    _run_audit = LinuxNodeProvenanceAndAuditTests._run_audit
-
-    def setUp(self):
-        self.now = int(time.time())
-        self.now_ms = self.now * 1000
-
-    def _detail(self, report, allows=None, packages=None, now_ms=None, stderr=b""):
-        with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
-            linux_source_build._check_audit_report(
-                report, [_allow(self.now_ms)] if allows is None else allows,
-                LOCKED if packages is None else packages, self.now_ms if now_ms is None else now_ms, stderr,
-            )
-        self.assertEqual(refused.exception.reason, "lock")
-        return refused.exception
-
-    def _report_cases(self):
-        good = json.loads(_honoured_report())
-        many = {"pkg-" + str(index): _vulnerability("pkg-" + str(index), via=["pkg-0"], nodes=[])
-                for index in range(linux_source_build.MAX_AUDIT_VULNERABILITIES + 1)}
-        runtime = dict(LOCKED, **{"node_modules/fixture-lib": {"version": "1.5.0"}})
-        newer = dict(LOCKED, **{"node_modules/fixture-lib": {"version": "1.6.0", "dev": True}})
-        cycle = _audit_json({
-            "tool-a": _vulnerability("tool-a", via=["fixture-lib"], nodes=["node_modules/tool-a"]),
-            "fixture-lib": _vulnerability("fixture-lib", via=["tool-a"], nodes=["node_modules/fixture-lib"]),
-        })
-        low_root = _audit_json({
-            "fixture-lib": _lib(severity="low", via=[_advisory_via(severity="low")]),
-            "tool-a": _vulnerability("tool-a", via=["fixture-lib"], nodes=["node_modules/tool-a"]),
-        }, low=1, moderate=1)
-        return {
-            "audit_json_empty": (b" \n\t", None, None, None),
-            "audit_json_encoding": (b'{"fixture-marker": "\xff"}', None, None, None),
-            "audit_json_prefix": (b"not json", None, None, None),
-            "audit_json_trailing": (b'{"fixture-marker": 1}\n{}', None, None, None),
-            "audit_json_duplicate": (b'{"fixture-marker": 1, "fixture-marker": 2}', None, None, None),
-            "audit_json_syntax": (b'{"fixture-marker": }', None, None, None),
-            "audit_json_not_object": (b"[]", None, None, None),
-            "audit_top_keys": (json.dumps(dict(good, extra={})).encode("ascii"), None, None, None),
-            "audit_version": (json.dumps(dict(good, auditReportVersion=1)).encode("ascii"), None, None, None),
-            "audit_entry_shape": (json.dumps(dict(good, vulnerabilities=[])).encode("ascii"), None, None, None),
-            "audit_meta": (json.dumps(dict(good, metadata=[])).encode("ascii"), None, None, None),
-            "audit_limit": (_audit_json(many), None, None, None),
-            "audit_count": (_audit_json({}, moderate=-1), None, None, None),
-            "audit_high": (_audit_json({}, high=1), None, None, None),
-            "audit_key_name": (_audit_json({"Bad Name": _lib(name="Bad Name")}), None, None, None),
-            "audit_severity": (_audit_json({"fixture-lib": _lib(severity="high")}), None, None, None),
-            "audit_via_shape": (_audit_json({"fixture-lib": _lib(via=[5])}), None, None, None),
-            "audit_via_unknown": (_audit_json({"fixture-lib": _lib(via=["absent-lib"])}), None, None, None),
-            "audit_advisory_unmatched": (_honoured_report(), [], None, None),
-            "audit_allow_expired": (_honoured_report(), [_allow(self.now_ms, allow_expires_at_ms=self.now_ms - 1)], None, None),
-            "audit_advisory_severity": (_audit_json({"fixture-lib": _lib(via=[_advisory_via(severity="high")])}), None, None, None),
-            "audit_nodes_shape": (_audit_json({"fixture-lib": _lib(nodes=[])}), None, None, None),
-            "audit_nondev": (_honoured_report(), None, runtime, None),
-            "audit_version_not_allowed": (_honoured_report(), None, newer, None),
-            "audit_consumer_over_ceiling": (low_root, [_allow(self.now_ms, severity="low")], None, None),
-            "audit_consumer_unreached": (cycle, None, None, None),
-        }
-
-    def test_every_report_detail_token_is_produced_by_its_case(self):
-        cases = self._report_cases()
-        for token, (report, allows, packages, now_ms) in cases.items():
-            with self.subTest(token=token):
-                self.assertEqual(self._detail(report, allows, packages, now_ms).detail, token)
-
-    def test_every_run_detail_token_is_produced_by_its_case(self):
-        refusal = linux_source_build.SourceBuildRefusal("lock")
-        cases = {
-            "audit_toolchain": dict(returncode=1, stdout=b"", missing_node=True),
-            "audit_provenance": dict(returncode=1, stdout=b"", source_inputs=refusal),
-            "audit_advisory_expired": dict(returncode=1, stdout=_honoured_report(), valid_until=self.now - 1),
-            "audit_run": dict(returncode=1, stdout=b"", run=OSError("x")),
-            "audit_exit": dict(returncode=2, stdout=_honoured_report()),
-            "audit_lock_changed": dict(returncode=1, stdout=_honoured_report(), check_lock=[None, refusal]),
-            "audit_exit_mismatch": dict(returncode=0, stdout=_honoured_report()),
-        }
-        for token, arguments in cases.items():
-            with self.subTest(token=token), self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
-                self._run_audit(**arguments)
-            self.assertEqual(refused.exception.detail, token)
-        covered = set(self._report_cases()) | set(cases) | {
-            "audit_json_empty_stderr_json", "audit_json_empty_stderr_text", "audit_unclassified", "audit_unexpected",
-        }
-        self.assertEqual(covered, set(linux_source_build.AUDIT_DETAILS))
-
-    def _json_line(self, stdout, stderr=b""):
-        code, output = self._run_audit(1, stdout, entry=_dispatch_audit, stderr=stderr)
-        self.assertEqual(code, 1)
-        for word in ("fixture-marker", "fixture-stderr", "leak"):
-            self.assertNotIn(word, output)
-        return output
-
-    def test_empty_audit_output_is_split_by_the_shape_of_stderr(self):
-        prefix = "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_empty"
-        for stderr in (b"", b" \n\t\n"):
-            with self.subTest(stderr=stderr):
-                self.assertEqual(self._json_line(b" \n\t", stderr), prefix + "\n")
-        self.assertEqual(self._json_line(b""), prefix + "\n")
-        self.assertEqual(
-            self._json_line(b"", b'\n  {"fixture-stderr": 1}\n\n'), prefix + "_stderr_json count=1\n",
-        )
-        self.assertEqual(
-            self._json_line(b"", b'{\n"fixture-stderr": 1,\n"leak": 2\n}\n'), prefix + "_stderr_json count=4\n",
-        )
-        self.assertEqual(
-            self._json_line(b"", b"fixture-stderr one\n\n  \nfixture-stderr two\nleak\n"), prefix + "_stderr_text count=3\n",
-        )
-        self.assertEqual(self._json_line(b"\n", b"[fixture-stderr]\n"), prefix + "_stderr_text count=1\n")
-        self.assertEqual(self._json_line(b"\n", b"fixture-stderr\n" * 150), prefix + "_stderr_text count=99\n")
-        self.assertEqual(self._json_line(b"\n", b'{"fixture-stderr": 1}\n' * 150), prefix + "_stderr_json count=99\n")
-
-    def test_non_utf8_audit_output_is_named_by_shape(self):
-        self.assertEqual(
-            self._json_line(b'{"fixture-marker": "\xff"}', b"fixture-stderr\n"),
-            "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_encoding\n",
-        )
-
-    def test_audit_output_not_starting_with_an_object_counts_lines_before_one(self):
-        prefix = "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_prefix"
-        cases = (
-            (b"fixture-marker is not json", 0), (b"\n  [1", 0), (b"npm warn fixture-marker\n{}", 1),
-            (b"fixture-marker\n\n  \nleak\n  {", 2), (b"fixture-marker\n" * 150 + b"{}", 99),
-            (b"fixture-marker\nleak\n", 0),
-        )
-        for stdout, count in cases:
-            with self.subTest(stdout=stdout[:24]):
-                self.assertEqual(self._json_line(stdout, b"fixture-stderr\n"), prefix + " count=" + str(count) + "\n")
-
-    def test_audit_output_with_data_after_the_first_value_counts_lines(self):
-        prefix = "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_trailing"
-        self.assertEqual(self._json_line(b'{"fixture-marker": 1} fixture-marker'), prefix + " count=1\n")
-        self.assertEqual(self._json_line(b'{"fixture-marker": 1}\n\nfixture-marker\n{}\n'), prefix + " count=2\n")
-        self.assertEqual(self._json_line(b'{}\n' + b"fixture-marker\n" * 150), prefix + " count=99\n")
-
-    def test_audit_output_with_a_duplicate_key_is_named_by_shape(self):
-        line = "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_duplicate\n"
-        for stdout in (
-            b'{"fixture-marker": 1, "fixture-marker": 2}',
-            b'{"vulnerabilities": {"fixture-marker": 1, "fixture-marker": 2}}',
-        ):
-            with self.subTest(stdout=stdout):
-                self.assertEqual(self._json_line(stdout), line)
-
-    def test_audit_output_that_fails_to_decode_is_named_by_shape(self):
-        line = "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_syntax\n"
-        for stdout in (b'{"fixture-marker": }', b'{"fixture-marker": NaN}', b'{"fixture-marker": 1', b'{"a":' * 100000):
-            with self.subTest(stdout=stdout[:24]):
-                self.assertEqual(self._json_line(stdout), line)
-
-    def test_audit_output_that_is_one_non_object_value_is_named_by_shape(self):
-        line = "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_not_object\n"
-        for stdout in (b"[]", b'"fixture-marker"', b'  ["fixture-marker"]\n', b"-1", b"12.5", b"null", b"true", b"false"):
-            with self.subTest(stdout=stdout):
-                self.assertEqual(self._json_line(stdout, b"fixture-stderr\n"), line)
-        prefix = "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_prefix"
-        self.assertEqual(self._json_line(b"[] fixture-marker"), prefix + " count=0\n")
-        self.assertEqual(self._json_line(b'["fixture-marker"]\n{}'), prefix + " count=1\n")
-        self.assertEqual(self._json_line(b'[{"fixture-marker": 1, "fixture-marker": 2}]'), prefix + " count=0\n")
-
-    def test_top_level_key_count_is_reported_and_bounded(self):
-        good = json.loads(_honoured_report())
-        two = self._detail(json.dumps(dict(good, one=1, two=2)).encode("ascii"))
-        self.assertEqual((two.detail, two.count), ("audit_top_keys", 2))
-        wide = {"key" + str(index): index for index in range(150)}
-        capped = self._detail(json.dumps(dict(good, **wide)).encode("ascii"))
-        self.assertEqual(capped.count, linux_source_build.MAX_DETAIL_COUNT)
-        self.assertEqual(self._detail(b"not json").count, 0)
-
-    def test_public_line_carries_only_a_token_for_the_audit_phase(self):
-        cases = {
-            "audit_exit": dict(returncode=2, stdout=_honoured_report()),
-            "audit_exit_mismatch": dict(returncode=0, stdout=_honoured_report()),
-            "audit_advisory_unmatched": dict(returncode=1, stdout=_honoured_report(), allows=[]),
-        }
-        for token, arguments in cases.items():
-            with self.subTest(token=token):
-                code, output = self._run_audit(entry=_dispatch_audit, **arguments)
-                self.assertEqual(code, 1)
-                self.assertEqual(output, "linux-source-build=refused phase=trusted-audit reason=lock detail=" + token + "\n")
-        good = json.loads(_honoured_report())
-        code, output = self._run_audit(
-            1, json.dumps(dict(good, one=1, two=2, three=3)).encode("ascii"), entry=_dispatch_audit,
-        )
-        self.assertEqual(
-            output, "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_top_keys count=3\n",
-        )
-        refusal = linux_source_build.SourceBuildRefusal("lock", "audit_json_syntax")
-        self.assertEqual(linux_source_build._refusal_line("checkout", refusal), "linux-source-build=refused phase=checkout reason=lock\n")
-        self.assertEqual(
-            linux_source_build._refusal_line("trusted-audit", linux_source_build.SourceBuildRefusal("lock")),
-            "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_unclassified\n",
-        )
-        invented = linux_source_build.SourceBuildRefusal("lock", "fixture-lib 1.5.0", count=-3)
-        self.assertIsNone(invented.detail)
-        self.assertIsNone(invented.count)
-        with patch.object(linux_source_build, "run_trusted_audit", side_effect=RuntimeError("fixture-lib")), \
-                patch("sys.stdout", io.StringIO()) as output:
-            self.assertEqual(linux_source_build._dispatch("trusted-audit"), 1)
-        self.assertEqual(
-            output.getvalue(), "linux-source-build=refused phase=trusted-audit reason=invalid detail=audit_unexpected\n",
-        )
-
-    def test_no_package_name_version_or_value_reaches_the_public_line(self):
-        secret = "zz-secret-lib"
-        entry = _vulnerability(secret, via=[_advisory_via(secret, source=7777777)], nodes=["node_modules/" + secret])
-        report = _audit_json({secret: entry})
-        lines = []
-        for arguments in (
-            dict(returncode=1, stdout=report, allows=[]),
-            dict(returncode=1, stdout=report),
-            dict(returncode=1, stdout=report.replace(secret.encode("ascii"), b"Bad Name")),
-            dict(returncode=2, stdout=report),
-            dict(returncode=1, stdout=json.dumps(dict(json.loads(report), **{secret: secret})).encode("ascii")),
-        ):
-            lines.append(self._run_audit(entry=_dispatch_audit, **arguments)[1])
-        for line in lines:
-            with self.subTest(line=line):
-                self.assertRegex(line, LINE_PATTERN)
-                for fragment in (secret, "7.7.7", "7777777", "GHSA", "Bad Name"):
-                    self.assertNotIn(fragment, line)
-        for token, (report, allows, packages, now_ms) in self._report_cases().items():
-            error = self._detail(report, allows, packages, now_ms)
-            line = linux_source_build._refusal_line("trusted-audit", error)
-            self.assertRegex(line, LINE_PATTERN)
-            self.assertIn(token, line)
-            for fragment in ("fixture-lib", "tool-a", "runtime-lib", "9000001", "GHSA"):
-                self.assertNotIn(fragment, line)
-
-    def test_info_only_report_with_a_zero_exit_is_accepted(self):
-        info = _audit_json(
-            {"fixture-lib": _lib(severity="info", via=[_advisory_via(severity="info")])}, info=1, moderate=0,
-        )
-        self.assertEqual(
-            linux_source_build._check_audit_report(info, [_allow(self.now_ms)], LOCKED, self.now_ms), (1, 1, 0),
-        )
-        code, output = self._run_audit(0, info)
-        self.assertEqual((code, output), (0, "linux-node-audit=verified phase=trusted findings=1 allowed=1\n"))
-        with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
-            self._run_audit(1, info)
-        self.assertEqual(refused.exception.detail, "audit_exit_mismatch")
-
-    def test_expected_exit_follows_the_low_and_moderate_counts(self):
-        low = _audit_json({"fixture-lib": _lib(severity="low", via=[_advisory_via(severity="low")])}, low=1, moderate=0)
-        self.assertEqual(linux_source_build._check_audit_report(low, [_allow(self.now_ms)], LOCKED, self.now_ms)[2], 1)
-        self.assertEqual(linux_source_build._check_audit_report(_honoured_report(), [_allow(self.now_ms)], LOCKED, self.now_ms)[2], 1)
-        self.assertEqual(self._detail(_audit_json({"fixture-lib": _lib()}, moderate=0)).detail, "audit_count")
-        self.assertEqual(self._detail(_audit_json({}, moderate=1)).detail, "audit_count")
-
-    def test_advisory_validity_window_is_enforced(self):
-        self.assertEqual(self._run_audit(1, _honoured_report(), valid_until=self.now + 60)[0], 0)
-        for valid_until in (self.now, self.now - 1):
-            with self.subTest(valid_until=valid_until), self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
-                self._run_audit(1, _honoured_report(), valid_until=valid_until)
-            self.assertEqual(refused.exception.detail, "audit_advisory_expired")
-
-    def test_consumer_chain_must_reach_a_matched_advisory(self):
-        chain = _audit_json({
-            "fixture-lib": _lib(),
-            "tool-a": _vulnerability("tool-a", via=["fixture-lib"], nodes=["node_modules/tool-a"]),
-            "tool-b": _vulnerability("tool-b", via=["tool-a"], nodes=["node_modules/tool-b"]),
-        })
-        packages = dict(LOCKED, **{"node_modules/tool-b": {"version": "1.0.0", "dev": True}})
-        self.assertEqual(
-            linux_source_build._check_audit_report(chain, [_allow(self.now_ms)], packages, self.now_ms), (3, 1, 1),
-        )
-        cycle = _audit_json({
-            "tool-a": _vulnerability("tool-a", via=["tool-b"], nodes=["node_modules/tool-a"]),
-            "tool-b": _vulnerability("tool-b", via=["tool-a"], nodes=["node_modules/tool-b"]),
-        })
-        self.assertEqual(self._detail(cycle, packages=packages).detail, "audit_consumer_unreached")
-        detached = _audit_json({
-            "fixture-lib": _lib(),
-            "tool-a": _vulnerability("tool-a", via=["tool-b"], nodes=["node_modules/tool-a"]),
-            "tool-b": _vulnerability("tool-b", via=["tool-a"], nodes=["node_modules/tool-b"]),
-        })
-        self.assertEqual(self._detail(detached, packages=packages).detail, "audit_consumer_unreached")
-
-    def test_long_consumer_chain_is_walked_once_and_accepted(self):
-        length = 300
-        entries = {"fixture-lib": _lib()}
-        packages = dict(LOCKED)
-        for index in range(length):
-            name = "tool-" + str(index)
-            target = "fixture-lib" if index == 0 else "tool-" + str(index - 1)
-            entries[name] = _vulnerability(name, via=[target], nodes=["node_modules/" + name])
-            packages["node_modules/" + name] = {"version": "1.0.0", "dev": True}
-        report = _audit_json(entries)
-        self.assertEqual(
-            linux_source_build._check_audit_report(report, [_allow(self.now_ms)], packages, self.now_ms),
-            (length + 1, 1, 1),
-        )
-        with patch.object(
-            linux_source_build, "_audit_reached_from_advisories", wraps=linux_source_build._audit_reached_from_advisories,
-        ) as walk:
-            linux_source_build._check_audit_report(report, [_allow(self.now_ms)], packages, self.now_ms)
-        self.assertEqual(walk.call_count, 1)
-
-    def test_metadata_counts_must_equal_the_entry_severities(self):
-        low_entry = _lib(severity="low", via=[_advisory_via(severity="low")])
-        cases = {
-            "extra_low": _audit_json({"fixture-lib": _lib()}, moderate=1, low=1, total=2),
-            "wrong_bucket": _audit_json({"fixture-lib": low_entry}, moderate=1, low=0),
-            "total_high": _audit_json({"fixture-lib": _lib()}, total=2),
-            "total_low": _audit_json({"fixture-lib": _lib()}, total=0),
-            "total_type": _audit_json({"fixture-lib": _lib()}, total="1"),
-            "total_boolean": _audit_json({"fixture-lib": _lib()}, total=True),
-            "total_negative": _audit_json({"fixture-lib": _lib()}, total=-1),
-        }
-        for label, report in cases.items():
-            with self.subTest(case=label):
-                self.assertEqual(self._detail(report).detail, "audit_count")
-        exact = _audit_json({"fixture-lib": low_entry}, moderate=0, low=1, total=1)
-        self.assertEqual(
-            linux_source_build._check_audit_report(exact, [_allow(self.now_ms)], LOCKED, self.now_ms), (1, 1, 1),
-        )
-        without_total = json.loads(_audit_json({"fixture-lib": _lib()}))
-        del without_total["metadata"]["vulnerabilities"]["total"]
-        self.assertEqual(
-            linux_source_build._check_audit_report(
-                json.dumps(without_total).encode("ascii"), [_allow(self.now_ms)], LOCKED, self.now_ms,
-            ),
-            (1, 1, 1),
-        )
-
-    def test_locked_versions_that_are_not_strings_are_refused_by_name(self):
-        for version in (["1.5.0"], {"version": "1.5.0"}, 1, None):
-            listed = dict(LOCKED, **{"node_modules/fixture-lib": {"version": version, "dev": True}})
-            unlisted = dict(LOCKED, **{"node_modules/other/node_modules/fixture-lib": {"version": version, "dev": True}})
-            for label, packages in (("listed", listed), ("unlisted", unlisted)):
-                with self.subTest(version=repr(version), where=label):
-                    self.assertEqual(
-                        self._detail(_honoured_report(), packages=packages).detail, "audit_version_not_allowed",
-                    )
-
-    def test_provenance_refusals_keep_their_own_reason_and_the_provenance_token(self):
-        for reason in ("binding", "registry", "lock", "source"):
-            with self.subTest(reason=reason), self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
-                self._run_audit(1, _honoured_report(), source_inputs=linux_source_build.SourceBuildRefusal(reason))
-            self.assertEqual((refused.exception.reason, refused.exception.detail), (reason, "audit_provenance"))
-        for error in (OSError("x"), ValueError("x"), KeyError("x"), TypeError("x")):
-            with self.subTest(error=type(error).__name__), self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
-                self._run_audit(1, _honoured_report(), source_inputs=error)
-            self.assertEqual((refused.exception.reason, refused.exception.detail), ("lock", "audit_provenance"))
-        code, output = self._run_audit(
-            1, _honoured_report(), entry=_dispatch_audit,
-            source_inputs=linux_source_build.SourceBuildRefusal("binding"),
-        )
-        self.assertEqual(code, 1)
-        self.assertEqual(
-            output, "linux-source-build=refused phase=trusted-audit reason=binding detail=audit_provenance\n",
-        )
-        self.assertRegex(output, LINE_PATTERN)
-
-    def test_catch_all_and_non_audit_refusal_lines_carry_no_detail(self):
-        with patch.object(linux_source_build, "checkout_source", side_effect=RuntimeError("fixture-lib")), \
-                patch("sys.stdout", io.StringIO()) as output:
-            self.assertEqual(linux_source_build._dispatch("checkout"), 1)
-        self.assertEqual(output.getvalue(), "linux-source-build=refused phase=checkout reason=invalid\n")
-        counted = linux_source_build.SourceBuildRefusal("lock", "audit_json_trailing", 3)
-        self.assertEqual(counted.count, 3)
-        self.assertEqual(
-            linux_source_build._refusal_line("checkout", counted), "linux-source-build=refused phase=checkout reason=lock\n",
-        )
-        self.assertEqual(
-            linux_source_build._refusal_line("trusted-audit", counted),
-            "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_trailing count=3\n",
-        )
-
-    def _capture_audit(self):
-        seen = {}
-
-        def capture(argv, cwd, environ=None, **unused):
-            seen["environ"] = dict(environ)
-            seen["private"] = Path(environ["HOME"])
-            seen["details"] = [
-                Path(environ[name]).lstat() for name in ("NPM_CONFIG_USERCONFIG", "NPM_CONFIG_GLOBALCONFIG")
-            ]
-            seen["parent"] = Path(environ["NPM_CONFIG_USERCONFIG"]).parent.lstat()
-            return types.SimpleNamespace(returncode=1, stdout=_honoured_report(), stderr=b"")
-
-        code, output = self._run_audit(1, _honoured_report(), run=capture)
-        self.assertEqual(code, 0)
-        return seen
-
-    def test_trusted_audit_uses_two_distinct_empty_regular_npm_configs(self):
-        seen = self._capture_audit()
-        environ = seen["environ"]
-        user = Path(environ["NPM_CONFIG_USERCONFIG"])
-        global_config = Path(environ["NPM_CONFIG_GLOBALCONFIG"])
-        self.assertNotEqual(user, global_config)
-        self.assertNotIn("/dev/null", (str(user), str(global_config)))
-        self.assertEqual(user.parent, global_config.parent)
-        self.assertEqual(user.parent.parent, seen["private"])
-        self.assertEqual(stat.S_IMODE(seen["parent"].st_mode), 0o700)
-        self.assertEqual(environ["NPM_CONFIG_UPDATE_NOTIFIER"], "false")
-        identities = set()
-        for details in seen["details"]:
-            self.assertTrue(stat.S_ISREG(details.st_mode))
-            self.assertEqual(details.st_size, 0)
-            self.assertEqual(stat.S_IMODE(details.st_mode), 0o600)
-            identities.add((details.st_dev, details.st_ino))
-        self.assertEqual(len(identities), 2)
-        self.assertEqual(
-            {user.name, global_config.name},
-            {linux_source_build.NPM_USER_CONFIG_NAME, linux_source_build.NPM_GLOBAL_CONFIG_NAME},
-        )
-
-    def test_trusted_audit_configs_are_created_fresh_and_never_reuse_a_path(self):
-        with tempfile.TemporaryDirectory() as directory:
-            private = Path(directory)
-            first = linux_source_build._audit_config_files(private)
-            second = linux_source_build._audit_config_files(private)
-            self.assertEqual(len({*first, *second}), 4)
-            for path in (*first, *second):
-                self.assertEqual(Path(path).stat().st_size, 0)
-            planted = private / "planted"
-            planted.write_text("keep\n", encoding="ascii")
-            with patch.object(linux_source_build.tempfile, "mkdtemp", return_value=str(private)):
-                (private / linux_source_build.NPM_GLOBAL_CONFIG_NAME).symlink_to(planted)
-                with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
-                    linux_source_build._audit_config_files(private)
-            self.assertEqual(refused.exception.detail, "audit_run")
-            self.assertEqual(planted.read_text(encoding="ascii"), "keep\n")
-
-    def test_trusted_audit_refuses_when_the_two_configs_would_be_one_file(self):
-        with patch.object(linux_source_build, "NPM_GLOBAL_CONFIG_NAME", linux_source_build.NPM_USER_CONFIG_NAME), \
-                tempfile.TemporaryDirectory() as directory:
-            with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
-                linux_source_build._audit_config_files(Path(directory))
-            self.assertEqual(refused.exception.detail, "audit_run")
-
-
-def _npm11_report(lowered=False):
-    report = json.loads(NPM11_REPORT_PATH.read_text(encoding="ascii"))
-    for entry in report["vulnerabilities"].values():
-        for item in entry["via"]:
-            if type(item) is dict:
-                item["url"] = linux_source_build.ADVISORY_URL_PREFIX + item["url"]
-                if lowered and item["severity"] == "high":
-                    item["severity"] = "moderate"
-        if lowered and entry["severity"] == "high":
-            entry["severity"] = "moderate"
-    if lowered:
-        counts = report["metadata"]["vulnerabilities"]
-        counts.update(moderate=counts["high"], high=0)
-    return json.dumps(report).encode("ascii")
-
-
-def _npm11_allows(now_ms, names=None):
-    report = json.loads(NPM11_REPORT_PATH.read_text(encoding="ascii"))
-    allows = {}
-    for entry in report["vulnerabilities"].values():
-        for item in entry["via"]:
-            if type(item) is dict and (names is None or item["name"] in names):
-                allows[(item["name"], item["url"])] = _allow(
-                    now_ms, name=item["name"], version=NPM11_VERSIONS[item["name"]], severity="moderate",
-                    advisory_id=item["url"], range=item["range"],
-                )
-    return list(allows.values())
-
-
-NPM11_REPORT_PATH = Path(__file__).resolve().parent / "fixtures" / "npm11_audit_report.json"
-NPM11_VERSIONS = {"brace-expansion": "2.0.1", "minimatch": "10.0.1"}
-NPM11_PACKAGES = {
-    "node_modules/brace-expansion": {"version": "2.0.1", "dev": True},
-    "packages/b/node_modules/brace-expansion": {"version": "2.0.1", "dev": True},
-    "node_modules/minimatch": {"version": "10.0.1", "dev": True},
-}
-
-
-@unittest.skipIf(_LINUX_ONLY, "the Linux source build suite runs only on Linux")
-class RealNpmReportTests(unittest.TestCase):
-    _run_audit = LinuxNodeProvenanceAndAuditTests._run_audit
-
-    def setUp(self):
-        self.now = int(time.time())
-        self.now_ms = self.now * 1000
-
-    def _check(self, report, allows):
-        return linux_source_build._check_audit_report(report, allows, NPM11_PACKAGES, self.now_ms)
-
-    def _refusal(self, report, allows):
-        with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
-            self._check(report, allows)
-        self.assertEqual(refused.exception.reason, "lock")
-        return refused.exception
-
-    def test_the_real_report_has_the_shape_the_checker_reads(self):
-        report = json.loads(_npm11_report())
-        self.assertEqual(set(report), {"auditReportVersion", "vulnerabilities", "metadata"})
-        self.assertEqual(report["auditReportVersion"], 2)
-        self.assertEqual(set(report["vulnerabilities"]), {"brace-expansion", "minimatch"})
-        self.assertEqual(sum(type(item) is dict for entry in report["vulnerabilities"].values() for item in entry["via"]), 19)
-        counts = report["metadata"]["vulnerabilities"]
-        self.assertEqual((counts["high"], counts["total"]), (2, 2))
-
-    def test_the_real_report_is_refused_for_its_high_severity_even_with_every_allow(self):
-        refusal = self._refusal(_npm11_report(), _npm11_allows(self.now_ms))
-        self.assertEqual(refusal.detail, "audit_high")
-
-    def test_the_real_report_shape_is_accepted_with_matching_allows(self):
-        report = _npm11_report(lowered=True)
-        allows = _npm11_allows(self.now_ms)
-        self.assertEqual(self._check(report, allows), (2, 19, 1))
-        code, output = self._run_audit(1, report, allows, packages=NPM11_PACKAGES)
-        self.assertEqual((code, output), (0, "linux-node-audit=verified phase=trusted findings=2 allowed=19\n"))
-        with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
-            self._run_audit(1, report, [], packages=NPM11_PACKAGES)
-        self.assertEqual(refused.exception.detail, "audit_advisory_unmatched")
-
-    def test_the_real_report_shape_is_refused_without_its_allows(self):
-        report = _npm11_report(lowered=True)
-        self.assertEqual(self._refusal(report, []).detail, "audit_advisory_unmatched")
-        partial = _npm11_allows(self.now_ms, names=("brace-expansion",))
-        self.assertEqual(self._refusal(report, partial).detail, "audit_advisory_unmatched")
-        expired = [dict(allow, allow_expires_at_ms=self.now_ms - 1) for allow in _npm11_allows(self.now_ms)]
-        self.assertEqual(self._refusal(report, expired).detail, "audit_allow_expired")
-        runtime = dict(NPM11_PACKAGES, **{"node_modules/minimatch": {"version": "10.0.1"}})
-        with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
-            linux_source_build._check_audit_report(report, _npm11_allows(self.now_ms), runtime, self.now_ms)
-        self.assertEqual(refused.exception.detail, "audit_nondev")
-
-    def test_the_real_report_exit_code_follows_the_counts(self):
-        report = _npm11_report(lowered=True)
-        self.assertEqual(self._check(report, _npm11_allows(self.now_ms))[2], 1)
-        tampered = json.loads(report)
-        tampered["metadata"]["vulnerabilities"]["total"] = 3
-        self.assertEqual(self._refusal(json.dumps(tampered).encode("ascii"), _npm11_allows(self.now_ms)).detail, "audit_count")
-
-
 @unittest.skipIf(_LINUX_ONLY, "the Linux source build suite runs only on Linux")
 class ManifestReadAndLockGuardTests(unittest.TestCase):
     def test_manifest_json_reads_only_a_bounded_regular_file(self):
@@ -3713,18 +3598,8 @@ class ManifestReadAndLockGuardTests(unittest.TestCase):
     def test_a_tree_with_no_cargo_lock_is_refused_by_the_explicit_guard(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-            with patch.object(linux_source_build, "_open_source_root", return_value=descriptor), patch.object(
-                linux_source_build, "_require_source_root_identity"
-            ), patch.object(linux_source_build, "_require_confined_manifests"), patch.object(
-                linux_source_build, "_rust_lock_paths", return_value=[]
-            ):
-                with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
-                    linux_source_build.run_rust_license_gate(
-                        {"SOURCE_PATH": str(root), "REQUESTED_SOURCE_SHA": "a" * 40}
-                    )
-            with self.assertRaises(OSError):
-                os.fstat(descriptor)
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
+                linux_source_build._validate_cargo_lock_sources(root)
 
 
 @unittest.skipIf(_LINUX_ONLY, "the Linux source build suite runs only on Linux")

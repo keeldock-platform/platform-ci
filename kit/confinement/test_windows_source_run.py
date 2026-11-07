@@ -709,18 +709,20 @@ class WindowsSourceRunTests(unittest.TestCase):
                       "(100644|100755) blob", "[StringComparer]::Ordinal"):
             self.assertIn(token, self.runner)
 
-    def test_configs_are_neutralised_and_cargo_lock_sources_are_authenticated(self):
+    def test_configs_are_neutralised_and_locked_sources_are_vendored_before_confinement(self):
         self.assertIn("'.npmrc'", self.runner)
         self.assertIn("(?im)^\\s*\\[(?:source\\.|registries\\.)|^\\s*(?:replace-with|registry)\\s*=", self.runner)
-        self.assertIn("'inspect-lock'", self.runner)
-        self.assertIn("Invoke-CargoLockAdmissions $project $bound['source_sha']", self.runner)
-        self.assertIn("$lockInfo['registry_packages']", self.runner)
+        self.assertIn("Invoke-CargoLockFetch $project", self.runner)
+        self.assertIn("cargo.exe", self.runner)
+        self.assertIn("'vendor', '--locked', '--versioned-dirs'", self.runner)
+        self.assertIn("Add-CargoVendorArguments $expanded $project", self.runner)
+        self.assertNotIn("cargo_rust_admission.py", self.runner)
 
-    def test_cargo_lock_metadata_guard_keeps_binary_operators_on_one_line(self):
-        self.assertIn(
-            "if ($lockInfo['schema_version'] -ne 1 -or $lockInfo['package_count'] -lt 1 -or $lockInfo['lock_sha256'] -cne (Get-FileSha256 $lockPath)) { throw 'cargo_admission_lock' }",
-            self.runner,
-        )
+    def test_cargo_lock_guard_rejects_links_and_oversized_locks_before_vendor(self):
+        self.assertIn("$item.Length -gt 4194304", self.runner)
+        self.assertIn("[IO.FileAttributes]::ReparsePoint", self.runner)
+        self.assertIn("$manifest = Join-Path (Split-Path -Parent $lockPath) 'Cargo.toml'", self.runner)
+        self.assertIn("if ($locks -lt 1) { throw 'lock' }", self.runner)
 
     def test_npm_tarballs_are_registry_only_integrity_checked_and_copied_not_moved(self):
         self.assertIn("$uri.Host -cne 'registry.npmjs.org'", self.runner)
@@ -1584,7 +1586,7 @@ const move = (kind, from, to) => {
             "if ($name -cne $NpmSteppedGate -or $steps.Count -ne 2) { throw 'gate_plan' }",
             "$then = [string[]](Expand-GateArgv @($steps[1]) $cargo $node $npm $project)",
             "if ($name -ceq $NpmSteppedGate) { throw 'gate_plan' }",
-            "$expanded = [string[]](Add-CargoAdmissionArguments $expanded $project)",
+            "$expanded = [string[]](Add-CargoVendorArguments $expanded $project)",
             "$gates += @{ Id = $name; Argv = $expanded; Then = $then }",
             "if ($gates.Count -ne $expectedCount -or $stepped -ne 1) { throw 'gate_plan' }",
         ):

@@ -29,11 +29,12 @@ const OAEP_PADDING = constants.RSA_PKCS1_OAEP_PADDING;
 const HEADER_BYTES = 4 + 1 + 1 + 32 + 32 + LOCK_ENVELOPE_LIMITS.wrappedKeyBytes
   + LOCK_ENVELOPE_LIMITS.ivBytes + 4;
 const FRAME_OVERHEAD = HEADER_BYTES + LOCK_ENVELOPE_LIMITS.tagBytes;
-const LOCK_CONTEXT_FIELDS = Object.freeze([
+const FEEDBACK_CONTEXT_FIELDS = Object.freeze([
   'request_id',
   'nonce',
   'recipient_fingerprint',
   'concern',
+  'kind',
   'repository_id',
   'source_sha',
   'base_sha',
@@ -46,21 +47,7 @@ const LOCK_CONTEXT_FIELDS = Object.freeze([
   'run_attempt',
   'expiry',
 ]);
-const FEEDBACK_CONTEXT_FIELDS = Object.freeze([
-  ...LOCK_CONTEXT_FIELDS.slice(0, 4),
-  'kind',
-  ...LOCK_CONTEXT_FIELDS.slice(4),
-]);
 export const RETURN_PROFILES = Object.freeze({
-  'core-node-lock-return': Object.freeze({
-    id: 1,
-    concern: 'core-node-lock-return',
-    kind: 'lock',
-    producerJob: 'node-lock-return',
-    artifactMember: 'lock-return-v1.enc',
-    contextDomain: 'node-lock-return-context-v1',
-    contextFields: LOCK_CONTEXT_FIELDS,
-  }),
   'core-rust-format-return': Object.freeze({
     id: 2,
     concern: 'core-rust-format-return',
@@ -76,24 +63,6 @@ export const RETURN_PROFILES = Object.freeze({
     kind: 'build_diagnostics',
     producerJob: 'core-build-diagnostic-return',
     artifactMember: 'build-diagnostic-return-v1.enc',
-    contextDomain: 'node-feedback-return-context-v1',
-    contextFields: FEEDBACK_CONTEXT_FIELDS,
-  }),
-  'core-rust-lock-return': Object.freeze({
-    id: 4,
-    concern: 'core-rust-lock-return',
-    kind: 'cargo_lock',
-    producerJob: 'core-rust-lock-return',
-    artifactMember: 'rust-lock-return-v1.enc',
-    contextDomain: 'node-feedback-return-context-v1',
-    contextFields: FEEDBACK_CONTEXT_FIELDS,
-  }),
-  'core-npm-admission-return': Object.freeze({
-    id: 5,
-    concern: 'core-npm-admission-return',
-    kind: 'npm_admission',
-    producerJob: 'core-npm-admission-return',
-    artifactMember: 'npm-admission-return-v1.enc',
     contextDomain: 'node-feedback-return-context-v1',
     contextFields: FEEDBACK_CONTEXT_FIELDS,
   }),
@@ -194,7 +163,7 @@ function normalizeContext(input, profile = contextProfile(input)) {
     reject('invalid_context');
   }
   if (context.concern !== profile.concern) reject('invalid_context');
-  if (profile.id !== 1 && context.kind !== profile.kind) reject('invalid_context');
+  if (context.kind !== profile.kind) reject('invalid_context');
   if (!isPositiveApiId(context.repository_id)) reject('invalid_context');
   if (typeof context.source_sha !== 'string' || !GIT_SHA.test(context.source_sha)) reject('invalid_context');
   if (typeof context.base_sha !== 'string' || !GIT_SHA.test(context.base_sha)) reject('invalid_context');
@@ -240,9 +209,7 @@ function parseCanonicalContextUnchecked(input) {
   if (!text.endsWith('\n') || text.includes('\r')) reject('invalid_context');
   const lines = text.slice(0, -1).split('\n');
   const domain = lines[0];
-  const domainFields = domain === 'node-lock-return-context-v1'
-    ? LOCK_CONTEXT_FIELDS
-    : domain === 'node-feedback-return-context-v1' ? FEEDBACK_CONTEXT_FIELDS : null;
+  const domainFields = domain === 'node-feedback-return-context-v1' ? FEEDBACK_CONTEXT_FIELDS : null;
   if (!domainFields || lines.length !== domainFields.length + 1) reject('invalid_context');
   const context = Object.create(null);
   for (let index = 0; index < domainFields.length; index += 1) {
@@ -363,21 +330,6 @@ export function encryptReturnEnvelope(options) {
   }
 }
 
-export function encryptLock(options) {
-  try {
-    if (contextProfile(options?.context).id !== 1) reject('invalid_context');
-    return encryptReturnEnvelopeUnchecked({
-      payloadBytes: options.lockBytes,
-      recipientPublicKey: options.recipientPublicKey,
-      context: options.context,
-      now: options.now,
-    });
-  } catch (error) {
-    if (error instanceof LockEnvelopeError) throw error;
-    reject('invalid_input');
-  }
-}
-
 function decryptReturnEnvelopeUnchecked({ envelope, recipientPrivateKey, expectedContext, now }) {
   const material = contextMaterial(expectedContext, now);
   const frame = asBytes(envelope, LOCK_ENVELOPE_LIMITS.frameBytes, 'frame_too_large');
@@ -431,16 +383,6 @@ function decryptReturnEnvelopeUnchecked({ envelope, recipientPrivateKey, expecte
 
 export function decryptReturnEnvelope(options) {
   try {
-    return decryptReturnEnvelopeUnchecked(options);
-  } catch (error) {
-    if (error instanceof LockEnvelopeError) throw error;
-    reject('invalid_input');
-  }
-}
-
-export function decryptLock(options) {
-  try {
-    if (contextProfile(options?.expectedContext).id !== 1) reject('invalid_context');
     return decryptReturnEnvelopeUnchecked(options);
   } catch (error) {
     if (error instanceof LockEnvelopeError) throw error;

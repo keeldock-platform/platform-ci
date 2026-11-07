@@ -701,9 +701,13 @@ foreach ($case in $cases) {
         worst = ladders + downloads * attempts * per_attempt + staging_allowance + dns_after + self.channel_budget() + self.fixture_budget()
         workflow = WORKFLOW.read_text(encoding="utf-8")
         minutes = [int(value) for value in re.findall(r"timeout-minutes: ([0-9]+)", workflow)]
-        self.assertEqual(len(minutes), 2)
-        self.assertEqual(minutes[1], 240)
-        self.assertLessEqual(worst, minutes[1] * 60 * 0.8)
+        self.assertEqual(minutes, [5, 15, 240])
+        spike = re.search(r"(?ms)^  windows-confinement-spike:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", workflow)
+        self.assertIsNotNone(spike)
+        spike_timeout = re.search(r"(?m)^    timeout-minutes: ([0-9]+)$", spike.group(1))
+        self.assertIsNotNone(spike_timeout)
+        self.assertEqual(int(spike_timeout.group(1)), 240)
+        self.assertLessEqual(worst, int(spike_timeout.group(1)) * 60 * 0.8)
 
     def channel_attempt_lines(self):
         body = self.function_body("Get-ChannelAttempts")
@@ -790,16 +794,50 @@ foreach ($case in $cases) {
 
     def test_workflow_runs_only_source_free_checks(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
+        jobs = {}
+        for name in ("promotion-check-reuse", "windows-policy", "windows-confinement-spike"):
+            match = re.search(
+                r"(?ms)^  " + re.escape(name) + r":\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+                workflow,
+            )
+            self.assertIsNotNone(match, name)
+            jobs[name] = match.group(1)
+
         for required in (
             "windows_confinement.ps1 -Mode compile",
             "windows_confinement.ps1 -Mode spike",
             "test_windows_confinement.py",
         ):
             with self.subTest(required=required):
-                self.assertIn(required, workflow)
-        for forbidden in ("secrets.", "source-read", "environment:", "id-token", "uses:"):
-            with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, workflow)
+                self.assertIn(required, jobs["windows-policy"] + jobs["windows-confinement-spike"])
+        for job_name in ("windows-policy", "windows-confinement-spike"):
+            for forbidden in ("secrets.", "source-read", "environment:", "id-token", "uses:"):
+                with self.subTest(job=job_name, forbidden=forbidden):
+                    self.assertNotIn(forbidden, jobs[job_name])
+
+        reuse = jobs["promotion-check-reuse"]
+        self.assertIn(
+            "if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/main') }}",
+            reuse,
+        )
+        self.assertIn("runs-on: ubuntu-24.04", reuse)
+        self.assertIn("timeout-minutes: 5", reuse)
+        self.assertIn("checks: read", reuse)
+        self.assertIn("contents: read", reuse)
+        self.assertIn("statuses: read", reuse)
+        self.assertRegex(reuse, r"(?m)^\s+uses: actions/checkout@[a-f0-9]{40}$")
+        self.assertIn("ref: ${{ github.sha }}", reuse)
+        self.assertIn("persist-credentials: false", reuse)
+        self.assertIn("PROMOTION_TARGET: ${{ github.ref_name }}", reuse)
+        self.assertIn("PROMOTION_SHA: ${{ github.sha }}", reuse)
+        self.assertIn("PROMOTION_WORKFLOW: windows-confinement", reuse)
+        self.assertIn("--reuse-checks-if-green", reuse)
+        self.assertIn("--target \"$PROMOTION_TARGET\" --sha \"$PROMOTION_SHA\"", reuse)
+        self.assertIn("--workflow \"$PROMOTION_WORKFLOW\"", reuse)
+        self.assertIn("skip_checks: ${{ steps.decide.outputs.skip_checks }}", reuse)
+        self.assertIn("needs: promotion-check-reuse", jobs["windows-policy"])
+        self.assertIn("needs.promotion-check-reuse.result == 'skipped'", jobs["windows-policy"])
+        self.assertIn("needs.promotion-check-reuse.outputs.skip_checks != 'true'", jobs["windows-policy"])
 
     def test_windows_has_no_source_mode_so_the_rust_licence_gate_is_linux_only(self):
         """Windows has no source mode, so the Rust licence gate is Linux source admission only."""

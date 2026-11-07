@@ -216,12 +216,19 @@ class LinuxSessionPureTests(unittest.TestCase):
         self.assertIs(session.LIMIT_PROFILES["project"], session.PROJECT_LIMITS)
         self.assertIs(session.LIMIT_PROFILES["fixture"], session.FIXTURE_LIMITS)
         self.assertIs(session.LIMIT_PROFILES["probe"], session.PROBE_LIMITS)
-        self.assertEqual(session.MAX_TIMEOUT_SECONDS, {"probe": 600, "fixture": 600, "project": 1800})
+        self.assertEqual(session.MAX_TIMEOUT_SECONDS, {
+            "probe": 600, "fixture": 600, "project": 1800, "runtime": 5400,
+        })
         session.validate_spec(good_spec(limits="project", timeout=1800))
+        with self.assertRaises(harness.ProofFailure):
+            session.validate_spec(good_spec(limits="project", timeout=5400))
+        session.validate_spec(good_spec(limits="runtime", timeout=5400))
+        with self.assertRaises(harness.ProofFailure):
+            session.validate_spec(good_spec(limits="runtime", timeout=5401))
         session.validate_spec(good_spec(limits="fixture", timeout=600))
 
     def test_limit_profiles_and_unshare_argument_sets(self):
-        self.assertEqual(set(session.LIMIT_PROFILES), {"probe", "fixture", "project"})
+        self.assertEqual(set(session.LIMIT_PROFILES), {"probe", "fixture", "project", "runtime"})
         self.assertIn("--net", session.CONFINED_UNSHARE)
         self.assertIn("--pid", session.CONFINED_UNSHARE)
         self.assertNotIn("--net", session.OPEN_UNSHARE)

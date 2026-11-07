@@ -37,7 +37,7 @@ TIMESTAMP = rb"(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9
 CIPHERTEXT_MARKER = re.compile(
     rb"(?m)^" + TIMESTAMP
     + rb"KD-FEEDBACK-CIPHERTEXT schema=1 control-sha=([a-f0-9]{40}) "
-    rb"run-id=([1-9][0-9]{0,18}) run-attempt=1 member=lock-return-v1\.enc "
+    rb"run-id=([1-9][0-9]{0,18}) run-attempt=1 member=build-diagnostic-return-v1\.enc "
     rb"ciphertext-sha256=([a-f0-9]{64}) ciphertext-size=([1-9][0-9]{0,6}) "
     rb"roundtrip=passed source=synthetic(?=\r?(?:\n|$))"
 )

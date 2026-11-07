@@ -48,60 +48,13 @@ const envelope = encryptDevelopmentFeedback({
   payloadBytes: Buffer.from(input.payload_base64, 'base64'),
   context: input.context,
   recipientPublicKey: publicKey,
-  expectedManifest: input.expected_manifest,
   now: input.now,
 });
 process.stdout.write(Buffer.from(envelope).toString('base64'));
 """
 
-LOCK_EXPECTATION = {
-    "root": {
-        "name": "fixture-root",
-        "version": "1.0.0",
-        "workspaces": ["packages/*"],
-        "devDependencies": {"typescript": "6.0.3"},
-    },
-    "workspaces": [
-        {
-            "path": "packages/client-api",
-            "name": "@fixture/client-api",
-            "version": "1.0.0",
-            "dependencies": {"@fixture/shared": "1.0.0"},
-        },
-        {"path": "packages/shared", "name": "@fixture/shared", "version": "1.0.0"},
-    ],
-}
-
-
-def _lock_bytes():
-    lock = {
-        "name": "fixture-root",
-        "version": "1.0.0",
-        "lockfileVersion": 3,
-        "requires": True,
-        "packages": {
-            "": {
-                "name": "fixture-root",
-                "version": "1.0.0",
-                "workspaces": ["packages/*"],
-                "devDependencies": {"typescript": "6.0.3"},
-            },
-            "packages/client-api": {
-                "name": "@fixture/client-api",
-                "version": "1.0.0",
-                "dependencies": {"@fixture/shared": "1.0.0"},
-            },
-            "packages/shared": {"name": "@fixture/shared", "version": "1.0.0"},
-            "node_modules/@fixture/client-api": {"resolved": "packages/client-api", "link": True},
-            "node_modules/@fixture/shared": {"resolved": "packages/shared", "link": True},
-            "node_modules/typescript": {
-                "version": "6.0.3",
-                "resolved": "https://registry.npmjs.org/typescript/-/typescript-6.0.3.tgz",
-                "integrity": "sha512-" + "A" * 86 + "==",
-            },
-        },
-    }
-    return (json.dumps(lock, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+def _diagnostic_bytes():
+    return b"compiler completed with zero warnings\n"
 
 
 class EncryptedProviderShapedAPI(ProviderShapedAPI):
@@ -215,12 +168,11 @@ def _qualified_node_runtime(private_directory):
 
 def _encrypt_fixture(node_path, public_spki_base64, context, now):
     module_url = Path(__file__).resolve().with_name("development_feedback.mjs").as_uri()
-    payload = _lock_bytes()
+    payload = _diagnostic_bytes()
     message = {
         "module_url": module_url,
         "public_spki_base64": public_spki_base64,
         "context": context,
-        "expected_manifest": LOCK_EXPECTATION,
         "now": now,
         "payload_base64": base64.b64encode(payload).decode("ascii"),
     }
@@ -247,7 +199,7 @@ def _context_for(request, api):
     profile = feedback_request.PROFILES[request["concern"]]
     context = {
         name: request[name]
-        for name in node_lock_receipt.CONTEXT_FIELDS
+        for name in node_lock_receipt.FEEDBACK_CONTEXT_FIELDS
         if name in request
     }
     context.update({
@@ -287,7 +239,7 @@ def _summary_review(request, api, job_names):
                      "native owner-wrapper integration requires POSIX filesystem semantics")
 class FeedbackAdminHostedIntegrationTests(unittest.TestCase):
     def test_real_key_encryption_authenticated_collection_release_and_replay_refusal(self):
-        profile = feedback_request.PROFILES["core-node-lock-return"]
+        profile = feedback_request.PROFILES["core-build-diagnostic-return"]
         job_names = (
             profile["producer_job"] + "-settings",
             profile["producer_job"] + "-prepare",
@@ -319,7 +271,7 @@ class FeedbackAdminHostedIntegrationTests(unittest.TestCase):
             )
             with mock.patch.object(feedback_admin.time, "time", return_value=NOW):
                 created = admin.create_request(
-                    request_fields, expected_manifest=LOCK_EXPECTATION, confirm_reviewed=True,
+                    request_fields, confirm_reviewed=True,
                 )
                 request = created["request"]
                 api = EncryptedProviderShapedAPI(request, NOW)
@@ -341,7 +293,7 @@ class FeedbackAdminHostedIntegrationTests(unittest.TestCase):
                     admin.consume_return(request["request_id"], wrong_actor_api,
                                          manual_summary_review=review)
                 self.assertFalse(os.path.exists(os.path.join(
-                    state_directory, "return-" + request["request_id"] + "-lock.payload",
+                    state_directory, "return-" + request["request_id"] + "-diagnostics.payload",
                 )))
 
                 corrupted = bytearray(encrypted_frame)
@@ -353,7 +305,7 @@ class FeedbackAdminHostedIntegrationTests(unittest.TestCase):
                                          manual_summary_review=review)
                 self.assertTrue(os.path.exists(key_path))
                 self.assertFalse(os.path.exists(os.path.join(
-                    state_directory, "return-" + request["request_id"] + "-lock.payload",
+                    state_directory, "return-" + request["request_id"] + "-diagnostics.payload",
                 )))
 
                 released = admin.consume_return(
@@ -365,11 +317,10 @@ class FeedbackAdminHostedIntegrationTests(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(output_info.st_mode), 0o600)
                 self.assertEqual(output_info.st_nlink, 1)
                 with open(output_path, "rb") as output:
-                    self.assertEqual(output.read(), _lock_bytes())
+                    self.assertEqual(output.read(), _diagnostic_bytes())
                 self.assertFalse(os.path.exists(key_path))
                 with admin._locked_directory(create=False) as dir_fd:
                     state = admin._read_state(dir_fd)
-                self.assertTrue(state["bootstrap_lock_consumed"])
                 self.assertEqual(state["requests"][0]["status"], "consumed")
                 self.assertEqual(state["requests"][0]["key_state"], "retired")
                 with self.assertRaises(feedback_admin.FeedbackAdminRefusal):

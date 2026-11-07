@@ -7,9 +7,7 @@ import { before, test } from 'node:test';
 
 import {
   canonicalContext,
-  decryptLock,
   decryptReturnEnvelope,
-  encryptLock,
   encryptReturnEnvelope,
   LOCK_ENVELOPE_LIMITS,
   LockEnvelopeError,
@@ -30,26 +28,6 @@ function fingerprint(key) {
   return createHash('sha256').update(key.export({ format: 'der', type: 'spki' })).digest('hex');
 }
 
-function sampleContext(recipientKey = recipient?.publicKey) {
-  return {
-    request_id: '1'.repeat(64),
-    nonce: '2'.repeat(64),
-    recipient_fingerprint: fingerprint(recipientKey),
-    concern: 'core-node-lock-return',
-    repository_id: '123456',
-    source_sha: 'a'.repeat(40),
-    base_sha: 'b'.repeat(40),
-    control_sha: 'c'.repeat(40),
-    base_branch: 'main',
-    reviewed_diff_sha256: 'd'.repeat(64),
-    workflow_ref: 'refs/heads/main',
-    run_id: '987654321',
-    producer_job: 'node-lock-return',
-    run_attempt: 1,
-    expiry: NOW + 3600,
-  };
-}
-
 function feedbackContext(profileName, recipientKey = recipient?.publicKey) {
   const profile = RETURN_PROFILES[profileName];
   return {
@@ -64,7 +42,7 @@ function feedbackContext(profileName, recipientKey = recipient?.publicKey) {
     control_sha: 'c'.repeat(40),
     base_branch: 'main',
     reviewed_diff_sha256: 'd'.repeat(64),
-    workflow_ref: 'refs/heads/main',
+    workflow_ref: profile.workflowRef ?? 'refs/heads/main',
     run_id: '987654321',
     producer_job: profile.producerJob,
     run_attempt: 1,
@@ -73,8 +51,8 @@ function feedbackContext(profileName, recipientKey = recipient?.publicKey) {
 }
 
 function encrypted(contextValue = context, bytes = PAYLOAD) {
-  return encryptLock({
-    lockBytes: bytes,
+  return encryptReturnEnvelope({
+    payloadBytes: bytes,
     recipientPublicKey: recipient.publicKey,
     context: contextValue,
     now: NOW,
@@ -82,7 +60,7 @@ function encrypted(contextValue = context, bytes = PAYLOAD) {
 }
 
 function decrypt(ciphertext = frame, contextValue = context, key = recipient.privateKey, now = NOW) {
-  return decryptLock({
+  return decryptReturnEnvelope({
     envelope: ciphertext,
     recipientPrivateKey: key,
     expectedContext: contextValue,
@@ -94,18 +72,18 @@ before(() => {
   recipient = generateKeyPairSync('rsa', { modulusLength: 3072, publicExponent: 65537 });
   otherRecipient = generateKeyPairSync('rsa', { modulusLength: 3072, publicExponent: 65537 });
   nonstandardExponentRecipient = generateKeyPairSync('rsa', { modulusLength: 3072, publicExponent: 3 });
-  context = sampleContext();
+  context = feedbackContext('core-rust-format-return');
   frame = encrypted();
 });
 
-test('round-trips only the caller-bound lock bytes', () => {
+test('round-trips only the caller-bound feedback bytes', () => {
   assert.deepEqual(decrypt(), PAYLOAD);
   assert.ok(frame.byteLength <= LOCK_ENVELOPE_LIMITS.frameBytes);
 });
 
 test('canonical context has the fixed field order and rejects duplicates', () => {
   const bytes = canonicalContext(context);
-  assert.ok(bytes.toString('ascii').startsWith('node-lock-return-context-v1\n'));
+  assert.ok(bytes.toString('ascii').startsWith('node-feedback-return-context-v1\n'));
   const parsed = parseCanonicalContext(bytes);
   assert.deepEqual(parsed, context);
   const lines = bytes.toString('ascii').split('\n');
@@ -123,32 +101,8 @@ test('canonical context has the fixed field order and rejects duplicates', () =>
   )), LockEnvelopeError);
 });
 
-test('lock context keeps the original canonical AAD byte shape', () => {
-  const lines = [
-    'node-lock-return-context-v1',
-    `request_id=${'1'.repeat(64)}`,
-    `nonce=${'2'.repeat(64)}`,
-    `recipient_fingerprint=${fingerprint(recipient.publicKey)}`,
-    'concern=core-node-lock-return',
-    'repository_id=123456',
-    `source_sha=${'a'.repeat(40)}`,
-    `base_sha=${'b'.repeat(40)}`,
-    `control_sha=${'c'.repeat(40)}`,
-    'base_branch=main',
-    `reviewed_diff_sha256=${'d'.repeat(64)}`,
-    'workflow_ref=refs/heads/main',
-    'run_id=987654321',
-    'producer_job=node-lock-return',
-    'run_attempt=1',
-    `expiry=${NOW + 3600}`,
-    '',
-  ];
-  assert.deepEqual(canonicalContext(context), Buffer.from(lines.join('\n'), 'ascii'));
-  assert.equal(frame[5], 1);
-});
-
 test('closed feedback profiles bind kind, producer, canonical fields, and frame id', () => {
-  for (const name of ['core-rust-format-return', 'core-build-diagnostic-return', 'core-rust-lock-return', 'core-npm-admission-return']) {
+  for (const name of ['core-rust-format-return', 'core-build-diagnostic-return', 'core-linux-quick-return']) {
     const expected = feedbackContext(name);
     const profile = RETURN_PROFILES[name];
     const aad = canonicalContext(expected);
@@ -170,12 +124,6 @@ test('closed feedback profiles bind kind, producer, canonical fields, and frame 
       expectedContext: expected,
       now: NOW,
     }), payload);
-    assert.throws(() => decryptLock({
-      envelope: encrypted,
-      recipientPrivateKey: recipient.privateKey,
-      expectedContext: expected,
-      now: NOW,
-    }), LockEnvelopeError);
   }
 });
 
@@ -250,15 +198,15 @@ test('key input must be a genuine RSA-3072 KeyObject with exponent 65537', () =>
     get type() { getterTouched = true; throw new Error('fixture-canary'); },
     export() { getterTouched = true; throw new Error('fixture-canary'); },
   };
-  assert.throws(() => encryptLock({
-    lockBytes: PAYLOAD,
+  assert.throws(() => encryptReturnEnvelope({
+    payloadBytes: PAYLOAD,
     recipientPublicKey: fakeKey,
     context,
     now: NOW,
   }), (error) => error instanceof LockEnvelopeError && error.message === 'Lock envelope rejected');
   assert.equal(getterTouched, false);
-  assert.throws(() => encryptLock({
-    lockBytes: PAYLOAD,
+  assert.throws(() => encryptReturnEnvelope({
+    payloadBytes: PAYLOAD,
     recipientPublicKey: nonstandardExponentRecipient.publicKey,
     context,
     now: NOW,
@@ -309,7 +257,7 @@ test('the Linux quick profile is the sixth closed profile and the only one bound
   assert.throws(() => canonicalContext({ ...quick, kind: 'build_diagnostics' }), LockEnvelopeError);
   for (const other of Object.keys(RETURN_PROFILES)) {
     if (other === name) continue;
-    const base = other === 'core-node-lock-return' ? sampleContext() : feedbackContext(other);
+    const base = feedbackContext(other);
     assert.equal(RETURN_PROFILES[other].workflowRef, undefined, other);
     assert.ok(canonicalContext(base).byteLength > 0, other);
     assert.throws(
@@ -344,12 +292,6 @@ test('the Linux quick profile seals a maximal fixed-size payload that only its o
   assert.throws(() => open({ ...quick, run_id: '987654322' }), LockEnvelopeError);
   assert.throws(() => open(feedbackContext('core-build-diagnostic-return')), LockEnvelopeError);
   assert.throws(() => open(quick, otherRecipient.privateKey), LockEnvelopeError);
-  assert.throws(() => decryptLock({
-    envelope: sealed,
-    recipientPrivateKey: recipient.privateKey,
-    expectedContext: quick,
-    now: NOW,
-  }), LockEnvelopeError);
   assert.throws(() => encryptReturnEnvelope({
     payloadBytes: Buffer.alloc(LOCK_ENVELOPE_LIMITS.plaintextBytes + 1),
     recipientPublicKey: recipient.publicKey,

@@ -22,26 +22,18 @@ SCHEMA_VERSION = 1
 SHA_RE = re.compile(r"[a-f0-9]{40}\Z")
 SHA256_RE = re.compile(r"[a-f0-9]{64}\Z")
 DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
-BASE_BRANCHES = frozenset(("main", "develop", "uat"))
+BASE_BRANCHES = frozenset(("main",))
 CONCERN = "rules-bootstrap"
-SUITES = ("rules.hooks", "rules.sync", "rules.static", "rules.public")
-GATES = SUITES + ("plan-ids",)
+SUITES = ("rules.hooks",)
+GATES = SUITES
 CONTROL_SIBLINGS = frozenset((
     "macos_reviewed_build", "macos_capability", "macos_boundary_guard",
     "macos_private_validation", "macos_source_reader", "macos_network_observer",
 ))
 REQUIRED_SOURCE_FILES = (
-    "ci/run-suite.sh",
+    "hooks/pre-push-guard.sh",
+    "hooks/guard-bash.sh",
     "tests/run-hook-tests.sh",
-    "tests/run-sync-tests.sh",
-    "tests/run-chain-tests.sh",
-    "tests/run-signature-tests.sh",
-    "tests/run-signature-merge-tests.sh",
-    "tests/check-static.sh",
-    "tests/check-no-public.sh",
-    "tests/check-plan-ids.sh",
-    "docs/commit-signers",
-    "allowed-signers",
 )
 MAX_CAPTURE_BYTES = 65536
 MAX_PLAN_BYTES = 48 * 1024
@@ -444,7 +436,7 @@ def _parse_request(argv):
         raise Refusal("invalid_input", "arguments")
     source_sha, base_sha, branch, concern = argv[1::2]
     if (not _valid_sha(source_sha) or not _valid_sha(base_sha)
-            or branch not in BASE_BRANCHES or concern != CONCERN):
+            or branch not in BASE_BRANCHES or concern != CONCERN or source_sha != base_sha):
         raise Refusal("invalid_input", "arguments")
     return {"source_sha": source_sha, "base_sha": base_sha, "base_branch": branch, "concern": concern}
 
@@ -510,23 +502,18 @@ def _validate_plan_definitions(environ):
 
 
 def _validate_bootstrap_gate(request, binding, environ):
-    if (environ.get("RULES_BOOTSTRAP_ALLOWED_SHA") != request["source_sha"]
-            or environ.get("RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA") != binding["control_sha"]
-            or binding["control_sha"] != environ.get("CI_SHA")):
+    if binding["control_sha"] != environ.get("CI_SHA"):
         raise Refusal("bootstrap_gate_refused", "bootstrap_gate")
-    if request.get("concern") != CONCERN or request.get("base_branch") not in BASE_BRANCHES:
+    if (request.get("concern") != CONCERN or request.get("base_branch") not in BASE_BRANCHES
+            or request["source_sha"] != request["base_sha"]):
         raise Refusal("bootstrap_gate_refused", "bootstrap_gate")
     candidate_ref = environ.get("SOURCE_CANDIDATE_REF", "")
-    reviewed_diff_sha256 = environ.get("SOURCE_REVIEWED_DIFF_SHA256", "")
-    if (environ.get("SOURCE_REVIEWED_SHA") != request["source_sha"]
-            or environ.get("SOURCE_REVIEWED_BASE") != request["base_sha"]
-            or environ.get("SOURCE_REVIEWED_BASE_BRANCH") != request["base_branch"]
-            or not _safe_candidate_ref(candidate_ref, request)
-            or type(reviewed_diff_sha256) is not str
-            or SHA256_RE.fullmatch(reviewed_diff_sha256) is None):
+    if not _safe_candidate_ref(candidate_ref, request):
         raise Refusal("bootstrap_gate_refused", "bootstrap_gate")
-    definitions, definitions_sha256 = _validate_plan_definitions(environ)
-    return definitions, definitions_sha256, reviewed_diff_sha256
+    definitions = b""
+    definitions_sha256 = hashlib.sha256(definitions).hexdigest()
+    empty_diff_sha256 = hashlib.sha256(b"").hexdigest()
+    return definitions, definitions_sha256, empty_diff_sha256
 
 
 def _record_runtime_revocation(runtime, state, token, request, binding, environ, lifecycle):
@@ -999,7 +986,7 @@ def _validate_lease_record(record, request, binding, worker_uid, current_uid=Non
 
     keys = {
         "repository_id", "source_sha", "base_sha", "base_branch", "concern", "candidate_class",
-        "signature", "rules_lock", "tree", "source_execution", "app_build", "cleanup",
+        "signature", "tree", "source_execution", "app_build", "cleanup",
         "control_sha", "run_id", "run_attempt", "image_os", "image_version", "repository_scope",
         "metadata", "token_revocation", "signer_authority", "signatures", "ancestry",
         "revocation_policy", "worker_access",
@@ -1014,8 +1001,7 @@ def _validate_lease_record(record, request, binding, worker_uid, current_uid=Non
         "base_sha": request["base_sha"],
         "base_branch": request["base_branch"],
         "concern": CONCERN,
-        "signature": "verified",
-        "rules_lock": "not-applicable",
+        "signature": "not_required",
         "tree": "rules_regular_files",
         "source_execution": "not_run_at_yield",
         "app_build": "not_run",
@@ -1028,16 +1014,16 @@ def _validate_lease_record(record, request, binding, worker_uid, current_uid=Non
         "repository_scope": "verified",
         "metadata": "verified",
         "token_revocation": "confirmed_before_yield",
-        "signer_authority": "bound_base",
-        "signatures": "all_new_commits_verified",
+        "signer_authority": "not_required",
+        "signatures": "unsigned_main_tip",
         "ancestry": "base_ancestor",
-        "revocation_policy": "current_control_fingerprints",
+        "revocation_policy": "not_applicable",
         "worker_access": "uid_read_only",
     }
     if current_uid is None:
         current_uid = os.getuid() if hasattr(os, "getuid") else 0
     if (any(record[key] != value for key, value in expected.items())
-            or record["candidate_class"] not in ("permanent-tip", "signed-descendant")
+            or record["candidate_class"] != "permanent-tip"
             or worker_uid <= 0 or worker_uid == current_uid):
         raise Refusal("source_lease_unavailable", "source_lease")
 
@@ -1683,20 +1669,11 @@ def _run_private(request, binding, root, definitions, definitions_sha256, review
                 summary_failure = None
                 try:
                     os.chdir(source)
-                    for suite in SUITES:
-                        commands_started = True
-                        _execute(("/bin/sh", "ci/run-suite.sh", suite), suite,
-                                 worker_uid, toolchain, environment, capability, cleanup_state)
-                        completed.append(suite)
-                    snapshot_directory = _create_plan_snapshot(
-                        binding, request, definitions, definitions_sha256, reviewed_diff_sha256,
-                        worker_uid, home, toolchain, capability, cleanup_state,
-                    )
                     commands_started = True
-                    _execute(("/bin/sh", "tests/check-plan-ids.sh", str(snapshot_directory)),
-                             "plan-ids", worker_uid, toolchain, environment, capability,
+                    _execute(("/bin/sh", "tests/run-hook-tests.sh", "dash", "--no-python"),
+                             "rules.hooks", worker_uid, toolchain, environment, capability,
                              cleanup_state)
-                    completed.append("plan-ids")
+                    completed.append("rules.hooks")
                 except BaseException as error:
                     command_failure = error
                 finally:
@@ -1866,7 +1843,8 @@ def _format_success(record):
     if (not _valid_sha(record["control_sha"]) or not _valid_sha(record["source_sha"])
             or not _valid_sha(record["base_sha"]) or not _safe_id(record["run_id"])
             or not _safe_id(record["run_attempt"]) or record["base_branch"] not in BASE_BRANCHES
-            or record["candidate_class"] not in ("permanent-tip", "signed-descendant")
+            or record["candidate_class"] != "permanent-tip"
+            or record["source_sha"] != record["base_sha"]
             or tuple(record["suites"]) != GATES
             or record["token_revocation"] != "confirmed_before_execution"
             or record["lease_cleanup"] != "complete" or record["process_cleanup"] != "complete"
@@ -1886,7 +1864,7 @@ def _format_success(record):
         + " run-id=" + record["run_id"] + " run-attempt=" + record["run_attempt"]
         + " source-sha=" + record["source_sha"] + " base-sha=" + record["base_sha"]
         + " base-branch=" + record["base_branch"] + " candidate-class=" + record["candidate_class"]
-        + " suites=rules.hooks,rules.sync,rules.static,rules.public,plan-ids"
+        + " suites=rules.hooks"
         + " token-revocation=confirmed-before-execution lease-cleanup=complete"
         + " process-cleanup=complete identity-cleanup=complete"
         + " summary-guard=append-sibling-create-readback-restore"

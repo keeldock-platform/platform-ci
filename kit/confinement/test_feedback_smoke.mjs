@@ -45,10 +45,10 @@ test('creates one bounded encrypted fixture and reports only ciphertext metadata
   assert.deepEqual(Object.keys(result).sort(), [
     'ciphertextPath', 'ciphertextSha256', 'ciphertextSize', 'memberName', 'roundTrip',
   ]);
-  assert.equal(result.memberName, 'lock-return-v1.enc');
+  assert.equal(result.memberName, 'build-diagnostic-return-v1.enc');
   assert.equal(result.roundTrip, true);
   assert.equal(bytes.subarray(0, 4).toString('ascii'), 'KDLE');
-  assert.equal(bytes[5], 1);
+  assert.equal(bytes[5], 3);
   assert.equal(bytes.includes(Buffer.from('feedback-smoke-canary-7c49b2')), false);
   assert.equal(bytes.length, result.ciphertextSize);
   assert.equal(createHash('sha256').update(bytes).digest('hex'), result.ciphertextSha256);
@@ -116,5 +116,5 @@ test('CLI entrypoint emits a bounded marker on every native path shape', () => {
   });
   assert.equal(result.status, 0);
   assert.equal(result.stderr, '');
-  assert.match(result.stdout, /^KD-FEEDBACK-CIPHERTEXT schema=1 control-sha=[a-f0-9]{40} run-id=24680 run-attempt=1 member=lock-return-v1\.enc ciphertext-sha256=[a-f0-9]{64} ciphertext-size=[1-9][0-9]* roundtrip=passed source=synthetic\n$/u);
+  assert.match(result.stdout, /^KD-FEEDBACK-CIPHERTEXT schema=1 control-sha=[a-f0-9]{40} run-id=24680 run-attempt=1 member=build-diagnostic-return-v1\.enc ciphertext-sha256=[a-f0-9]{64} ciphertext-size=[1-9][0-9]* roundtrip=passed source=synthetic\n$/u);
 });

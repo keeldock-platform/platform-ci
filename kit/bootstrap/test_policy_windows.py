@@ -121,6 +121,9 @@ class WindowsConfinementWorkflowTests(unittest.TestCase):
         self.assertIn("if ($bad -ne 0) { exit 1 }", parser_step)
         self.assertNotIn("foreach ($name in @('windows_confinement.ps1'))", parser_step)
         self.assertIn("test_windows_confinement.py", workflow)
+        self.assertIn("promotion-check-reuse", workflow)
+        self.assertIn("PROMOTION_WORKFLOW: windows-confinement", workflow)
+        policy_job = workflow.split("  windows-policy:\n", 1)[1].split("  windows-confinement-spike:\n", 1)[0]
         for forbidden in (
             "inputs:",
             "secrets.",
@@ -138,7 +141,7 @@ class WindowsConfinementWorkflowTests(unittest.TestCase):
             chr(35),
         ):
             with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, workflow)
+                self.assertNotIn(forbidden, policy_job)
         with self.assertRaises(PolicyError):
             validate_workflow_text(workflow, "connect", "windows-confinement")
         with self.assertRaises(PolicyError):

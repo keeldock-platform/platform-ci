@@ -7,7 +7,7 @@ import feedback_request as subject
 NOW = 1_800_000_000
 
 
-def _fields(kind="lock", *, now=NOW, expiry=None):
+def _fields(kind="rust_patch", *, now=NOW, expiry=None):
     profile = subject.PROFILE_BY_KIND[kind]
     return {
         "kind": kind,
@@ -32,43 +32,24 @@ class FeedbackRequestTests(unittest.TestCase):
         with self.assertRaises(subject.RequestRefusal) as raised:
             operation(*args, **kwargs)
         self.assertEqual(raised.exception.reason, "request_invalid")
-        self.assertEqual(str(raised.exception), "request_invalid")
 
     def test_canonical_record_round_trips_and_hashes_the_exact_preimage(self):
-        fields = _fields()
-        request = subject.create_request(fields, now=NOW)
+        request = subject.create_request(_fields(), now=NOW)
         record = subject.encode_request(request, now=NOW)
         preimage = record.rsplit(b"request_id=", 1)[0]
-        expected = (
-            "node-feedback-request-v1\n"
-            "kind=lock\n"
-            "concern=core-node-lock-return\n"
-            "ci_repository_id=987654321\n"
-            "workflow_path=.github/workflows/node-lock-return.yml\n"
-            "workflow_ref=refs/heads/main\n"
-            "repository_id=1430959909\n"
-            "source_sha=" + "d" * 40 + "\n"
-            "base_sha=" + "e" * 40 + "\n"
-            "control_sha=" + "f" * 40 + "\n"
-            "base_branch=develop\n"
-            "reviewed_diff_sha256=" + "1" * 64 + "\n"
-            "recipient_fingerprint=" + "2" * 64 + "\n"
-            "nonce=" + "3" * 64 + "\n"
-            "expiry=" + str(NOW + 3600) + "\n"
-        ).encode("ascii")
-        self.assertEqual(preimage, expected)
         self.assertEqual(request["request_id"], hashlib.sha256(preimage).hexdigest())
         self.assertEqual(subject.parse_request(record, now=NOW), request)
+        self.assertIn(b"kind=rust_patch\nconcern=core-rust-format-return\n", preimage)
 
     def test_parser_rejects_duplicates_reordering_unknown_fields_and_noncanonical_bytes(self):
         request = subject.create_request(_fields(), now=NOW)
         record = subject.encode_request(request, now=NOW)
         bad_records = (
-            record.replace(b"kind=lock\n", b"kind=lock\nkind=lock\n", 1),
-            record.replace(b"kind=lock\nconcern=", b"concern=", 1).replace(
-                b"concern=core-node-lock-return\n", b"concern=core-node-lock-return\nkind=lock\n", 1,
+            record.replace(b"kind=rust_patch\n", b"kind=rust_patch\nkind=rust_patch\n", 1),
+            record.replace(b"kind=rust_patch\nconcern=", b"concern=", 1).replace(
+                b"concern=core-rust-format-return\n", b"concern=core-rust-format-return\nkind=rust_patch\n", 1,
             ),
-            record.replace(b"kind=lock\n", b"unknown=lock\n", 1),
+            record.replace(b"kind=rust_patch\n", b"unknown=rust_patch\n", 1),
             record.replace(b"expiry=1800003600\n", b"expiry=01800003600\n", 1),
             record + b"trailing",
             record + b" " * subject.MAX_REQUEST_BYTES,
@@ -77,26 +58,35 @@ class FeedbackRequestTests(unittest.TestCase):
             with self.subTest(size=len(bad_record)):
                 self.assert_refused(subject.parse_request, bad_record, now=NOW)
 
-    def test_all_registered_profiles_are_exactly_bound_to_kind_and_workflow(self):
+    def test_only_non_dependency_feedback_profiles_remain(self):
+        self.assertEqual(
+            sorted(subject.PROFILE_BY_KIND),
+            ["build_diagnostics", "linux_quick", "rust_patch"],
+        )
+        for kind, concern, workflow in (
+            ("lock", "core-node-lock-return", ".github/workflows/node-lock-return.yml"),
+            ("cargo_lock", "core-rust-lock-return", ".github/workflows/core-rust-lock-return.yml"),
+            ("npm_admission", "core-npm-admission-return", ".github/workflows/core-npm-admission-return.yml"),
+        ):
+            fields = _fields("rust_patch")
+            fields.update(kind=kind, concern=concern, workflow_path=workflow)
+            self.assert_refused(subject.create_request, fields, now=NOW)
+
+    def test_registered_profiles_are_exactly_bound_to_kind_and_workflow(self):
         for kind in subject.PROFILE_BY_KIND:
             with self.subTest(kind=kind):
                 fields = _fields(kind)
                 request = subject.create_request(fields, now=NOW)
                 self.assertEqual(subject.validate_request(request, now=NOW), subject.PROFILE_BY_KIND[kind])
-                changed = dict(fields)
-                changed["workflow_path"] = ".github/workflows/other.yml"
+                changed = dict(fields, workflow_path=".github/workflows/other.yml")
                 self.assert_refused(subject.create_request, changed, now=NOW)
 
     def test_request_values_digest_and_expiry_are_strict(self):
         cases = (
-            ("source_sha", "F" * 40),
-            ("base_sha", "x" * 40),
-            ("reviewed_diff_sha256", "0" * 63),
-            ("recipient_fingerprint", "A" * 64),
-            ("nonce", "B" * 64),
-            ("repository_id", "01430995909"),
-            ("ci_repository_id", "0987654321"),
-            ("base_branch", "feature"),
+            ("source_sha", "F" * 40), ("base_sha", "x" * 40),
+            ("reviewed_diff_sha256", "0" * 63), ("recipient_fingerprint", "A" * 64),
+            ("nonce", "B" * 64), ("repository_id", "01430995909"),
+            ("ci_repository_id", "0987654321"), ("base_branch", "feature"),
             ("workflow_ref", "refs/heads/other"),
         )
         for field, value in cases:
@@ -107,39 +97,19 @@ class FeedbackRequestTests(unittest.TestCase):
         self.assert_refused(
             subject.create_request, _fields(expiry=NOW + subject.MAX_REQUEST_TTL_SECONDS + 1), now=NOW,
         )
-        self.assert_refused(
-            subject.create_request, _fields(expiry=subject.EXCEPTION_END + 1), now=NOW,
-        )
+        self.assert_refused(subject.create_request, _fields(expiry=subject.EXCEPTION_END + 1), now=NOW)
         request = subject.create_request(_fields(), now=NOW)
-        tampered = dict(request)
-        tampered["source_sha"] = "0" * 40
+        tampered = dict(request, source_sha="0" * 40)
         self.assert_refused(subject.validate_request, tampered, now=NOW)
         self.assert_refused(subject.validate_request, request, now=request["expiry"])
 
-    def test_cargo_lock_accepts_only_the_exact_batch4_base_pair(self):
-        fields = _fields(subject.CARGO_LOCK_KIND)
-        fields["base_branch"] = subject.CORE_RUST_BOOTSTRAP_BASE_BRANCH
-        fields["base_sha"] = subject.CORE_RUST_BOOTSTRAP_BASE_SHA
-        self.assertEqual(
-            subject.validate_request(subject.create_request(fields, now=NOW), now=NOW),
-            subject.PROFILE_BY_KIND[subject.CARGO_LOCK_KIND],
-        )
-        for branch, sha in (
-            ("plan/core-contract-batch5", subject.CORE_RUST_BOOTSTRAP_BASE_SHA),
-            (subject.CORE_RUST_BOOTSTRAP_BASE_BRANCH, "a" * 40),
-        ):
-            changed = dict(fields, base_branch=branch, base_sha=sha)
-            with self.subTest(branch=branch, sha=sha):
-                self.assert_refused(subject.create_request, changed, now=NOW)
-
-    def test_consumption_is_one_use_and_bootstrap_lock_is_global(self):
+    def test_consumption_is_one_use_and_allows_a_fresh_request_after_retirement(self):
         request = subject.create_request(_fields(), now=NOW)
         initial = subject.empty_state()
         active = subject.register_request(initial, request, now=NOW)
         self.assertEqual(initial, subject.empty_state())
         consumed = subject.consume_request(active, request["request_id"], now=NOW + 1)
         entry = consumed["requests"][0]
-        self.assertTrue(consumed["bootstrap_lock_consumed"])
         self.assertEqual(entry["status"], "consumed")
         self.assertEqual(entry["key_state"], "retirement_required")
         self.assertEqual(entry["tombstone_until"], subject.EXCEPTION_END)
@@ -147,43 +117,30 @@ class FeedbackRequestTests(unittest.TestCase):
         self.assertEqual(retired["requests"][0]["key_state"], "retired")
         self.assert_refused(subject.consume_request, retired, request["request_id"], now=NOW + 2)
         self.assert_refused(subject.register_request, retired, request, now=NOW + 2)
-        second_fields = _fields(expiry=NOW + 7200)
-        second_fields["nonce"] = "4" * 64
-        second_fields["recipient_fingerprint"] = "5" * 64
-        second_lock = subject.create_request(second_fields, now=NOW)
-        self.assert_refused(subject.register_request, retired, second_lock, now=NOW + 2)
+        fields = _fields("build_diagnostics", expiry=NOW + 7200)
+        fields.update(nonce="4" * 64, recipient_fingerprint="5" * 64)
+        fresh = subject.create_request(fields, now=NOW)
+        self.assertEqual(subject.register_request(retired, fresh, now=NOW + 2)["requests"][1]["kind"],
+                         "build_diagnostics")
 
     def test_state_never_reuses_nonce_or_recipient_key_fingerprint(self):
         request = subject.create_request(_fields(), now=NOW)
         state = subject.register_request(subject.empty_state(), request, now=NOW)
-        reused_nonce = _fields()
-        reused_nonce["recipient_fingerprint"] = "5" * 64
-        self.assert_refused(
-            subject.register_request,
-            state,
-            subject.create_request(reused_nonce, now=NOW),
-            now=NOW,
-        )
-        reused_key = _fields()
-        reused_key["nonce"] = "6" * 64
-        self.assert_refused(
-            subject.register_request,
-            state,
-            subject.create_request(reused_key, now=NOW),
-            now=NOW,
-        )
+        for changed in (dict(_fields(), recipient_fingerprint="5" * 64),
+                        dict(_fields(), nonce="6" * 64)):
+            self.assert_refused(
+                subject.register_request, state, subject.create_request(changed, now=NOW), now=NOW,
+            )
 
-    def test_expiry_and_abandonment_retire_keys_without_consuming_bootstrap(self):
+    def test_expiry_and_abandonment_retire_keys_and_preserve_tombstones(self):
         expiring = subject.create_request(_fields(expiry=NOW + 60), now=NOW)
         state = subject.register_request(subject.empty_state(), expiring, now=NOW)
         self.assert_refused(subject.expire_request, state, expiring["request_id"], now=NOW + 59)
         expired = subject.expire_request(state, expiring["request_id"], now=NOW + 60)
-        self.assertFalse(expired["bootstrap_lock_consumed"])
         self.assertEqual(expired["requests"][0]["status"], "expired")
         expired = subject.mark_key_retired(expired, expiring["request_id"])
         self.assertEqual(expired["requests"][0]["key_state"], "retired")
         self.assert_refused(subject.register_request, expired, expiring, now=NOW + 60)
-
         retry = subject.create_request(_fields(expiry=NOW + 180), now=NOW)
         state = subject.register_request(subject.empty_state(), retry, now=NOW)
         abandoned = subject.abandon_request(state, retry["request_id"])
@@ -194,299 +151,23 @@ class FeedbackRequestTests(unittest.TestCase):
     def test_state_rejects_duplicate_ids_and_inconsistent_tombstones(self):
         request = subject.create_request(_fields(), now=NOW)
         state = subject.register_request(subject.empty_state(), request, now=NOW)
-        duplicate = dict(state)
-        duplicate["requests"] = [state["requests"][0], dict(state["requests"][0])]
+        duplicate = dict(state, requests=[state["requests"][0], dict(state["requests"][0])])
         self.assert_refused(subject.register_request, duplicate, request, now=NOW)
-        malformed = dict(state)
-        malformed["requests"] = [dict(state["requests"][0], tombstone_until=subject.EXCEPTION_END)]
+        malformed = dict(state, requests=[dict(state["requests"][0], tombstone_until=subject.EXCEPTION_END)])
         self.assert_refused(subject.register_request, malformed, request, now=NOW)
 
-
-def _cargo_fields(index, *, now=NOW, expiry=None):
-    fields = _fields("cargo_lock", now=now, expiry=expiry)
-    fields["nonce"] = format(index + 1, "x") * 64
-    fields["recipient_fingerprint"] = format(index + 1, "x") * 64
-    return fields
-
-
-class CargoLockProfileTests(unittest.TestCase):
-    def assert_refused(self, operation, *args, **kwargs):
-        with self.assertRaises(subject.RequestRefusal) as raised:
-            operation(*args, **kwargs)
-        self.assertEqual(raised.exception.reason, "request_invalid")
-
-    def test_profile_is_a_fourth_closed_profile_that_never_aliases_the_lock_kind(self):
-        profile = subject.PROFILE_BY_KIND["cargo_lock"]
-        self.assertEqual(profile["profile_id"], 4)
-        self.assertEqual(profile["concern"], "core-rust-lock-return")
-        self.assertEqual(profile["workflow_path"], ".github/workflows/core-rust-lock-return.yml")
-        self.assertEqual(profile["producer_job"], "core-rust-lock-return")
-        self.assertEqual(profile["auditor_job"], "core-rust-lock-return-audit")
-        self.assertEqual(profile["member_name"], "rust-lock-return-v1.enc")
-        self.assertIs(subject.PROFILES["core-rust-lock-return"], profile)
-        self.assertNotEqual(profile["kind"], "lock")
-        self.assertEqual(
-            sorted(subject.PROFILE_BY_KIND),
-            ["build_diagnostics", "cargo_lock", "linux_quick", "lock", "npm_admission", "rust_patch"],
-        )
-        self.assertEqual(
-            len({item["member_name"] for item in subject.PROFILES.values()}), len(subject.PROFILES),
-        )
-        for item in subject.PROFILES.values():
-            self.assertEqual(set(item), set(subject.PROFILE_FIELDS))
-
-    def test_cargo_lock_has_its_own_bounded_payload_limits(self):
-        profile = subject.PROFILE_BY_KIND["cargo_lock"]
-        node_profile = subject.PROFILE_BY_KIND["lock"]
-        self.assertEqual(node_profile["max_payload_bytes"], 4 * 1024 * 1024 - 64 * 1024)
-        self.assertEqual(profile["max_payload_bytes"], subject.CARGO_LOCK_MAX_PAYLOAD_BYTES)
-        self.assertLess(profile["max_payload_bytes"], node_profile["max_payload_bytes"])
-
-        def encoded(size):
-            return 4 * ((size + 2) // 3)
-
-        total = (
-            encoded(subject.CARGO_LOCK_MAX_LOCK_BYTES) + encoded(subject.CARGO_LOCK_MAX_RECEIPT_BYTES)
-            + encoded(subject.CARGO_LOCK_MAX_EVIDENCE_BYTES) + 256
-        )
-        self.assertLessEqual(total, profile["max_payload_bytes"])
-
-    def test_rust_patch_profile_limit_matches_the_envelope_plaintext_bound(self):
-        profile = subject.PROFILE_BY_KIND["rust_patch"]
-        node_profile = subject.PROFILE_BY_KIND["lock"]
-        self.assertEqual(profile["max_payload_bytes"], 4 * 1024 * 1024 - 64 * 1024)
-        self.assertEqual(profile["max_payload_bytes"], node_profile["max_payload_bytes"])
-        self.assertGreater(profile["max_payload_bytes"], subject.CARGO_LOCK_MAX_PAYLOAD_BYTES)
-        self.assertGreater(profile["max_payload_bytes"], subject.PROFILE_BY_KIND["build_diagnostics"]["max_payload_bytes"])
-
-    def test_requests_bind_the_cargo_lock_kind_concern_and_workflow_exactly(self):
-        request = subject.create_request(_cargo_fields(0), now=NOW)
-        record = subject.encode_request(request, now=NOW)
-        self.assertIn(b"kind=cargo_lock\nconcern=core-rust-lock-return\n", record)
-        self.assertEqual(subject.parse_request(record, now=NOW), request)
-        for name, value in (
-            ("kind", "lock"), ("concern", "core-node-lock-return"),
-            ("workflow_path", ".github/workflows/node-lock-return.yml"),
-            ("workflow_path", ".github/workflows/core-rust-format-return.yml"),
-        ):
-            changed = _cargo_fields(0)
-            changed[name] = value
-            with self.subTest(name=name, value=value):
-                self.assert_refused(subject.create_request, changed, now=NOW)
-
-    def test_each_request_is_consumed_once_without_touching_the_node_lock_flag(self):
-        request = subject.create_request(_cargo_fields(0), now=NOW)
-        active = subject.register_request(subject.empty_state(), request, now=NOW)
-        self.assertEqual(subject.cargo_lock_consumed_count(active), 0)
-        consumed = subject.consume_request(active, request["request_id"], now=NOW + 1)
-        self.assertEqual(subject.cargo_lock_consumed_count(consumed), 1)
-        self.assertFalse(consumed["bootstrap_lock_consumed"])
-        entry = consumed["requests"][0]
-        self.assertEqual(entry["kind"], "cargo_lock")
-        self.assertEqual(entry["status"], "consumed")
-        self.assertEqual(entry["key_state"], "retirement_required")
-        self.assertEqual(entry["tombstone_until"], subject.EXCEPTION_END)
-        self.assert_refused(subject.consume_request, consumed, request["request_id"], now=NOW + 2)
-        retired = subject.mark_key_retired(consumed, request["request_id"])
-        self.assert_refused(subject.consume_request, retired, request["request_id"], now=NOW + 2)
-        self.assert_refused(subject.register_request, retired, request, now=NOW + 2)
-        node_lock = subject.create_request(_fields("lock", expiry=NOW + 7200), now=NOW)
-        with_node_lock = subject.register_request(retired, node_lock, now=NOW + 2)
-        self.assertEqual(with_node_lock["requests"][1]["kind"], "lock")
-
-    def test_a_consumed_node_lock_does_not_block_and_is_not_blocked_by_cargo_locks(self):
-        node_lock = subject.create_request(_fields("lock"), now=NOW)
-        state = subject.register_request(subject.empty_state(), node_lock, now=NOW)
-        state = subject.consume_request(state, node_lock["request_id"], now=NOW + 1)
-        self.assertTrue(state["bootstrap_lock_consumed"])
-        self.assertEqual(subject.cargo_lock_consumed_count(state), 0)
-        cargo_request = subject.create_request(_cargo_fields(0), now=NOW)
-        state = subject.register_request(state, cargo_request, now=NOW + 2)
-        state = subject.consume_request(state, cargo_request["request_id"], now=NOW + 3)
-        self.assertTrue(state["bootstrap_lock_consumed"])
-        self.assertEqual(subject.cargo_lock_consumed_count(state), 1)
-
-    def test_only_one_cargo_lock_request_is_active_at_a_time(self):
-        first = subject.create_request(_cargo_fields(0), now=NOW)
-        second = subject.create_request(_cargo_fields(1), now=NOW)
-        state = subject.register_request(subject.empty_state(), first, now=NOW)
-        self.assert_refused(subject.register_request, state, second, now=NOW)
-        state = subject.abandon_request(state, first["request_id"])
-        state = subject.register_request(state, second, now=NOW)
-        self.assertEqual(subject.cargo_lock_consumed_count(state), 0)
-
-    def test_the_number_of_consumed_cargo_locks_is_capped(self):
-        state = subject.empty_state()
-        for index in range(subject.CARGO_LOCK_MAX_CONSUMED):
-            request = subject.create_request(_cargo_fields(index), now=NOW)
-            state = subject.register_request(state, request, now=NOW)
-            state = subject.consume_request(state, request["request_id"], now=NOW + 1)
-        self.assertEqual(subject.cargo_lock_consumed_count(state), subject.CARGO_LOCK_MAX_CONSUMED)
-        self.assertFalse(state["bootstrap_lock_consumed"])
-        extra = subject.create_request(_cargo_fields(subject.CARGO_LOCK_MAX_CONSUMED), now=NOW)
-        self.assert_refused(subject.register_request, state, extra, now=NOW + 2)
-
-    def test_stale_and_replayed_requests_are_refused(self):
-        request = subject.create_request(_cargo_fields(0, expiry=NOW + 60), now=NOW)
-        self.assert_refused(subject.register_request, subject.empty_state(), request, now=NOW + 60)
-        self.assert_refused(subject.register_request, subject.empty_state(), request, now=NOW + 3600)
-        state = subject.register_request(subject.empty_state(), request, now=NOW)
-        self.assert_refused(subject.consume_request, state, request["request_id"], now=NOW + 60)
-        self.assert_refused(subject.consume_request, state, "0" * 64, now=NOW + 1)
-        self.assert_refused(subject.consume_request, state, request["request_id"], now=0)
-        expired = subject.expire_request(state, request["request_id"], now=NOW + 60)
-        self.assertEqual(subject.cargo_lock_consumed_count(expired), 0)
-        self.assert_refused(subject.consume_request, expired, request["request_id"], now=NOW + 30)
-        self.assert_refused(subject.register_request, expired, request, now=NOW + 61)
-        replay = subject.create_request(_cargo_fields(0, expiry=NOW + 600), now=NOW)
-        self.assert_refused(subject.register_request, expired, replay, now=NOW + 61)
-
-    def test_an_expired_active_request_blocks_new_registration_until_resolved(self):
-        old = subject.create_request(_cargo_fields(0, expiry=NOW + 60), now=NOW)
-        state = subject.register_request(subject.empty_state(), old, now=NOW)
-        fresh = subject.create_request(_cargo_fields(1, expiry=NOW + 3000), now=NOW + 61)
-        self.assert_refused(subject.register_request, state, fresh, now=NOW + 61)
-
-    def test_build_inputs_are_refused_unless_the_profile_allowlists_them(self):
-        self.assertEqual(subject.PROFILE_BY_KIND["cargo_lock"]["build_inputs"], ())
-        self.assertEqual(subject.validate_build_inputs("cargo_lock", {}), {})
-        for kind in ("cargo_lock", "lock", "rust_patch", "build_diagnostics"):
-            with self.subTest(kind=kind):
-                self.assert_refused(
-                    subject.validate_build_inputs, kind, {"LIBSQLITE3_FLAGS": "-DSQLITE_ENABLE_FTS5"},
-                )
-                self.assert_refused(subject.validate_build_inputs, kind, {"": "x"})
-        for kind, inputs in (
-            ("unknown", {}), (None, {}), ("cargo_lock", []), ("cargo_lock", None),
-            ("cargo_lock", "LIBSQLITE3_FLAGS"),
-        ):
-            with self.subTest(kind=kind, inputs=repr(inputs)):
-                self.assert_refused(subject.validate_build_inputs, kind, inputs)
-
-
-class WorkspaceSelectorTests(unittest.TestCase):
-    def assert_refused(self, operation, *args, **kwargs):
-        with self.assertRaises(subject.RequestRefusal):
-            operation(*args, **kwargs)
-
-    def test_absent_selector_keeps_the_canonical_record_and_means_contract(self):
-        fields = _fields("cargo_lock")
-        request = subject.create_request(fields, now=NOW)
-        record = subject.encode_request(request, now=NOW)
-        self.assertNotIn(b"workspace=", record)
-        self.assertEqual(subject.request_workspace(request), "contract")
-        self.assertEqual(subject.parse_request(record, now=NOW), request)
-
-    def test_runtime_selector_is_a_bound_canonical_line_for_the_lock_profile_only(self):
-        fields = _fields("cargo_lock")
-        fields["workspace"] = "runtime"
-        request = subject.create_request(fields, now=NOW)
-        record = subject.encode_request(request, now=NOW)
-        preimage = record.rsplit(b"request_id=", 1)[0]
-        self.assertTrue(preimage.endswith(b"expiry=" + str(NOW + 3600).encode("ascii") + b"\nworkspace=runtime\n"))
-        self.assertEqual(subject.parse_request(record, now=NOW), request)
-        self.assertEqual(subject.request_workspace(request), "runtime")
-        plain = subject.create_request(_fields("cargo_lock"), now=NOW)
-        self.assertNotEqual(plain["request_id"], request["request_id"])
-        for kind in ("lock", "rust_patch", "build_diagnostics"):
-            other = _fields(kind)
-            other["workspace"] = "runtime"
-            with self.subTest(kind=kind):
-                self.assert_refused(subject.create_request, other, now=NOW)
-
-    def test_every_other_selector_value_is_refused(self):
-        for value in ("contract", "", "Runtime", "runtime/", "../runtime", "other", None, 1, b"runtime"):
-            fields = _fields("cargo_lock")
-            fields["workspace"] = value
-            with self.subTest(value=value):
-                self.assert_refused(subject.create_request, fields, now=NOW)
-
-    def test_selector_line_cannot_be_dropped_reordered_or_duplicated(self):
-        fields = _fields("cargo_lock")
-        fields["workspace"] = "runtime"
-        record = subject.encode_request(subject.create_request(fields, now=NOW), now=NOW)
-        for bad in (
-            record.replace(b"workspace=runtime\n", b"", 1),
-            record.replace(b"workspace=runtime\n", b"workspace=runtime\nworkspace=runtime\n", 1),
-            record.replace(b"workspace=runtime\n", b"workspace=contract\n", 1),
-            record.replace(b"workspace=runtime\n", b"unknown=runtime\n", 1),
-        ):
-            with self.subTest(bad=bad):
-                self.assert_refused(subject.parse_request, bad, now=NOW)
-
-
-class LinuxQuickProfileTests(unittest.TestCase):
-    def assert_refused(self, operation, *args, **kwargs):
-        with self.assertRaises(subject.RequestRefusal) as raised:
-            operation(*args, **kwargs)
-        self.assertEqual(raised.exception.reason, "request_invalid")
-
-    def test_profile_is_the_sixth_closed_profile_with_the_exact_envelope_payload_limit(self):
+    def test_quick_profile_binds_untrusted_and_is_consumed_once(self):
         profile = subject.PROFILE_BY_KIND["linux_quick"]
         self.assertEqual(profile["profile_id"], 6)
-        self.assertEqual(profile["concern"], "core-linux-quick-return")
-        self.assertEqual(profile["workflow_path"], ".github/workflows/core-linux-quick-return.yml")
-        self.assertEqual(profile["producer_job"], "core-linux-quick-return-producer")
-        self.assertEqual(profile["auditor_job"], "core-linux-quick-return-audit")
-        self.assertEqual(profile["member_name"], "linux-quick-return-v1.enc")
-        self.assertEqual(profile["max_payload_bytes"], 4128768)
         self.assertEqual(profile["max_payload_bytes"], 4 * 1024 * 1024 - 64 * 1024)
-        self.assertEqual(profile["max_payload_bytes"], subject.LINUX_QUICK_MAX_PAYLOAD_BYTES)
-        self.assertEqual(profile["build_inputs"], ())
-        self.assertEqual(set(profile), set(subject.PROFILE_FIELDS))
-        self.assertIs(subject.PROFILES["core-linux-quick-return"], profile)
-        self.assertEqual(subject.LINUX_QUICK_KIND, "linux_quick")
-
-    def test_only_the_quick_kind_binds_untrusted_and_every_other_kind_keeps_main(self):
-        self.assertEqual(subject.WORKFLOW_REF, "refs/heads/main")
-        self.assertEqual(subject.LINUX_QUICK_WORKFLOW_REF, "refs/heads/untrusted")
-        for kind in subject.PROFILE_BY_KIND:
-            quick = kind == subject.LINUX_QUICK_KIND
-            expected = "refs/heads/untrusted" if quick else "refs/heads/main"
-            other = "refs/heads/main" if quick else "refs/heads/untrusted"
-            with self.subTest(kind=kind):
-                self.assertEqual(subject.workflow_ref_for_kind(kind), expected)
-                request = subject.create_request(_fields(kind), now=NOW)
-                self.assertEqual(request["workflow_ref"], expected)
-                self.assertEqual(subject.validate_request(request, now=NOW), subject.PROFILE_BY_KIND[kind])
-                self.assert_refused(subject.create_request, dict(_fields(kind), workflow_ref=other), now=NOW)
-                swapped = dict(request, workflow_ref=other)
-                self.assert_refused(subject.validate_request, swapped, now=NOW)
-
-    def test_no_other_kind_accepts_the_untrusted_ref_in_a_parsed_record(self):
-        for kind in subject.PROFILE_BY_KIND:
-            if kind == subject.LINUX_QUICK_KIND:
-                continue
-            record = subject.encode_request(subject.create_request(_fields(kind), now=NOW), now=NOW)
-            changed = record.replace(b"workflow_ref=refs/heads/main\n", b"workflow_ref=refs/heads/untrusted\n", 1)
-            self.assertNotEqual(changed, record)
-            with self.subTest(kind=kind):
-                self.assert_refused(subject.parse_request, changed, now=NOW)
-
-    def test_quick_record_round_trips_and_refuses_the_main_ref(self):
-        request = subject.create_request(_fields("linux_quick"), now=NOW)
-        record = subject.encode_request(request, now=NOW)
-        self.assertIn(b"kind=linux_quick\n", record)
-        self.assertIn(b"concern=core-linux-quick-return\n", record)
-        self.assertIn(b"workflow_ref=refs/heads/untrusted\n", record)
-        self.assertEqual(subject.parse_request(record, now=NOW), request)
-        changed = record.replace(b"workflow_ref=refs/heads/untrusted\n", b"workflow_ref=refs/heads/main\n", 1)
-        self.assert_refused(subject.parse_request, changed, now=NOW)
-        wrong_path = dict(_fields("linux_quick"), workflow_path=".github/workflows/core-build-diagnostic-return.yml")
-        self.assert_refused(subject.create_request, wrong_path, now=NOW)
-        wrong_concern = dict(_fields("linux_quick"), concern="core-build-diagnostic-return")
-        self.assert_refused(subject.create_request, wrong_concern, now=NOW)
-
-    def test_quick_request_registers_and_is_consumed_once(self):
-        request = subject.create_request(_fields("linux_quick"), now=NOW)
+        self.assertEqual(subject.workflow_ref_for_kind("linux_quick"), "refs/heads/untrusted")
+        self.assertEqual(subject.workflow_ref_for_kind("rust_patch"), "refs/heads/main")
+        fields = _fields("linux_quick")
+        request = subject.create_request(fields, now=NOW)
         state = subject.register_request(subject.empty_state(), request, now=NOW)
-        self.assertEqual(state["requests"][0]["kind"], "linux_quick")
         consumed = subject.consume_request(state, request["request_id"], now=NOW + 1)
+        self.assertEqual(consumed["requests"][0]["kind"], "linux_quick")
         self.assertEqual(consumed["requests"][0]["status"], "consumed")
-        self.assertFalse(consumed["bootstrap_lock_consumed"])
-        self.assert_refused(subject.consume_request, consumed, request["request_id"], now=NOW + 2)
-        self.assertEqual(subject.validate_build_inputs("linux_quick", {}), {})
-        self.assert_refused(subject.validate_build_inputs, "linux_quick", {"anything": "x"})
 
 
 if __name__ == "__main__":

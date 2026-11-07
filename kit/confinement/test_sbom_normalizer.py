@@ -4,7 +4,7 @@ import json
 import shutil
 import unittest
 
-import cargo_lock_receipt
+import cargo_lock_parser
 import sbom_normalizer as subject
 
 
@@ -16,11 +16,11 @@ CARGO_LOCK_BYTES = (
     "[[package]]\n"
     "name = \"fixture-app\"\n"
     "version = \"1.0.0\"\n"
-    "dependencies = [\"serde 1.0.0 (" + cargo_lock_receipt.REGISTRY_SOURCE + ")\"]\n\n"
+    "dependencies = [\"serde 1.0.0 (" + cargo_lock_parser.REGISTRY_SOURCE + ")\"]\n\n"
     "[[package]]\n"
     "name = \"serde\"\n"
     "version = \"1.0.0\"\n"
-    "source = \"" + cargo_lock_receipt.REGISTRY_SOURCE + "\"\n"
+    "source = \"" + cargo_lock_parser.REGISTRY_SOURCE + "\"\n"
     "checksum = \"" + CARGO_HASH + "\"\n"
 ).encode("ascii")
 PACKAGE_LOCK_VALUE = {

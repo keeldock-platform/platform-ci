@@ -8,7 +8,6 @@ import {
   parseCanonicalContext,
   returnProfileForContext,
 } from './node_lock_envelope.mjs';
-import { LOCK_MANIFEST_LIMITS, validateLockManifest } from './node_lock_manifest.mjs';
 
 // Callers must validate the trusted receipt, API evidence, and replay state.
 export const DEVELOPMENT_FEEDBACK_LIMITS = Object.freeze({
@@ -24,34 +23,18 @@ export const DEVELOPMENT_FEEDBACK_LIMITS = Object.freeze({
   reviewedRustPaths: 512,
   hunkLines: 16_384,
   hunkCount: 1_000_000,
-  cargoLockBytes: 1024 * 1024,
-  cargoLockLockBytes: 256 * 1024,
-  cargoLockReceiptBytes: 128 * 1024,
-  cargoLockEvidenceBytes: 192 * 1024,
-  npmAdmissionBytes: 3 * 1024 * 1024 + 512 * 1024,
-  npmAdmissionLockBytes: 1536 * 1024,
-  npmAdmissionReceiptBytes: 256 * 1024,
-  npmAdmissionEvidenceBytes: 640 * 1024,
-  npmDiagnosticBytes: 64 * 1024,
-  npmDiagnosticLines: 401,
-  npmDiagnosticLineCodeUnits: 2048,
   linuxQuickBytes: 4 * 1024 * 1024 - 64 * 1024,
   linuxQuickLines: 2,
   linuxQuickLineCodeUnits: 4 * 1024 * 1024 - 64 * 1024,
 });
 
-const PROFILE_KINDS = new Set(['lock', 'rust_patch', 'build_diagnostics', 'cargo_lock', 'npm_admission', 'linux_quick']);
-const NPM_DIAGNOSTICS_PREFIX = 'KD-NPM-DIAGNOSTICS ';
-const NPM_DIAGNOSTICS_HEADER = /^KD-NPM-DIAGNOSTICS schema=1 step=npm_(?:resolve|lock|bundle) reason=[a-z0-9_]{1,40}$/u;
-const CARGO_LOCK_FIELDS = Object.freeze(['evidence_b64', 'lock_b64', 'receipt_b64', 'schema_version']);
-const BASE64_TEXT = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
+const PROFILE_KINDS = new Set(['rust_patch', 'build_diagnostics', 'linux_quick']);
 const RUST_PATH = /^(?:[A-Za-z0-9_-][A-Za-z0-9._-]*\/)*[A-Za-z0-9_-][A-Za-z0-9._-]*\.rs$/u;
 const TOKEN_SHAPE = /(?:^|[^A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{16,}|npm_[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16}|ASIA[A-Z0-9]{16})(?:$|[^A-Za-z0-9])/u;
 const PRIVATE_KEY_HEADER = /-----BEGIN [A-Z0-9 ]{0,64}PRIVATE KEY-----/u;
 const CREDENTIAL_ASSIGNMENT = /\b(?:authorization|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|passwd|api[_-]?key|private[_-]?key|secret|token|credential)\b\s*[:=]\s*(?:Bearer\s+)?[^\s,;]{8,}/iu;
 const BEARER_TOKEN = /\bBearer\s+[A-Za-z0-9._~+/-]{24,}={0,2}/u;
 const CREDENTIAL_URL = /\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:[^/\s@]+@/iu;
-const BIDI_CONTROL = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
 const UTF8 = new TextDecoder('utf-8', { fatal: true });
 const TYPED_ARRAY_PROTO = Object.getPrototypeOf(Uint8Array.prototype);
 const VIEW_BUFFER = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTO, 'buffer').get;
@@ -83,7 +66,7 @@ function dataOptions(input, required = ['payloadBytes', 'context', 'now']) {
     reject('invalid_input');
   }
   const allowed = [
-    'payloadBytes', 'context', 'expectedManifest', 'reviewedRustPaths', 'recipientPublicKey',
+    'payloadBytes', 'context', 'reviewedRustPaths', 'recipientPublicKey',
     'recipientPrivateKey', 'envelope', 'now',
   ];
   if ((prototype !== Object.prototype && prototype !== null)
@@ -371,110 +354,8 @@ function validateExceptionWindow(context, now) {
   }
 }
 
-function cargoLockMember(value, limit, multiline) {
-  if (typeof value !== 'string' || value.length === 0) reject('invalid_cargo_lock');
-  if (value.length > Math.ceil(limit / 3) * 4) reject('payload_too_large');
-  if (!BASE64_TEXT.test(value)) reject('invalid_cargo_lock');
-  const bytes = Buffer.from(value, 'base64');
-  if (bytes.byteLength === 0 || bytes.toString('base64') !== value) reject('invalid_cargo_lock');
-  if (bytes.byteLength > limit) reject('payload_too_large');
-  for (const byte of bytes) {
-    if (byte > 0x7e || (byte < 0x20 && !(multiline && byte === 0x0a))) reject('invalid_cargo_lock');
-  }
-  if (multiline && bytes[bytes.byteLength - 1] !== 0x0a) reject('invalid_cargo_lock');
-  return bytes;
-}
-
-function lockBundleBounds(kind) {
-  if (kind === 'npm_admission') {
-    return {
-      bundle: DEVELOPMENT_FEEDBACK_LIMITS.npmAdmissionBytes,
-      lock: DEVELOPMENT_FEEDBACK_LIMITS.npmAdmissionLockBytes,
-      receipt: DEVELOPMENT_FEEDBACK_LIMITS.npmAdmissionReceiptBytes,
-      evidence: DEVELOPMENT_FEEDBACK_LIMITS.npmAdmissionEvidenceBytes,
-    };
-  }
-  return {
-    bundle: DEVELOPMENT_FEEDBACK_LIMITS.cargoLockBytes,
-    lock: DEVELOPMENT_FEEDBACK_LIMITS.cargoLockLockBytes,
-    receipt: DEVELOPMENT_FEEDBACK_LIMITS.cargoLockReceiptBytes,
-    evidence: DEVELOPMENT_FEEDBACK_LIMITS.cargoLockEvidenceBytes,
-  };
-}
-
-function validateCargoLockBundle(bytes, kind = 'cargo_lock') {
-  const bounds = lockBundleBounds(kind);
-  if (bytes.byteLength > bounds.bundle) reject('payload_too_large');
-  if (bytes.byteLength === 0) reject('invalid_cargo_lock');
-  let text;
-  let parsed;
-  try {
-    text = UTF8.decode(bytes);
-    parsed = JSON.parse(text);
-  } catch {
-    reject('invalid_cargo_lock');
-  }
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) reject('invalid_cargo_lock');
-  const keys = Object.keys(parsed).sort();
-  if (keys.length !== CARGO_LOCK_FIELDS.length
-      || keys.some((key, index) => key !== CARGO_LOCK_FIELDS[index])
-      || parsed.schema_version !== 1) reject('invalid_cargo_lock');
-  cargoLockMember(parsed.lock_b64, bounds.lock, true);
-  cargoLockMember(parsed.receipt_b64, bounds.receipt, false);
-  cargoLockMember(parsed.evidence_b64, bounds.evidence, false);
-  const canonical = JSON.stringify({
-    evidence_b64: parsed.evidence_b64,
-    lock_b64: parsed.lock_b64,
-    receipt_b64: parsed.receipt_b64,
-    schema_version: 1,
-  });
-  if (canonical !== text) reject('invalid_cargo_lock');
-}
-
-function validateNpmDiagnostics(bytes) {
-  if (bytes.byteLength > DEVELOPMENT_FEEDBACK_LIMITS.npmDiagnosticBytes) reject('payload_too_large');
-  const text = decodeText(bytes, DEVELOPMENT_FEEDBACK_LIMITS.npmDiagnosticLines,
-    DEVELOPMENT_FEEDBACK_LIMITS.npmDiagnosticLineCodeUnits);
-  const lines = text.split('\n');
-  if (lines.pop() !== '' || lines.length < 3 || !NPM_DIAGNOSTICS_HEADER.test(lines[0])
-      || lines[1] !== 'stderr:') reject('invalid_payload');
-  let reportIndex = -1;
-  for (let index = 2; index < lines.length; index += 1) {
-    if (lines[index] === 'report:') {
-      if (reportIndex !== -1) reject('invalid_payload');
-      reportIndex = index;
-    } else if (!lines[index].startsWith('  ')) reject('invalid_payload');
-  }
-  if (reportIndex === -1 || BIDI_CONTROL.test(text)) reject('invalid_payload');
-  validateDiagnosticText(text);
-}
-
 function validatePayload(bytes, profile, options, originalRustFiles) {
   if (!PROFILE_KINDS.has(profile.kind)) reject('unsupported_kind');
-  if (profile.kind === 'npm_admission' && Buffer.from(bytes.subarray(0, NPM_DIAGNOSTICS_PREFIX.length))
-    .toString('latin1') === NPM_DIAGNOSTICS_PREFIX) {
-    if (Object.hasOwn(options, 'expectedManifest') || Object.hasOwn(options, 'reviewedRustPaths')) {
-      reject('invalid_expectation');
-    }
-    validateNpmDiagnostics(bytes);
-    return;
-  }
-  if (profile.kind === 'cargo_lock' || profile.kind === 'npm_admission') {
-    if (Object.hasOwn(options, 'expectedManifest') || Object.hasOwn(options, 'reviewedRustPaths')) {
-      reject('invalid_expectation');
-    }
-    validateCargoLockBundle(bytes, profile.kind);
-    return;
-  }
-  if (profile.kind === 'lock') {
-    if (!Object.hasOwn(options, 'expectedManifest')) reject('invalid_expectation');
-    try {
-      validateLockManifest(bytes, options.expectedManifest);
-    } catch {
-      reject('invalid_lock_manifest');
-    }
-    return;
-  }
   if (profile.kind === 'rust_patch') {
     const reviewedPaths = rustPaths(options.reviewedRustPaths);
     if (bytes.byteLength > DEVELOPMENT_FEEDBACK_LIMITS.rustPatchBytes) reject('payload_too_large');
@@ -511,10 +392,8 @@ function validatePayload(bytes, profile, options, originalRustFiles) {
 function payloadLimit(kind) {
   if (kind === 'rust_patch') return DEVELOPMENT_FEEDBACK_LIMITS.rustPatchBytes;
   if (kind === 'build_diagnostics') return DEVELOPMENT_FEEDBACK_LIMITS.diagnosticBytes;
-  if (kind === 'cargo_lock') return DEVELOPMENT_FEEDBACK_LIMITS.cargoLockBytes;
-  if (kind === 'npm_admission') return DEVELOPMENT_FEEDBACK_LIMITS.npmAdmissionBytes;
   if (kind === 'linux_quick') return DEVELOPMENT_FEEDBACK_LIMITS.linuxQuickBytes;
-  return LOCK_MANIFEST_LIMITS.inputBytes;
+  return DEVELOPMENT_FEEDBACK_LIMITS.diagnosticBytes;
 }
 
 function prepare(options, originalRustFiles) {

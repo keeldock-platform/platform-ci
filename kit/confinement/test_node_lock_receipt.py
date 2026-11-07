@@ -19,7 +19,7 @@ AUDITOR_JOB_ID = 13580
 ARTIFACT_ID = 97531
 
 
-def _request(kind="lock"):
+def _request(kind="rust_patch"):
     request_profile = request_subject.PROFILE_BY_KIND[kind]
     return request_subject.create_request({
         "kind": kind,
@@ -129,7 +129,7 @@ def _zip_with_hidden_tail(compression, payload=b"synthetic encrypted envelope"):
     return bytes(updated)
 
 
-def _fixture(kind="lock"):
+def _fixture(kind="rust_patch"):
     request = _request(kind)
     profile = request_subject.PROFILE_BY_KIND[kind]
     artifact_name = kind + "-return-24680-1"
@@ -137,10 +137,7 @@ def _fixture(kind="lock"):
     archive_bytes = _make_zip(payload, name=profile["member_name"])
     archive_digest = hashlib.sha256(archive_bytes).hexdigest()
     ciphertext_digest = hashlib.sha256(payload).hexdigest()
-    context_fields = (
-        subject.CONTEXT_FIELDS if profile["profile_id"] == 1
-        else subject.FEEDBACK_CONTEXT_FIELDS
-    )
+    context_fields = subject.FEEDBACK_CONTEXT_FIELDS
     context = {name: request[name] for name in context_fields if name in request}
     context.update({
         "run_id": str(RUN_ID),
@@ -236,14 +233,16 @@ class NodeLockReceiptTests(unittest.TestCase):
 
     def test_context_encoding_matches_the_fixed_node_field_order(self):
         request, unused_receipt, unused_api, unused_output, unused_archive, unused_args = _fixture()
-        context = {name: request[name] for name in subject.CONTEXT_FIELDS if name in request}
-        context.update({"run_id": str(RUN_ID), "producer_job": subject.PRODUCER_JOB, "run_attempt": 1})
+        profile = request_subject.PROFILE_BY_KIND[request["kind"]]
+        context = {name: request[name] for name in subject.FEEDBACK_CONTEXT_FIELDS if name in request}
+        context.update({"run_id": str(RUN_ID), "producer_job": profile["producer_job"], "run_attempt": 1})
         expected = (
-            "node-lock-return-context-v1\n"
+            "node-feedback-return-context-v1\n"
             "request_id=" + request["request_id"] + "\n"
             "nonce=" + "b" * 64 + "\n"
             "recipient_fingerprint=" + "c" * 64 + "\n"
-            "concern=" + subject.CONCERN + "\n"
+            "concern=" + profile["concern"] + "\n"
+            "kind=rust_patch\n"
             "repository_id=1430959909\n"
             "source_sha=" + "d" * 40 + "\n"
             "base_sha=" + "e" * 40 + "\n"
@@ -252,7 +251,7 @@ class NodeLockReceiptTests(unittest.TestCase):
             "reviewed_diff_sha256=" + "1" * 64 + "\n"
             "workflow_ref=" + subject.WORKFLOW_REF + "\n"
             "run_id=" + str(RUN_ID) + "\n"
-            "producer_job=" + subject.PRODUCER_JOB + "\n"
+            "producer_job=" + profile["producer_job"] + "\n"
             "run_attempt=1\n"
             "expiry=" + str(NOW + 3600) + "\n"
         ).encode("ascii")
@@ -264,7 +263,7 @@ class NodeLockReceiptTests(unittest.TestCase):
         self.assertEqual(result["ciphertext"], b"synthetic encrypted envelope")
         self.assertEqual(result["context"]["source_sha"], fixture[0]["source_sha"])
         self.assertEqual(result["context"]["run_id"], str(RUN_ID))
-        self.assertEqual(result["context"]["producer_job"], subject.PRODUCER_JOB)
+        self.assertEqual(result["context"]["producer_job"], request_subject.PROFILE_BY_KIND[fixture[0]["kind"]]["producer_job"])
         self.assertEqual(set(result), {"context", "ciphertext"})
 
     def test_format_and_diagnostic_receipts_use_distinct_fixed_profiles(self):

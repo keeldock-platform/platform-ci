@@ -27,13 +27,8 @@ except ImportError:
         validate_request as _validate_feedback_request,
     )
 
-LOCK_PROFILE = FEEDBACK_PROFILES["core-node-lock-return"]
-CONCERN = LOCK_PROFILE["concern"]
-WORKFLOW_PATH = LOCK_PROFILE["workflow_path"]
 WORKFLOW_REF = "refs/heads/main"
-PRODUCER_JOB = LOCK_PROFILE["producer_job"]
-AUDITOR_JOB = LOCK_PROFILE["auditor_job"]
-ZIP_MEMBER = LOCK_PROFILE["member_name"]
+ZIP_MEMBER = FEEDBACK_PROFILES["core-rust-format-return"]["member_name"]
 ZIP_MEMBERS = frozenset(profile["member_name"] for profile in FEEDBACK_PROFILES.values())
 SCHEMA_VERSION = 1
 MAX_ARCHIVE_BYTES = 4 * 1024 * 1024
@@ -46,11 +41,6 @@ HEX64_RE = re.compile(r"[a-f0-9]{64}\Z")
 DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
 ACTOR_RE = re.compile(r"[A-Za-z0-9-]{1,39}\Z")
 LABEL_RE = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
-CONTEXT_FIELDS = (
-    "request_id", "nonce", "recipient_fingerprint", "concern", "repository_id",
-    "source_sha", "base_sha", "control_sha", "base_branch", "reviewed_diff_sha256",
-    "workflow_ref", "run_id", "producer_job", "run_attempt", "expiry",
-)
 FEEDBACK_CONTEXT_FIELDS = (
     "request_id", "nonce", "recipient_fingerprint", "concern", "kind", "repository_id",
     "source_sha", "base_sha", "control_sha", "base_branch", "reviewed_diff_sha256",
@@ -61,7 +51,7 @@ RECEIPT_EVIDENCE_FIELDS = frozenset((
     "artifact_id", "ciphertext_digest", "archive_digest", "job_id", "size", "retention",
     "member_size", "archive_size",
 ))
-RECEIPT_FIELDS = RECEIPT_COMMON_FIELDS | frozenset(CONTEXT_FIELDS) | RECEIPT_EVIDENCE_FIELDS
+RECEIPT_FIELDS = RECEIPT_COMMON_FIELDS | frozenset(FEEDBACK_CONTEXT_FIELDS) | RECEIPT_EVIDENCE_FIELDS
 RUN_FIELDS = frozenset((
     "id", "repository_id", "head_sha", "workflow_path", "workflow_ref", "event",
     "status", "conclusion", "actor_login", "run_attempt",
@@ -131,16 +121,13 @@ def _profile_for_context(context):
     profile = FEEDBACK_PROFILES.get(context["concern"])
     if profile is None:
         _refuse()
-    if profile["profile_id"] == 1:
-        if "kind" in context:
-            _refuse()
-    elif context.get("kind") != profile["kind"]:
+    if context.get("kind") != profile["kind"]:
         _refuse()
     return profile
 
 
 def _context_fields(profile):
-    return CONTEXT_FIELDS if profile["profile_id"] == 1 else FEEDBACK_CONTEXT_FIELDS
+    return FEEDBACK_CONTEXT_FIELDS
 
 
 def _validate_context(context, profile=None):
@@ -167,19 +154,15 @@ def _validate_context(context, profile=None):
             or type(context["producer_job"]) is not str
             or type(context["run_attempt"]) is not int or context["run_attempt"] != 1):
         _refuse()
-    if profile["profile_id"] != 1:
-        if context["kind"] != profile["kind"]:
-            _refuse()
+    if context["kind"] != profile["kind"]:
+        _refuse()
 
 
 def canonical_context(context):
     """Return the exact fixed-order context bytes for one registered profile."""
     profile = _profile_for_context(context)
     _validate_context(context, profile)
-    domain = (
-        "node-lock-return-context-v1"
-        if profile["profile_id"] == 1 else "node-feedback-return-context-v1"
-    )
+    domain = "node-feedback-return-context-v1"
     lines = [domain + "\n"]
     for name in _context_fields(profile):
         value = context[name]

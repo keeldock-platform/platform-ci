@@ -53,9 +53,6 @@ class WindowsSourceBindingTests(unittest.TestCase):
             "SOURCE_REPOSITORY_ID": "7", "SOURCE_REPOSITORY_OWNER": "owner",
             "SOURCE_REPOSITORY_NAME": "source", "SOURCE_READER_INSTALLATION_ID": "8",
             "SOURCE_READER_CLIENT_ID": "client",
-            prefix + "_ACCEPTED_NODE_LOCK_SHA256": "f" * 64,
-            prefix + "_ACCEPTED_MANIFEST_SHA256": "1" * 64,
-            prefix + "_ACCEPTED_NODE_PROVENANCE_JSON": "{}",
             prefix + "_ENVIRONMENT_NAME": "linux-source-read",
             "REQUESTED_ENVIRONMENT_NAME": "linux-source-read",
         }
@@ -76,28 +73,22 @@ class WindowsSourceBindingTests(unittest.TestCase):
         )
 
     def test_windows_binding_reads_only_the_windows_names(self):
-        with patch.object(linux_source_build, "_validate_provenance_binding") as provenance:
-            identity = linux_source_build._source_inputs(self._environment(), prefix="WINDOWS_SOURCE")
-            self.assertEqual(identity["source_sha"], self.SOURCE)
-            self.assertEqual(identity["reviewed_diff_sha256"], self.FINGERPRINT)
-            self.assertEqual(identity["repository_id"], "7")
-            provenance.assert_called_once()
-            self.assertEqual(provenance.call_args.args[2], "WINDOWS_SOURCE")
-            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
-                linux_source_build._source_inputs(self._environment("LINUX_SOURCE"), prefix="WINDOWS_SOURCE")
-            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
-                linux_source_build._source_inputs(self._environment("WINDOWS_SOURCE"))
-            provenance.assert_called_once()
-            linux_source_build._source_inputs(self._environment("LINUX_SOURCE"))
-            self.assertEqual(provenance.call_count, 2)
+        identity = linux_source_build._source_inputs(self._environment(), prefix="WINDOWS_SOURCE")
+        self.assertEqual(identity["source_sha"], self.SOURCE)
+        self.assertEqual(identity["reviewed_diff_sha256"], self.FINGERPRINT)
+        self.assertEqual(identity["repository_id"], "7")
+        with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+            linux_source_build._source_inputs(self._environment("LINUX_SOURCE"), prefix="WINDOWS_SOURCE")
+        with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+            linux_source_build._source_inputs(self._environment("WINDOWS_SOURCE"))
+        linux_source_build._source_inputs(self._environment("LINUX_SOURCE"))
 
     def test_every_windows_binding_name_is_required_and_checked(self):
         for suffix in (
             "_ALLOWED_SHA", "_ALLOWED_BASE_SHA", "_ALLOWED_BASE_BRANCH", "_ALLOWED_FINGERPRINT",
-            "_ALLOWED_CONTROL_SHA", "_ACCEPTED_NODE_LOCK_SHA256", "_ACCEPTED_MANIFEST_SHA256",
-            "_ACCEPTED_NODE_PROVENANCE_JSON", "_ENVIRONMENT_NAME",
+            "_ALLOWED_CONTROL_SHA", "_ENVIRONMENT_NAME",
         ):
-            changes = ("missing", "empty") if suffix == "_ACCEPTED_NODE_PROVENANCE_JSON" else ("missing", "empty", "other")
+            changes = ("missing", "empty", "other")
             for change in changes:
                 environment = self._environment()
                 name = "WINDOWS_SOURCE" + suffix
@@ -107,26 +98,20 @@ class WindowsSourceBindingTests(unittest.TestCase):
                     environment[name] = ""
                 else:
                     environment[name] = "x" * 3
-                with self.subTest(name=name, change=change), patch.object(
-                    linux_source_build, "_validate_provenance_binding"
-                ) as provenance:
+                with self.subTest(name=name, change=change):
                     with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
                         linux_source_build._source_inputs(environment, prefix="WINDOWS_SOURCE")
-                    provenance.assert_not_called()
         environment = self._environment()
         environment["WINDOWS_SOURCE_ENVIRONMENT_NAME"] = "source-read"
         environment["REQUESTED_ENVIRONMENT_NAME"] = "source-read"
-        with patch.object(linux_source_build, "_validate_provenance_binding"):
-            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
-                linux_source_build._source_inputs(environment, prefix="WINDOWS_SOURCE")
+        with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+            linux_source_build._source_inputs(environment, prefix="WINDOWS_SOURCE")
 
     def test_unknown_prefixes_are_refused_everywhere(self):
         for prefix in ("", "WINDOWS", "windows_source", "LINUX_SOURCE_", "MACOS_SOURCE", 5, b"LINUX_SOURCE"):
             with self.subTest(prefix=prefix):
                 with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
                     linux_source_build._source_inputs(self._environment("LINUX_SOURCE"), prefix=prefix)
-                with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
-                    linux_source_build._validate_provenance_binding({}, {}, prefix)
                 with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "identity"):
                     linux_source_build.validate_dispatch({}, "token", prefix)
 
@@ -137,48 +122,20 @@ class WindowsSourceBindingTests(unittest.TestCase):
             linux_source_build.validate_dispatch(environment, None, "LINUX_SOURCE")
 
     def test_the_prefix_comes_from_the_dispatch_environment_when_not_passed(self):
-        with patch.object(linux_source_build, "_validate_provenance_binding") as provenance:
-            environment = self._environment("WINDOWS_SOURCE")
-            environment["KD_SOURCE_PREFIX"] = "WINDOWS_SOURCE"
-            identity = linux_source_build._source_inputs(environment)
-            self.assertEqual(identity["source_sha"], self.SOURCE)
-            self.assertEqual(provenance.call_args.args[2], "WINDOWS_SOURCE")
-            environment["KD_SOURCE_PREFIX"] = "LINUX_SOURCE"
-            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
-                linux_source_build._source_inputs(environment)
-            for value in ("", "WINDOWS", "windows_source", "MACOS_SOURCE"):
-                environment["KD_SOURCE_PREFIX"] = value
-                with self.subTest(value=value):
-                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
-                        linux_source_build._source_inputs(environment)
-
-    def test_the_lock_provenance_check_reads_the_prefixed_accepted_values(self):
         environment = self._environment("WINDOWS_SOURCE")
         environment["KD_SOURCE_PREFIX"] = "WINDOWS_SOURCE"
-        lock = b"{}"
-        environment["WINDOWS_SOURCE_ACCEPTED_NODE_LOCK_SHA256"] = hashlib.sha256(lock).hexdigest()
-        environment["WINDOWS_SOURCE_ACCEPTED_MANIFEST_SHA256"] = "2" * 64
-        with patch.object(
-            linux_source_build, "_validate_provenance_binding",
-            return_value={"lock_sha256": hashlib.sha256(lock).hexdigest()},
-        ), patch.object(linux_source_build, "_manifest_digest", return_value="2" * 64):
-            self.assertEqual(
-                linux_source_build._check_lock_provenance(lock, {}, environment, Path(".")),
-                (hashlib.sha256(lock).hexdigest(), "2" * 64),
-            )
-            environment["WINDOWS_SOURCE_ACCEPTED_MANIFEST_SHA256"] = "3" * 64
-            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
-                linux_source_build._check_lock_provenance(lock, {}, environment, Path("."))
+        identity = linux_source_build._source_inputs(environment)
+        self.assertEqual(identity["source_sha"], self.SOURCE)
+        environment["KD_SOURCE_PREFIX"] = "LINUX_SOURCE"
+        with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+            linux_source_build._source_inputs(environment)
+        for value in ("", "WINDOWS", "windows_source", "MACOS_SOURCE"):
+            environment["KD_SOURCE_PREFIX"] = value
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                    linux_source_build._source_inputs(environment)
 
-    def test_windows_provenance_text_comes_from_the_windows_variable(self):
-        with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
-            linux_source_build._validate_provenance_binding(
-                {}, {"LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON": "{}"}, "WINDOWS_SOURCE",
-            )
-        with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
-            linux_source_build._validate_provenance_binding(
-                {}, {"WINDOWS_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON": "{}"},
-            )
+
 
     def test_windows_source_dispatch_runs_only_on_untrusted_and_synthetic_only_on_main(self):
         order = []
@@ -332,8 +289,8 @@ class WindowsSourceBindingTests(unittest.TestCase):
                         self.assertEqual(function(environment), 1)
                     self.assertEqual(output.getvalue(), name + "=refused reason=" + reason + "\n")
         audit = types.SimpleNamespace(
-            _default_api_factory=Mock(return_value="api"), _collect_caches=Mock(return_value=[]),
-            cache_inventory_digest=Mock(return_value="e" * 64),
+            _default_api_factory=Mock(return_value="api"),
+            snapshot_cache_digest=Mock(return_value=("e" * 64, [])),
         )
         with tempfile.TemporaryDirectory() as temporary:
             sink = Path(temporary) / "output"
@@ -345,6 +302,7 @@ class WindowsSourceBindingTests(unittest.TestCase):
                 with patch.object(linux_source_build.sys, "stdout", output):
                     self.assertEqual(linux_source_build.windows_snapshot(environment), 0)
                 self.assertEqual(output.getvalue(), "windows-source-settings=verified mode=synthetic cache=snapped\n")
+                audit.snapshot_cache_digest.assert_called_once_with("api", linux_source_build.REPOSITORY)
                 self.assertEqual(dispatch.call_args.args, (environment, "token", "WINDOWS_SOURCE"))
                 self.assertEqual(dispatch.call_args.kwargs, {"source_identity": False})
             self.assertEqual(sink.read_text(encoding="ascii"), "cache_digest=" + "e" * 64 + "\n")
@@ -380,9 +338,7 @@ class WindowsSourceBindingTests(unittest.TestCase):
         )
 
     def test_the_settings_binding_checks_the_request_without_any_source_identity(self):
-        with patch.object(linux_source_build, "_validate_provenance_binding") as provenance:
-            binding = linux_source_build._settings_binding(self._settings_environment(), "WINDOWS_SOURCE")
-            provenance.assert_not_called()
+        binding = linux_source_build._settings_binding(self._settings_environment(), "WINDOWS_SOURCE")
         self.assertEqual(binding, {
             "source_sha": self.SOURCE, "base_sha": self.BASE, "base_branch": "main",
             "reviewed_diff_sha256": self.FINGERPRINT, "control_sha": self.CONTROL,
@@ -395,12 +351,9 @@ class WindowsSourceBindingTests(unittest.TestCase):
             for value in ("", "7", "owner"):
                 environment = self._settings_environment()
                 environment[name] = value
-                with self.subTest(name=name, value=value), patch.object(
-                    linux_source_build, "_validate_provenance_binding"
-                ) as provenance:
+                with self.subTest(name=name, value=value):
                     with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
                         linux_source_build._settings_binding(environment, "WINDOWS_SOURCE")
-                    provenance.assert_not_called()
 
     def test_the_settings_binding_is_windows_only(self):
         for prefix in ("LINUX_SOURCE", "", None, "windows_source", 5):
@@ -411,10 +364,9 @@ class WindowsSourceBindingTests(unittest.TestCase):
     def test_the_settings_binding_still_checks_every_request_name(self):
         for suffix in (
             "_ALLOWED_SHA", "_ALLOWED_BASE_SHA", "_ALLOWED_BASE_BRANCH", "_ALLOWED_FINGERPRINT",
-            "_ALLOWED_CONTROL_SHA", "_ACCEPTED_NODE_LOCK_SHA256", "_ACCEPTED_MANIFEST_SHA256",
-            "_ACCEPTED_NODE_PROVENANCE_JSON", "_ENVIRONMENT_NAME",
+            "_ALLOWED_CONTROL_SHA", "_ENVIRONMENT_NAME",
         ):
-            changes = ("missing", "empty") if suffix == "_ACCEPTED_NODE_PROVENANCE_JSON" else ("missing", "empty", "other")
+            changes = ("missing", "empty", "other")
             for change in changes:
                 environment = self._settings_environment()
                 name = "WINDOWS_SOURCE" + suffix
@@ -446,27 +398,22 @@ class WindowsSourceBindingTests(unittest.TestCase):
                     del environment[name]
                 else:
                     environment[name] = ""
-                with self.subTest(name=name, change=change), patch.object(
-                    linux_source_build, "_validate_provenance_binding"
-                ) as provenance:
+                with self.subTest(name=name, change=change):
                     with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
                         linux_source_build._source_inputs(environment, prefix="WINDOWS_SOURCE")
-                    provenance.assert_not_called()
         for name, value in (
             ("SOURCE_REPOSITORY_ID", "07"), ("SOURCE_READER_INSTALLATION_ID", "x"),
             ("SOURCE_REPOSITORY_OWNER", "-owner"), ("SOURCE_REPOSITORY_NAME", "a/b"),
         ):
             environment = self._environment()
             environment[name] = value
-            with self.subTest(name=name), patch.object(linux_source_build, "_validate_provenance_binding"):
+            with self.subTest(name=name):
                 with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
                     linux_source_build._source_inputs(environment, prefix="WINDOWS_SOURCE")
-        with patch.object(linux_source_build, "_validate_provenance_binding") as provenance:
-            identity = linux_source_build._source_inputs(self._environment(), prefix="WINDOWS_SOURCE")
+        identity = linux_source_build._source_inputs(self._environment(), prefix="WINDOWS_SOURCE")
         self.assertEqual(
             (identity["repository_id"], identity["owner"], identity["name"]), ("7", "owner", "source"),
         )
-        self.assertIs(provenance.call_args.args[0], identity)
 
     def test_a_windows_settings_source_dispatch_binds_the_request_but_not_the_source(self):
         order = []
@@ -497,8 +444,6 @@ class WindowsSourceBindingTests(unittest.TestCase):
         environment["KD_SOURCE_PREFIX"] = "WINDOWS_SOURCE"
         with patch.object(linux_source_build, "_reference_sha", side_effect=["b" * 40, self.CONTROL]), patch.object(
             linux_source_build, "_comparison", return_value="ahead"
-        ), patch.object(
-            linux_source_build, "_validate_provenance_binding", side_effect=AssertionError("no provenance in settings")
         ), patch.object(linux_source_build, "_verify_environment") as verified, patch.object(
             linux_source_build, "_require_no_duplicate"
         ) as duplicate:
@@ -771,10 +716,7 @@ class LinuxBrowserTierTests(unittest.TestCase):
         }
         if browser_root is not None:
             environment["BROWSER_ROOT"] = browser_root
-        with patch.object(
-            linux_source_build.rust_license_gate, "require_lock_admission",
-            wraps=linux_source_build.rust_license_gate.require_lock_admission,
-        ), patch.object(linux_source_build, "_job_elapsed_seconds", return_value=0.0), patch.object(
+        with patch.object(linux_source_build, "_job_elapsed_seconds", return_value=0.0), patch.object(
             linux_source_build, "_project_gate_directories",
         ), patch.object(
             linux_source_build, "_gate_commands", side_effect=commands,
@@ -915,7 +857,7 @@ class LinuxBrowserTierTests(unittest.TestCase):
         self.assertEqual(admission.count('KD_BROWSER_TIER: "1"'), 2)
         self.assertEqual(admission.count("BROWSER_ROOT: ${{ steps."), 2)
         self.assertEqual(
-            admission.count("REQUESTED_SOURCE_SHA,BROWSER_ROOT,CI_SHA,KD_CARGO_DENY_PATH"), 2,
+            admission.count("REQUESTED_SOURCE_SHA,BROWSER_ROOT,CI_SHA"), 2,
         )
         self.assertIn("BROWSER_ROOT: ${{ steps.toolchains.outputs.browser_root }}", admission)
         self.assertIn("BROWSER_ROOT: ${{ steps.verifier-toolchain.outputs.browser_root }}", admission)

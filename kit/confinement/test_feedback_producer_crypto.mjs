@@ -27,12 +27,10 @@ function fixture(kind = 'build_diagnostics') {
   const der = pair.publicKey.export({ format: 'der', type: 'spki' });
   const fingerprint = createHash('sha256').update(der).digest('hex');
   const profiles = {
-    lock: { concern: 'core-node-lock-return', producerJob: 'node-lock-return' },
     rust_patch: { concern: 'core-rust-format-return', producerJob: 'core-rust-format-return' },
     build_diagnostics: {
       concern: 'core-build-diagnostic-return', producerJob: 'core-build-diagnostic-return',
     },
-    cargo_lock: { concern: 'core-rust-lock-return', producerJob: 'core-rust-lock-return' },
     linux_quick: {
       concern: 'core-linux-quick-return', producerJob: 'core-linux-quick-return-producer',
       workflowRef: 'refs/heads/untrusted',
@@ -56,7 +54,7 @@ function fixture(kind = 'build_diagnostics') {
     run_attempt: 1,
     expiry: NOW + 3600,
   };
-  if (kind !== 'lock') context.kind = kind;
+  context.kind = kind;
   let payload;
   const input = {
     schema_version: 1,
@@ -65,32 +63,10 @@ function fixture(kind = 'build_diagnostics') {
     recipient_spki_b64: Buffer.from(der).toString('base64'),
     now: NOW,
   };
-  if (kind === 'lock') {
-    payload = Buffer.from(JSON.stringify({
-      name: 'synthetic-root',
-      version: '1.0.0',
-      lockfileVersion: 3,
-      requires: true,
-      packages: {
-        '': { name: 'synthetic-root', version: '1.0.0', workspaces: ['packages/*'] },
-        'packages/host-api': { name: '@synthetic/host-api', version: '1.0.0' },
-      },
-    }));
-    input.expected_manifest = {
-      root: { name: 'synthetic-root', version: '1.0.0', workspaces: ['packages/*'] },
-      workspaces: [{ path: 'packages/host-api', name: '@synthetic/host-api', version: '1.0.0' }],
-    };
-  } else if (kind === 'rust_patch') {
+  if (kind === 'rust_patch') {
     payload = Buffer.from('diff --git a/src/lib.rs b/src/lib.rs\n'
       + '--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n');
     input.reviewed_rust_paths = ['src/lib.rs'];
-  } else if (kind === 'cargo_lock') {
-    payload = Buffer.from(JSON.stringify({
-      evidence_b64: Buffer.from('{"schema_version":1}', 'ascii').toString('base64'),
-      lock_b64: Buffer.from('version = 4\n', 'ascii').toString('base64'),
-      receipt_b64: Buffer.from('{"schema_version":1}', 'ascii').toString('base64'),
-      schema_version: 1,
-    }));
   } else if (kind === 'linux_quick') {
     payload = quickPayload();
   } else {
@@ -109,12 +85,7 @@ test('producer encrypts only a profile-bound bounded payload', () => {
   assert.equal(ciphertext.includes(Buffer.from('bounded synthetic diagnostic')), false);
 });
 
-test('producer validates lock and reviewed Rust patch profiles before encryption', () => {
-  const lock = fixture('lock');
-  const lockCiphertext = encryptFeedbackPayload(lock.input);
-  assert.equal(lockCiphertext[5], 1);
-  assert.equal(lockCiphertext.includes(Buffer.from('synthetic-root')), false);
-
+test('producer validates reviewed Rust patch profiles before encryption', () => {
   const patch = fixture('rust_patch');
   const patchCiphertext = encryptFeedbackPayload(patch.input);
   assert.equal(patchCiphertext[5], 2);
@@ -256,29 +227,6 @@ test('CLI asynchronously reads bounded stdin and emits only ciphertext or a gene
   assert.equal(oversized.status, 1);
   assert.equal(oversized.stdout.length, 0);
   assert.deepEqual(oversized.stderr, Buffer.from('KD-FEEDBACK-ENCRYPTION-REFUSAL input_too_large\n'));
-});
-
-test('producer encrypts a cargo lock bundle under its own profile and refuses expectations', () => {
-  const value = fixture('cargo_lock');
-  const ciphertext = encryptFeedbackPayload(value.input);
-  assert.equal(ciphertext[5], 4);
-  assert.equal(ciphertext.includes(Buffer.from('version = 4')), false);
-
-  const withManifest = fixture('cargo_lock');
-  withManifest.input.expected_manifest = { root: {}, workspaces: [] };
-  assert.throws(() => encryptFeedbackPayload(withManifest.input));
-
-  const withPaths = fixture('cargo_lock');
-  withPaths.input.reviewed_rust_paths = ['src/lib.rs'];
-  assert.throws(() => encryptFeedbackPayload(withPaths.input));
-
-  const oversized = fixture('cargo_lock');
-  oversized.input.payload_b64 = Buffer.alloc(1024 * 1024 + 1, 0x20).toString('base64');
-  assert.throws(() => encryptFeedbackPayload(oversized.input));
-
-  const wrongKind = fixture('cargo_lock');
-  wrongKind.input.kind = 'build_diagnostics';
-  assert.throws(() => encryptFeedbackPayload(wrongKind.input));
 });
 
 test('producer encrypts the fixed-size Linux quick payload under its own untrusted-ref profile', () => {

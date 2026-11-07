@@ -228,7 +228,7 @@ function strictEnvelope(value) {
 function decryptToDescriptor(input) {
   const values = exactObject(input, [
     'operation', 'private_key_path', 'context', 'now', 'envelope_base64', 'plaintext_fd',
-  ], ['expected_manifest', 'reviewed_rust_paths', 'rust_source_directory']);
+  ], ['reviewed_rust_paths', 'rust_source_directory']);
   if (values.operation !== 'decrypt' || !Number.isSafeInteger(values.now) || values.now < 0
       || !Number.isSafeInteger(values.plaintext_fd) || values.plaintext_fd < 3) refuse();
   const envelope = strictEnvelope(values.envelope_base64);
@@ -243,7 +243,6 @@ function decryptToDescriptor(input) {
         context: values.context,
         now: values.now,
       };
-      if (Object.hasOwn(values, 'expected_manifest')) options.expectedManifest = values.expected_manifest;
       if (Object.hasOwn(values, 'reviewed_rust_paths')) options.reviewedRustPaths = values.reviewed_rust_paths;
       if (Object.hasOwn(values, 'rust_source_directory')) {
         if (!Object.hasOwn(values, 'reviewed_rust_paths')

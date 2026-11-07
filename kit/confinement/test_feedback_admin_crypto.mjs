@@ -25,49 +25,11 @@ import { handleRequest } from './feedback_admin_crypto.mjs';
 
 const NOW = 1_800_000_000;
 const POSIX_OWNER_FILESYSTEM = process.platform !== 'win32' && typeof process.getuid === 'function';
-const lockExpectation = {
-  root: {
-    name: 'fixture-root',
-    version: '1.0.0',
-    workspaces: ['packages/*'],
-    devDependencies: { typescript: '6.0.3' },
-  },
-  workspaces: [{
-    path: 'packages/client-api',
-    name: '@fixture/client-api',
-    version: '1.0.0',
-    dependencies: { '@fixture/shared': '1.0.0' },
-  }, { path: 'packages/shared', name: '@fixture/shared', version: '1.0.0' }],
-};
-
-function lockBytes() {
-  return Buffer.from(`${JSON.stringify({
-    name: 'fixture-root',
-    version: '1.0.0',
-    lockfileVersion: 3,
-    requires: true,
-    packages: {
-      '': {
-        name: 'fixture-root', version: '1.0.0', workspaces: ['packages/*'],
-        devDependencies: { typescript: '6.0.3' },
-      },
-      'packages/client-api': {
-        name: '@fixture/client-api', version: '1.0.0',
-        dependencies: { '@fixture/shared': '1.0.0' },
-      },
-      'packages/shared': { name: '@fixture/shared', version: '1.0.0' },
-      'node_modules/@fixture/client-api': { resolved: 'packages/client-api', link: true },
-      'node_modules/@fixture/shared': { resolved: 'packages/shared', link: true },
-      'node_modules/typescript': {
-        version: '6.0.3',
-        resolved: 'https://registry.npmjs.org/typescript/-/typescript-6.0.3.tgz',
-        integrity: `sha512-${'A'.repeat(86)}==`,
-      },
-    },
-  })}\n`, 'utf8');
+function diagnosticPayload() {
+  return Buffer.from('compiler completed with zero warnings\n', 'utf8');
 }
 
-function makeContext(fingerprint, profileName = 'core-node-lock-return') {
+function makeContext(fingerprint, profileName = 'core-build-diagnostic-return') {
   const profile = RETURN_PROFILES[profileName];
   return {
     request_id: '1'.repeat(64),
@@ -85,7 +47,7 @@ function makeContext(fingerprint, profileName = 'core-node-lock-return') {
     producer_job: profile.producerJob,
     run_attempt: 1,
     expiry: NOW + 3600,
-    ...(profile.id === 1 ? {} : { kind: profile.kind }),
+    kind: profile.kind,
   };
 }
 
@@ -101,10 +63,9 @@ async function setup() {
 
 function encryptFixture(context, publicKey) {
   return encryptDevelopmentFeedback({
-    payloadBytes: lockBytes(),
+    payloadBytes: diagnosticPayload(),
     context,
     recipientPublicKey: publicKey,
-    expectedManifest: lockExpectation,
     now: NOW,
   });
 }
@@ -120,7 +81,6 @@ async function decryptFixture(state, envelope, overrides = {}) {
       now: overrides.now ?? NOW,
       envelope_base64: Buffer.from(envelope).toString('base64'),
       plaintext_fd: fd,
-      expected_manifest: lockExpectation,
     });
     return { result, outputPath };
   } finally {
@@ -207,7 +167,7 @@ test('decrypts only an authenticated payload matching the exact context',
   const envelope = encryptFixture(state.context, state.publicKey);
   const { result, outputPath } = await decryptFixture(state, envelope);
   assert.deepEqual(result, { schema_version: 1, ok: true });
-  assert.deepEqual(readFileSync(outputPath), lockBytes());
+  assert.deepEqual(readFileSync(outputPath), diagnosticPayload());
 });
 
 test('decrypts a whitespace-equivalent rust patch using consumer-local originals',

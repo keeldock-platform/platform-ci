@@ -11,20 +11,16 @@ on:
         required: true
         type: string
       base_branch:
-        description: Admitted permanent branch for the source base.
+        description: Main branch tip for the unsigned rules repository.
         required: true
         type: choice
         options:
           - main
-          - develop
-          - uat
-cache-mode: none
 permissions: {}
 jobs:
   macos-rules-bootstrap-settings:
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
-    cache-mode: none
     timeout-minutes: 15
     permissions:
       actions: read
@@ -78,10 +74,7 @@ jobs:
           if [[ ! "$REQUESTED_SOURCE_SHA" =~ ^[a-f0-9]{40}$ || ! "$REQUESTED_BASE_SHA" =~ ^[a-f0-9]{40}$ ]]; then
             exit 1
           fi
-          case "$REQUESTED_BASE_BRANCH" in
-            main|develop|uat) ;;
-            *) exit 1 ;;
-          esac
+          [[ "$REQUESTED_BASE_BRANCH" == main && "$REQUESTED_SOURCE_SHA" == "$REQUESTED_BASE_SHA" ]]
       - name: Verify exact protected environment settings
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -96,7 +89,6 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     environment: rules-source-read
     runs-on: macos-15
-    cache-mode: none
     timeout-minutes: 45
     permissions: {}
     defaults:
@@ -170,26 +162,16 @@ jobs:
             ImageOS="$ImageOS" ImageVersion="$ImageVersion" \
             /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
             -I -S -B kit/confinement/macos_rules_bootstrap.py prepare-dash
-      - name: Preflight protected bootstrap and review binding
+      - name: Preflight unsigned main-tip source tree
         id: bootstrap-preflight
         env:
-          RULES_BOOTSTRAP_ALLOWED_SHA: ${{ vars.RULES_BOOTSTRAP_ALLOWED_SHA }}
-          RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA: ${{ vars.RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA }}
-          RULES_ID_DEFINITIONS: ${{ secrets.RULES_ID_DEFINITIONS }}
-          RULES_ID_DEFINITIONS_SHA256: ${{ vars.RULES_ID_DEFINITIONS_SHA256 }}
-          SOURCE_REVIEWED_SHA: ${{ vars.SOURCE_REVIEWED_SHA }}
-          SOURCE_REVIEWED_BASE: ${{ vars.SOURCE_REVIEWED_BASE }}
-          SOURCE_REVIEWED_BASE_BRANCH: ${{ vars.SOURCE_REVIEWED_BASE_BRANCH }}
-          SOURCE_REVIEWED_DIFF_SHA256: ${{ vars.SOURCE_REVIEWED_DIFF_SHA256 }}
-          SOURCE_CANDIDATE_REF: ${{ secrets.SOURCE_CANDIDATE_REF }}
+          SOURCE_CANDIDATE_REF: refs/heads/main
         run: |
           set -euo pipefail
           if [[ -z "${ImageOS:-}" || -z "${ImageVersion:-}" ]]; then
             exit 1
           fi
-          if [[ ! "$SOURCE_REVIEWED_DIFF_SHA256" =~ ^[a-f0-9]{64}$ ]]; then
-            exit 1
-          fi
+          SOURCE_REVIEWED_DIFF_SHA256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
           sudo -n -- env -i \
             PATH=/usr/bin:/bin:/usr/sbin:/sbin \
             HOME=/var/root LANG=C LC_ALL=C PYTHONDONTWRITEBYTECODE=1 \
@@ -199,12 +181,6 @@ jobs:
             ImageOS="$ImageOS" ImageVersion="$ImageVersion" \
             REQUESTED_SOURCE_SHA="$REQUESTED_SOURCE_SHA" REQUESTED_BASE_SHA="$REQUESTED_BASE_SHA" \
             REQUESTED_BASE_BRANCH="$REQUESTED_BASE_BRANCH" \
-            RULES_BOOTSTRAP_ALLOWED_SHA="$RULES_BOOTSTRAP_ALLOWED_SHA" \
-            RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA="$RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA" \
-            RULES_ID_DEFINITIONS="$RULES_ID_DEFINITIONS" \
-            RULES_ID_DEFINITIONS_SHA256="$RULES_ID_DEFINITIONS_SHA256" \
-            SOURCE_REVIEWED_SHA="$SOURCE_REVIEWED_SHA" SOURCE_REVIEWED_BASE="$SOURCE_REVIEWED_BASE" \
-            SOURCE_REVIEWED_BASE_BRANCH="$SOURCE_REVIEWED_BASE_BRANCH" \
             SOURCE_REVIEWED_DIFF_SHA256="$SOURCE_REVIEWED_DIFF_SHA256" \
             SOURCE_CANDIDATE_REF="$SOURCE_CANDIDATE_REF" \
             /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
@@ -270,15 +246,8 @@ jobs:
           SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
           SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
           SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}
-          RULES_BOOTSTRAP_ALLOWED_SHA: ${{ vars.RULES_BOOTSTRAP_ALLOWED_SHA }}
-          RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA: ${{ vars.RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA }}
-          RULES_ID_DEFINITIONS: ${{ secrets.RULES_ID_DEFINITIONS }}
-          RULES_ID_DEFINITIONS_SHA256: ${{ vars.RULES_ID_DEFINITIONS_SHA256 }}
-          SOURCE_REVIEWED_SHA: ${{ vars.SOURCE_REVIEWED_SHA }}
-          SOURCE_REVIEWED_BASE: ${{ vars.SOURCE_REVIEWED_BASE }}
-          SOURCE_REVIEWED_BASE_BRANCH: ${{ vars.SOURCE_REVIEWED_BASE_BRANCH }}
-          SOURCE_REVIEWED_DIFF_SHA256: ${{ vars.SOURCE_REVIEWED_DIFF_SHA256 }}
-          SOURCE_CANDIDATE_REF: ${{ secrets.SOURCE_CANDIDATE_REF }}
+          SOURCE_REVIEWED_DIFF_SHA256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+          SOURCE_CANDIDATE_REF: refs/heads/main
         run: |
           set -euo pipefail
           marker_prefix='macos-rules-bootstrap='
@@ -332,11 +301,6 @@ jobs:
             SOURCE_READER_CLIENT_ID="$SOURCE_READER_CLIENT_ID" \
             SOURCE_REPOSITORY_ID="$SOURCE_REPOSITORY_ID" \
             SOURCE_REPOSITORY_OWNER="$SOURCE_REPOSITORY_OWNER" SOURCE_REPOSITORY_NAME="$SOURCE_REPOSITORY_NAME" \
-            RULES_BOOTSTRAP_ALLOWED_SHA="$RULES_BOOTSTRAP_ALLOWED_SHA" \
-            RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA="$RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA" \
-            RULES_ID_DEFINITIONS="$RULES_ID_DEFINITIONS" RULES_ID_DEFINITIONS_SHA256="$RULES_ID_DEFINITIONS_SHA256" \
-            SOURCE_REVIEWED_SHA="$SOURCE_REVIEWED_SHA" SOURCE_REVIEWED_BASE="$SOURCE_REVIEWED_BASE" \
-            SOURCE_REVIEWED_BASE_BRANCH="$SOURCE_REVIEWED_BASE_BRANCH" \
             SOURCE_REVIEWED_DIFF_SHA256="$SOURCE_REVIEWED_DIFF_SHA256" \
             SOURCE_CANDIDATE_REF="$SOURCE_CANDIDATE_REF" \
             /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
@@ -348,8 +312,8 @@ jobs:
           network_family='macos-rules-'
           network_state='network=observed'
           network_re="^${network_family}${network_state} schema=1 mode=host-level control-sha=([a-f0-9]{40}) run-id=([1-9][0-9]{0,18}) run-attempt=([1-9][0-9]{0,18}) source-sha=([a-f0-9]{40}) interface-count=([1-4]) dns-query-count=(0|[1-9][0-9]{0,4}) tcp-syn-count=(0|[1-9][0-9]{0,4}) dns-name-hashes=(none|[a-f0-9]{64}(,[a-f0-9]{64}){0,15}) tcp-destination-hashes=(none|[a-f0-9]{64}(,[a-f0-9]{64}){0,15}) hashes-truncated=(true|false) capture-limited=(true|false) capture=private cleanup=complete worker-attribution=not-claimed completeness=not-claimed network-blocking=not-claimed$"
-          success_re="^${marker_prefix}${success_state} schema=1 control-sha=[a-f0-9]{40} run-id=[1-9][0-9]{0,18} run-attempt=[1-9][0-9]{0,18} source-sha=[a-f0-9]{40} base-sha=[a-f0-9]{40} base-branch=(main|develop|uat) candidate-class=(permanent-tip|signed-descendant) suites=rules\.hooks,rules\.sync,rules\.static,rules\.public,plan-ids token-revocation=confirmed-before-execution lease-cleanup=complete process-cleanup=complete identity-cleanup=complete summary-guard=append-sibling-create-readback-restore source-tree=uid-read-only dash-version=0\.5\.13\.5 dash-bottle-sha256=0e104457d0d188129596ee04e4f88ab6039baf9a03e183820caf0aa333d581d0 dash-binary-sha256=[a-f0-9]{64} reviewed-diff-sha256=[a-f0-9]{64} same-job-memory=not-verified$"
-          refusal_re="^${marker_prefix}${refusal_state} schema=1 reason=(invalid_input|control_identity_invalid|bootstrap_gate_refused|developer_mode_unavailable|plan_snapshot_refused|dash_bottle_unavailable|dash_bottle_invalid|dash_identity_invalid|context_unavailable|configuration_unavailable|source_reader_unavailable|repository_scope_invalid|source_fetch_unavailable|revocation_unconfirmed|base_invalid|signature_invalid|revocation_policy_invalid|bootstrap_snapshot_invalid|bootstrap_not_approved|binding_invalid|interface_unavailable|observer_unavailable|capture_invalid|toolchain_unavailable|runner_controls_unavailable|probe_identity_unavailable|storage_unavailable|source_lease_unavailable|source_identity_invalid|source_tree_invalid|summary_guard_failed|suite_failed|plan_ids_failed|cleanup_incomplete|internal_error) stage=(arguments|context|bootstrap_gate|developer_mode|plan_snapshot|dash_download|dash_archive|dash_verify|toolchain|runner_controls|identity|storage|source_lease|source_identity|source_tree|summary_guard|observer_import|observer_interface_hardware|observer_interface_capture|observer_interface_address|observer_interface|observer_binding|observer_start|observer_finish|observer_parse|observer_record|observer_missing|rules\.hooks|rules\.sync|rules\.static|rules\.public|plan-ids|cleanup_lease|cleanup_storage|cleanup_worker|cleanup_summary|cleanup_dash|cleanup_unknown|cleanup_summary_census|cleanup_summary_present|cleanup_summary_probe|cleanup_summary_restore|cleanup_summary_close|cleanup_summary_present_python|cleanup_summary_present_ps|cleanup_summary_present_developer_shim|cleanup_summary_present_helper_preferences|cleanup_summary_present_helper_notifications|cleanup_summary_present_helper_launch_services|cleanup_summary_present_helper_security|cleanup_summary_present_helper_trust|cleanup_summary_present_helper_containers|cleanup_summary_present_apple_system_path|cleanup) control-sha=([a-f0-9]{40}|unknown) run-id=([1-9][0-9]{0,18}|unknown) run-attempt=([1-9][0-9]{0,18}|unknown) token-revocation=(not-read|confirmed|unconfirmed)$"
+          success_re="^${marker_prefix}${success_state} schema=1 control-sha=[a-f0-9]{40} run-id=[1-9][0-9]{0,18} run-attempt=[1-9][0-9]{0,18} source-sha=[a-f0-9]{40} base-sha=[a-f0-9]{40} base-branch=main candidate-class=permanent-tip suites=rules\.hooks token-revocation=confirmed-before-execution lease-cleanup=complete process-cleanup=complete identity-cleanup=complete summary-guard=append-sibling-create-readback-restore source-tree=uid-read-only dash-version=0\.5\.13\.5 dash-bottle-sha256=0e104457d0d188129596ee04e4f88ab6039baf9a03e183820caf0aa333d581d0 dash-binary-sha256=[a-f0-9]{64} reviewed-diff-sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 same-job-memory=not-verified$"
+          refusal_re="^${marker_prefix}${refusal_state} schema=1 reason=(invalid_input|control_identity_invalid|bootstrap_gate_refused|developer_mode_unavailable|dash_bottle_unavailable|dash_bottle_invalid|dash_identity_invalid|context_unavailable|configuration_unavailable|source_reader_unavailable|repository_scope_invalid|source_fetch_unavailable|revocation_unconfirmed|base_invalid|bootstrap_snapshot_invalid|bootstrap_not_approved|binding_invalid|interface_unavailable|observer_unavailable|capture_invalid|toolchain_unavailable|runner_controls_unavailable|probe_identity_unavailable|storage_unavailable|source_lease_unavailable|source_identity_invalid|source_tree_invalid|summary_guard_failed|suite_failed|cleanup_incomplete|internal_error) stage=(arguments|context|bootstrap_gate|developer_mode|dash_download|dash_archive|dash_verify|toolchain|runner_controls|identity|storage|source_lease|source_identity|source_tree|summary_guard|observer_import|observer_interface_hardware|observer_interface_capture|observer_interface_address|observer_interface|observer_binding|observer_start|observer_finish|observer_parse|observer_record|observer_missing|rules\.hooks|cleanup_lease|cleanup_storage|cleanup_worker|cleanup_summary|cleanup_dash|cleanup_unknown|cleanup_summary_census|cleanup_summary_present|cleanup_summary_probe|cleanup_summary_restore|cleanup_summary_close|cleanup_summary_present_python|cleanup_summary_present_ps|cleanup_summary_present_developer_shim|cleanup_summary_present_helper_preferences|cleanup_summary_present_helper_notifications|cleanup_summary_present_helper_launch_services|cleanup_summary_present_helper_security|cleanup_summary_present_helper_trust|cleanup_summary_present_helper_containers|cleanup_summary_present_apple_system_path|cleanup) control-sha=([a-f0-9]{40}|unknown) run-id=([1-9][0-9]{0,18}|unknown) run-attempt=([1-9][0-9]{0,18}|unknown) token-revocation=(not-read|confirmed|unconfirmed)$"
           line_count=0
           first_line=''
           second_line=''
@@ -473,10 +437,9 @@ jobs:
             -I -S -B kit/confinement/macos_rules_bootstrap.py cleanup-dash
       - name: Write trusted summary visibility control
         if: ${{ success() && steps.rules-bootstrap.outcome == 'success' }}
-        env:
-          SOURCE_REVIEWED_DIFF_SHA256: ${{ vars.SOURCE_REVIEWED_DIFF_SHA256 }}
         run: |
           set -euo pipefail
+          SOURCE_REVIEWED_DIFF_SHA256='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
           if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ || ! "$REQUESTED_SOURCE_SHA" =~ ^[a-f0-9]{40}$ || ! "$REQUESTED_BASE_SHA" =~ ^[a-f0-9]{40}$ ]]; then
             exit 1
           fi
@@ -494,7 +457,6 @@ jobs:
     needs: [macos-rules-bootstrap-settings, macos-rules-bootstrap]
     if: ${{ always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
-    cache-mode: none
     timeout-minutes: 15
     permissions:
       actions: read

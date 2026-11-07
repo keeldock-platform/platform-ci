@@ -574,20 +574,7 @@ function Get-TrustedEnvironment([string]$toolPath, [string]$homePath) {
     }
 }
 
-function Get-CargoAdmissionEnvironment([string]$python) {
-    $environment = Get-TrustedEnvironment $python $script:Layout.Private
-    $required = @('KD_CARGO_DENY_PATH', 'KD_CARGO_DENY_RECEIPT_PATH',
-                  'KD_CARGO_DENY_HOME', 'KD_RUSTSEC_ADVISORY_DB_PATH', 'CI_SHA')
-    foreach ($name in $required) {
-        $value = [string][Environment]::GetEnvironmentVariable($name)
-        if ([string]::IsNullOrWhiteSpace($value)) { throw 'cargo_admission_config' }
-        $environment[$name] = $value
-    }
-    $environment['RUST_ROOT'] = [string]$script:Layout.RustPrefix
-    return $environment
-}
-
-function Add-CargoAdmissionArguments([string[]]$argv, [string]$project) {
+function Add-CargoVendorArguments([string[]]$argv, [string]$project) {
     if ($argv.Count -lt 2 -or $argv[0] -cne (Join-Path $script:Layout.RustBin 'cargo.exe')) {
         return $argv
     }
@@ -600,17 +587,15 @@ function Add-CargoAdmissionArguments([string[]]$argv, [string]$project) {
     while ($true) {
         $lockRelative = 'Cargo.lock'
         if ($relativeParent.Length -gt 0) { $lockRelative = $relativeParent + '/Cargo.lock' }
-        if ($script:CargoAdmissionByLock.ContainsKey($lockRelative)) {
-            $vendor = [string[]]$script:CargoAdmissionByLock[$lockRelative]
-            if ($vendor.Count -lt 2 -or $vendor.Count % 2 -ne 0) { throw 'cargo_admission_config' }
-            for ($position = 0; $position -lt $vendor.Count; $position += 2) {
-                if ($vendor[$position] -cne '--config') { throw 'cargo_admission_config' }
-            }
+        if ($script:CargoVendorByLock.ContainsKey($lockRelative)) {
+            $configPath = [string]$script:CargoVendorByLock[$lockRelative]
+            if ($configPath -cnotmatch '^[A-Za-z]:\\[A-Za-z0-9_.\\-]+$' -or
+                    -not (Test-Path -LiteralPath $configPath -PathType Leaf)) { throw 'cargo_vendor_config' }
             $split = [Array]::IndexOf($argv, '--')
             if ($split -lt 0) { $split = $argv.Count }
             $combined = @()
             if ($split -gt 0) { $combined += $argv[0..($split - 1)] }
-            $combined += $vendor
+            $combined += @('--config', $configPath)
             if ($split -lt $argv.Count) { $combined += $argv[$split..($argv.Count - 1)] }
             return [string[]]$combined
         }
@@ -621,44 +606,36 @@ function Add-CargoAdmissionArguments([string[]]$argv, [string]$project) {
     return $argv
 }
 
-function Invoke-CargoLockAdmissions([string]$project, [string]$sourceSha) {
-    $script:CargoAdmissionByLock = @{}
+function Invoke-CargoLockFetch([string]$project) {
+    $script:CargoVendorByLock = @{}
     if ($script:RunMode -cne 'source') { return }
-    $python = Get-TrustedTool 'python.exe'
-    $helper = Join-Path $PSScriptRoot 'cargo_rust_admission.py'
-    $environment = Get-CargoAdmissionEnvironment $python
-    $evidenceRoot = [string]$env:KD_CARGO_LOCK_EVIDENCE_DIR
+    $cargo = Join-Path $script:Layout.RustBin 'cargo.exe'
+    if (-not (Test-Path -LiteralPath $cargo -PathType Leaf)) { throw 'cargo_toolchain' }
+    $fetchHome = Join-Path $script:Layout.Private 'cargo-fetch-home'
+    $vendorRoot = Join-Path $script:Layout.ReadOnly 'cargo-vendor'
+    New-Item -ItemType Directory -Path $fetchHome, $vendorRoot | Out-Null
+    $environment = Get-TrustedEnvironment $cargo $fetchHome
+    $environment['CARGO_HOME'] = $fetchHome
+    $environment['CARGO_INCREMENTAL'] = '0'
+    $environment['CARGO_TERM_COLOR'] = 'never'
+    $environment['RUSTC'] = Join-Path $script:Layout.RustBin 'rustc.exe'
     foreach ($entry in @(Get-SourceWalk $project 'Cargo.lock' $false)) {
         $lockPath = $entry.Substring(2)
         $relative = [IO.Path]::GetRelativePath($project, $lockPath).Replace('\', '/')
-        if ($relative -cnotmatch '^[A-Za-z0-9._/@ +-]+$' -or $relative.Contains('..')) { throw 'cargo_admission_lock' }
-        $inspected = Invoke-TrustedProcess $python @('-B', $helper, 'inspect-lock', '--lock-path', $lockPath) $PSScriptRoot $environment 120 4096
-        if ($inspected.TimedOut -or $inspected.ExitCode -ne 0) { throw 'cargo_admission_lock' }
-        try { $lockInfo = ([string]$inspected.Stdout | ConvertFrom-Json -AsHashtable) } catch { throw 'cargo_admission_lock' }
-        if ($lockInfo['schema_version'] -ne 1 -or $lockInfo['package_count'] -lt 1 -or $lockInfo['lock_sha256'] -cne (Get-FileSha256 $lockPath)) { throw 'cargo_admission_lock' }
-        if ([int]$lockInfo['registry_packages'] -eq 0) { continue }
-        if ([string]::IsNullOrWhiteSpace($evidenceRoot) -or -not (Test-Path -LiteralPath $evidenceRoot -PathType Container)) { throw 'cargo_admission_receipt' }
-        $profile = [IO.Path]::GetDirectoryName($relative)
-        if ([string]::IsNullOrEmpty($profile)) { $profile = '.' }
+        if ($relative -cnotmatch '^[A-Za-z0-9._/@ +-]+$' -or $relative.Contains('..')) { throw 'cargo_lock' }
+        $lockItem = Get-Item -LiteralPath $lockPath -Force
+        if ($lockItem.PSIsContainer -or ([int]$lockItem.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0 -or $lockItem.Length -gt 4194304 -or $lockItem.Length -eq 0) { throw 'cargo_lock' }
+        $manifest = Join-Path (Split-Path -Parent $lockPath) 'Cargo.toml'
+        if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) { throw 'cargo_manifest' }
         $sha = [Security.Cryptography.SHA256]::Create()
         try { $key = ([Convert]::ToHexString($sha.ComputeHash([Text.Encoding]::ASCII.GetBytes($relative)))).ToLowerInvariant() } finally { $sha.Dispose() }
-        $receiptPath = Join-Path $evidenceRoot ($key + '.receipt.json')
-        $bindingPath = Join-Path $evidenceRoot ($key + '.binding.json')
-        $vendorParent = [string]$script:Layout.ReadOnly
-        $arguments = @('-B', $helper, 'admit-lock', '--source-root', $project,
-                       '--source-sha', $sourceSha, '--profile', $profile,
-                       '--lock-path', $lockPath, '--receipt-path', $receiptPath,
-                       '--binding-path', $bindingPath, '--vendor-parent', $vendorParent,
-                       '--rust-root', [string]$script:Layout.RustPrefix)
-        $admitted = Invoke-TrustedProcess $python $arguments $PSScriptRoot $environment 900 65536
-        if ($admitted.TimedOut -or $admitted.ExitCode -ne 0) { throw 'cargo_admission_refused' }
-        try { $proof = ([string]$admitted.Stdout | ConvertFrom-Json -AsHashtable) } catch { throw 'cargo_admission_refused' }
-        if ($proof['source_sha'] -cne $sourceSha -or $proof['lock_path'] -cne $relative -or
-                $proof['required_flags'] -isnot [System.Collections.IEnumerable] -or
-                @($proof['required_flags']) -notcontains '--locked' -or
-                @($proof['required_flags']) -notcontains '--offline' -or
-                $proof['cargo_arguments'] -isnot [System.Collections.IEnumerable]) { throw 'cargo_admission_refused' }
-        $script:CargoAdmissionByLock[$relative] = [string[]]@($proof['cargo_arguments'])
+        $vendorPath = Join-Path $vendorRoot $key
+        $vendorConfig = Join-Path $vendorRoot ($key + '.toml')
+        $vendored = Invoke-TrustedProcess $cargo @('vendor', '--locked', '--versioned-dirs', '--manifest-path', $manifest, $vendorPath) $project $environment 900 1048576
+        if ($vendored.TimedOut -or $vendored.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace([string]$vendored.Stdout)) { throw 'cargo_vendor' }
+        if (([string]$vendored.Stdout).Length -gt 65536 -or ([string]$vendored.Stdout) -notmatch '(?m)^\[source\.crates-io\]') { throw 'cargo_vendor_config' }
+        [IO.File]::WriteAllText($vendorConfig, [string]$vendored.Stdout, (New-Object System.Text.UTF8Encoding($false)))
+        $script:CargoVendorByLock[$relative] = $vendorConfig
     }
 }
 
@@ -974,18 +951,10 @@ function Remove-SourceConfigFiles([string]$project) {
         [IO.File]::Delete($entry.Substring(2))
     }
     $locks = 0
-    $python = Get-TrustedTool 'python.exe'
-    $lockInspector = Join-Path $PSScriptRoot 'cargo_rust_admission.py'
     foreach ($entry in @(Get-SourceWalk $project 'Cargo.lock' $false)) {
         $file = $entry.Substring(2)
         $item = Get-Item -LiteralPath $file -Force
-        if ($item.Length -gt 4194304) { throw 'lock' }
-        $inspectionEnvironment = Get-TrustedEnvironment $python $script:Layout.Private
-        $inspected = Invoke-TrustedProcess $python @('-B', $lockInspector, 'inspect-lock', '--lock-path', $file) $PSScriptRoot $inspectionEnvironment 120 4096
-        if ($inspected.TimedOut -or $inspected.ExitCode -ne 0) { throw 'lock' }
-        try { $lockInfo = ([string]$inspected.Stdout | ConvertFrom-Json -AsHashtable) } catch { throw 'lock' }
-        if ($lockInfo['schema_version'] -ne 1 -or $lockInfo['package_count'] -lt 1 -or
-                $lockInfo['lock_sha256'] -cne (Get-FileSha256 $file)) { throw 'lock' }
+        if ($item.PSIsContainer -or ([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.Length -gt 4194304 -or $item.Length -eq 0) { throw 'lock' }
         $locks += 1
     }
     if ($locks -lt 1) { throw 'lock' }
@@ -1344,7 +1313,7 @@ function Get-GatePlan([string]$project, [string]$cargo, [string]$node, [string]$
             throw 'gate_plan'
         }
         $expanded = [string[]](Expand-GateArgv $argv $cargo $node $npm $project)
-        $expanded = [string[]](Add-CargoAdmissionArguments $expanded $project)
+        $expanded = [string[]](Add-CargoVendorArguments $expanded $project)
         $gates += @{ Id = $name; Argv = $expanded; Then = $then }
     }
     if ($gates.Count -ne $expectedCount -or $stepped -ne 1) { throw 'gate_plan' }
@@ -2004,7 +1973,7 @@ try {
 
             $phase = 'gate_plan'
             $runtimeProfile = Resolve-GatePlanRuntimeProfile $project $bound['source_sha']
-            Invoke-CargoLockAdmissions $project $bound['source_sha']
+            Invoke-CargoLockFetch $project
             $plan = Get-GatePlan $project ($layout.RustBin + '\cargo.exe') ($layout.NodeDir + '\node.exe') $layout.NpmCli $runtimeProfile
             Write-Line ('windows-source-gate-plan=ready gates=' + $plan.Count)
 

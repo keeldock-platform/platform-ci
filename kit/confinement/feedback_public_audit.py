@@ -35,10 +35,6 @@ SETTINGS_PREFIX = b"KD-FEEDBACK-SETTINGS "
 PREPARE_PREFIX = b"KD-FEEDBACK-PREPARE "
 PRODUCER_SUMMARY_PREFIX = b"KD-FEEDBACK-PRODUCER-SUMMARY "
 AUDIT_SUMMARY_PREFIX = b"KD-FEEDBACK-AUDIT-SUMMARY "
-NPM_DIAGNOSTIC_MARKER = b"KD-FEEDBACK-NPM-DIAGNOSTIC"
-NPM_DIAGNOSTIC_LINE_RE = re.compile(
-    rb"KD-FEEDBACK-NPM-DIAGNOSTIC schema=1 step=(npm_resolve|npm_lock|npm_bundle) reason=([a-z0-9_]{1,40})\Z"
-)
 AUDIT_FAILURE_PHASES = frozenset((
     "request", "identity", "run", "workflow", "history", "jobs",
     "job_surfaces", "check_surfaces", "job_steps", "job_logs",
@@ -201,8 +197,13 @@ def _write_outputs(environ, values):
     allowed = {"cache_snapshot", "request_id", "source_sha", "base_sha", "base_branch", "kind"}
     if type(values) is not dict or not set(values).issubset(allowed):
         _refuse()
+    if "cache_snapshot" in values:
+        try:
+            public_audit._decode_cache_baseline(values["cache_snapshot"])
+        except BaseException:
+            _refuse()
     payload = "".join(name + "=" + str(value) + "\n" for name, value in values.items()).encode("ascii")
-    if len(payload) > 4096:
+    if len(payload) > 600000:
         _refuse()
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
@@ -235,8 +236,7 @@ def _write_outputs(environ, values):
 
 
 def _snapshot_cache(api, control_sha):
-    entries = public_audit._fetch_cache_entries(api, control_sha, reviewed=True)
-    return public_audit.cache_inventory_digest(entries)
+    return public_audit._fetch_cache_entries(api, control_sha, reviewed=True)
 
 
 def settings(environ=None, api_factory=None, *, now=None):
@@ -248,9 +248,11 @@ def settings(environ=None, api_factory=None, *, now=None):
     token = env.get("GITHUB_TOKEN", "")
     factory = public_audit.GitHubAPI if api_factory is None else api_factory
     api = factory(token)
-    digest = _snapshot_cache(api, request["control_sha"])
+    entries = _snapshot_cache(api, request["control_sha"])
+    baseline = public_audit.cache_inventory_baseline(entries)
+    digest = public_audit.cache_inventory_baseline_digest(baseline)
     _write_outputs(env, {
-        "cache_snapshot": digest,
+        "cache_snapshot": baseline,
         "request_id": request["request_id"],
         "source_sha": request["source_sha"],
         "base_sha": request["base_sha"],
@@ -378,29 +380,6 @@ def _read_cache_snapshot(log, control_sha, run_id):
             or matches[0].group(2).decode("ascii") != run_id):
         _refuse()
     return matches[0].group(3).decode("ascii")
-
-
-def _npm_diagnostic_lines_ok(logs, profile):
-    """Accept no diagnostic line, or exactly one strict closed line in the npm producer log.
-
-    Only log lines whose content starts with the marker count, so the echoed step script is ignored.
-    """
-    keys_by_step = dict(public_audit.CORE_CONTRACT_SOURCE_GATES_NPM_KEYS_BY_STEP)
-    found = 0
-    for name, log in logs.items():
-        for line in log.splitlines():
-            body = line
-            if not line.startswith(NPM_DIAGNOSTIC_MARKER) and len(line) > 30 and line[4:5] == b"-" and b"Z " in line[:32]:
-                body = line.split(b"Z ", 1)[1]
-            if not body.startswith(NPM_DIAGNOSTIC_MARKER):
-                continue
-            match = NPM_DIAGNOSTIC_LINE_RE.match(body)
-            if (match is None or name != profile["producer_job"]
-                    or profile["kind"] != feedback_request.NPM_ADMISSION_KIND
-                    or match.group(2).decode("ascii") not in keys_by_step[match.group(1).decode("ascii")]):
-                return False
-            found += 1
-    return found <= 1
 
 
 READINESS_ATTEMPTS = 15
@@ -665,7 +644,7 @@ def audit_live(environ=None, api_factory=None, *, now=None, sleep=None, monotoni
 
     cache_digest = None
     try:
-        cache_digest = _snapshot_cache(api, control_sha)
+        cache_entries = _snapshot_cache(api, control_sha)
     except Exception:
         fail("cache_snapshot")
     settings_name = profile["producer_job"] + feedback_api.SETTINGS_SUFFIX
@@ -673,7 +652,12 @@ def audit_live(environ=None, api_factory=None, *, now=None, sleep=None, monotoni
     producer_name = profile["producer_job"]
     try:
         baseline = _read_cache_snapshot(logs[settings_name], control_sha, run_id)
-        if cache_digest != baseline:
+        baseline_value = env.get("MACOS_CACHE_SNAPSHOT", "")
+        try:
+            public_audit.cache_inventory_matches(baseline_value, cache_entries)
+        except BaseException:
+            fail("summary_markers")
+        if public_audit.cache_inventory_baseline_digest(baseline_value) != baseline:
             fail("summary_markers")
         expected_settings = (SETTINGS_PREFIX + b"schema=1 request-id="
                              + request["request_id"].encode("ascii") + b" profile="
@@ -692,12 +676,6 @@ def audit_live(environ=None, api_factory=None, *, now=None, sleep=None, monotoni
             fail("summary_markers")
     except (KeyError, Exception):
         fail("summary_markers")
-    try:
-        if not _npm_diagnostic_lines_ok(logs, profile):
-            fail("producer_evidence")
-    except Exception:
-        fail("producer_evidence")
-
     producer_record = None
     producer_output = None
     producer_job = next((job for job in jobs if job.get("name") == producer_name), None)

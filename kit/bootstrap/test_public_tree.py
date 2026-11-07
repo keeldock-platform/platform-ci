@@ -36,6 +36,138 @@ PINNED_ACTION_LOG_SOURCE_CONTRACT = {
 }
 
 
+def _secret_job_output_flows(workflow):
+    lines = workflow.splitlines()
+    jobs_header = next((index for index, line in enumerate(lines) if line == "jobs:"), None)
+    if jobs_header is None:
+        return []
+    jobs_end = next(
+        (index for index in range(jobs_header + 1, len(lines))
+         if lines[index] and not lines[index][0].isspace()),
+        len(lines),
+    )
+    headers = [
+        (index, match.group(1))
+        for index in range(jobs_header + 1, jobs_end)
+        if (match := re.match(r"^  ([A-Za-z0-9_-]+):[ \t]*$", lines[index]))
+    ]
+    violations = []
+    secret_reference = re.compile(r"\$\{\{[^}]*\bsecrets(?:\.|\[)")
+    step_output_reference = re.compile(r"\bstep[s]?\.([A-Za-z0-9_-]+)\.outputs\b")
+
+    for header_index, (job_start, job_id) in enumerate(headers):
+        job_end = headers[header_index + 1][0] if header_index + 1 < len(headers) else jobs_end
+        job_lines = lines[job_start + 1:job_end]
+
+        output_lines = []
+        for index, line in enumerate(job_lines):
+            if re.match(r"^    outputs:\s*$", line):
+                for output_line in job_lines[index + 1:]:
+                    if re.match(r"^    [A-Za-z0-9_-]+:\s*$", output_line):
+                        break
+                    output_lines.append(output_line)
+                break
+        if not output_lines:
+            continue
+
+        job_secret_env_names = set()
+        env_start = next(
+            (index for index, line in enumerate(job_lines) if re.match(r"^    env:\s*$", line)),
+            None,
+        )
+        if env_start is not None:
+            for line in job_lines[env_start + 1:]:
+                if re.match(r"^    [A-Za-z0-9_-]+:\s*$", line):
+                    break
+                match = re.match(r"^      ([A-Za-z_][A-Za-z0-9_]*):", line)
+                if match and secret_reference.search(line):
+                    job_secret_env_names.add(match.group(1))
+
+        step_headers = [
+            (index, match.group(1))
+            for index, line in enumerate(job_lines)
+            if (match := re.match(r"^      - (.*)$", line))
+        ]
+        steps = {}
+        for step_index, (relative_start, _) in enumerate(step_headers):
+            relative_end = (
+                step_headers[step_index + 1][0]
+                if step_index + 1 < len(step_headers)
+                else len(job_lines)
+            )
+            block = "\n".join(job_lines[relative_start:relative_end])
+            id_match = re.search(
+                r"(?m)^      - id:\s*['\"]?([A-Za-z0-9_-]+)|^        id:\s*['\"]?([A-Za-z0-9_-]+)",
+                block,
+            )
+            if id_match:
+                steps[id_match.group(1) or id_match.group(2)] = block
+
+        tainted_steps = set()
+        changed = True
+        while changed:
+            changed = False
+            for step_id, block in steps.items():
+                secret_env_names = set()
+                env_start = re.search(r"(?m)^        env:\s*$", block)
+                if env_start:
+                    for line in block[env_start.end():].splitlines():
+                        if re.match(r"^        [A-Za-z0-9_-]+:", line):
+                            break
+                        match = re.match(r"^          ([A-Za-z_][A-Za-z0-9_]*):", line)
+                        if match and secret_reference.search(line):
+                            secret_env_names.add(match.group(1))
+
+                tainted_names = job_secret_env_names | secret_env_names
+                block_lines = block.splitlines()
+                uses_secret_action = bool(
+                    re.search(r"(?m)^        uses:", block)
+                    and (secret_reference.search(block)
+                         or set(step_output_reference.findall(block)) & tainted_steps)
+                )
+                lines_changed = True
+                while lines_changed:
+                    lines_changed = False
+                    for line in block_lines:
+                        assignment = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)", line)
+                        if not assignment or assignment.group(1) in tainted_names:
+                            continue
+                        rhs = assignment.group(2)
+                        references_secret = secret_reference.search(rhs) or any(
+                            re.search(rf"(?:\$\{{\{{\s*env\.{name}\s*\}}\}}|\$\{{?{name}\b)", rhs)
+                            for name in tainted_names
+                        )
+                        references_secret = references_secret or bool(
+                            set(step_output_reference.findall(rhs)) & tainted_steps
+                        )
+                        if references_secret:
+                            tainted_names.add(assignment.group(1))
+                            lines_changed = True
+
+                output_write_has_secret = False
+                for line in block_lines:
+                    if "GITHUB_OUTPUT" not in line:
+                        continue
+                    if secret_reference.search(line) or set(step_output_reference.findall(line)) & tainted_steps:
+                        output_write_has_secret = True
+                    if any(
+                        re.search(rf"(?:\$\{{\{{\s*env\.{name}\s*\}}\}}|\$\{{?{name}\b)", line)
+                        for name in tainted_names
+                    ):
+                        output_write_has_secret = True
+
+                if (uses_secret_action or output_write_has_secret) and step_id not in tainted_steps:
+                    tainted_steps.add(step_id)
+                    changed = True
+
+        output_text = "\n".join(output_lines)
+        if secret_reference.search(output_text):
+            violations.append(f"{job_id}:direct-secret")
+        for step_id in sorted(set(step_output_reference.findall(output_text)) & tainted_steps):
+            violations.append(f"{job_id}:step-{step_id}")
+    return violations
+
+
 class PublicTreeTests(unittest.TestCase):
     def test_parent_runner_workspace_is_not_a_valid_checkout_root(self):
         with tempfile.TemporaryDirectory(prefix="platform-workspace-root-") as temporary:
@@ -123,7 +255,7 @@ class PublicTreeTests(unittest.TestCase):
                 text=True,
                 timeout=10,
             )
-            self.assertEqual(checkout.returncode, 0)
+            self.assertEqual(checkout.returncode, 0, (checkout.stdout, checkout.stderr))
             self.assertEqual(checkout.stdout, "candidate-policy=accepted control-sha=" + sha + "\n")
             self.assertEqual(checkout.stderr, "")
 
@@ -243,22 +375,16 @@ class PublicTreeTests(unittest.TestCase):
         self.assertIn('__all__ = ["WindowsSourceBindingTests", "LinuxBrowserTierTests"]', tiers)
         self.assertNotIn("import test_linux_source_build\n", tiers)
         self.assertNotIn("from test_linux_source_build import", tiers)
-        self.assertIn("kit/confinement/rust_license_gate.py", PLATFORM_FILES)
-        self.assertIn("kit/confinement/test_rust_license_gate.py", PLATFORM_FILES)
-        self.assertIn("kit/confinement/cargo_deny_installer.py", PLATFORM_FILES)
-        self.assertIn("kit/confinement/test_cargo_deny_installer.py", PLATFORM_FILES)
-        self.assertIn("kit/confinement/cargo_deny_policy.toml", PLATFORM_FILES)
-        self.assertIn("kit/confinement/rust_license_checker.py", PLATFORM_FILES)
         action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
         self.assertEqual(action.count('"test_linux_source_build.py"'), 1)
-        self.assertEqual(action.count('"test_rust_license_gate.py"'), 1)
+        self.assertEqual(action.count('"test_rust_license_gate.py"'), 0)
         condition = 'if [[ "${RUNNER_OS:-}" == "Linux" ]]; then\n'
         self.assertEqual(action.count(condition), 1)
         start = action.index(condition)
         end = action.index("\n        fi\n", start)
         block = action[start:end]
         self.assertEqual(block.count('"test_linux_source_build.py"'), 1)
-        self.assertEqual(block.count('"test_rust_license_gate.py"'), 1)
+        self.assertEqual(block.count('"test_rust_license_gate.py"'), 0)
         self.assertIn('"$python_bin" -B -m unittest discover', block)
         self.assertNotIn("python3.9", block)
         self.assertLess(start, action.index('"${RUNNER_OS:-}" == "macOS"'))
@@ -294,7 +420,6 @@ class PublicTreeTests(unittest.TestCase):
         unit_end = workflow.index("  linux-source-admission-source-read:", unit_start)
         unit_job = workflow[unit_start:unit_end]
         self.assertIn("python3 -B kit/confinement/test_linux_source_build.py", unit_job)
-        self.assertIn("python3 -B kit/confinement/test_rust_license_gate.py", unit_job)
 
     def test_core_ci_files_are_registered_and_the_suite_is_discovered_on_linux_only(self):
         for name in (
@@ -316,6 +441,196 @@ class PublicTreeTests(unittest.TestCase):
         self.assertNotIn("core-ci", macos)
         workflow = (ROOT / ".github/workflows/core-linux-quick-return.yml").read_text(encoding="utf-8")
         self.assertIn("python3 -B core-ci/test_linux_quick_return.py", workflow)
+
+    def test_branch_promotion_requires_exact_green_checks_and_verifies_the_remote_target(self):
+        for name in (
+            "kit/promotion/branch_promotion.py",
+            "kit/promotion/test_branch_promotion.py",
+            "docs/branch-promotion.md",
+        ):
+            self.assertIn(name, PLATFORM_FILES)
+            self.assertIn(name, PINNED_FILE_SHA256)
+        source = (ROOT / "kit/promotion/branch_promotion.py").read_text(encoding="utf-8")
+        self.assertIn('"git", "push", "origin", sha + ":refs/heads/" + target', source)
+        self.assertIn("verify_exact_target(sha, _remote_sha(root, target))", source)
+        self.assertIn("green_required_checks(required", source)
+        self.assertIn("--owner-approved", source)
+        rules = (ROOT / "docs/branch-promotion.md").read_text(encoding="utf-8")
+        self.assertIn("Require status checks to pass", rules)
+        self.assertIn("15368", rules)
+        self.assertIn("promotion-check-reuse", rules)
+        self.assertIn("does not modify GitHub branch protection", rules)
+        action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
+        self.assertIn('discover -s "$CI_ACTION_PATH/../promotion" -p "test_*.py"', action)
+
+    def test_runtime_workspace_dependency_check_uses_the_confined_runner(self):
+        workflow = (ROOT / ".github/workflows/core-dependency-checks.yml").read_text(encoding="utf-8")
+        start = workflow.index("  runtime-workspace:")
+        end = workflow.index("  npm:", start)
+        job = workflow[start:end]
+        self.assertIn("KD_INCLUDE_RUNTIME_NPM_LOCK: \"true\"", job)
+        self.assertIn("linux_source_build.py runtime-workspace", job)
+        self.assertIn("Build and test the registered runtime workspace suite in confinement", job)
+        self.assertNotIn("npm --prefix runtime run check:workspace", job)
+        source_build = (ROOT / "kit/confinement/linux_source_build.py").read_text(encoding="utf-8")
+        self.assertIn('"CARGO_NET_OFFLINE": "true"', source_build)
+        self.assertIn('"NPM_CONFIG_OFFLINE": "true"', source_build)
+        self.assertIn("timeout=RUNTIME_WORKSPACE_TIMEOUT_SECONDS", source_build)
+
+    def test_public_platform_workflow_caches_only_hash_scoped_trusted_rust_outputs(self):
+        workflow = (ROOT / ".github/workflows/core-dependency-checks.yml").read_text(encoding="utf-8")
+        self.assertIn("  workflow_call:\n", workflow)
+        self.assertIn("github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core')", workflow)
+        self.assertEqual(workflow.count("uses: actions/cache/restore@"), 2)
+        self.assertEqual(workflow.count("uses: actions/cache/save@"), 2)
+        self.assertEqual(workflow.count("restore-keys:"), 0)
+        self.assertEqual(workflow.count("timeout 10m sudo -n --preserve-env="), 2)
+        for action in ("uses: actions/cache/restore@", "uses: actions/cache/save@"):
+            offset = 0
+            while True:
+                offset = workflow.find(action, offset)
+                if offset < 0:
+                    break
+                step_start = workflow.rfind("      - name:", 0, offset)
+                condition = workflow[step_start:offset]
+                if "restore@" in action:
+                    self.assertIn("KD_RUST_CACHE_ENABLED == 'true'", condition)
+                else:
+                    self.assertIn("github.event_name == 'workflow_dispatch'", condition)
+                    self.assertIn("github.ref == 'refs/heads/main'", condition)
+                    self.assertNotIn("github.event_name == 'push'", condition)
+                    self.assertNotIn("pull_request", condition)
+                offset += len(action)
+        self.assertIn("RUST_CACHE_TRUST_CLASS: primary", workflow)
+        self.assertEqual(workflow.count("${{ runner.temp }}/kd-rust-cache/rust-cache.tar"), 4)
+        self.assertEqual(workflow.count("KD_RUST_CACHE_DIR: ${{ runner.temp }}/kd-rust-cache"), 6)
+        key_expression = (
+            "KD_RUST_CACHE_ENCRYPTION_KEY_B64: ${{ github.repository == 'keeldock-platform/platform-ci' "
+            "&& github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' "
+            "&& secrets.RUST_CACHE_ENCRYPTION_KEY || '' }}"
+        )
+        self.assertEqual(workflow.count(key_expression), 4)
+        for start, end in (
+            ("  rust:\n", "  runtime-workspace:\n"),
+            ("  runtime-workspace:\n", "  npm:\n"),
+            ("  npm:\n", None),
+        ):
+            job = workflow.split(start, 1)[1]
+            if end is not None:
+                job = job.split(end, 1)[0]
+            self.assertIn("linux-source-read-main", job)
+            self.assertIn("github.ref == 'refs/heads/main'", job)
+            self.assertIn("github.event_name == 'workflow_dispatch'", job)
+        for action in ("actions/cache/restore@", "actions/cache/save@"):
+            cursor = 0
+            while True:
+                cursor = workflow.find(f"uses: {action}", cursor)
+                if cursor < 0:
+                    break
+                step_start = workflow.rfind("      - name:", 0, cursor)
+                step_end = workflow.find("      - name:", cursor)
+                step = workflow[step_start:step_end if step_end >= 0 else len(workflow)]
+                self.assertIn("${{ runner.temp }}/kd-rust-cache/rust-cache.tar", step)
+                self.assertNotIn("${{ runner.temp }}/kd-rust-cache/target", step)
+                self.assertNotIn("${{ runner.temp }}/kd-rust-cache/cargo-home", step)
+                cursor += len(action)
+        self.assertNotIn("pull_request' && github.repository == 'keeldock-platform/platform-ci'", workflow)
+        self.assertIn("linux_source_build.py rust-cache-import", workflow)
+        self.assertIn("linux_source_build.py rust-cache-package", workflow)
+        self.assertLess(workflow.index("uses: actions/cache/restore@"), workflow.index("linux_source_build.py rust-cache-import"))
+        self.assertLess(workflow.index("linux_source_build.py rust-cache-import"), workflow.index("sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT"))
+        self.assertIn("CACHE_MODE: none", workflow)
+
+    def test_workflows_never_forward_secret_values_through_job_outputs(self):
+        direct_secret = "jobs:\n  direct:\n    outputs:\n      leaked: ${{ secrets.CACHE_KEY }}\n    steps:\n      - run: true\n"
+        encoded_secret = (
+            "jobs:\n  encoded:\n    outputs:\n      leaked: ${{ steps.encode.outputs.value }}\n    steps:\n"
+            "      - id: encode\n        env:\n          CACHE_KEY: ${{ secrets.CACHE_KEY }}\n"
+            "        run: printf 'value=%s\\n' \\\"$(printf '%s' \\\"$CACHE_KEY\\\" | base64)\\\" >> \\\"$GITHUB_OUTPUT\\\"\n"
+        )
+        self.assertEqual(_secret_job_output_flows(direct_secret), ["direct:direct-secret"])
+        self.assertEqual(_secret_job_output_flows(encoded_secret), ["encoded:step-encode"])
+
+        workflow_paths = sorted((ROOT / ".github/workflows").glob("*.yml"))
+        workflow_paths += sorted((ROOT / ".github/workflows").glob("*.yaml"))
+        violations = [
+            f"{path.relative_to(ROOT).as_posix()}:{flow}"
+            for path in workflow_paths
+            for flow in _secret_job_output_flows(path.read_text(encoding="utf-8"))
+        ]
+        self.assertEqual(violations, [])
+
+    def test_every_cargo_build_workflow_uses_pinned_exact_archive_caches_outside_confinement(self):
+        expected = {
+            ".github/workflows/core-dependency-checks.yml": (2, 2),
+            ".github/workflows/linux-source-admission.yml": (2, 2),
+            ".github/workflows/core-linux-quick-return.yml": (0, 0),
+        }
+        for relative, (restores, saves) in expected.items():
+            workflow = (ROOT / relative).read_text(encoding="utf-8")
+            with self.subTest(workflow=relative):
+                self.assertEqual(workflow.count("uses: actions/cache/restore@"), restores)
+                self.assertEqual(workflow.count("uses: actions/cache/save@"), saves)
+                if "core-linux-quick-return" in relative:
+                    self.assertNotIn("actions/cache/", workflow)
+                    self.assertNotIn("KD_RUST_CACHE_ENCRYPTION_KEY_B64", workflow)
+                    continue
+                self.assertEqual(workflow.count("restore-keys:"), 0)
+                self.assertIn("3edfce9056124e459a23f683a21433670d47daca", workflow)
+                self.assertIn("linux_source_build.py rust-cache-key", workflow)
+                self.assertIn("linux_source_build.py rust-cache-import", workflow)
+                self.assertIn("linux_source_build.py rust-cache-export", workflow)
+                self.assertIn("linux_source_build.py rust-cache-package", workflow)
+                self.assertIn("rust-cache.tar", workflow)
+                if "core-dependency-checks" in relative:
+                    self.assertEqual(workflow.count("KD_RUST_CACHE_ENCRYPTION_KEY_B64: ${{ github.repository =="), 4)
+                else:
+                    expected_secret_uses = 2 if "core-linux-quick-return" in relative else 4
+                    self.assertEqual(
+                        workflow.count("KD_RUST_CACHE_ENCRYPTION_KEY_B64: ${{ secrets.RUST_CACHE_ENCRYPTION_KEY }}"),
+                        expected_secret_uses,
+                    )
+                if "linux-source-admission" in relative:
+                    source_read = workflow.split("  linux-source-admission-source-read:\n", 1)[1].split(
+                        "  linux-source-admission-verdict:\n", 1,
+                    )[0]
+                    verifier = workflow.split("  linux-source-admission-verdict:\n", 1)[1].split(
+                        "  linux-source-admission-audit:\n", 1,
+                    )[0]
+                    self.assertLess(source_read.index("uses: actions/cache/restore@"), source_read.index("Run all offline project gates"))
+                    self.assertLess(source_read.index("Run all offline project gates"), source_read.index("uses: actions/cache/save@"))
+                    self.assertLess(verifier.index("uses: actions/cache/restore@"), verifier.index("Run independent offline project gates"))
+                    self.assertLess(verifier.index("Run independent offline project gates"), verifier.index("uses: actions/cache/save@"))
+                    self.assertNotIn("cache-mode:", workflow)
+                elif "core-dependency-checks" in relative:
+                    for start, end, build in (
+                        ("  rust:\n", "  runtime-workspace:\n", "Build and test root and fuzz Rust workspaces with locks enforced"),
+                        ("  runtime-workspace:\n", "  npm:\n", "Build and test the registered runtime workspace suite in confinement"),
+                    ):
+                        job = workflow.split(start, 1)[1].split(end, 1)[0]
+                        self.assertLess(job.index("uses: actions/cache/restore@"), job.index(build))
+                        self.assertLess(job.index(build), job.index("uses: actions/cache/save@"))
+                for action in ("uses: actions/cache/restore@", "uses: actions/cache/save@"):
+                    offset = 0
+                    while True:
+                        offset = workflow.find(action, offset)
+                        if offset < 0:
+                            break
+                        start = workflow.rfind("      - name:", 0, offset)
+                        end = workflow.find("      - name:", offset)
+                        if end < 0:
+                            end = len(workflow)
+                        step = workflow[start:end]
+                        self.assertIn("${{ runner.temp }}/kd-rust-cache/rust-cache.tar", step)
+                        if "restore@" in action and "core-dependency-checks" not in relative and "linux-source-admission" not in relative:
+                            self.assertLess(offset, workflow.index("Run all offline project gates"))
+                        else:
+                            condition = step.split("        if:", 1)[1].split("\n", 1)[0]
+                            self.assertNotIn("pull_request", condition)
+                        offset += len(action)
+        source_build = (ROOT / "kit/confinement/linux_source_build.py").read_text(encoding="utf-8")
+        self.assertIn('"rust-toolchain.toml"', source_build)
+        self.assertIn('"Cargo.lock"', source_build)
 
     def test_platform_allowlist_rejects_an_unreviewed_extra_file(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -390,10 +705,11 @@ class PublicTreeTests(unittest.TestCase):
 
     def test_reviewed_native_and_source_controls_have_public_tree_hash_pins(self):
         expected = {
+            '.github/workflows/core-dependency-checks.yml',
+            'docs/branch-promotion.md',
             '.github/workflows/linux-source-admission.yml',
             'kit/bootstrap/action.yml',
             'kit/bootstrap/public_tree.py',
-            '.github/workflows/node-lock-return.yml',
             '.github/workflows/core-rust-format-return.yml',
             '.github/workflows/core-build-diagnostic-return.yml',
             '.github/workflows/windows-source-admission.yml',
@@ -402,12 +718,6 @@ class PublicTreeTests(unittest.TestCase):
             '.github/workflows/lane-h-capsule-attester.yml',
             'kit/confinement/windows_source_run.ps1',
             'kit/confinement/test_windows_source_run.py',
-            'kit/confinement/foundation_node_feedback.py',
-            'kit/confinement/test_foundation_node_feedback.py',
-            'kit/confinement/macos_node_contract.py',
-            'kit/confinement/test_macos_node_contract.py',
-            'kit/confinement/node_contract_validation.mjs',
-            'kit/confinement/test_node_contract_validation.mjs',
             'kit/confinement/macos_feedback_producer.py',
             'kit/confinement/test_macos_feedback_producer.py',
             'kit/confinement/test_macos_feedback_output_limits.py',
@@ -455,8 +765,6 @@ class PublicTreeTests(unittest.TestCase):
             'kit/confinement/test_linux_session.py',
             'kit/confinement/linux_channels.py',
             'kit/confinement/test_linux_channels.py',
-            'kit/confinement/npm_admission.py',
-            'kit/confinement/test_confinement_npm_admission.py',
             'kit/bootstrap/policy_linux.py',
             'kit/bootstrap/test_policy_linux.py',
             'kit/confinement/fixtures/npm11_audit_report.json',
@@ -464,14 +772,10 @@ class PublicTreeTests(unittest.TestCase):
             'core-ci/linux_quick_return.py',
             'core-ci/test_linux_quick_return.py',
             'core-ci/test_separation.py',
-            'kit/confinement/rust_license_gate.py',
-            'kit/confinement/cargo_lock_receipt.py',
-            'kit/confinement/test_cargo_lock_receipt.py',
-            'kit/confinement/test_rust_license_gate.py',
-            'kit/confinement/cargo_deny_installer.py',
-            'kit/confinement/test_cargo_deny_installer.py',
-            'kit/confinement/cargo_deny_policy.toml',
-            'kit/confinement/rust_license_checker.py',
+            'kit/promotion/branch_promotion.py',
+            'kit/promotion/test_branch_promotion.py',
+            'kit/confinement/cargo_lock_parser.py',
+            'kit/confinement/test_cargo_lock_parser.py',
             'kit/bootstrap/test_public_tree.py',
             '.github/workflows/macos-rust-toolchain-smoke.yml',
             'kit/confinement/macos_rust_toolchain.py',
@@ -516,20 +820,10 @@ class PublicTreeTests(unittest.TestCase):
             "kit/bootstrap/test_policy_handoff.py",
             "kit/confinement/release_build_verify.py",
             "kit/confinement/test_release_build_verify.py",
-            'kit/confinement/cargo_vendor_verify.py',
-            'kit/confinement/test_cargo_vendor_verify.py',
-            'kit/confinement/test_cargo_vendor_producer.py',
-            'kit/confinement/cargo_vendor_producer.py',
-            'kit/confinement/cargo_rust_admission.py',
-            'kit/confinement/test_cargo_rust_admission.py',
-            'kit/confinement/cargo_deny_qualification.py',
-            'kit/confinement/cargo_deny_qualification_reviewed.json',
-            'kit/confinement/test_cargo_deny_qualification.py',
-            'kit/confinement/cargo_archive_producer.py',
-            'kit/confinement/test_cargo_archive_producer.py',
-            'kit/confinement/cargo_deny_installer.py',
-            'kit/confinement/test_cargo_deny_installer.py',
-            'kit/confinement/cargo_deny_policy.toml',
+            'kit/bootstrap/policy_rust.py',
+            'kit/bootstrap/test_policy_rust.py',
+            'kit/bootstrap/policy_npm.py',
+            'kit/bootstrap/test_policy_npm.py',
             'kit/confinement/fixtures/cargo-deny/issue-910-cycle/Cargo.toml',
             'kit/confinement/fixtures/cargo-deny/issue-910-cycle/Cargo.lock',
             'kit/confinement/fixtures/cargo-deny/issue-910-cycle/a/Cargo.toml',
@@ -544,23 +838,9 @@ class PublicTreeTests(unittest.TestCase):
             'kit/confinement/fixtures/cargo-deny/rustsec-2020-0071-patched/Cargo.lock',
             'kit/confinement/fixtures/cargo-deny/rustsec-2020-0071-patched/build.rs',
             'kit/confinement/fixtures/cargo-deny/rustsec-2020-0071-patched/src/lib.rs',
-            'kit/confinement/rust_license_checker.py',
-            '.github/workflows/core-rust-lock-return.yml',
-            'kit/bootstrap/policy_rust.py',
-            'kit/bootstrap/test_policy_rust.py',
             'kit/confinement/cargo_lock_bootstrap.py',
             'kit/confinement/test_confinement_cargo_lock_bootstrap.py',
-            '.github/workflows/core-npm-admission-return.yml',
-            'kit/bootstrap/policy_npm.py',
-            'kit/bootstrap/test_policy_npm.py',
-            'kit/confinement/npm_admission_bootstrap.py',
-            'kit/confinement/test_confinement_npm_admission_bootstrap.py',
-            'kit/confinement/npm_semver.py',
-            'kit/confinement/test_confinement_npm_semver.py',
-            'kit/confinement/test_feedback_request_npm.py',
-            'kit/confinement/test_macos_feedback_producer_npm.py',
-            'kit/confinement/test_npm_admission_feedback.mjs',
-            "kit/confinement/release_evidence.py",
+                "kit/confinement/release_evidence.py",
             "kit/confinement/test_release_evidence.py",
             "kit/confinement/release_tool_ledger.py",
             "kit/confinement/release_tool_ledger.json",

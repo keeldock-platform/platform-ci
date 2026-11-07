@@ -73,13 +73,37 @@ jobs:
 WINDOWS_CONFINEMENT_WORKFLOW_TEMPLATE = """name: windows-confinement
 on:
   push:
-    branches:
-      - "**"
   pull_request:
   workflow_dispatch:
 permissions: {}
 jobs:
+  promotion-check-reuse:
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/main') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      checks: read
+      contents: read
+      statuses: read
+    outputs:
+      skip_checks: ${{ steps.decide.outputs.skip_checks }}
+    steps:
+      - name: Fetch the exact candidate SHA
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check prior workflow results for this exact SHA
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROMOTION_TARGET: ${{ github.ref_name }}
+          PROMOTION_SHA: ${{ github.sha }}
+          PROMOTION_WORKFLOW: windows-confinement
+        run: timeout 1m python -B kit/promotion/branch_promotion.py --reuse-checks-if-green --target "$PROMOTION_TARGET" --sha "$PROMOTION_SHA" --workflow "$PROMOTION_WORKFLOW"
   windows-policy:
+    needs: promotion-check-reuse
+    if: ${{ always() && (needs.promotion-check-reuse.result == 'skipped' || needs.promotion-check-reuse.outputs.skip_checks != 'true') }}
     runs-on: windows-2025
     timeout-minutes: 15
     defaults:

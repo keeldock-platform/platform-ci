@@ -24,7 +24,6 @@ TEMP_ROOT = Path(chr(47) + "private" + chr(47) + "tmp")
 RUN_PREFIX = "macos-core-contract-"
 WORKER_PREFIX = "macos-core-contract-worker-"
 MAX_TOTAL_SECONDS = 15 * 60
-NPM_ADMISSION_TOTAL_SECONDS = 40 * 60
 MAX_COMMAND_SECONDS = 120
 MAX_TEST_COMMAND_SECONDS = 300
 GATE_TIMEOUT_RETURNCODE = 124
@@ -41,21 +40,13 @@ ALLOWED_CONTROL_SIBLINGS = frozenset((
     "macos_capability", "macos_reviewed_build", "macos_boundary_guard",
     "macos_private_validation", "macos_source_reader", "macos_network_observer",
     "macos_rust_toolchain", "macos_rules_bootstrap", "macos_feedback_producer",
-    "macos_node_contract", "foundation_node_feedback", "cargo_lock_bootstrap",
-    "npm_admission_bootstrap", "cargo_lock_receipt", "cargo_rust_admission",
-    "rust_license_gate", "cargo_deny_installer",
+    "cargo_lock_bootstrap",
 ))
 FEEDBACK_TREE_LABELS = {
     "core-contract": "core_contract",
-    "core-node-lock-return": "core_node_lock_return",
     "core-rust-format-return": "core_rust_format_return",
     "core-build-diagnostic-return": "core_build_diagnostic_return",
-    "core-rust-lock-return": "core_rust_lock_return",
-    "core-npm-admission-return": "core_npm_admission_return",
 }
-LOCKED_FOUNDATION_TREE = "core_build_diagnostic_return_with_package_lock"
-NPM_FIXTURE_TREE = "npm_fixture_admission_return"
-NPM_ADMISSION_CONCERN = "core-npm-admission-return"
 API_FEATURE_GATE_NAMES = ("api_feature_clippy", "api_feature_tests")
 API_FEATURE_NAME = "dev-uat-policy-import"
 GATE_NAMES = (
@@ -64,10 +55,33 @@ GATE_NAMES = (
 )
 PARSER_GATE_NAMES = ("parser_format", "parser_clippy", "parser_replay")
 RUNTIME_GATE_NAMES = ("runtime_format", "runtime_clippy", "runtime_tests")
-SOURCE_GATE_STAGES = GATE_NAMES + PARSER_GATE_NAMES + RUNTIME_GATE_NAMES
+NODE_GATE_NAMES = ("node_dependency_prepare", "typescript_typecheck", "typescript_tests")
+NODE_NPM_VERSION = "11.19.1"
+NODE_WORKSPACE_PACKAGES = ("packages/host-api", "packages/kernel-i18n")
+NODE_UI_KIT_PACKAGES = ("packages/kernel-icons", "packages/kernel-ui-kit")
+NODE_EXTRA_FILES = frozenset(("packages/kernel-i18n/tests/support.ts",))
+NODE_REVIEWED_FILES = frozenset((
+    ".node-version", "package.json", "tsconfig.base.json",
+    "packages/host-api/package.json", "packages/host-api/tsconfig.json",
+    "packages/kernel-i18n/package.json", "packages/kernel-i18n/tsconfig.json",
+    "tools/node-test/no-net-use.mjs",
+    "crates/host/api/tests/fixtures/i18n-regression-v1.jsonl",
+    "crates/host/api/tests/fixtures/i18n-v1.jsonl",
+    "packages/host-api/src/budget.ts", "packages/host-api/src/effects.ts",
+    "packages/host-api/src/entitlements.ts", "packages/host-api/src/errors.ts",
+    "packages/host-api/src/ids.ts", "packages/host-api/src/index.ts",
+    "packages/host-api/src/manifest.ts", "packages/host-api/src/metadata.ts",
+    "packages/host-api/src/module.ts", "packages/host-api/src/plugin.ts",
+    "packages/host-api/src/result.ts", "packages/host-api/src/streams.ts",
+    "packages/host-api/src/version.ts", "packages/host-api/tests/budget-streams.test.ts",
+    "packages/host-api/tests/entitlements-errors.test.ts",
+    "packages/host-api/tests/ids-version.test.ts",
+    "packages/host-api/tests/manifest-metadata.test.ts",
+))
+SOURCE_GATE_STAGES = GATE_NAMES + PARSER_GATE_NAMES + RUNTIME_GATE_NAMES + NODE_GATE_NAMES
 TEST_GATE_STAGES = frozenset((
     "workspace_tests", "api_tests", "api_feature_tests", "mock_tests", "conformance_tests",
-    "parser_replay", "runtime_tests",
+    "parser_replay", "runtime_tests", "typescript_tests",
 ))
 SUITE_NAMES = (
     "core.static", "core.host-api", "core.mock-host", "core.conformance",
@@ -90,8 +104,8 @@ PRIVATE_FETCH_CLASSES = frozenset((
     "exit_nonzero", "stderr_present", "process_failure", "unexpected_exception",
 ))
 CORE_BOOTSTRAP_CHECKS = frozenset((
-    "tree_entries", "required_files", "path_mode", "base_policy", "rules_manifest",
-    "rules_inventory", "rules_hash", "workspace_decode", "workspace_members",
+    "tree_entries", "required_files", "path_mode", "base_policy",
+    "workspace_decode", "workspace_members",
     "cargo_lock_decode", "cargo_lock_shape", "toolchain", "package_decode",
     "package_build", "checkout", "lease_paths", "lease_acl", "lease_access", "lease_census",
     "source_inventory",
@@ -118,8 +132,7 @@ STAGES = frozenset((
     "format", "clippy", "workspace_tests", "api_tests", "api_feature_clippy",
     "api_feature_tests", "mock_tests", "conformance_tests", "parser_format", "parser_clippy",
     "parser_replay",
-    "runtime_format", "runtime_clippy", "runtime_tests",
-    "node_dependency_prepare", "node_dependency_audit", "typescript_typecheck", "typescript_tests",
+    "runtime_format", "runtime_clippy", "runtime_tests", *NODE_GATE_NAMES,
     "cleanup", "receipt", "internal",
 ))
 OPERATION_DIAGNOSTICS = frozenset((
@@ -163,133 +176,15 @@ SOURCE_GATE_COMMAND_DIAGNOSTICS = {
     "capture_overflow": "source_gate_capture_overflow",
 }
 SOURCE_GATE_DIAGNOSTICS = frozenset(SOURCE_GATE_COMMAND_DIAGNOSTICS.values())
-SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE = (
-    ("none", (
-        "invalid_input", "tool_unavailable", "accepted_provenance_invalid", "lock_missing",
-        "lock_already_present", "manifest_invalid", "limit_exceeded", "deadline_exceeded",
-        "capture_invalid", "contract_refused",
-    )),
-    ("runtime_version", (
-        "toolchain_mismatch", "command_failed", "capture_invalid", "tool_unavailable",
-        "deadline_exceeded",
-    )),
-    ("npm_version", (
-        "toolchain_mismatch", "command_failed", "capture_invalid", "tool_unavailable",
-        "deadline_exceeded",
-    )),
-    ("lock_generation", (
-        "command_failed", "capture_invalid", "tool_unavailable", "deadline_exceeded",
-    )),
-    ("lock_validation", ("accepted_provenance_invalid",)),
-    ("bulk_audit", (
-        "limit_exceeded", "manifest_invalid", "lock_missing", "accepted_provenance_invalid",
-        "audit_unavailable", "audit_response_invalid", "vulnerable_dependency",
-        "deadline_exceeded", "capture_invalid", "command_failed", "tool_unavailable",
-    )),
-    ("npm_ci", ("command_failed", "capture_invalid", "tool_unavailable", "deadline_exceeded")),
-    ("typecheck", ("command_failed", "capture_invalid", "tool_unavailable", "deadline_exceeded")),
-    ("tests", ("command_failed", "capture_invalid", "tool_unavailable", "deadline_exceeded")),
-)
-SOURCE_GATES_NODE_COMMAND_SUBSTAGES = (
-    "runtime_version", "npm_version", "lock_generation", "bulk_audit", "npm_ci", "typecheck",
-    "tests",
-)
-SOURCE_GATES_NODE_COMMAND_CHECKS = (
-    "spawn_failure", "nonzero_exit", "timeout", "capture_invalid", "capture_overflow",
-    "helper_failure",
-)
-SOURCE_GATES_NODE_DIAGNOSTIC_REASONS = {
-    **{
-        "source_gates_node_" + substage + "_" + reason:
-            "capture_invalid" if reason == "capture_invalid" else "runner_unavailable"
-        for substage, reasons in SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE
-        for reason in reasons
-    },
-    **{
-        "source_gates_node_" + substage + "_command_" + check: "runner_unavailable"
-        for substage in SOURCE_GATES_NODE_COMMAND_SUBSTAGES
-        for check in SOURCE_GATES_NODE_COMMAND_CHECKS
-    },
-}
-SOURCE_GATES_NODE_DIAGNOSTICS = frozenset(SOURCE_GATES_NODE_DIAGNOSTIC_REASONS)
-ACCEPTED_NODE_PROVENANCE_MAX_BYTES = 16384
-ACCEPTED_NODE_PROVENANCE_OVERSIZE = "source_gates_node_none_limit_exceeded"
-SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE = {
-    "runtime_version": "node_dependency_prepare", "npm_version": "node_dependency_prepare",
-    "lock_generation": "node_dependency_prepare", "lock_validation": "node_dependency_prepare",
-    "bulk_audit": "node_dependency_audit", "npm_ci": "node_dependency_audit",
-    "typecheck": "typescript_typecheck", "tests": "typescript_tests",
-}
-SOURCE_GATES_NODE_DIAGNOSTIC_STAGES = {
-    **{
-        "source_gates_node_" + substage + "_" + reason: SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE[substage]
-        for substage, reasons in SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE
-        if substage in SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE
-        for reason in reasons
-    },
-    **{
-        "source_gates_node_" + substage + "_command_" + check:
-            SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE[substage]
-        for substage in SOURCE_GATES_NODE_COMMAND_SUBSTAGES
-        for check in SOURCE_GATES_NODE_COMMAND_CHECKS
-    },
-}
-SOURCE_GATES_NODE_PROFILE_REASONS = (
-    "manifest_invalid", "command_failed", "capture_invalid", "output_unavailable",
-)
-SOURCE_GATES_NODE_OUTCOME_CHECKS = (
-    "rust", "stage", "capture", "substage", "verification", "reviewed_files",
-)
-SOURCE_GATES_NPM_RESOLVE_CODES = (
-    "eresolve", "ebadengine", "etarget", "enotfound", "etimedout", "econnreset", "e404",
-    "eintegrity", "enoversions", "other",
-)
-SOURCE_GATES_NPM_RUNNER_KEYS = ("timeout", "spawn", "runner", "capture_invalid")
-SOURCE_GATES_NPM_BUNDLE_REASONS = (
-    "npm_input_invalid", "npm_environment_refused", "npm_manifest_refused", "npm_request_refused",
-    "npm_request_mismatch", "npm_lock_refused", "npm_network_refused", "npm_integrity_mismatch",
-    "npm_package_too_young", "npm_package_deprecated", "npm_licence_refused", "npm_peer_refused",
-    "npm_archive_refused", "npm_advisory_blocked", "npm_advisory_invalid", "npm_evidence_invalid",
-    "npm_stale", "npm_payload_too_large", "npm_policy_refused",
-)
-SOURCE_GATES_NPM_KEYS_BY_STEP = (
-    ("npm_inputs", (
-        "npm_input_invalid", "npm_manifest_refused", "npm_request_refused", "npm_request_mismatch",
-        "npm_policy_refused", "npm_stale", "manifest_invalid",
-    )),
-    ("npm_config", (
-        "npm_environment_refused", "npm_input_invalid", "manifest_invalid", "output_unavailable",
-        "tool_unavailable",
-    )),
-    ("npm_version", ("nonzero_exit", "mismatch") + SOURCE_GATES_NPM_RUNNER_KEYS),
-    ("npm_resolve", SOURCE_GATES_NPM_RESOLVE_CODES + SOURCE_GATES_NPM_RUNNER_KEYS),
-    ("npm_lock", ("npm_lock_refused", "npm_payload_too_large", "capture_invalid")),
-    ("npm_bundle", SOURCE_GATES_NPM_BUNDLE_REASONS),
-)
 SOURCE_GATES_STEP_DIAGNOSTICS_BY_KEY = {
     ("payload", "payload_invalid"): "source_gates_payload_invalid",
     ("payload", "capture_invalid"): "source_gates_payload_capture_invalid",
-    **{
-        ("node_profile", reason): "source_gates_node_profile_" + reason
-        for reason in SOURCE_GATES_NODE_PROFILE_REASONS
-    },
-    **{
-        ("node_outcome", check): "source_gates_node_outcome_" + check
-        for check in SOURCE_GATES_NODE_OUTCOME_CHECKS
-    },
-    **{
-        (step, key): "source_gates_" + step + "_" + key
-        for step, keys in SOURCE_GATES_NPM_KEYS_BY_STEP
-        for key in keys
-    },
 }
 SOURCE_GATES_STEP_DIAGNOSTIC_REASONS = {
     diagnostic: "capture_invalid" if key[1] == "capture_invalid" else "runner_unavailable"
     for key, diagnostic in SOURCE_GATES_STEP_DIAGNOSTICS_BY_KEY.items()
 }
 SOURCE_GATES_STEP_DIAGNOSTICS = frozenset(SOURCE_GATES_STEP_DIAGNOSTIC_REASONS)
-NPM_DIAGNOSTIC_STEPS = ("npm_resolve", "npm_lock", "npm_bundle")
-NPM_DIAGNOSTIC_LINE_PREFIX = "KD-FEEDBACK-NPM-DIAGNOSTIC schema=1 step="
 SUMMARY_GUARD_VERIFY_DIRECTORY_CLASSES = ("temp_dir", "diag_dir", "other_dir")
 SUMMARY_GUARD_VERIFY_FILE_CLASSES = ("env_file", "output_file", "path_file", "summary_file")
 SUMMARY_GUARD_VERIFY_FAILURES = {
@@ -326,7 +221,7 @@ SUMMARY_GUARD_DIAGNOSTICS = frozenset(SUMMARY_GUARD_DIAGNOSTIC_MAP.values())
 PRESERVED_SOURCE_DIAGNOSTICS = (
     SOURCE_RUNTIME_DIAGNOSTICS | SOURCE_FETCH_DIAGNOSTICS
     | SOURCE_BOOTSTRAP_DIAGNOSTICS | SOURCE_LEASE_OPEN_CLASS_DIAGNOSTICS
-    | SOURCE_GATE_DIAGNOSTICS | SOURCE_GATES_NODE_DIAGNOSTICS | SOURCE_GATES_STEP_DIAGNOSTICS
+    | SOURCE_GATE_DIAGNOSTICS | SOURCE_GATES_STEP_DIAGNOSTICS
 )
 PRESERVED_SUMMARY_GUARD_DIAGNOSTICS = SUMMARY_GUARD_DIAGNOSTICS
 PRIVILEGE_PROBE_CHECK_DIAGNOSTICS = {
@@ -377,10 +272,10 @@ FOREIGN_CONTEXT_MODULE_TAGS = {module: tag for tag, module, unused_reasons in FO
 SUCCESS_RECEIPT_DETAILS = (
     "payload_missing", "tool_path", "input_size", "spawn", "node_exit", "output_size",
     "output_shape", "output_directory", "output_write", "output_member",
-    "expected_manifest_invalid", "reviewed_paths_invalid", "encryptor_unavailable",
+    "reviewed_paths_invalid", "encryptor_unavailable",
 ) + tuple("node_" + code for code in (
-    "credential_like_content", "envelope_rejected", "exception_expired", "invalid_cargo_lock",
-    "invalid_context", "invalid_expectation", "invalid_input", "invalid_lock_manifest",
+    "credential_like_content", "envelope_rejected", "exception_expired",
+    "invalid_context", "invalid_expectation", "invalid_input",
     "invalid_payload", "invalid_payload_bom", "invalid_payload_c0", "invalid_payload_c1",
     "invalid_payload_cr", "invalid_payload_nul", "invalid_payload_utf8",
     "invalid_recipient", "invalid_rust_patch", "limit_exceeded",
@@ -391,7 +286,7 @@ SUCCESS_RECEIPT_DIAGNOSTICS = frozenset("success_receipt_" + detail for detail i
 DIAGNOSTICS = (
     OPERATION_DIAGNOSTICS | CLEANUP_DIAGNOSTICS | SOURCE_RUNTIME_DIAGNOSTICS
     | SOURCE_FETCH_DIAGNOSTICS | SOURCE_BOOTSTRAP_DIAGNOSTICS | SOURCE_LEASE_OPEN_CLASS_DIAGNOSTICS
-    | SOURCE_GATE_DIAGNOSTICS | SOURCE_GATES_NODE_DIAGNOSTICS | SOURCE_GATES_STEP_DIAGNOSTICS
+    | SOURCE_GATE_DIAGNOSTICS | SOURCE_GATES_STEP_DIAGNOSTICS
     | SUMMARY_GUARD_DIAGNOSTICS | FOREIGN_CONTEXT_DIAGNOSTICS | SUCCESS_RECEIPT_DIAGNOSTICS | frozenset(("none", "unavailable"))
 )
 DETAILED_DIAGNOSTICS = DIAGNOSTICS - frozenset(("none", "unavailable"))
@@ -754,7 +649,7 @@ def _validate_smoke_receipt(runner_temp, binding, rust):
 def _validate_source_lease(record, request, binding, worker_uid, runtime):
     required = {
         "repository_id", "source_sha", "base_sha", "base_branch", "concern", "candidate_class",
-        "signature", "rules_lock", "tree", "source_execution", "app_build", "cleanup",
+        "signature", "tree", "source_execution", "app_build", "cleanup",
         "repository_scope", "metadata", "control_sha", "run_id", "run_attempt", "image_os",
         "image_version", "token_revocation", "signer_authority", "signatures", "ancestry",
         "revocation_policy", "worker_access",
@@ -764,20 +659,10 @@ def _validate_source_lease(record, request, binding, worker_uid, runtime):
     if set(record.keys()) != required:
         raise Refusal("source_validation_failed", "source_lease")
     expected_tree = FEEDBACK_TREE_LABELS.get(request["concern"])
-    if (request["concern"] == "core-build-diagnostic-return"
-            and record.get("tree") == LOCKED_FOUNDATION_TREE
-            and getattr(runtime, "CORE_CONTRACT_PACKAGE_LOCK_TREE", None) == LOCKED_FOUNDATION_TREE):
-        expected_tree = LOCKED_FOUNDATION_TREE
-    expected_rules_lock = "present"
-    if (request["concern"] == NPM_ADMISSION_CONCERN
-            and record.get("tree") == NPM_FIXTURE_TREE
-            and getattr(runtime, "NPM_FIXTURE_TREE", None) == NPM_FIXTURE_TREE):
-        expected_tree = NPM_FIXTURE_TREE
-        expected_rules_lock = "not-applicable"
     expected = {
         "source_sha": request["source_sha"], "base_sha": request["base_sha"],
         "base_branch": request["base_branch"], "concern": request["concern"],
-        "signature": "verified", "rules_lock": expected_rules_lock,
+        "signature": "verified",
         "tree": expected_tree,
         "source_execution": "not_run_at_yield", "app_build": "not_run", "cleanup": "lease_open",
         "repository_scope": "verified", "metadata": "verified", "control_sha": binding["control_sha"],
@@ -991,8 +876,6 @@ def _validated_fuzz_workspace(source, lease_record, runtime):
     try:
         marker_info = marker.lstat()
     except FileNotFoundError:
-        if concern == "core-node-lock-return":
-            raise Refusal("source_validation_failed", "source_validation") from None
         return False
     except OSError:
         raise Refusal("source_validation_failed", "source_validation") from None
@@ -1064,15 +947,6 @@ def _run_privilege_probe(worker_uid, home, host_toolchain, reviewed):
         if getattr(error, "reason", None) == "cleanup_incomplete":
             raise Refusal("cleanup_incomplete", "cleanup", diagnostic="worker_privilege_census") from None
         raise Refusal("runner_unavailable", "worker_setup", diagnostic="worker_privilege_census") from None
-
-
-def _npm_feedback_result(producer, error):
-    step = getattr(error, "source_gates_step", None)
-    key = getattr(error, "source_gates_key", None)
-    if (type(step) is not str or type(key) is not str or step not in NPM_DIAGNOSTIC_STEPS
-            or (step, key) not in SOURCE_GATES_STEP_DIAGNOSTICS_BY_KEY):
-        raise error
-    return producer.npm_diagnostic_result(error)
 
 
 def _run_inside_source(source, original_cwd, command):
@@ -1151,46 +1025,58 @@ def _gate_timeout_result(limit_seconds):
     return result
 
 
-def _ensure_cargo_deny_control(tools, control_sha):
-    installer = _load_control_sibling("cargo_deny_installer")
-    names = (
-        "KD_CARGO_DENY_PATH", "KD_CARGO_DENY_RECEIPT_PATH", "KD_CARGO_DENY_HOME",
-        "KD_RUSTSEC_ADVISORY_DB_PATH",
-    )
-    configured = tuple(os.environ.get(name) for name in names)
-    if any(configured) and not all(configured):
-        raise Refusal("gate_failed", "source_gates")
-    if not any(configured):
-        runner_temp = os.environ.get("RUNNER_TEMP", "")
-        if not runner_temp or not os.path.isabs(runner_temp):
-            raise Refusal("gate_failed", "source_gates")
-        root = Path(runner_temp) / "kd-rust-license-control"
-        try:
-            root.mkdir(mode=0o700)
-            deny_root = root / "cargo-deny"
-            cargo_home = root / "cargo-home"
-            executable, receipt = installer.install(deny_root)
-            database = installer.prepare_advisories(cargo_home)
-        except BaseException:
-            raise Refusal("gate_failed", "source_gates") from None
-        os.environ["KD_CARGO_DENY_PATH"] = str(executable)
-        os.environ["KD_CARGO_DENY_RECEIPT_PATH"] = str(receipt)
-        os.environ["KD_CARGO_DENY_HOME"] = str(cargo_home)
-        os.environ["KD_RUSTSEC_ADVISORY_DB_PATH"] = str(database)
-    os.environ["CI_SHA"] = control_sha
-    os.environ["RUST_ROOT"] = str(Path(tools["cargo"]).parent.parent)
+def _prepare_cargo_registry(source, environment, uid, capability, tools, deadline):
+    bootstrap = _load_control_sibling("cargo_lock_bootstrap")
     try:
-        installer.verify_installed(
-            os.environ["KD_CARGO_DENY_PATH"], os.environ["KD_CARGO_DENY_RECEIPT_PATH"],
-        )
-        installer.verify_advisory_database(os.environ["KD_RUSTSEC_ADVISORY_DB_PATH"])
-    except BaseException:
+        source_root = Path(source)
+        if not source_root.is_dir():
+            return
+        locks = []
+        for current, directories, files in os.walk(source_root, followlinks=False):
+            directories[:] = [name for name in directories
+                              if not os.path.islink(os.path.join(current, name))]
+            if "Cargo.lock" in files and "Cargo.toml" in files:
+                locks.append(Path(current) / "Cargo.toml")
+        if not locks:
+            return
+        bootstrap.refuse_cargo_config(source_root)
+        cargo_home = environment.get("CARGO_HOME")
+        if type(cargo_home) is not str or not os.path.isabs(cargo_home):
+            raise OSError
+        fetch_environment = dict(environment)
+        fetch_environment["CARGO_HOME"] = cargo_home
+        fetch_environment["CARGO_NET_OFFLINE"] = "false"
+        fetch_environment["CARGO_INCREMENTAL"] = "0"
+        for manifest in sorted(locks):
+            remaining = int(deadline - time.monotonic())
+            if remaining < 1:
+                raise subprocess.TimeoutExpired(tools["cargo"], 0)
+            subprocess.run(
+                [str(tools["cargo"]), "fetch", "--locked", "--manifest-path", str(manifest)],
+                cwd=str(source), env=fetch_environment, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+                timeout=min(900, remaining),
+            )
+        cargo_home_path = Path(cargo_home)
+        for current, directories, files in os.walk(cargo_home_path, followlinks=False):
+            for name in list(directories) + files:
+                path = Path(current) / name
+                info = path.lstat()
+                if stat.S_ISLNK(info.st_mode):
+                    raise OSError
+                os.chown(path, uid, capability.PROBE_PRIMARY_GID)
+                os.chmod(path, stat.S_IMODE(info.st_mode) & 0o777)
+        os.chown(cargo_home_path, uid, capability.PROBE_PRIMARY_GID)
+        os.chmod(cargo_home_path, 0o700)
+    except BaseException as error:
+        if getattr(error, "reason", None) == "cleanup_incomplete":
+            raise
         raise Refusal("gate_failed", "source_gates") from None
 
 
 def _run_gates(source, environment, uid, host_toolchain, capability, rust, tools, deadline,
                capture_failure=False, include_parser=False, include_runtime=False,
-               source_sha=None):
+               ):
     if (type(capture_failure) is not bool or type(include_parser) is not bool
             or type(include_runtime) is not bool):
         raise Refusal("capture_invalid", "source_gates")
@@ -1201,84 +1087,7 @@ def _run_gates(source, environment, uid, host_toolchain, capability, rust, tools
     commands = _source_commands(
         source, tools, include_parser=include_parser, include_runtime=include_runtime,
     )
-    vendor_admissions = {}
-    if source_sha is not None:
-        cargo = _load_control_sibling("cargo_lock_receipt")
-        admission = _load_control_sibling("cargo_rust_admission")
-        license_gate = _load_control_sibling("rust_license_gate")
-        for current, directories, files in os.walk(source, followlinks=False):
-            directories[:] = [name for name in directories
-                              if not os.path.islink(os.path.join(current, name))]
-            if "Cargo.lock" not in files:
-                continue
-            lock_path = Path(current) / "Cargo.lock"
-            try:
-                lock_bytes = lock_path.read_bytes()
-                parsed = cargo.parse_cargo_lock(lock_bytes)
-            except (OSError, cargo.Refusal):
-                raise Refusal("source_validation_failed", "source_validation") from None
-            registry = any(item.get("source") == cargo.REGISTRY_SOURCE
-                           for item in parsed["packages"])
-            if not registry:
-                continue
-            relative_lock = lock_path.relative_to(source).as_posix()
-            profile = Path(relative_lock).parent.as_posix()
-            try:
-                receipt_bytes, binding_bytes = admission.control_files_for_lock(
-                    os.environ.get("KD_CARGO_LOCK_EVIDENCE_DIR", ""), source, relative_lock,
-                )
-                _ensure_cargo_deny_control(tools, os.environ.get("CI_SHA", ""))
-                vendor_admissions[relative_lock] = admission.admit_lock(
-                    lock_bytes, source, source_sha, profile, receipt_bytes, binding_bytes,
-                    os.environ.get("RUNNER_TEMP", "/tmp"),
-                    str(Path(tools["cargo"]).parent.parent), license_gate.TRUSTED_PORTS,
-                )
-            except (admission.RustAdmissionRefusal, license_gate.LicenseGateRefusal):
-                raise Refusal("gate_failed", "source_gates") from None
-
-    def bind_vendor_arguments(argv):
-        actual = tuple(argv)
-        if not vendor_admissions:
-            return actual
-        if not actual or os.path.realpath(actual[0]) != os.path.realpath(str(tools["cargo"])):
-            return actual
-        manifest = None
-        try:
-            manifest = Path(actual[actual.index("--manifest-path") + 1])
-        except (ValueError, IndexError):
-            manifest = Path(source) / "Cargo.toml"
-        try:
-            parent = manifest.parent.resolve(strict=True).relative_to(Path(source).resolve(strict=True))
-        except (OSError, ValueError):
-            raise Refusal("gate_failed", "source_gates") from None
-        while True:
-            relative = (parent / "Cargo.lock").as_posix() if parent.parts else "Cargo.lock"
-            selected = vendor_admissions.get(relative)
-            if selected is not None:
-                config = selected.get("cargo_arguments")
-                flags = selected.get("required_flags")
-                if (type(config) is not list or len(config) % 2
-                        or type(flags) is not tuple or "--locked" not in flags
-                        or "--offline" not in flags):
-                    raise Refusal("gate_failed", "source_gates")
-                for position in range(0, len(config), 2):
-                    if config[position] != "--config":
-                        raise Refusal("gate_failed", "source_gates")
-                try:
-                    separator = actual.index("--")
-                except ValueError:
-                    separator = len(actual)
-                required_flags = tuple(
-                    flag for flag in ("--locked", "--offline") if flag not in actual
-                )
-                return (actual[:separator] + required_flags + tuple(config)
-                        + actual[separator:])
-            if not parent.parts:
-                break
-            parent = parent.parent
-        return actual
-
-    commands = tuple((stage, bind_vendor_arguments(argv)) for stage, argv in commands)
+    _prepare_cargo_registry(source, environment, uid, capability, tools, deadline)
     selected_gates = tuple(stage for stage, unused_argv in commands)
     expected_gates = GATE_NAMES
     if include_parser:
@@ -1349,6 +1158,269 @@ def _run_gates(source, environment, uid, host_toolchain, capability, rust, tools
     if tuple(completed) != selected_gates:
         raise Refusal("gate_failed", "receipt")
     return {name: "passed" for name in selected_gates}
+
+
+def _typescript_workspace_files(source, runtime):
+    source_files = getattr(runtime, "CORE_CONTRACT_FEEDBACK_FILES", None)
+    kernel_files = getattr(runtime, "CORE_CONTRACT_KERNEL_FEEDBACK_FILES", None)
+    if (type(source_files) is not frozenset or type(kernel_files) is not frozenset
+            or not NODE_REVIEWED_FILES.issubset(source_files | kernel_files)):
+        raise ValueError
+    package_root = source / "packages"
+    with os.scandir(package_root) as iterator:
+        package_names = sorted(entry.name for entry in iterator)
+    workspace_names = [path.rsplit("/", 1)[-1] for path in NODE_WORKSPACE_PACKAGES]
+    kit_names = [path.rsplit("/", 1)[-1] for path in NODE_UI_KIT_PACKAGES]
+    has_ui_kit = any(name in package_names for name in kit_names)
+    expected_names = sorted(workspace_names + (kit_names if has_ui_kit else []))
+    inert_names = sorted(expected_names + ["kernel-tokens"])
+    if package_names == inert_names:
+        inert = package_root / "kernel-tokens"
+        if (not stat.S_ISDIR(inert.lstat().st_mode) or inert.is_symlink()
+                or os.path.lexists(inert / "package.json")):
+            raise ValueError
+    elif package_names != expected_names:
+        raise ValueError
+
+    discovered = set()
+    for relative in NODE_WORKSPACE_PACKAGES:
+        for folder in ("src", "tests"):
+            directory = source / relative / folder
+            info = directory.lstat()
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise ValueError
+            for current, directories, names in os.walk(directory, followlinks=False):
+                if any(os.path.islink(os.path.join(current, name)) for name in directories):
+                    raise ValueError
+                for name in names:
+                    path = os.path.join(current, name)
+                    if not stat.S_ISREG(os.lstat(path).st_mode):
+                        raise ValueError
+                    discovered.add(os.path.relpath(path, source).replace(os.sep, "/"))
+    if not NODE_EXTRA_FILES.issubset(discovered):
+        raise ValueError
+    patterned = discovered - NODE_EXTRA_FILES
+    pattern_paths = getattr(runtime, "_core_contract_pattern_paths", None)
+    if not callable(pattern_paths):
+        raise ValueError
+    matched = pattern_paths(patterned)
+    selected = matched["ts_sources"] | matched["ts_tests"]
+    baseline = pattern_paths(source_files)
+    required_ts = baseline["ts_sources"] | baseline["ts_tests"]
+    if (selected != patterned
+            or len(matched["ts_sources"]) > runtime.MAX_CORE_CONTRACT_TS_SOURCES
+            or len(matched["ts_tests"]) > runtime.MAX_CORE_CONTRACT_TS_TESTS
+            or not required_ts.issubset(selected)):
+        raise ValueError
+
+    kit_selected = set()
+    if has_ui_kit:
+        kit_files = getattr(runtime, "CORE_CONTRACT_KERNEL_UI_KIT_FILES", None)
+        gated = getattr(runtime, "CORE_CONTRACT_KERNEL_UI_KIT_GATED_FILES", None)
+        if (type(kit_files) is not frozenset or type(gated) is not frozenset
+                or not gated or not gated.issubset(kit_files)):
+            raise ValueError
+        kit_discovered = set()
+        for relative in NODE_UI_KIT_PACKAGES:
+            for folder in ("src", "tests"):
+                directory = source / relative / folder
+                info = directory.lstat()
+                if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                    raise ValueError
+                for current, directories, names in os.walk(directory, followlinks=False):
+                    if any(os.path.islink(os.path.join(current, name)) for name in directories):
+                        raise ValueError
+                    for name in names:
+                        path = os.path.join(current, name)
+                        if not stat.S_ISREG(os.lstat(path).st_mode):
+                            raise ValueError
+                        kit_discovered.add(os.path.relpath(path, source).replace(os.sep, "/"))
+        if not kit_discovered.issubset(kit_files):
+            raise ValueError
+        for path in kit_files:
+            try:
+                info = (source / path).lstat()
+            except FileNotFoundError:
+                if path in gated:
+                    raise ValueError
+                continue
+            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise ValueError
+            kit_selected.add(path)
+    return tuple(sorted(NODE_REVIEWED_FILES | selected | kit_selected))
+
+
+def _typescript_failure(completed, stage, returncode=1, stdout=b"", stderr=b"TypeScript workspace check failed.\n",
+                        stdout_truncated=False, stderr_truncated=False):
+    return {
+        "completed": tuple(completed), "failed_stage": stage, "selected_gates": NODE_GATE_NAMES,
+        "returncode": returncode, "stdout": stdout, "stderr": stderr,
+        "stdout_truncated": stdout_truncated, "stderr_truncated": stderr_truncated,
+    }
+
+
+def _typescript_workspace_gates(source, worker_storage, worker_uid, environment, host_toolchain,
+                                capability, rust, deadline, node, tool_cache_root, runtime,
+                                producer):
+    completed = []
+    try:
+        files = _typescript_workspace_files(source, runtime)
+        lock_path = source / runtime.CORE_CONTRACT_PACKAGE_LOCK_PATH
+        lock_bytes = producer._read_file(
+            lock_path, maximum=runtime.MAX_CORE_CONTRACT_PACKAGE_LOCK_BYTES,
+        )
+        if not lock_bytes:
+            raise ValueError
+        node_path = Path(node).resolve(strict=True)
+        cache_root = Path(tool_cache_root).resolve(strict=True)
+        node_root = (cache_root / "node" / producer.NODE_VERSION).resolve(strict=True)
+        npm_path = node_path.parent.parent / "lib/node_modules/npm/bin/npm-cli.js"
+        npm_info = npm_path.lstat()
+        if (node_root not in node_path.parents or not npm_path.is_file() or npm_path.is_symlink()
+                or not stat.S_ISREG(npm_info.st_mode) or npm_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+            raise ValueError
+        worker_gid = getattr(capability, "PROBE_PRIMARY_GID", None)
+        if type(worker_gid) is not int or worker_gid <= 0:
+            raise ValueError
+        root = Path(worker_storage)
+        storage = root / "typescript-workspace"
+        producer._make_worker_directory(storage, worker_uid, worker_gid)
+        project = storage / "project"
+        producer._copy_reviewed_files(source, project, files, worker_uid, worker_gid)
+        producer._write_worker_file(
+            project / runtime.CORE_CONTRACT_PACKAGE_LOCK_PATH, lock_bytes, worker_uid, worker_gid,
+        )
+        for name in ("node-home", "node-tmp", "node-cache"):
+            producer._make_worker_directory(storage / name, worker_uid, worker_gid)
+        user_config = storage / "npm-user-empty.npmrc"
+        global_config = storage / "npm-global-empty.npmrc"
+        producer._write_worker_file(user_config, b"\n", worker_uid, worker_gid)
+        producer._write_worker_file(global_config, b"\n", worker_uid, worker_gid)
+        node_environment = {
+            "PATH": str(node_path.parent) + ":/usr/bin:/bin:/usr/sbin:/sbin",
+            "HOME": str(storage / "node-home"), "TMPDIR": str(storage / "node-tmp"),
+            "LANG": "C", "LC_ALL": "C", "CI": "true",
+            "npm_config_cache": str(storage / "node-cache"),
+            "npm_config_registry": "https://registry.npmjs.org/",
+            "npm_config_userconfig": str(user_config),
+            "npm_config_globalconfig": str(global_config),
+            "npm_config_ignore_scripts": "true", "npm_config_audit": "false",
+            "npm_config_fund": "false", "npm_config_fetch_retries": "0",
+            "npm_config_fetch_timeout": "30000", "npm_config_update_notifier": "false",
+        }
+        reviewed = _load_control_sibling("macos_reviewed_build")
+
+        def command(stage, argv, timeout, expected_stdout=None):
+            if time.monotonic() >= deadline:
+                return _typescript_failure(completed, stage, 124)
+            run_error = None
+            result = None
+            original_cwd = Path.cwd()
+            try:
+                os.chdir(project)
+                result = rust._run_worker_command(
+                    argv, worker_uid, node_environment, host_toolchain["python"], capability,
+                    stage=stage, deadline=deadline, timeout=timeout, allow_nonzero_capture=True,
+                )
+            except BaseException as error:
+                run_error = error
+            finally:
+                try:
+                    os.chdir(original_cwd)
+                except BaseException:
+                    raise Refusal("cleanup_incomplete", "cleanup", diagnostic="source_gates_restore") from None
+            try:
+                reviewed._worker_census(worker_uid, host_toolchain["python"], stage)
+            except BaseException as error:
+                raise Refusal("cleanup_incomplete", "cleanup", diagnostic=_gate_census_diagnostic(error)) from None
+            if run_error is not None:
+                if getattr(run_error, "reason", None) == "cleanup_incomplete":
+                    raise Refusal("cleanup_incomplete", "cleanup", diagnostic=_gate_cleanup_diagnostic(run_error)) from None
+                return _typescript_failure(completed, stage)
+            if (type(result.returncode) is not int or type(result.stdout) is not bytes
+                    or type(result.stderr) is not bytes or len(result.stdout) > MAX_CAPTURE_BYTES
+                    or len(result.stderr) > MAX_CAPTURE_BYTES):
+                raise Refusal("capture_invalid", stage)
+            stdout_truncated = bool(getattr(result, "stdout_truncated", False))
+            stderr_truncated = bool(getattr(result, "stderr_truncated", False))
+            stdout = result.stdout
+            stderr = result.stderr
+            if len(stdout) > 32_768:
+                stdout = producer._trim_incomplete_utf8(stdout[:32_768])
+                stdout_truncated = True
+            if len(stderr) > 32_768:
+                stderr = producer._trim_incomplete_utf8(stderr[:32_768])
+                stderr_truncated = True
+            expected_ok = expected_stdout is None or (stdout == expected_stdout and not stderr)
+            if result.returncode != 0 or not expected_ok:
+                return _typescript_failure(
+                    completed, stage, result.returncode if result.returncode != 0 else 1,
+                    stdout, stderr if stderr else b"Node toolchain version mismatch.\n",
+                    stdout_truncated, stderr_truncated,
+                )
+            return None
+
+        node_check = command("node_dependency_prepare", (str(node_path), "--version"), 10,
+                             ("v" + producer.NODE_VERSION + "\n").encode("ascii"))
+        if node_check is not None:
+            return node_check
+        npm_check = command("node_dependency_prepare", (str(node_path), str(npm_path), "--version"), 10,
+                            (NODE_NPM_VERSION + "\n").encode("ascii"))
+        if npm_check is not None:
+            return npm_check
+        ci = command(
+            "node_dependency_prepare",
+            (str(node_path), str(npm_path), "ci", "--workspaces=true", "--include-workspace-root", "--ignore-scripts"),
+            MAX_TEST_COMMAND_SECONDS,
+        )
+        if ci is not None:
+            return ci
+        if producer._read_worker_file(
+                project / runtime.CORE_CONTRACT_PACKAGE_LOCK_PATH,
+                worker_uid, runtime.MAX_CORE_CONTRACT_PACKAGE_LOCK_BYTES,
+        ) != lock_bytes:
+            return _typescript_failure(completed, "node_dependency_prepare")
+        completed.append("node_dependency_prepare")
+        for stage, script in (("typescript_typecheck", "typecheck"), ("typescript_tests", "test")):
+            result = command(
+                stage, (str(node_path), str(npm_path), "run", script, "--workspaces", "--ignore-scripts"),
+                MAX_TEST_COMMAND_SECONDS,
+            )
+            if result is not None:
+                return result
+            completed.append(stage)
+        return {
+            "completed": tuple(completed), "failed_stage": None, "selected_gates": NODE_GATE_NAMES,
+            "returncode": 0, "stdout": b"", "stderr": b"",
+            "stdout_truncated": False, "stderr_truncated": False,
+        }
+    except BaseException as error:
+        if getattr(error, "reason", None) == "cleanup_incomplete":
+            raise
+        return _typescript_failure(completed, "node_dependency_prepare")
+
+
+def _extend_build_diagnostic_outcome(rust_outcome, node_outcome):
+    if (type(rust_outcome) is not dict or type(rust_outcome.get("selected_gates")) is not tuple
+            or type(rust_outcome.get("completed")) is not tuple):
+        raise Refusal("capture_invalid", "source_gates")
+    selected = rust_outcome["selected_gates"] + NODE_GATE_NAMES
+    if rust_outcome.get("failed_stage") is not None:
+        return {**rust_outcome, "selected_gates": selected}
+    if (type(node_outcome) is not dict or node_outcome.get("selected_gates") != NODE_GATE_NAMES
+            or type(node_outcome.get("completed")) is not tuple):
+        raise Refusal("capture_invalid", "source_gates")
+    if node_outcome.get("failed_stage") is not None:
+        return {
+            **node_outcome,
+            "selected_gates": selected,
+            "completed": rust_outcome["completed"] + node_outcome["completed"],
+        }
+    return {
+        "completed": selected, "failed_stage": None, "selected_gates": selected,
+        "returncode": 0, "stdout": b"", "stderr": b"",
+        "stdout_truncated": False, "stderr_truncated": False,
+    }
 
 
 def _success_gate_names(gates):
@@ -1538,27 +1610,6 @@ def _make_directory(prefix, mode):
         raise Refusal("runner_unavailable", "worker_setup") from None
 
 
-def _node_refusal_diagnostic(error):
-    try:
-        if type(error).__name__ != "NodeContractRefusal":
-            return None
-        reason = getattr(error, "reason", None)
-        substage = getattr(error, "substage", None)
-        command_check = getattr(error, "command_check", None)
-        if type(reason) is not str or (substage is not None and type(substage) is not str):
-            return None
-        label = "none" if substage is None else substage
-        if reason == "command_failed" and type(command_check) is str:
-            candidate = "source_gates_node_" + label + "_command_" + command_check
-        else:
-            candidate = "source_gates_node_" + label + "_" + reason
-        if candidate in SOURCE_GATES_NODE_DIAGNOSTICS:
-            return candidate
-    except BaseException:
-        pass
-    return None
-
-
 def _tag_source_gates_step(error, step, key):
     """Record which source_gates step an exception came from. The first tag wins; a tag that cannot
     be set only costs the specific diagnostic, never the refusal."""
@@ -1590,28 +1641,11 @@ def _toolchain_refusal(error, stage):
         if type(diagnostic) is str and diagnostic in SOURCE_GATES_CLEANUP_DIAGNOSTICS:
             return Refusal("cleanup_incomplete", "cleanup", diagnostic=diagnostic)
         return Refusal("cleanup_incomplete", "cleanup")
-    node_diagnostic = None
-    node_stage = None
-    if stage == "worker_setup":
-        node_diagnostic = _node_refusal_diagnostic(error)
-        if node_diagnostic is None:
-            node_diagnostic = _source_gates_step_diagnostic(error)
-        elif node_diagnostic in SOURCE_GATES_NODE_DIAGNOSTIC_STAGES:
-            node_stage = SOURCE_GATES_NODE_DIAGNOSTIC_STAGES[node_diagnostic]
-            if getattr(error, "stage", None) != node_stage:
-                node_diagnostic = None
-                node_stage = None
-    expected_reason = None
-    if node_diagnostic is not None:
-        expected_reason = SOURCE_GATES_NODE_DIAGNOSTIC_REASONS.get(
-            node_diagnostic, SOURCE_GATES_STEP_DIAGNOSTIC_REASONS.get(node_diagnostic),
-        )
+    source_diagnostic = _source_gates_step_diagnostic(error) if stage == "worker_setup" else None
+    expected_reason = SOURCE_GATES_STEP_DIAGNOSTIC_REASONS.get(source_diagnostic)
     if reason == "capture_invalid":
         if expected_reason == "capture_invalid":
-            return Refusal(
-                "capture_invalid", stage if node_stage is None else node_stage,
-                diagnostic=node_diagnostic,
-            )
+            return Refusal("capture_invalid", stage, diagnostic=source_diagnostic)
         return Refusal("capture_invalid", stage)
     if reason == "version_mismatch":
         return Refusal("toolchain_version_mismatch", "toolchain_install")
@@ -1624,15 +1658,12 @@ def _toolchain_refusal(error, stage):
     if stage == "toolchain_install":
         return Refusal("toolchain_install_failed", "toolchain_install")
     if expected_reason == "runner_unavailable":
-        return Refusal(
-            "runner_unavailable", "worker_setup" if node_stage is None else node_stage,
-            diagnostic=node_diagnostic,
-        )
+        return Refusal("runner_unavailable", stage, diagnostic=source_diagnostic)
     return Refusal("runner_unavailable", "worker_setup")
 
 
 def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha256, deadline, lifecycle,
-                feedback=None, workspace_selector="contract"):
+                feedback=None):
     reviewed, capability, runtime, rust, rules = controls
     host_toolchain = None
     worker_tools = None
@@ -1739,7 +1770,6 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
         lease_context = runtime.validated_source(
             request, binding, root, environ, worker_uid=worker_uid,
             storage_root=lease_storage, revocation_state=revocation_state,
-            workspace_selector=workspace_selector,
         )
         command_failure = None
         observer_failure = None
@@ -1760,7 +1790,7 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                 phase = "source_tree"
                 operation = "source_path_validation"
                 source = _validate_source_path(
-                    lease.source_path, lease_storage, fixture=lease_record["tree"] == NPM_FIXTURE_TREE,
+                    lease.source_path, lease_storage, fixture=False,
                 )
                 operation = "source_tree_probe"
                 rules._run_tree_probe(source, worker_uid, home, host_toolchain, capability)
@@ -1823,7 +1853,6 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                             source, environment, worker_uid, host_toolchain, capability, rust,
                             toolchain_paths.command_paths(), deadline,
                             include_runtime=runtime_workspace_present,
-                            source_sha=lease_record["source_sha"],
                         ),
                     )
                 else:
@@ -1841,27 +1870,16 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                                 source, environment, worker_uid, host_toolchain, capability, rust,
                                 toolchain_paths.command_paths(), deadline, capture_failure=True,
                                 include_parser=validated_fuzz_workspace,
-                                source_sha=lease_record["source_sha"],
                             ),
                         )
-                        if lease_record["tree"] == LOCKED_FOUNDATION_TREE:
-                            adapter = _load_control_sibling("foundation_node_feedback")
-                            contract = _load_control_sibling("macos_node_contract")
-                            outcome = adapter.extend_diagnostic_outcome(
-                                outcome,
-                                lambda: adapter.run_node_profile(
-                                    "verify", dispatch=feedback["dispatch"], source=source,
-                                    worker_storage=worker_storage, worker_uid=worker_uid,
-                                    environment=environment, host_toolchain=host_toolchain,
-                                    capability=capability, rust=rust, deadline=deadline,
-                                    node=feedback["node"], npm_cli=feedback["npm_cli"],
-                                    contract=contract, producer=producer, source_runtime=runtime,
-                                    tool_cache_root=feedback["tool_cache_root"],
-                                    accepted_provenance=feedback.get("accepted_node_provenance"),
-                                    validated_tree=lease_record["tree"],
-                                ),
-                                contract,
+                        node_outcome = None
+                        if outcome["failed_stage"] is None:
+                            node_outcome = _typescript_workspace_gates(
+                                source, worker_storage, worker_uid, environment, host_toolchain,
+                                capability, rust, deadline, feedback["node"],
+                                feedback["tool_cache_root"], runtime, producer,
                             )
+                        outcome = _extend_build_diagnostic_outcome(outcome, node_outcome)
                         try:
                             diagnostic_payload = producer.build_diagnostic_payload(outcome)
                         except BaseException as payload_error:
@@ -1871,59 +1889,9 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                             raise
                         feedback_result = {
                             "payload_bytes": diagnostic_payload,
-                            "expected_manifest": None, "reviewed_rust_paths": None,
+                            "reviewed_rust_paths": None,
                             "source_result": "gate_failure" if outcome["failed_stage"] else "all_gates_completed",
                         }
-                    elif feedback["profile"]["kind"] == "lock":
-                        adapter = _load_control_sibling("foundation_node_feedback")
-                        node_result = adapter.run_node_profile(
-                            "bootstrap", dispatch=feedback["dispatch"], source=source,
-                            worker_storage=worker_storage, worker_uid=worker_uid,
-                            environment=environment, host_toolchain=host_toolchain,
-                            capability=capability, rust=rust, deadline=deadline,
-                            node=feedback["node"], npm_cli=feedback["npm_cli"],
-                            contract=_load_control_sibling("macos_node_contract"),
-                            producer=producer, source_runtime=runtime,
-                            tool_cache_root=feedback["tool_cache_root"],
-                            validated_tree=lease_record["tree"],
-                        )
-                        feedback_result = {
-                            "payload_bytes": node_result["lock_bytes"],
-                            "expected_manifest": producer._expected_manifest(source),
-                            "reviewed_rust_paths": None, "source_result": "command_completed",
-                        }
-                    elif feedback["profile"]["kind"] == "cargo_lock":
-                        admitted_selector = getattr(lease, "workspace_selector", None)
-                        requested_selector = producer.feedback_request.request_workspace(
-                            feedback["dispatch"]["request"],
-                        )
-                        if admitted_selector != requested_selector:
-                            raise Refusal("source_binding_mismatch", "source_lease")
-                        feedback_result = _run_inside_source(
-                            source,
-                            original_cwd,
-                            lambda: producer.run_cargo_lock_profile(
-                                feedback["dispatch"], source, worker_storage, worker_uid, environment,
-                                toolchain_paths.command_paths(), host_toolchain, capability, rust,
-                                deadline, _load_control_sibling("cargo_lock_bootstrap"), environ,
-                                admitted_workspace_selector=admitted_selector,
-                            ),
-                        )
-                    elif feedback["profile"]["kind"] == "npm_admission":
-                        try:
-                            feedback_result = _run_inside_source(
-                                source,
-                                original_cwd,
-                                lambda: producer.run_npm_admission_profile(
-                                    feedback["dispatch"], source, worker_storage, worker_uid, environment,
-                                    host_toolchain, capability, rust, deadline,
-                                    _load_control_sibling("npm_admission_bootstrap"),
-                                    _load_control_sibling("macos_node_contract"),
-                                    feedback["node"], feedback["npm_cli"], environ,
-                                ),
-                            )
-                        except producer.FeedbackRefusal as npm_error:
-                            feedback_result = _npm_feedback_result(producer, npm_error)
                     else:
                         feedback_result = _run_inside_source(
                             source,
@@ -1931,7 +1899,7 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                             lambda: producer.run_source_profile(
                                 feedback["dispatch"], source, worker_storage, worker_uid, environment,
                                 toolchain_paths.command_paths(), host_toolchain, capability, rust,
-                                reviewed, deadline, feedback["node"], feedback.get("npm_cli"),
+                                reviewed, deadline, feedback["node"],
                                 validated_fuzz_workspace=validated_fuzz_workspace,
                             ),
                         )
@@ -2144,16 +2112,13 @@ def _execute(arguments, environ, token_reference, lifecycle, feedback_kind=None)
     operation = "load_controls"
     try:
         started = time.monotonic()
-        deadline = started + (
-            NPM_ADMISSION_TOTAL_SECONDS if feedback_kind == "npm_admission" else MAX_TOTAL_SECONDS
-        )
+        deadline = started + MAX_TOTAL_SECONDS
         controls = _load_controls()
         reviewed, capability, boundary, runtime, rust, rules = controls
         operation = "arguments"
         request = _parse_arguments(arguments)
         feedback = None
         feedback_producer = None
-        workspace_selector = "contract"
         if feedback_kind is not None:
             feedback_producer = _load_control_sibling("macos_feedback_producer")
             try:
@@ -2163,10 +2128,6 @@ def _execute(arguments, environ, token_reference, lifecycle, feedback_kind=None)
                        for name in ("source_sha", "base_sha", "base_branch")):
                     raise ValueError
                 request["concern"] = dispatch["profile"]["concern"]
-                if dispatch["profile"]["kind"] == "cargo_lock":
-                    workspace_selector = feedback_producer.feedback_request.request_workspace(
-                        dispatch["request"],
-                    )
                 feedback = {"profile": dispatch["profile"], "dispatch": dispatch}
             except feedback_producer.FeedbackRefusal:
                 raise Refusal("invalid_input", "arguments") from None
@@ -2189,34 +2150,13 @@ def _execute(arguments, environ, token_reference, lifecycle, feedback_kind=None)
         smoke_versions = _validate_smoke_receipt(runner_temp, binding, rust)
         if feedback is not None:
             operation = "toolchain_node"
-            provenance_oversize = False
             try:
-                node, npm_cli = feedback_producer.resolve_node(
-                    environ,
-                    require_npm=feedback["profile"]["kind"] in ("lock", "build_diagnostics", "npm_admission"),
-                )
+                node = feedback_producer.resolve_node(environ)
                 feedback["node"] = node
-                feedback["npm_cli"] = npm_cli
                 feedback["tool_cache_root"] = environ.get("RUNNER_TOOL_CACHE", "")
-                provenance = environ.get("CORE_CONTRACT_ACCEPTED_NODE_LOCK_JSON", "")
-                if provenance:
-                    if feedback["profile"]["kind"] != "build_diagnostics":
-                        raise ValueError
-                    encoded = provenance.encode("utf-8")
-                    if len(encoded) > ACCEPTED_NODE_PROVENANCE_MAX_BYTES:
-                        provenance_oversize = True
-                        raise ValueError
-                    parsed = feedback_producer._strict_json(encoded, ACCEPTED_NODE_PROVENANCE_MAX_BYTES)
-                    if type(parsed) is not dict:
-                        raise ValueError
-                    feedback["accepted_node_provenance"] = parsed
             except feedback_producer.FeedbackRefusal:
                 raise Refusal("runner_unavailable", "worker_setup") from None
             except BaseException:
-                if provenance_oversize:
-                    raise Refusal(
-                        "runner_unavailable", "worker_setup", diagnostic=ACCEPTED_NODE_PROVENANCE_OVERSIZE,
-                    ) from None
                 raise Refusal("runner_unavailable", "worker_setup") from None
         operation = "token_input"
         if type(token_reference) is not str or TOKEN_RE.fullmatch(token_reference) is None:
@@ -2228,7 +2168,7 @@ def _execute(arguments, environ, token_reference, lifecycle, feedback_kind=None)
             lease_record, versions, gates, network_captured, summary_guard_passed = _run_source(
                 request, binding, root, runner_temp, environ,
                 (reviewed, capability, runtime, rust, rules), diff_sha256, deadline, lifecycle,
-                feedback=feedback, workspace_selector=workspace_selector,
+                feedback=feedback,
             )
         finally:
             lifecycle.pop("token_reference", None)
@@ -2243,8 +2183,6 @@ def _execute(arguments, environ, token_reference, lifecycle, feedback_kind=None)
             payload = receipt.encode("ascii", "strict")
             if len(payload) > MAX_RECEIPT_BYTES:
                 raise Refusal("capture_invalid", "receipt")
-            if type(gates) is dict and gates.get("npm_diagnostic") is not None:
-                lifecycle["npm_diagnostic"] = gates["npm_diagnostic"]
             return payload
         record = _build_success_record(binding, request, lease_record, diff_sha256, versions, gates)
         _validate_success_record(
@@ -2361,11 +2299,6 @@ def main(arguments=None, environ=None, stdin=None, stdout=None, feedback_kind=No
     if (pending_tokens
             and lifecycle.get("token_revocation") == "confirmed_before_execution"):
         error_stream.write("KD-PRODUCER-TOKEN-REVOCATION confirmed\n")
-    diagnostic = lifecycle.get("npm_diagnostic")
-    if (feedback_kind == "npm_admission" and type(diagnostic) is tuple and len(diagnostic) == 2
-            and all(type(part) is str for part in diagnostic) and diagnostic[0] in NPM_DIAGNOSTIC_STEPS
-            and diagnostic in SOURCE_GATES_STEP_DIAGNOSTICS_BY_KEY):
-        error_stream.write(NPM_DIAGNOSTIC_LINE_PREFIX + diagnostic[0] + " reason=" + diagnostic[1] + "\n")
     return 0
 
 

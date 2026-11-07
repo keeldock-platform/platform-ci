@@ -86,17 +86,13 @@ OWNER_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
 REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
 FINGERPRINT_PATTERN = re.compile(r"SHA256:[A-Za-z0-9+/]{43}\Z")
 BRANCHES = frozenset(("main", "develop", "uat"))
-CORE_RUST_BOOTSTRAP_BASE_BRANCH = "plan/core-contract-batch4"
-CORE_RUST_BOOTSTRAP_BASE_SHA = "8296d2977a204edd2eafc06ed9e3280bf5480cbf"
 FEEDBACK_PROFILE_CONCERNS = frozenset((
-    "core-node-lock-return",
     "core-rust-format-return",
     "core-build-diagnostic-return",
-    "core-rust-lock-return",
-    "core-npm-admission-return",
 ))
 CORE_CONTRACT_CONCERNS = frozenset(("core-contract",)) | FEEDBACK_PROFILE_CONCERNS
-SOURCE_DESCENDANT_CONCERNS = frozenset(("rules-bootstrap",)) | CORE_CONTRACT_CONCERNS
+SOURCE_DESCENDANT_CONCERNS = CORE_CONTRACT_CONCERNS
+WORKER_SOURCE_CONCERNS = frozenset(("rules-bootstrap",)) | CORE_CONTRACT_CONCERNS
 CONCERNS = frozenset(("core-bootstrap", "rules-bootstrap")) | CORE_CONTRACT_CONCERNS
 REASONS = frozenset((
     "invalid_input",
@@ -130,9 +126,6 @@ CORE_BOOTSTRAP_CHECKS = frozenset((
     "required_files",
     "path_mode",
     "base_policy",
-    "rules_manifest",
-    "rules_inventory",
-    "rules_hash",
     "workspace_decode",
     "workspace_members",
     "cargo_lock_decode",
@@ -151,14 +144,11 @@ SOURCE_REPOSITORY_ID_ENV = "SOURCE_REPOSITORY_ID"
 SOURCE_REPOSITORY_OWNER_ENV = "SOURCE_REPOSITORY_OWNER"
 SOURCE_REPOSITORY_NAME_ENV = "SOURCE_REPOSITORY_NAME"
 SOURCE_CANDIDATE_REF_ENV = "SOURCE_CANDIDATE_REF"
-RULES_BOOTSTRAP_SOURCE_GATE_ENV = "RULES_BOOTSTRAP_ALLOWED_SHA"
-RULES_BOOTSTRAP_CONTROL_GATE_ENV = "RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA"
 CORE_CONTRACT_SOURCE_GATE_ENV = "CORE_CONTRACT_ALLOWED_SHA"
 CORE_CONTRACT_CONTROL_GATE_ENV = "CORE_CONTRACT_ALLOWED_CONTROL_SHA"
 REVOCATION_INVENTORY = "ci/revoked-signer-fingerprints"
 SIGNER_PATH_PARTS = ("docs", "commit-signers")
 RULES_DIRECTORY = chr(46) + "claude"
-RULES_LOCK_PATH = RULES_DIRECTORY + "/shared.lock"
 CORE_CONTRACT_CRATE_ROOTS = (
     ("crates", "host", "api"),
     ("crates", "host", "mock"),
@@ -185,8 +175,8 @@ CORE_CONTRACT_ROOT_FILES = frozenset((
     "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml", "clippy.toml",
 ))
 CORE_CONTRACT_PACKAGE_LOCK_PATH = "package-lock.json"
-CORE_CONTRACT_PACKAGE_LOCK_TREE = "core_build_diagnostic_return_with_package_lock"
-MAX_FEEDBACK_LOCK_BYTES = 4 * 1024 * 1024 - 64 * 1024
+CORE_CONTRACT_PACKAGE_LOCK_TREE = "core_build_diagnostic_return"
+MAX_CORE_CONTRACT_PACKAGE_LOCK_BYTES = 4 * 1024 * 1024 - 64 * 1024
 CORE_CONTRACT_PACKAGE_FILES = frozenset(("Cargo.toml", "README.md", "CONTRACT.md", "CHANGELOG.md"))
 CORE_CONTRACT_FEEDBACK_FILES = frozenset((
     ".node-version",
@@ -247,39 +237,9 @@ CORE_CONTRACT_KERNEL_FEEDBACK_FILES = frozenset((
 CORE_CONTRACT_WORKSPACE_MEMBERS_PATTERN = re.compile(r"(?m)^members\s*=\s*\[([^\]]*)\]\s*$")
 CORE_CONTRACT_WORKSPACE_MEMBER_PATTERN = re.compile(r'\s*"([A-Za-z0-9/_-]{1,128})"\s*(?:,|\Z)')
 CORE_CONTRACT_PACKAGE_LOCK_CONCERNS = frozenset((
-    "core-build-diagnostic-return", "core-rust-format-return", "core-npm-admission-return",
+    "core-build-diagnostic-return", "core-rust-format-return",
 ))
-CORE_CONTRACT_NPM_ADMISSION_CONCERN = "core-npm-admission-return"
-CORE_CONTRACT_NPM_REQUEST_PATH = re.compile(
-    r"docs/dependencies/[a-z][a-z0-9]*(?:[-.][a-z0-9]+)*\.(?:md|json)\Z"
-)
 CORE_CONTRACT_NPM_POLICY_PATH = "dependency-policy.json"
-NPM_FIXTURE_REPOSITORY_ID_ENV = "NPM_FIXTURE_REPOSITORY_ID"
-NPM_FIXTURE_TREE = "npm_fixture_admission_return"
-NPM_FIXTURE_REQUEST_PATH = "docs/dependencies/quick-fixture.md"
-NPM_FIXTURE_NPM_MATERIAL = frozenset((
-    ".node-version", ".npmrc", "package.json", CORE_CONTRACT_NPM_POLICY_PATH,
-    NPM_FIXTURE_REQUEST_PATH, CORE_CONTRACT_PACKAGE_LOCK_PATH,
-    "packages/host-api/package.json", "packages/kernel-i18n/package.json",
-))
-NPM_FIXTURE_REQUIRED_FILES = frozenset((
-    ".node-version", ".npmrc", "package.json", CORE_CONTRACT_NPM_POLICY_PATH,
-    NPM_FIXTURE_REQUEST_PATH, "packages/host-api/package.json",
-    "packages/kernel-i18n/package.json", "docs/commit-signers",
-    "Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
-    "crates/host/api/Cargo.toml", "crates/host/conformance/Cargo.toml",
-    "crates/host/mock/Cargo.toml",
-))
-NPM_FIXTURE_FILES = NPM_FIXTURE_NPM_MATERIAL | NPM_FIXTURE_REQUIRED_FILES | frozenset((
-    "LICENSE", "README.md",
-    "crates/host/api/src/lib.rs", "crates/host/conformance/src/lib.rs",
-    "crates/host/mock/src/lib.rs",
-    "fuzz/Cargo.lock", "fuzz/Cargo.toml", "fuzz/src/main.rs",
-    "packages/host-api/src/index.ts", "packages/host-api/tests/smoke.mjs",
-    "packages/host-api/tsconfig.json",
-    "packages/kernel-i18n/src/index.ts", "packages/kernel-i18n/tests/smoke.mjs",
-    "packages/kernel-i18n/tsconfig.json",
-))
 CORE_CONTRACT_INERT_DEPENDENCY_FILES = frozenset((
     CORE_CONTRACT_NPM_POLICY_PATH, "docs/dependencies/dependency-policy.schema.json",
 ))
@@ -368,9 +328,7 @@ CORE_CONTRACT_INERT_DEPENDENCY_NOTE_PATH = re.compile(
     r"docs/dependencies/[a-z][a-z0-9]*(?:[-.][a-z0-9]+)*\.md\Z"
 )
 CORE_CONTRACT_BUILD_DIAGNOSTIC_CONCERN = "core-build-diagnostic-return"
-CORE_CONTRACT_BUILD_FILE_CONCERNS = frozenset((
-    CORE_CONTRACT_BUILD_DIAGNOSTIC_CONCERN, CORE_CONTRACT_NPM_ADMISSION_CONCERN,
-))
+CORE_CONTRACT_BUILD_FILE_CONCERNS = frozenset((CORE_CONTRACT_BUILD_DIAGNOSTIC_CONCERN,))
 CORE_CONTRACT_BUILD_DATA_FILES = frozenset((
     "crates/host/api/src/entitlements/key_register.tsv",
     "crates/host/api/tests/fixtures/entitlement-key-register.ids",
@@ -469,20 +427,16 @@ CORE_CONTRACT_MANIFEST_ASSIGNMENT_PATTERN = re.compile(r"([A-Za-z0-9_.-]{1,64})\
 CORE_CONTRACT_MANIFEST_NAME_PATTERN = re.compile(r'"[a-z][a-z0-9]*(?:-[a-z0-9]+)*"\Z')
 CORE_CONTRACT_MANIFEST_TEXT_PATTERN = re.compile(r'"[A-Za-z0-9 ,.:()-]{1,256}"\Z')
 CORE_CONTRACT_MANIFEST_WORKSPACE_VALUE_PATTERN = re.compile(r"\{\s*workspace\s*=\s*true\s*\}\Z")
-CORE_CONTRACT_MANIFEST_EXTERNAL_DEPENDENCIES = {
-    "serde": re.compile(
-        r'\{\s*version\s*=\s*"=1\.0\.229"\s*,\s*default-features\s*=\s*false\s*,\s*'
-        r'features\s*=\s*\[\s*"derive"\s*,\s*"std"\s*\]\s*\}\Z'
-    ),
-    "serde_json": re.compile(
-        r'\{\s*version\s*=\s*"=1\.0\.154"\s*,\s*default-features\s*=\s*false\s*,\s*'
-        r'features\s*=\s*\[\s*"std"\s*\]\s*\}\Z'
-    ),
-    "schemars": re.compile(
-        r'\{\s*version\s*=\s*"=1\.2\.3"\s*,\s*default-features\s*=\s*false\s*,\s*'
-        r'features\s*=\s*\[\s*"derive"\s*,\s*"std"\s*\]\s*\}\Z'
-    ),
-}
+CORE_CONTRACT_MANIFEST_DEPENDENCY_NAME_PATTERN = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z"
+)
+CORE_CONTRACT_MANIFEST_PINNED_REGISTRY_VALUE_PATTERN = re.compile(
+    r'"=(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)'
+    r'(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?"\Z'
+    r'|\{[^{}\r\n]{0,500}version\s*=\s*"=(?:0|[1-9][0-9]*)\.'
+    r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)'
+    r'(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?"[^{}\r\n]*\}\Z'
+)
 CORE_CONTRACT_ROOT_PATH_DEPENDENCIES = {
     "keeldock" "-host-api": "crates/host/api",
     "keeldock" "-host-mock": "crates/host/mock",
@@ -553,44 +507,12 @@ CORE_CONTRACT_FUZZ_CORPUS_PATH = re.compile(
 )
 CORE_CONTRACT_TREE_BY_CONCERN = {
     "core-contract": "core_contract",
-    "core-node-lock-return": "core_node_lock_return",
     "core-rust-format-return": "core_rust_format_return",
     "core-build-diagnostic-return": "core_build_diagnostic_return",
-    "core-rust-lock-return": "core_rust_lock_return",
-    "core-npm-admission-return": "core_npm_admission_return",
 }
-CORE_CONTRACT_RULES_TAG_PATTERN = re.compile(r"tag v(?:2\.0\.0|3\.0\.0|4\.0\.0)\Z")
 CORE_CONTRACT_RUST_POLICY_FILES = frozenset((
     "deny.toml", "dependency-policy.toml", "supply-chain/audits.toml",
     "supply-chain/config.toml", "supply-chain/imports.lock",
-))
-CORE_CONTRACT_RUST_POLICY_OBJECTS = {
-    "deny.toml": "4d42231927ec45b0fec267d689956dd3a8416076",
-    "dependency-policy.toml": "aa07796b200eece7b6ae79e9fd42dd6ad8d9200d",
-    "supply-chain/audits.toml": "a19ea474cabfb9c36200e799072c2822eb391f1a",
-    "supply-chain/config.toml": "b1c3c53dde85ac5a423e4079d0551c56ac73d64a",
-    "supply-chain/imports.lock": "97800a9d48c227190f29d740c4c84fec5395cfcd",
-}
-CORE_CONTRACT_RUST_BOOTSTRAP_LOCK_OBJECT = "b589a4bd0c7b1d6d339658d7bbc57dd3ca89e53b"
-CORE_CONTRACT_RULES_V2_LOCK_OBJECT = "685ad6816eac9355b4578105fcf4b7c7b9c69304"
-CORE_CONTRACT_RULES_V3_LOCK_OBJECT = "567fdb4063a720109005e63949cdc14e21f4e82c"
-CORE_CONTRACT_RULES_V3_CHANGED_PATHS = frozenset((
-    "AGENTS.md", RULES_LOCK_PATH,
-    RULES_DIRECTORY + "/rules/shared/agents-and-orchestration.md",
-    RULES_DIRECTORY + "/rules/shared/ci-and-admission.md",
-    RULES_DIRECTORY + "/rules/shared/rust.md",
-    RULES_DIRECTORY + "/rules/shared/source-execution-confinement.md",
-    RULES_DIRECTORY + "/rules/shared/supply-chain.md",
-))
-CORE_CONTRACT_RULES_V4_LOCK_OBJECT = "ea502d669da414b7180fddb1796cec2828e69561"
-CORE_CONTRACT_RULES_V4_ADDED_RULE = RULES_DIRECTORY + "/rules/node-test-processes.md"
-CORE_CONTRACT_RULES_V4_ADDED_RULE_OBJECT = "7999d4144d72bef6c0a31c73d993809cfbb8f2af"
-CORE_CONTRACT_RULES_V4_CHANGED_PATHS = frozenset((
-    RULES_LOCK_PATH,
-    CORE_CONTRACT_RULES_V4_ADDED_RULE,
-    RULES_DIRECTORY + "/rules/shared/agents-and-orchestration.md",
-    RULES_DIRECTORY + "/rules/shared/ci-and-admission.md",
-    RULES_DIRECTORY + "/rules/shared/source-execution-confinement.md",
 ))
 CORE_CONTRACT_REPOSITORY_RULE_PATTERN = re.compile(
     re.escape(RULES_DIRECTORY) + r"/rules/([a-z][a-z0-9]*(?:-[a-z0-9]+)*)\.md\Z"
@@ -644,13 +566,6 @@ RUNTIME_BATCH_SEVEN_DOC_FILES = frozenset(("README.md", "CONTRACT.md", "CHANGELO
 RUNTIME_HOST_API_POLICY_API_PACKAGE = "keeldock" + "-host-api"
 RUNTIME_HOST_API_POLICY_API_PATH = "../crates/host/api"
 RUNTIME_HOST_API_POLICY_API_VERSION = "=0.2.0"
-RUNTIME_WAVE_70_REGISTRY_DEPENDENCIES = {
-    RUNTIME_APP_TAURI_ROOTS[0]: {"tauri": '"=2.12.4"'},
-    RUNTIME_APP_TAURI_ROOTS[1]: {"tauri": '"=2.12.4"'},
-    RUNTIME_WAVE_70_CRATE_ROOTS[3]: {
-        "rusqlite": '{ version = "=0.37.0", features = ["bundled"] }',
-    },
-}
 RUNTIME_HOST_API_POLICY_API_CONSUMER_ROOTS = (
     RUNTIME_HOST_DIRECTORY + ("registry",), RUNTIME_HOST_DIRECTORY + ("core",),
     RUNTIME_HOST_DIRECTORY + ("settings-schema",), RUNTIME_SERVICES_DIRECTORY + ("palette",),
@@ -784,7 +699,6 @@ class RevocationState:
 class SourceLease:
     source_path: Path
     record: object
-    workspace_selector: str = "contract"
 
     def __repr__(self):
         return "SourceLease"
@@ -794,16 +708,12 @@ def _full_sha(value):
     return type(value) is str and SOURCE_SHA_PATTERN.fullmatch(value) is not None
 
 
-def _valid_base_selection(base_sha, base_branch, concern):
+def _valid_base_selection(base_sha, base_branch, concern=None):
     if type(base_branch) is not str:
         return False
-    if base_branch in BRANCHES:
-        return True
-    return (
-        concern == "core-rust-lock-return"
-        and base_branch == CORE_RUST_BOOTSTRAP_BASE_BRANCH
-        and base_sha == CORE_RUST_BOOTSTRAP_BASE_SHA
-    )
+    if concern == "rules-bootstrap":
+        return base_branch == "main"
+    return base_branch in BRANCHES
 
 
 def parse_request(arguments):
@@ -817,7 +727,8 @@ def parse_request(arguments):
         raise Refusal("invalid_input", "input")
     if type(arguments[6]) is not str or arguments[6] != "--concern" or type(arguments[7]) is not str or arguments[7] not in CONCERNS:
         raise Refusal("invalid_input", "input")
-    if not _valid_base_selection(arguments[3], arguments[5], arguments[7]):
+    if (not _valid_base_selection(arguments[3], arguments[5], arguments[7])
+            or (arguments[7] == "rules-bootstrap" and arguments[1] != arguments[3])):
         raise Refusal("invalid_input", "input")
     return {
         "source_sha": arguments[1],
@@ -1837,10 +1748,8 @@ def _administrative_tree(repository, git_executable, repo_env, commit):
     if result.returncode != 0 or result.stderr or len(result.stdout) > MAX_TREE_BYTES:
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
     root_files = {".gitignore", "AGENTS.md", "CLAUDE.md", "README.md"}
-    rules_lock = RULES_LOCK_PATH
     signers = "/".join(SIGNER_PATH_PARTS)
     known_paths = {
-        rules_lock,
         RULES_DIRECTORY + "/settings.json",
         signers,
     }
@@ -1867,11 +1776,10 @@ def _administrative_tree(repository, git_executable, repo_env, commit):
         )
         if not valid:
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
-    lock_entry = _source_entry(repository, git_executable, repo_env, commit, rules_lock)
     signer_entry = _source_entry(
         repository, git_executable, repo_env, commit, signers, stage="signature",
     )
-    if lock_entry[:2] != ("100644", "blob") or signer_entry[:2] != ("100644", "blob"):
+    if signer_entry[:2] != ("100644", "blob"):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
 
 
@@ -1917,11 +1825,6 @@ def _safe_rules_tree(repository, git_executable, repo_env, commit):
         ):
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
         folded.add(path.casefold())
-    signer_entry = _source_entry(
-        repository, git_executable, repo_env, commit, "/".join(SIGNER_PATH_PARTS), stage="signature",
-    )
-    if signer_entry[:2] != ("100644", "blob"):
-        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
 
 
 def _contract_tree_entries(repository, git_executable, repo_env, commit):
@@ -1972,10 +1875,12 @@ def _contract_blob(
     repository, git_executable, repo_env, entries, path, *, core_check,
     max_bytes=MAX_CORE_CONTRACT_FILE_BYTES,
 ):
-    if (type(max_bytes) is not int or not 1 <= max_bytes <= MAX_FEEDBACK_LOCK_BYTES
-            or max_bytes > MAX_CORE_CONTRACT_FILE_BYTES
-            and (path != CORE_CONTRACT_PACKAGE_LOCK_PATH
-                 or core_check != "package_decode" or max_bytes != MAX_FEEDBACK_LOCK_BYTES)):
+    if (
+        type(max_bytes) is not int or not 1 <= max_bytes <= MAX_CORE_CONTRACT_PACKAGE_LOCK_BYTES
+        or max_bytes > MAX_CORE_CONTRACT_FILE_BYTES
+        and (path != CORE_CONTRACT_PACKAGE_LOCK_PATH or core_check != "package_decode"
+             or max_bytes != MAX_CORE_CONTRACT_PACKAGE_LOCK_BYTES)
+    ):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check=core_check)
     entry = entries.get(path)
     if entry is None or entry[0] not in ("100644", "100755"):
@@ -2298,7 +2203,6 @@ def _feedback_corpus_shape(corpus_paths, payloads, target_names=None):
 def _core_contract_admin_mode(path):
     root_files = {".gitignore", "AGENTS.md", "CLAUDE.md", "README.md"}
     known_paths = {
-        RULES_LOCK_PATH,
         RULES_DIRECTORY + "/settings.json",
         "/".join(SIGNER_PATH_PARTS),
     }
@@ -2370,7 +2274,7 @@ def _core_contract_member_roots(workspace_payload):
     return tuple(tuple(path.split("/")) for path in ordered)
 
 
-def _core_contract_crate_manifest_shape(text, *, crate_root=None, require_first_batch=False):
+def _core_contract_crate_manifest_shape(text, *, crate_root=None):
     if type(text) is not str or "\r" in text or "\x00" in text:
         return False
     section = None
@@ -2416,14 +2320,16 @@ def _core_contract_crate_manifest_shape(text, *, crate_root=None, require_first_
                 key in CORE_CONTRACT_MANIFEST_DEPENDENCIES
                 and CORE_CONTRACT_MANIFEST_WORKSPACE_VALUE_PATTERN.fullmatch(value) is not None
             ) or (
-                crate_root == CORE_CONTRACT_CRATE_ROOTS[0]
-                and key in CORE_CONTRACT_MANIFEST_EXTERNAL_DEPENDENCIES
-                and CORE_CONTRACT_MANIFEST_EXTERNAL_DEPENDENCIES[key].fullmatch(value) is not None
+                CORE_CONTRACT_MANIFEST_DEPENDENCY_NAME_PATTERN.fullmatch(key) is not None
+                and CORE_CONTRACT_MANIFEST_PINNED_REGISTRY_VALUE_PATTERN.fullmatch(value) is not None
             )
         elif section == "dev-dependencies":
             valid = (
                 key in CORE_CONTRACT_MANIFEST_DEPENDENCIES
                 and CORE_CONTRACT_MANIFEST_WORKSPACE_VALUE_PATTERN.fullmatch(value) is not None
+            ) or (
+                CORE_CONTRACT_MANIFEST_DEPENDENCY_NAME_PATTERN.fullmatch(key) is not None
+                and CORE_CONTRACT_MANIFEST_PINNED_REGISTRY_VALUE_PATTERN.fullmatch(value) is not None
             )
         elif section == "features":
             valid = CORE_CONTRACT_API_FEATURES.get(key) == value
@@ -2435,11 +2341,6 @@ def _core_contract_crate_manifest_shape(text, *, crate_root=None, require_first_
         return False
     if "features" in keys and keys["features"] != set(CORE_CONTRACT_API_FEATURES):
         return False
-    if crate_root == CORE_CONTRACT_CRATE_ROOTS[0] and require_first_batch:
-        return (
-            keys.get("dependencies") == set(CORE_CONTRACT_MANIFEST_EXTERNAL_DEPENDENCIES)
-            and "dev-dependencies" not in keys
-        )
     return True
 
 
@@ -2470,9 +2371,15 @@ def _core_contract_workspace_paths_shape(workspace_text):
             return False
         key, value = assignment.group(1), assignment.group(2)
         shape = CORE_CONTRACT_ROOT_KEYS[section].get(key)
-        if shape is None or key in seen[section]:
+        if key in seen[section]:
             return False
         seen[section].add(key)
+        if (section == "[workspace.dependencies]" and shape is None
+                and CORE_CONTRACT_MANIFEST_DEPENDENCY_NAME_PATTERN.fullmatch(key) is not None
+                and CORE_CONTRACT_MANIFEST_PINNED_REGISTRY_VALUE_PATTERN.fullmatch(value) is not None):
+            continue
+        if shape is None:
+            return False
         if shape is CORE_CONTRACT_ROOT_ARRAY_PATTERN and value == "[":
             open_array = True
         elif shape.fullmatch(value) is None:
@@ -2577,10 +2484,6 @@ def _core_contract_expected_mode(path, *, concern="core-contract"):
     admin_mode = _core_contract_admin_mode(path)
     if admin_mode is not None:
         return admin_mode
-    if (concern == CORE_CONTRACT_NPM_ADMISSION_CONCERN
-            and (CORE_CONTRACT_NPM_REQUEST_PATH.fullmatch(path) is not None
-                 or path == CORE_CONTRACT_NPM_POLICY_PATH)):
-        return "100644"
     if type(path) is str and (
         path in CORE_CONTRACT_INERT_DEPENDENCY_FILES
         or path in CORE_CONTRACT_KERNEL_TOKENS_INERT_FILES
@@ -2780,7 +2683,6 @@ def _runtime_root_manifest_shape(text, crate_roots):
         if ".." in without_api_edge or len(RUNTIME_HOST_API_POLICY_API_ASSIGNMENT_PATTERN.findall(text)) != 1:
             return False
     expected = _runtime_member_listing(crate_roots)
-    wave70_profile = set(RUNTIME_APP_TAURI_ROOTS).issubset(crate_roots)
     if _runtime_workspace_members(text) != expected:
         return False
     section = None
@@ -2819,17 +2721,16 @@ def _runtime_root_manifest_shape(text, crate_roots):
             pattern = RUNTIME_ROOT_PACKAGE_VALUES.get(key)
             valid = pattern is not None and pattern.fullmatch(value) is not None
         elif section == "[workspace.dependencies]":
-            match = RUNTIME_ROOT_PATH_PATTERN.fullmatch(value)
             if key == RUNTIME_HOST_API_POLICY_API_PACKAGE:
-                edge_pattern = (
-                    RUNTIME_HOST_API_POLICY_API_EDGE_PATTERN
-                    if wave70_profile else RUNTIME_HOST_API_POLICY_API_EDGE_LEGACY_PATTERN
-                )
-                valid = edge_pattern.fullmatch(value) is not None
-            else:
                 valid = (
-                    RUNTIME_DEPENDENCY_NAME_PATTERN.fullmatch(key) is not None
-                    and match is not None and match.group(1) in expected
+                    RUNTIME_HOST_API_POLICY_API_EDGE_PATTERN.fullmatch(value) is not None
+                    or RUNTIME_HOST_API_POLICY_API_EDGE_LEGACY_PATTERN.fullmatch(value) is not None
+                )
+            else:
+                path_match = RUNTIME_ROOT_PATH_PATTERN.fullmatch(value)
+                valid = RUNTIME_DEPENDENCY_NAME_PATTERN.fullmatch(key) is not None and (
+                    path_match is not None and path_match.group(1) in expected
+                    or CORE_CONTRACT_MANIFEST_PINNED_REGISTRY_VALUE_PATTERN.fullmatch(value) is not None
                 )
         else:
             valid = (
@@ -2838,12 +2739,7 @@ def _runtime_root_manifest_shape(text, crate_roots):
             )
         if not valid:
             return False
-    dependencies = seen.get("[workspace.dependencies]", set())
-    batch_seven_profile = set(RUNTIME_BATCH_SEVEN_CRATE_ROOTS).issubset(crate_roots)
-    return (
-        seen.get("[workspace]") == {"resolver", "members"}
-        and (RUNTIME_HOST_API_POLICY_API_PACKAGE in dependencies) == batch_seven_profile
-    )
+    return seen.get("[workspace]") == {"resolver", "members"}
 
 
 def _runtime_declared_dependencies(text):
@@ -2898,18 +2794,17 @@ def _runtime_crate_manifest_name(text, declared, crate_root):
             valid = (
                 key in declared
                 and RUNTIME_WORKSPACE_VALUE_PATTERN.fullmatch(value) is not None
+            ) or (
+                RUNTIME_DEPENDENCY_NAME_PATTERN.fullmatch(key) is not None
+                and CORE_CONTRACT_MANIFEST_PINNED_REGISTRY_VALUE_PATTERN.fullmatch(value) is not None
             )
-            if key in RUNTIME_WAVE_70_REGISTRY_DEPENDENCIES.get(crate_root, {}):
-                valid = value == RUNTIME_WAVE_70_REGISTRY_DEPENDENCIES[crate_root][key]
-            if key == RUNTIME_HOST_API_POLICY_API_PACKAGE:
-                valid = (
-                    crate_root in RUNTIME_HOST_API_POLICY_API_CONSUMER_ROOTS
-                    or crate_root == RUNTIME_HOST_API_POLICY_OPTIONAL_CONSUMER_ROOT
-                ) and RUNTIME_WORKSPACE_VALUE_PATTERN.fullmatch(value) is not None
         elif section == "dev-dependencies":
             valid = (
-                key in declared and key != RUNTIME_HOST_API_POLICY_API_PACKAGE
+                key in declared
                 and RUNTIME_WORKSPACE_VALUE_PATTERN.fullmatch(value) is not None
+            ) or (
+                RUNTIME_DEPENDENCY_NAME_PATTERN.fullmatch(key) is not None
+                and CORE_CONTRACT_MANIFEST_PINNED_REGISTRY_VALUE_PATTERN.fullmatch(value) is not None
             )
         else:
             valid = key == "workspace" and value == "true"
@@ -2920,16 +2815,6 @@ def _runtime_crate_manifest_name(text, declared, crate_root):
         name is None or package is None
         or not (RUNTIME_MANIFEST_INHERITED_KEYS | {"name"}).issubset(package)
     ):
-        return None
-    dependency_names = keys.get("dependencies", set())
-    if crate_root in RUNTIME_HOST_API_POLICY_API_CONSUMER_ROOTS:
-        if RUNTIME_HOST_API_POLICY_API_PACKAGE not in dependency_names:
-            return None
-    elif crate_root == RUNTIME_HOST_API_POLICY_OPTIONAL_CONSUMER_ROOT:
-        pass
-    elif RUNTIME_HOST_API_POLICY_API_PACKAGE in dependency_names:
-        return None
-    if RUNTIME_HOST_API_POLICY_API_PACKAGE in keys.get("dev-dependencies", set()):
         return None
     return name
 
@@ -3031,7 +2916,7 @@ def _check_runtime_profile_runtime_contract_edge(
     except UnicodeDecodeError:
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode") from None
     if not _core_contract_crate_manifest_shape(
-        api_text, crate_root=CORE_CONTRACT_CRATE_ROOTS[0], require_first_batch=False,
+        api_text, crate_root=CORE_CONTRACT_CRATE_ROOTS[0],
     ):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
     contract_root = _contract_blob(
@@ -3052,7 +2937,6 @@ def _check_runtime_profile_runtime_contract_edge(
     try:
         contract_names = cargo_lock_bootstrap.check_manifests(
             identity_manifests, contract_members, cargo_lock_bootstrap.CONTRACT_WORKSPACE,
-            require_first_batch=False,
         )
         contract_identities = cargo_lock_bootstrap.manifest_package_identities(
             identity_manifests, cargo_lock_bootstrap.CONTRACT_WORKSPACE,
@@ -3128,11 +3012,10 @@ def _check_runtime_workspace(repository, git_executable, repo_env, entries, *, c
             required.update(prefix + "/" + name for name in RUNTIME_BATCH_SEVEN_DOC_FILES)
     if not required.issubset(entries):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
-    wave70a_profile = set(RUNTIME_WAVE_70A_CRATE_ROOTS).issubset(crate_root_set)
-    wave70b_profile = set(RUNTIME_WAVE_70B_CRATE_ROOTS).issubset(crate_root_set)
+    runtime_apps_profile = set(RUNTIME_APP_TAURI_ROOTS).issubset(crate_root_set)
     inventory_paths = set()
     approved_build_paths = set()
-    if wave70a_profile or wave70b_profile:
+    if runtime_apps_profile:
         inventory_path = cargo_lock_bootstrap.SOURCE_INVENTORY_PATH
         inventory_blob = _contract_blob(
             repository, git_executable, repo_env, entries, inventory_path,
@@ -3187,13 +3070,8 @@ def _check_runtime_workspace(repository, git_executable, repo_env, entries, *, c
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
     if not _runtime_root_manifest_shape(root_text, crate_roots):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="workspace_members")
-    batch_seven_profile = set(RUNTIME_BATCH_SEVEN_CRATE_ROOTS).issubset(crate_roots)
     api_identity = None
     contract_dependency_rules = {}
-    if batch_seven_profile:
-        api_identity, contract_dependency_rules = _check_runtime_profile_runtime_contract_edge(
-            repository, git_executable, repo_env, entries, concern=concern,
-        )
     declared = _runtime_declared_dependencies(root_text)
     names = []
     runtime_manifests = {RUNTIME_ROOT_MANIFEST_PATH: root_payload}
@@ -3216,23 +3094,35 @@ def _check_runtime_workspace(repository, git_executable, repo_env, entries, *, c
         runtime_manifests["/".join(root) + "/Cargo.toml"] = payload
     if len(set(names)) != len(names) or cargo_lock_bootstrap is None:
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
+    runtime_documents = {
+        path: cargo_lock_bootstrap._parse_manifest(payload)
+        for path, payload in runtime_manifests.items()
+    }
+    runtime_api_profile = cargo_lock_bootstrap._documents_reference_dependency(
+        runtime_documents, RUNTIME_HOST_API_POLICY_API_PACKAGE,
+        cargo_lock_bootstrap.RUNTIME_WORKSPACE,
+    )
+    if runtime_api_profile:
+        api_identity, contract_dependency_rules = _check_runtime_profile_runtime_contract_edge(
+            repository, git_executable, repo_env, entries, concern=concern,
+        )
     try:
         package_names = cargo_lock_bootstrap.check_manifests(
             runtime_manifests, {"/".join(root) for root in crate_roots},
             cargo_lock_bootstrap.RUNTIME_WORKSPACE,
         )
-        expected_names = names + ([RUNTIME_HOST_API_POLICY_API_PACKAGE] if batch_seven_profile else [])
+        expected_names = names + ([RUNTIME_HOST_API_POLICY_API_PACKAGE] if runtime_api_profile else [])
         if package_names != frozenset(expected_names):
             raise ValueError
         package_identities = set(cargo_lock_bootstrap.manifest_package_identities(
             runtime_manifests, cargo_lock_bootstrap.RUNTIME_WORKSPACE,
         ))
-        if batch_seven_profile:
+        if runtime_api_profile:
             package_identities.add(api_identity)
         dependency_rules = cargo_lock_bootstrap.manifest_dependency_rules(
             runtime_manifests, cargo_lock_bootstrap.RUNTIME_WORKSPACE,
         )
-        if batch_seven_profile:
+        if runtime_api_profile:
             dependency_rules.update(contract_dependency_rules)
     except (cargo_lock_bootstrap.BootstrapRefusal, ValueError):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode") from None
@@ -3250,120 +3140,18 @@ def _check_runtime_workspace(repository, git_executable, repo_env, entries, *, c
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="cargo_lock_shape")
 
 
-def _parse_rules_file_manifest(payload):
-    try:
-        text = payload.decode("ascii", "strict")
-        lines = text.splitlines()
-    except (AttributeError, UnicodeDecodeError):
-        raise Refusal("bootstrap_snapshot_invalid", "bootstrap") from None
-    if b"\r" in payload or not payload.endswith(b"\n"):
-        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
-    for required in ("format 3", "profile full", "signature verified"):
-        if lines.count(required) != 1:
-            raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
-    tags = [line for line in lines if line.startswith("tag ")]
-    if len(tags) != 1 or CORE_CONTRACT_RULES_TAG_PATTERN.fullmatch(tags[0]) is None:
-        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
-    files = {}
-    folded = set()
-    rules_prefix = RULES_DIRECTORY + "/rules/shared/"
-    hooks_prefix = RULES_DIRECTORY + "/hooks/shared/"
-    for line in lines:
-        if not line.startswith("file "):
-            continue
-        fields = line.split(" ")
-        if len(fields) != 3:
-            raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
-        path, digest = fields[1], fields[2]
-        allowed = (
-            path == "AGENTS.md"
-            or path.startswith(rules_prefix) and path.endswith(".md")
-            or path.startswith(hooks_prefix) and path.endswith(".sh")
-        )
-        if (
-            not allowed
-            or re.fullmatch(r"[a-f0-9]{64}", digest) is None
-            or path.casefold() in folded
-        ):
-            raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
-        files[path] = digest
-        folded.add(path.casefold())
-    if (
-        "AGENTS.md" not in files
-        or not any(path.startswith(rules_prefix) for path in files)
-        or not any(path.startswith(hooks_prefix) for path in files)
-    ):
-        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
-    return files
-
-
-def _rules_file_manifest(payload):
-    try:
-        return _parse_rules_file_manifest(payload)
-    except Refusal as error:
-        if error.reason == "bootstrap_snapshot_invalid" and error.stage == "bootstrap":
-            raise Refusal(error.reason, error.stage, core_check="rules_manifest") from None
-        raise
-
-
-def _core_contract_policy_matches_base(base_entries, entries):
-    signer_path = "/".join(SIGNER_PATH_PARTS)
-    policy_paths = {
-        path: entry for path, entry in entries.items()
-        if path == "AGENTS.md" or path == signer_path or path.startswith(RULES_DIRECTORY + "/")
-    }
-    base_policy_paths = {
-        path: entry for path, entry in base_entries.items()
-        if path == "AGENTS.md" or path == signer_path or path.startswith(RULES_DIRECTORY + "/")
-    }
-    if policy_paths == base_policy_paths:
-        return True
-    if base_policy_paths.get(signer_path) != policy_paths.get(signer_path):
-        return False
-    base_lock = base_policy_paths.get(RULES_LOCK_PATH)
-    candidate_lock = policy_paths.get(RULES_LOCK_PATH)
-    if (
-        base_lock == ("100644", CORE_CONTRACT_RULES_V2_LOCK_OBJECT)
-        and candidate_lock == ("100644", CORE_CONTRACT_RULES_V3_LOCK_OBJECT)
-    ):
-        expected_changes = CORE_CONTRACT_RULES_V3_CHANGED_PATHS
-    elif (
-        base_lock == ("100644", CORE_CONTRACT_RULES_V3_LOCK_OBJECT)
-        and candidate_lock == ("100644", CORE_CONTRACT_RULES_V4_LOCK_OBJECT)
-        and CORE_CONTRACT_RULES_V4_ADDED_RULE not in base_policy_paths
-        and policy_paths.get(CORE_CONTRACT_RULES_V4_ADDED_RULE)
-        == ("100644", CORE_CONTRACT_RULES_V4_ADDED_RULE_OBJECT)
-    ):
-        expected_changes = CORE_CONTRACT_RULES_V4_CHANGED_PATHS
-    else:
-        return False
-    changed_paths = {
-        path for path in set(base_policy_paths) | set(policy_paths)
-        if base_policy_paths.get(path) != policy_paths.get(path)
-    }
-    return changed_paths == expected_changes
-
-
-def _core_contract_rust_policy_matches(entries):
-    present = CORE_CONTRACT_RUST_POLICY_FILES.intersection(entries)
-    if not present:
-        return True
-    if present != CORE_CONTRACT_RUST_POLICY_FILES:
-        return False
-    return all(
-        entries[path] == ("100644", object_id)
-        for path, object_id in CORE_CONTRACT_RUST_POLICY_OBJECTS.items()
+def _core_contract_trust_policy_matches_base(base_entries, entries):
+    protected_paths = (
+        RULES_DIRECTORY + "/settings.json",
+        "/".join(SIGNER_PATH_PARTS),
     )
+    return all(base_entries.get(path) == entries.get(path) for path in protected_paths)
 
 
 def _safe_core_contract_tree(
     repository, git_executable, repo_env, base_commit, commit, *, concern="core-contract",
-    workspace_selector="contract",
 ):
     if type(concern) is not str or concern not in CORE_CONTRACT_CONCERNS:
-        raise Refusal("bootstrap_not_approved", "configuration")
-    if (type(workspace_selector) is not str or workspace_selector not in ("contract", "runtime")
-            or workspace_selector == "runtime" and concern != "core-rust-lock-return"):
         raise Refusal("bootstrap_not_approved", "configuration")
     base_entries = _contract_tree_entries(repository, git_executable, repo_env, base_commit)
     entries = _contract_tree_entries(repository, git_executable, repo_env, commit)
@@ -3372,11 +3160,9 @@ def _safe_core_contract_tree(
     wave70_contract_profile = False
     signer_path = "/".join(SIGNER_PATH_PARTS)
     required = {
-        ".gitignore", "AGENTS.md", "CLAUDE.md", "README.md", RULES_LOCK_PATH,
+        ".gitignore", "AGENTS.md", "CLAUDE.md", "README.md",
         RULES_DIRECTORY + "/settings.json", signer_path,
     } | set(CORE_CONTRACT_ROOT_FILES)
-    if concern == "core-rust-lock-return":
-        required.update(CORE_CONTRACT_RUST_POLICY_FILES)
     for crate_root in contract_roots:
         prefix = "/".join(crate_root)
         required.update(prefix + "/" + path for path in CORE_CONTRACT_PACKAGE_FILES)
@@ -3386,11 +3172,6 @@ def _safe_core_contract_tree(
             required.add(prefix + "/src/lib.rs")
     if not required.issubset(entries):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
-    if (concern == "core-rust-lock-return"
-            and tuple("/".join(root) for root in contract_roots)
-            == tuple("/".join(root) for root in CORE_CONTRACT_CRATE_ROOTS)
-            and entries.get("Cargo.lock") != ("100644", CORE_CONTRACT_RUST_BOOTSTRAP_LOCK_OBJECT)):
-        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="cargo_lock_shape")
     foundation_present = any(
         _core_contract_foundation_path(path)
         for path in entries
@@ -3399,8 +3180,6 @@ def _safe_core_contract_tree(
     package_lock_present = CORE_CONTRACT_PACKAGE_LOCK_PATH in entries
     if (concern in CORE_CONTRACT_PACKAGE_LOCK_CONCERNS and package_lock_present
             and not foundation_present):
-        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
-    if concern == "core-node-lock-return" and not foundation_present:
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
     if foundation_present:
         if concern not in FEEDBACK_PROFILE_CONCERNS:
@@ -3491,7 +3270,7 @@ def _safe_core_contract_tree(
                 raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="path_mode")
             package_lock = _contract_blob(
                 repository, git_executable, repo_env, entries, CORE_CONTRACT_PACKAGE_LOCK_PATH,
-                core_check="package_decode", max_bytes=MAX_FEEDBACK_LOCK_BYTES,
+                core_check="package_decode", max_bytes=MAX_CORE_CONTRACT_PACKAGE_LOCK_BYTES,
             )
             if not package_lock:
                 raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
@@ -3513,33 +3292,9 @@ def _safe_core_contract_tree(
             and entries[CORE_CONTRACT_NODE_TEST_PATH]
             != ("100644", CORE_CONTRACT_NODE_TEST_OBJECT)):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
-    if not _core_contract_rust_policy_matches(entries):
-        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
-    if not _core_contract_policy_matches_base(base_entries, entries):
+    if not _core_contract_trust_policy_matches_base(base_entries, entries):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="base_policy")
 
-    lock_payload = _contract_blob(
-        repository, git_executable, repo_env, entries, RULES_LOCK_PATH,
-        core_check="rules_manifest",
-    )
-    manifest = _rules_file_manifest(lock_payload)
-    installed_paths = {
-        path for path in entries
-        if path == "AGENTS.md"
-        or path.startswith(RULES_DIRECTORY + "/rules/shared/")
-        or path.startswith(RULES_DIRECTORY + "/hooks/shared/")
-    }
-    if installed_paths != set(manifest):
-        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="rules_inventory")
-    total_rules_bytes = 0
-    for path, expected_hash in manifest.items():
-        payload = _contract_blob(
-            repository, git_executable, repo_env, entries, path,
-            core_check="rules_hash",
-        )
-        total_rules_bytes += len(payload)
-        if total_rules_bytes > MAX_TREE_BYTES or hashlib.sha256(payload).hexdigest() != expected_hash:
-            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="rules_hash")
     workspace = _contract_blob(
         repository, git_executable, repo_env, entries, "Cargo.toml",
         core_check="workspace_decode",
@@ -3593,8 +3348,6 @@ def _safe_core_contract_tree(
                 raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode") from None
             if not _core_contract_crate_manifest_shape(
                 manifest_text, crate_root=crate_root,
-                require_first_batch=(concern == "core-rust-lock-return"
-                                     and workspace_selector == "contract"),
             ):
                 raise Refusal(
                     "bootstrap_snapshot_invalid", "bootstrap",
@@ -3605,8 +3358,6 @@ def _safe_core_contract_tree(
             contract_names = cargo_lock_bootstrap.check_manifests(
                 contract_manifests, set(contract_member_paths),
                 cargo_lock_bootstrap.CONTRACT_WORKSPACE,
-                require_first_batch=(concern == "core-rust-lock-return"
-                                     and workspace_selector == "contract"),
             )
             contract_identities = cargo_lock_bootstrap.manifest_package_identities(
                 contract_manifests, cargo_lock_bootstrap.CONTRACT_WORKSPACE,
@@ -3640,68 +3391,16 @@ def _safe_core_contract_tree(
         _check_runtime_workspace(
             repository, git_executable, repo_env, entries, concern=concern, source_sha=commit,
         )
-    elif workspace_selector == "runtime":
-        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
     tree_kind = CORE_CONTRACT_TREE_BY_CONCERN[concern]
-    if concern == "core-build-diagnostic-return" and package_lock_present:
-        tree_kind = CORE_CONTRACT_PACKAGE_LOCK_TREE
     return tree_kind
 
 
-def _npm_fixture_selected(concern, environ, repository_id):
-    if type(concern) is not str or concern != CORE_CONTRACT_NPM_ADMISSION_CONCERN:
-        return False
-    value = environ.get(NPM_FIXTURE_REPOSITORY_ID_ENV, "")
-    if value == "":
-        return False
-    if (
-        type(value) is not str or REPOSITORY_ID_PATTERN.fullmatch(value) is None
-        or type(repository_id) is not int
-    ):
-        raise Refusal("bootstrap_not_approved", "configuration")
-    return int(value) == repository_id
-
-
-def _safe_npm_fixture_tree(repository, git_executable, repo_env, base_commit, commit):
-    base_entries = _contract_tree_entries(repository, git_executable, repo_env, base_commit)
-    entries = _contract_tree_entries(repository, git_executable, repo_env, commit)
-    for tree in (base_entries, entries):
-        for path, (mode, unused_object_id) in tree.items():
-            if path not in NPM_FIXTURE_FILES or mode != "100644":
-                raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="path_mode")
-    if not NPM_FIXTURE_REQUIRED_FILES.issubset(entries):
-        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
-    signer_path = "/".join(SIGNER_PATH_PARTS)
-    if base_entries.get(signer_path) != entries.get(signer_path):
-        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="base_policy")
-    changed = {
-        path for path in set(base_entries) | set(entries)
-        if base_entries.get(path) != entries.get(path)
-    }
-    if not changed.issubset(NPM_FIXTURE_NPM_MATERIAL):
-        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="base_policy")
-    total_bytes = 0
-    for path in sorted(entries):
-        total_bytes += _contract_blob_size(
-            repository, git_executable, repo_env, entries, path, core_check="tree_entries",
-        )
-        if total_bytes > MAX_TREE_BYTES:
-            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="tree_entries")
-    return NPM_FIXTURE_TREE
-
-
-def _snapshot_tree(repository, git_executable, repo_env, request, environ, repository_id,
-                   *, workspace_selector="contract"):
-    if _npm_fixture_selected(request["concern"], environ, repository_id):
-        tree_kind = _safe_npm_fixture_tree(
-            repository, git_executable, repo_env, request["base_sha"], request["source_sha"],
-        )
-        return tree_kind, "not-applicable"
+def _snapshot_tree(repository, git_executable, repo_env, request, environ, repository_id):
     tree_kind = _safe_core_contract_tree(
         repository, git_executable, repo_env, request["base_sha"], request["source_sha"],
-        concern=request["concern"], workspace_selector=workspace_selector,
+        concern=request["concern"],
     )
-    return tree_kind, "present"
+    return tree_kind
 
 
 LEASE_ACCESS_SCRIPT = '''\
@@ -3710,12 +3409,12 @@ import os
 import sys
 
 uid = int(sys.argv[1])
-root, source, signer = sys.argv[2:]
+root, source, protected_file = sys.argv[2:]
 if os.getuid() != uid or os.geteuid() != uid:
     raise SystemExit(20)
 if not os.listdir(source):
     raise SystemExit(21)
-with open(signer, "rb") as stream:
+with open(protected_file, "rb") as stream:
     stream.read(1)
 
 def denied(action):
@@ -3726,7 +3425,7 @@ def denied(action):
             return
     raise SystemExit(22)
 
-denied(lambda: open(signer, "ab").close())
+denied(lambda: open(protected_file, "ab").close())
 denied(lambda: os.mkdir(os.path.join(root, "lease-write-probe"), 0o700))
 os.write(1, b"KD-MPV:lease-acl=verified\\n")
 '''
@@ -3871,7 +3570,9 @@ def _lease_paths(temporary, *, core_contract=False):
     return directories, files
 
 
-def _grant_worker_readonly(temporary, source_path, storage_root, worker_uid, *, core_contract=False):
+def _grant_worker_readonly(
+    temporary, source_path, storage_root, worker_uid, *, core_contract=False, require_signer=True,
+):
     check = "lease_paths"
     try:
         username = capability.USERNAME
@@ -3908,8 +3609,11 @@ def _grant_worker_readonly(temporary, source_path, storage_root, worker_uid, *, 
                 raise ValueError
         check = "lease_access"
         python_executable = capability._resolve_trusted_toolchain()["python"]
-        source_signers = source_path.joinpath(*SIGNER_PATH_PARTS)
-        if not source_signers.is_file() or (temporary / "lease-write-probe").exists():
+        protected_file = (
+            source_path.joinpath(*SIGNER_PATH_PARTS)
+            if require_signer else source_path / "tests" / "run-hook-tests.sh"
+        )
+        if not protected_file.is_file() or (temporary / "lease-write-probe").exists():
             raise ValueError
         environment = {
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
@@ -3921,7 +3625,7 @@ def _grant_worker_readonly(temporary, source_path, storage_root, worker_uid, *, 
         result = capability._run_as_probe_user(
             (
                 python_executable, "-I", "-S", "-B", "-c", LEASE_ACCESS_SCRIPT,
-                str(worker_uid), str(temporary), str(source_path), str(source_signers),
+                str(worker_uid), str(temporary), str(source_path), str(protected_file),
             ),
             worker_uid,
             env=environment,
@@ -4198,6 +3902,7 @@ def _check_request(request):
         or not _valid_base_selection(
             request.get("base_sha"), request.get("base_branch"), request.get("concern"),
         )
+        or (request["concern"] == "rules-bootstrap" and request["source_sha"] != request["base_sha"])
     ):
         raise Refusal("invalid_input", "input")
     return True
@@ -4206,12 +3911,9 @@ def _check_request(request):
 def _check_rules_bootstrap_gate(request, environ):
     if request["concern"] != "rules-bootstrap":
         return
-    control_sha = environ.get("CI_SHA", "")
-    if (
-        not _full_sha(control_sha)
-        or environ.get(RULES_BOOTSTRAP_SOURCE_GATE_ENV) != request["source_sha"]
-        or environ.get(RULES_BOOTSTRAP_CONTROL_GATE_ENV) != control_sha
-    ):
+    if (request["base_branch"] != "main" or request["source_sha"] != request["base_sha"]
+            or not _full_sha(environ.get("CI_SHA", ""))
+            or environ.get(SOURCE_CANDIDATE_REF_ENV) != "refs/heads/main"):
         raise Refusal("bootstrap_not_approved", "configuration")
 
 
@@ -4382,7 +4084,6 @@ def validated_source(
     worker_uid=None,
     storage_root=None,
     revocation_state=None,
-    workspace_selector="contract",
 ):
     _check_request(request)
     _check_rules_bootstrap_gate(request, environ)
@@ -4401,7 +4102,7 @@ def validated_source(
         raise Refusal("context_unavailable", "context") from None
     if current_binding != binding or current_root != supplied_root:
         raise Refusal("context_unavailable", "context")
-    worker_required = request["concern"] in SOURCE_DESCENDANT_CONCERNS
+    worker_required = request["concern"] in WORKER_SOURCE_CONCERNS
     if worker_required:
         _check_worker_identity(current_root, worker_uid)
         storage_root = _validate_storage_root(storage_root)
@@ -4421,7 +4122,6 @@ def validated_source(
             retain=True,
             temp_parent=storage_root if worker_required else None,
             revocation_state=revocation_state,
-            workspace_selector=workspace_selector,
         )
         worker_access = "not_applicable"
         if worker_required:
@@ -4431,6 +4131,7 @@ def validated_source(
                 storage_root,
                 worker_uid,
                 core_contract=request["concern"] in CORE_CONTRACT_CONCERNS,
+                require_signer=request["concern"] != "rules-bootstrap",
             )
             worker_access = "uid_read_only"
         record["repository_scope"] = "verified"
@@ -4441,10 +4142,11 @@ def validated_source(
         record["image_os"] = binding["image_os"]
         record["image_version"] = binding["image_version"]
         record["token_revocation"] = "confirmed_before_yield"
-        record["signer_authority"] = "bound_base"
-        record["signatures"] = "all_new_commits_verified"
+        signed_source = request["concern"] != "rules-bootstrap"
+        record["signer_authority"] = "bound_base" if signed_source else "not_required"
+        record["signatures"] = "all_new_commits_verified" if signed_source else "unsigned_main_tip"
         record["ancestry"] = "base_ancestor"
-        record["revocation_policy"] = "current_control_fingerprints"
+        record["revocation_policy"] = "current_control_fingerprints" if signed_source else "not_applicable"
         if request["concern"] not in CORE_CONTRACT_CONCERNS:
             record["tree"] = {
                 "core-bootstrap": "core_administrative",
@@ -4454,7 +4156,7 @@ def validated_source(
         record["source_execution"] = "not_run_at_yield"
         record["cleanup"] = "lease_open"
         lease = SourceLease(
-            source_path, MappingProxyType(dict(record)), workspace_selector=workspace_selector,
+            source_path, MappingProxyType(dict(record)),
         )
     except BaseException:
         _revoke_on_early_refusal(environ, revocation_state, request, binding)
@@ -4508,14 +4210,16 @@ def _source_snapshot(
     retain=False,
     temp_parent=None,
     revocation_state=None,
-    workspace_selector="contract",
 ):
     _check_request(request)
     _check_core_contract_gate(request, environ)
     if candidate_ref != _check_source_ref_binding(request, environ):
         raise Refusal("bootstrap_not_approved", "configuration")
     git_executable = _resolve_trusted_executable("/usr/bin/git")
-    ssh_keygen = _resolve_trusted_executable("/usr/bin/ssh-keygen")
+    ssh_keygen = (
+        None if request["concern"] == "rules-bootstrap"
+        else _resolve_trusted_executable("/usr/bin/ssh-keygen")
+    )
     temporary = _safe_temp_root(temp_parent)
     repository = temporary / "repository.git"
     env = None
@@ -4530,7 +4234,10 @@ def _source_snapshot(
     pending_failure = None
     transferred = False
     try:
-        fingerprints = _control_inventory(root, binding["control_sha"], git_executable, temporary)
+        fingerprints = (
+            () if request["concern"] == "rules-bootstrap"
+            else _control_inventory(root, binding["control_sha"], git_executable, temporary)
+        )
         reader = _load_source_reader(root)
         repository_id, owner, repository_name, token = _repository_configuration(reader, environ)
         _verify_repository_scope(reader, repository_id, owner, repository_name, token)
@@ -4602,15 +4309,16 @@ def _source_snapshot(
         )
         if shallow_payload != b"false\n":
             raise Refusal("base_invalid", "history")
-        signer_entry = _source_entry(
-            repository, git_executable, git_environment, request["base_sha"], signer_path,
-            stage="signature",
-        )
-        if signer_entry[:2] != ("100644", "blob"):
-            raise Refusal("signature_invalid", "signature")
-        signer_payload = _read_source_blob(
-            repository, git_executable, git_environment, signer_entry[2], MAX_SIGNER_BYTES,
-        )
+        if request["concern"] != "rules-bootstrap":
+            signer_entry = _source_entry(
+                repository, git_executable, git_environment, request["base_sha"], signer_path,
+                stage="signature",
+            )
+            if signer_entry[:2] != ("100644", "blob"):
+                raise Refusal("signature_invalid", "signature")
+            signer_payload = _read_source_blob(
+                repository, git_executable, git_environment, signer_entry[2], MAX_SIGNER_BYTES,
+            )
         _run_source_git(
             "remote_remove",
             (git_executable, "remote", "remove", "source"),
@@ -4650,14 +4358,15 @@ def _source_snapshot(
         raise Refusal("revocation_unconfirmed", "revoke")
     try:
         env = _base_git_environment(temporary)
-        signer_keys = _signer_inventory(signer_payload)
-        revoked_payload = _revocation_payload(fingerprints, signer_keys)
-        base_allowed_path = temporary / "base-allowed-signers"
-        current_allowed_path = temporary / "current-allowed-signers"
-        revoked_path = temporary / "revoked-signers"
-        _write_private_file(base_allowed_path, signer_payload)
-        _write_private_file(current_allowed_path, _active_signer_payload(signer_keys))
-        _write_private_file(revoked_path, revoked_payload)
+        if request["concern"] != "rules-bootstrap":
+            signer_keys = _signer_inventory(signer_payload)
+            revoked_payload = _revocation_payload(fingerprints, signer_keys)
+            base_allowed_path = temporary / "base-allowed-signers"
+            current_allowed_path = temporary / "current-allowed-signers"
+            revoked_path = temporary / "revoked-signers"
+            _write_private_file(base_allowed_path, signer_payload)
+            _write_private_file(current_allowed_path, _active_signer_payload(signer_keys))
+            _write_private_file(revoked_path, revoked_payload)
         shallow = _run_process(
             (git_executable, "rev-parse", "--is-shallow-repository"),
             cwd=repository,
@@ -4672,41 +4381,39 @@ def _source_snapshot(
         )
         if ancestry.returncode != 0 or ancestry.stdout or ancestry.stderr:
             raise Refusal("base_invalid", "history")
-        commits = _commit_list(
-            repository, git_executable, env, request["base_sha"], request["source_sha"],
-        )
-        if request["source_sha"] == request["base_sha"]:
-            commits_to_verify = (request["base_sha"],)
-        else:
-            commits_to_verify = commits
-            if not commits_to_verify:
-                raise Refusal("base_invalid", "history")
-        for commit in commits_to_verify:
-            if commit != request["base_sha"] and signer_path in _changed_paths(
-                repository, git_executable, env, commit,
-            ):
-                raise Refusal("signature_invalid", "signature")
-            _verify_commit(
-                repository,
-                git_executable,
-                env,
-                ssh_keygen,
-                base_allowed_path if commit == request["base_sha"] else current_allowed_path,
-                revoked_path,
-                commit,
+        if request["concern"] != "rules-bootstrap":
+            commits = _commit_list(
+                repository, git_executable, env, request["base_sha"], request["source_sha"],
             )
+            if request["source_sha"] == request["base_sha"]:
+                commits_to_verify = (request["base_sha"],)
+            else:
+                commits_to_verify = commits
+                if not commits_to_verify:
+                    raise Refusal("base_invalid", "history")
+            for commit in commits_to_verify:
+                if commit != request["base_sha"] and signer_path in _changed_paths(
+                    repository, git_executable, env, commit,
+                ):
+                    raise Refusal("signature_invalid", "signature")
+                _verify_commit(
+                    repository,
+                    git_executable,
+                    env,
+                    ssh_keygen,
+                    base_allowed_path if commit == request["base_sha"] else current_allowed_path,
+                    revoked_path,
+                    commit,
+                )
         if request["concern"] == "core-bootstrap":
             _administrative_tree(repository, git_executable, env, request["source_sha"])
-            rules_lock = "present"
             tree_kind = "core_administrative"
         elif request["concern"] == "rules-bootstrap":
             _safe_rules_tree(repository, git_executable, env, request["source_sha"])
-            rules_lock = "not-applicable"
             tree_kind = "rules_regular_files"
         elif request["concern"] in CORE_CONTRACT_CONCERNS:
-            tree_kind, rules_lock = _snapshot_tree(
+            tree_kind = _snapshot_tree(
                 repository, git_executable, env, request, environ, repository_id,
-                workspace_selector=workspace_selector,
             )
         else:
             raise Refusal("bootstrap_not_approved", "configuration")
@@ -4714,6 +4421,7 @@ def _source_snapshot(
             repository, git_executable, env, temporary, request["source_sha"],
             core_contract=request["concern"] in CORE_CONTRACT_CONCERNS,
         )
+        signed_source = request["concern"] != "rules-bootstrap"
         record = {
             "repository_id": str(repository_id),
             "source_sha": request["source_sha"],
@@ -4721,8 +4429,7 @@ def _source_snapshot(
             "base_branch": request["base_branch"],
             "concern": request["concern"],
             "candidate_class": "permanent-tip" if request["source_sha"] == request["base_sha"] else "signed-descendant",
-            "signature": "verified",
-            "rules_lock": rules_lock,
+            "signature": "verified" if signed_source else "not_required",
             "tree": tree_kind,
             "source_execution": "not_run",
             "app_build": "not_run",
@@ -4740,7 +4447,7 @@ def _source_snapshot(
 def _format_success(record, binding):
     required = {
         "repository_id", "source_sha", "base_sha", "base_branch", "concern",
-        "candidate_class", "signature", "rules_lock", "tree", "source_execution", "app_build", "cleanup",
+        "candidate_class", "signature", "tree", "source_execution", "app_build", "cleanup",
         "control_sha", "run_id", "run_attempt", "image_os", "image_version",
         "repository_scope", "metadata", "token_revocation", "signer_authority",
         "signatures", "ancestry", "revocation_policy", "worker_access",
@@ -4761,6 +4468,7 @@ def _format_success(record, binding):
         or record["candidate_class"] not in {"permanent-tip", "signed-descendant"}
         or (record["candidate_class"] == "permanent-tip") != (record["source_sha"] == record["base_sha"])
         or (record["concern"] == "core-bootstrap" and record["source_sha"] != record["base_sha"])
+        or (record["concern"] == "rules-bootstrap" and record["source_sha"] != record["base_sha"])
     ):
         raise Refusal("internal_error", "input")
     expected_tree = {
@@ -4768,30 +4476,18 @@ def _format_success(record, binding):
         "rules-bootstrap": "rules_regular_files",
         **CORE_CONTRACT_TREE_BY_CONCERN,
     }.get(record.get("concern"))
-    if (record.get("concern") == "core-build-diagnostic-return"
-            and record.get("tree") == CORE_CONTRACT_PACKAGE_LOCK_TREE):
-        expected_tree = CORE_CONTRACT_PACKAGE_LOCK_TREE
-    fixture_tree = (
-        record.get("concern") == CORE_CONTRACT_NPM_ADMISSION_CONCERN
-        and record.get("tree") == NPM_FIXTURE_TREE
-    )
-    if fixture_tree:
-        expected_tree = NPM_FIXTURE_TREE
+    signed_source = record.get("concern") != "rules-bootstrap"
     fixed = {
-        "signature": "verified",
-        "rules_lock": (
-            "not-applicable" if record.get("concern") == "rules-bootstrap" or fixture_tree
-            else "present"
-        ),
+        "signature": "verified" if signed_source else "not_required",
         "tree": expected_tree,
         "source_execution": "not_run_at_yield",
         "repository_scope": "verified",
         "metadata": "verified",
         "token_revocation": "confirmed_before_yield",
-        "signer_authority": "bound_base",
-        "signatures": "all_new_commits_verified",
+        "signer_authority": "bound_base" if signed_source else "not_required",
+        "signatures": "all_new_commits_verified" if signed_source else "unsigned_main_tip",
         "ancestry": "base_ancestor",
-        "revocation_policy": "current_control_fingerprints",
+        "revocation_policy": "current_control_fingerprints" if signed_source else "not_applicable",
         "worker_access": "not_applicable" if record.get("concern") == "core-bootstrap" else "uid_read_only",
         "app_build": "not_run",
         "cleanup": "complete",
@@ -4812,8 +4508,7 @@ def _format_success(record, binding):
         "base-sha=" + record["base_sha"],
         "concern=" + record["concern"],
         "candidate-class=" + record["candidate_class"],
-        "signature=verified",
-        "rules-lock=" + record["rules_lock"],
+        "signature=" + record["signature"],
         "source-execution=not-run",
         "app-build=not-run",
         "cleanup=complete",

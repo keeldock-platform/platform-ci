@@ -1,8 +1,7 @@
-import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 import stat
 import sys
@@ -10,7 +9,6 @@ from collections.abc import Mapping
 
 
 SHA_RE = re.compile(r"[a-f0-9]{40}\Z")
-SHA256_RE = re.compile(r"[a-f0-9]{64}\Z")
 DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
 TOKEN_READER_RE = re.compile(r"[!-~]{1,4096}\Z")
 READER_REASONS = frozenset((
@@ -30,15 +28,12 @@ READER_FAILURE = {
     "revocation": "unconfirmed",
 }
 TOKEN_REFUSAL_STATES = frozenset(("not-read", "confirmed", "unconfirmed"))
-TAG_RE = re.compile(r"v[0-9]+(?:\.[0-9]+){0,3}(?:[-+][A-Za-z0-9.-]+)?\Z")
 TOKEN_RE = re.compile(r"[A-Za-z0-9_.+@/-]{1,256}\Z")
-SETTING_RE = re.compile(r"[A-Za-z][A-Za-z0-9.]{0,127}\Z")
-FINGERPRINT_RE = re.compile(r"SHA256:[A-Za-z0-9+/]{43}\Z")
 PHASES = frozenset(("preflight", "bootstrap"))
 REASONS = frozenset((
     "invalid_input", "bootstrap_gate_refused", "context_unavailable", "control_import_unavailable",
     "revocation_policy_invalid", "runner_controls_unavailable", "probe_identity_unavailable",
-    "summary_write_allowed", "summary_changed", "lock_invalid", "manifest_mismatch",
+    "summary_write_allowed", "summary_changed",
     "source_lease_unavailable", "configuration_unavailable", "source_reader_unavailable",
     "repository_scope_invalid", "source_fetch_unavailable", "revocation_unconfirmed",
     "base_invalid", "signature_invalid", "bootstrap_snapshot_invalid", "bootstrap_not_approved",
@@ -52,7 +47,7 @@ SOURCE_VALIDATION_REASONS = frozenset((
 ))
 STAGES = frozenset((
     "input", "gate", "context", "import", "inventory", "toolchain", "controls", "identity",
-    "summary", "source_lease", "lock", "manifest", "cleanup",
+    "summary", "source_lease", "cleanup",
 ))
 SOURCE_DIAGNOSTIC_OPERATIONS = frozenset((
     "git_init", "remote_add", "base_fetch", "base_ref", "candidate_fetch",
@@ -63,13 +58,6 @@ SOURCE_DIAGNOSTIC_CLASSES = frozenset((
 ))
 CORE_SOURCE_GATE_ENV = "CORE_BOOTSTRAP_ALLOWED_SHA"
 CORE_CONTROL_GATE_ENV = "CORE_BOOTSTRAP_ALLOWED_CONTROL_SHA"
-MAX_LOCK_BYTES = 262144
-MAX_LOCK_LINES = 4096
-MAX_LOCK_LINE_BYTES = 2048
-MAX_MANIFEST_FILES = 1024
-MAX_MANIFEST_FILE_BYTES = 4 * 1024 * 1024
-MAX_MANIFEST_TOTAL_BYTES = 32 * 1024 * 1024
-RULES_DIRECTORY = chr(46) + "claude"
 STANDIN_GUARD_MARKER = b"summary-standin=write-denied\n"
 STANDIN_GUARD_SCRIPT = r'''
 import errno, os, sys
@@ -439,197 +427,6 @@ def _run_summary_probe(root, binding, capability, reviewed_build):
     return summary_identity
 
 
-def _safe_relative_path(value):
-    if type(value) is not str or not value or "\\" in value or "\x00" in value:
-        return None
-    try:
-        value.encode("ascii", "strict")
-    except UnicodeEncodeError:
-        return None
-    parts = value.split("/")
-    if any(part in ("", ".", "..") for part in parts):
-        return None
-    path = PurePosixPath(value)
-    if path.is_absolute() or path.as_posix() != value:
-        return None
-    return parts
-
-
-def _read_source_file(root, relative, maximum):
-    parts = _safe_relative_path(relative)
-    if parts is None:
-        raise Refusal("lock_invalid", "manifest")
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    directory_flag = getattr(os, "O_DIRECTORY", 0)
-    if not nofollow or not directory_flag or not hasattr(os, "open"):
-        raise Refusal("lock_invalid", "manifest")
-    current = None
-    descriptor = None
-    try:
-        current = os.open(root, os.O_RDONLY | nofollow | directory_flag)
-        root_info = os.fstat(current)
-        if (
-            not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != 0
-            or root_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)
-        ):
-            raise ValueError
-        for component in parts[:-1]:
-            following = os.open(component, os.O_RDONLY | nofollow | directory_flag, dir_fd=current)
-            os.close(current)
-            current = following
-            info = os.fstat(current)
-            if (
-                not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
-                or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)
-            ):
-                raise ValueError
-        named = os.stat(parts[-1], dir_fd=current, follow_symlinks=False)
-        descriptor = os.open(parts[-1], os.O_RDONLY | nofollow, dir_fd=current)
-        opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode) or not stat.S_ISREG(named.st_mode)
-            or opened.st_uid != 0 or opened.st_nlink != 1
-            or opened.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)
-            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
-            or opened.st_size > maximum
-        ):
-            raise ValueError
-        chunks = []
-        size = 0
-        while True:
-            chunk = os.read(descriptor, min(65536, maximum + 1 - size))
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > maximum:
-                raise ValueError
-            chunks.append(chunk)
-        current_named = os.stat(parts[-1], dir_fd=current, follow_symlinks=False)
-        final = os.fstat(descriptor)
-        if (
-            (final.st_dev, final.st_ino) != (opened.st_dev, opened.st_ino)
-            or (current_named.st_dev, current_named.st_ino) != (opened.st_dev, opened.st_ino)
-            or final.st_size != opened.st_size or size != opened.st_size
-        ):
-            raise ValueError
-        return b"".join(chunks)
-    except Refusal:
-        raise
-    except BaseException:
-        raise Refusal("lock_invalid", "manifest") from None
-    finally:
-        for value in (descriptor, current):
-            if value is not None:
-                try:
-                    os.close(value)
-                except OSError:
-                    raise Refusal("cleanup_incomplete", "cleanup") from None
-
-
-def _parse_lock(payload):
-    if (
-        type(payload) is not bytes or not payload or len(payload) > MAX_LOCK_BYTES
-        or not payload.endswith(b"\n") or b"\r" in payload or b"\x00" in payload
-    ):
-        raise Refusal("lock_invalid", "lock")
-    try:
-        lines = payload[:-1].decode("ascii", "strict").split("\n")
-    except BaseException:
-        raise Refusal("lock_invalid", "lock") from None
-    if not lines or len(lines) > MAX_LOCK_LINES:
-        raise Refusal("lock_invalid", "lock")
-    if lines[0].startswith(chr(35)):
-        lines = lines[1:]
-    fields = {}
-    files = {}
-    hooks = []
-    settings = {}
-    anchors = []
-    downgrade_count = 0
-    for line in lines:
-        if not line or len(line.encode("ascii")) > MAX_LOCK_LINE_BYTES:
-            raise Refusal("lock_invalid", "lock")
-        values = line.split(" ")
-        if any(not value for value in values):
-            raise Refusal("lock_invalid", "lock")
-        key = values[0]
-        if key == "file" and len(values) == 3:
-            path, digest = values[1:]
-            if path in files or _safe_relative_path(path) is None or SHA256_RE.fullmatch(digest) is None:
-                raise Refusal("lock_invalid", "lock")
-            files[path] = digest
-        elif key == "hook" and len(values) == 4:
-            event, matcher, path = values[1:]
-            if TOKEN_RE.fullmatch(event) is None or re.fullmatch(r"[A-Za-z0-9_.+@|/-]{1,256}", matcher) is None:
-                raise Refusal("lock_invalid", "lock")
-            if _safe_relative_path(path) is None:
-                raise Refusal("lock_invalid", "lock")
-            hooks.append(path)
-        elif key == "anchor" and len(values) == 4:
-            tag, object_id, fingerprint = values[1:]
-            if not TAG_RE.fullmatch(tag) or not SHA_RE.fullmatch(object_id) or not FINGERPRINT_RE.fullmatch(fingerprint):
-                raise Refusal("lock_invalid", "lock")
-            anchors.append((tag, object_id, fingerprint))
-        elif key == "setting" and len(values) == 3:
-            name, value = values[1:]
-            if not SETTING_RE.fullmatch(name) or TOKEN_RE.fullmatch(value) is None or name in settings:
-                raise Refusal("lock_invalid", "lock")
-            settings[name] = value
-        elif key == "downgrade" and values == ["downgrade", "allowed"]:
-            downgrade_count += 1
-        else:
-            if key not in {
-                "format", "source", "profile", "tag", "tag-object", "commit", "signature",
-                "signer", "signers-sha256", "fragment",
-            } or key in fields or len(values) != 2:
-                raise Refusal("lock_invalid", "lock")
-            fields[key] = values[1]
-    required = {
-        "format", "source", "profile", "tag", "tag-object", "commit", "signature",
-        "signer", "signers-sha256", "fragment",
-    }
-    if (
-        set(fields) != required or fields["format"] != "3" or fields["profile"] != "full"
-        or TOKEN_RE.fullmatch(fields["source"]) is None or not TAG_RE.fullmatch(fields["tag"])
-        or not SHA_RE.fullmatch(fields["tag-object"]) or not SHA_RE.fullmatch(fields["commit"])
-        or fields["signature"] != "verified" or TOKEN_RE.fullmatch(fields["signer"]) is None
-        or not SHA256_RE.fullmatch(fields["signers-sha256"])
-        or not SHA256_RE.fullmatch(fields["fragment"])
-        or not anchors or not files or not hooks or downgrade_count > 1
-        or set(settings) != {"includeCoAuthoredBy"}
-        or settings.get("includeCoAuthoredBy") != "false"
-        or any(path not in files for path in hooks)
-        or len(set(hooks)) != len(hooks)
-        or len(set(anchors)) != len(anchors)
-    ):
-        raise Refusal("lock_invalid", "lock")
-    return {"files": files, "fields": fields}
-
-
-def _verify_lock_manifest(source_root):
-    lock_path = RULES_DIRECTORY + "/shared.lock"
-    payload = _read_source_file(source_root, lock_path, MAX_LOCK_BYTES)
-    parsed = _parse_lock(payload)
-    files = parsed["files"]
-    if len(files) > MAX_MANIFEST_FILES:
-        raise Refusal("lock_invalid", "manifest")
-    total = 0
-    for relative, expected_digest in files.items():
-        content = _read_source_file(source_root, relative, MAX_MANIFEST_FILE_BYTES)
-        total += len(content)
-        if total > MAX_MANIFEST_TOTAL_BYTES:
-            raise Refusal("lock_invalid", "manifest")
-        actual_digest = hashlib.sha256(content).hexdigest()
-        if actual_digest != expected_digest:
-            raise Refusal("manifest_mismatch", "manifest")
-    return {
-        "format": "3",
-        "manifest": "matched",
-        "signers_hash": "well-formed",
-        "fragment_hash": "well-formed",
-    }
-
-
 def _validate_lease_record(runtime, record, binding, source_sha):
     if not isinstance(record, Mapping):
         raise Refusal("source_lease_unavailable", "source_lease")
@@ -641,7 +438,6 @@ def _validate_lease_record(runtime, record, binding, source_sha):
         "concern": "core-bootstrap",
         "candidate_class": "permanent-tip",
         "signature": "verified",
-        "rules_lock": "present",
         "tree": "core_administrative",
         "source_execution": "not_run_at_yield",
         "app_build": "not_run",
@@ -672,7 +468,7 @@ def _validate_lease_record(runtime, record, binding, source_sha):
     return copy
 
 
-def _success_line(record, binding, manifest):
+def _success_line(record, binding):
     return " ".join((
         "macos-core-bootstrap=verified",
         "schema=1",
@@ -688,12 +484,6 @@ def _success_line(record, binding, manifest):
         "concern=core-bootstrap",
         "source-signature=verified",
         "token-revocation=confirmed-before-execution",
-        "rules-lock=present",
-        "rules-lock-signature=declared-verified",
-        "lock-format=" + manifest["format"],
-        "manifest=" + manifest["manifest"],
-        "signers-hash=" + manifest["signers_hash"],
-        "fragment-hash=" + manifest["fragment_hash"],
         "source-execution=not-run",
         "app-build=not-run",
         "worker-access=not-applicable",
@@ -857,7 +647,6 @@ def run(arguments=None, environ=None, token_reader=None):
                 if not token_confirmed:
                     raise Refusal("source_lease_unavailable", "source_lease")
                 record = _validate_lease_record(runtime, lease.record, binding, source_sha)
-                manifest = _verify_lock_manifest(lease.source_path)
         except runtime.Refusal as error:
             token_confirmed = token_confirmed or _runtime_revocation_confirmed(
                 runtime,
@@ -891,7 +680,7 @@ def run(arguments=None, environ=None, token_reader=None):
         except BaseException:
             raise Refusal("source_lease_unavailable", "source_lease") from None
         record["cleanup"] = "complete"
-        line = _success_line(record, binding, manifest)
+        line = _success_line(record, binding)
         _append_summary(summary_identity, line)
         return line, None
     except Refusal as error:

@@ -79,6 +79,7 @@ def _environment(request, key, job_name):
         "GITHUB_JOB": job_name,
         "GITHUB_RUN_ID": "8123",
         "GITHUB_RUN_ATTEMPT": "1",
+        "MACOS_CACHE_SNAPSHOT": macos_public_audit.cache_inventory_baseline([]),
         "GITHUB_ACTOR": "fixture-actor",
         "GITHUB_REPOSITORY_ID": "1",
         "SOURCE_REPOSITORY_ID": "2",
@@ -224,7 +225,8 @@ class LiveAuditProvider(macos_public_audit.GitHubAPI):
             "run_attempt": 1,
         })
         timestamp = b"2026-10-28T04:00:00Z "
-        digest = macos_public_audit.cache_inventory_digest([])
+        baseline = macos_public_audit.cache_inventory_baseline([])
+        digest = macos_public_audit.cache_inventory_baseline_digest(baseline)
         logs = {}
         logs[101] = (
             timestamp
@@ -421,6 +423,10 @@ class PreflightTests(unittest.TestCase):
         self.assertTrue(marker.startswith("KD-FEEDBACK-CACHE-SNAPSHOT schema=1 "))
         self.assertEqual(output_writer.call_args.args[1]["source_sha"], request["source_sha"])
         self.assertEqual(output_writer.call_args.args[1]["base_sha"], request["base_sha"])
+        self.assertEqual(
+            output_writer.call_args.args[1]["cache_snapshot"],
+            macos_public_audit.cache_inventory_baseline([]),
+        )
 
     def test_producer_preflight_binds_public_request_to_all_protected_values(self):
         for profile_name in MAIN_PROFILES:
@@ -771,108 +777,6 @@ class LiveProviderPipelineTests(unittest.TestCase):
                 self.assertEqual(history_queries[0]["created"], ["2026-10-27..2026-10-28"])
                 self.assertEqual(history_queries[0]["page"], ["1"])
 
-    NPM_PROFILE = "core-npm-admission-return"
-    NPM_DIAGNOSTIC = b"KD-FEEDBACK-NPM-DIAGNOSTIC schema=1 step=npm_resolve reason=eresolve\n"
-    STAMP = b"2026-10-28T04:00:00Z "
-
-    def _npm_diagnostic_audit(self, lines, profile_name=None, job=103):
-        environment, api = self._live(profile_name or self.NPM_PROFILE)
-        for line in lines:
-            api.logs[job] = api.logs[job] + line
-        return self._audit(environment, api)
-
-    def _npm_diagnostic_phase(self, lines, profile_name=None, job=103):
-        with self.assertRaises(subject.FeedbackAuditRefusal) as caught:
-            self._npm_diagnostic_audit(lines, profile_name, job)
-        return caught.exception.phase
-
-    def test_the_npm_producer_log_may_carry_exactly_one_closed_diagnostic_line(self):
-        plain = self._npm_diagnostic_audit([])
-        self.assertTrue(plain.startswith("KD-FEEDBACK-AUDIT {"))
-        for lines in ([self.NPM_DIAGNOSTIC], [self.STAMP + self.NPM_DIAGNOSTIC]):
-            with self.subTest(lines=lines):
-                accepted = self._npm_diagnostic_audit(lines)
-                self.assertEqual(accepted, plain)
-        for step, keys in macos_public_audit.CORE_CONTRACT_SOURCE_GATES_NPM_KEYS_BY_STEP:
-            if step not in ("npm_resolve", "npm_lock", "npm_bundle"):
-                continue
-            for key in keys:
-                line = ("KD-FEEDBACK-NPM-DIAGNOSTIC schema=1 step=" + step + " reason=" + key + "\n").encode("ascii")
-                with self.subTest(step=step, key=key):
-                    self.assertEqual(self._npm_diagnostic_audit([self.STAMP + line]), plain)
-
-    ESC = b"\x1b"
-
-    def _echoed_producer_script(self):
-        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/core-npm-admission-return.yml")
-        lines = workflow.read_text(encoding="utf-8").splitlines()
-        start = lines.index("      - name: Run and publish encrypted feedback")
-        begin = next(i for i in range(start, len(lines)) if lines[i].strip() == "run: |") + 1
-        end = next((i for i in range(begin, len(lines)) if lines[i].startswith("      - name:")), len(lines))
-        script = [line[10:] for line in lines[begin:end] if line.strip()]
-        legacy = "diagnostic_pattern='^KD-FEEDBACK-NPM-DIAGNOSTIC schema=1 step=npm_(resolve|lock|bundle) reason=[a-z0-9_]{1,40}$'"
-        script.insert(3, legacy)
-        out = [self.STAMP + b"\x23\x23[group]Run set -euo pipefail\n"]
-        for line in script:
-            out.append(self.STAMP + self.ESC + b"[36;1m" + line.encode("utf-8") + self.ESC + b"[0m\n")
-        out.append(self.STAMP + b"shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}\n")
-        out.append(self.STAMP + b"\x23\x23[endgroup]\n")
-        return out
-
-    def test_the_echoed_producer_step_script_is_not_a_diagnostic_line(self):
-        echoed = self._echoed_producer_script()
-        self.assertTrue(any(b"KD-FEEDBACK-NPM-DIAGNOSTIC" in line for line in echoed))
-        plain = self._npm_diagnostic_audit([])
-        for real in ([], [self.NPM_DIAGNOSTIC], [self.STAMP + self.NPM_DIAGNOSTIC]):
-            with self.subTest(real=real):
-                self.assertEqual(self._npm_diagnostic_audit(echoed + real), plain)
-                self.assertEqual(self._npm_diagnostic_audit(real + echoed), plain)
-        two = [self.NPM_DIAGNOSTIC, self.STAMP + self.NPM_DIAGNOSTIC]
-        malformed = [self.NPM_DIAGNOSTIC.replace(b"reason=eresolve", b"reason=bogus"),
-                     self.STAMP + self.NPM_DIAGNOSTIC.replace(b"schema=1", b"schema=2")]
-        for real in (two, malformed[:1], malformed[1:]):
-            with self.subTest(real=real):
-                self.assertEqual(self._npm_diagnostic_phase(echoed + real), "producer_evidence")
-
-    def test_a_marker_that_does_not_start_the_log_content_is_not_a_diagnostic_line(self):
-        good = self.NPM_DIAGNOSTIC
-        plain = self._npm_diagnostic_audit([])
-        for lines in ([b"prefix " + good], [self.STAMP + b"prefix " + good]):
-            with self.subTest(lines=lines):
-                self.assertEqual(self._npm_diagnostic_audit(lines), plain)
-
-    def test_every_other_diagnostic_line_shape_or_placement_is_refused(self):
-        good = self.NPM_DIAGNOSTIC
-        for lines in (
-            [good, good], [good, self.STAMP + good],
-            [good.replace(b"schema=1", b"schema=2")],
-            [good.replace(b"step=npm_resolve", b"step=npm_version")],
-            [good.replace(b"step=npm_resolve", b"step=npm_inputs reason=npm_stale").replace(b"reason=eresolve", b"")],
-            [good.replace(b"reason=eresolve", b"reason=bogus")],
-            [good.replace(b"reason=eresolve", b"reason=ERESOLVE")],
-            [good.replace(b"reason=eresolve", b"reason=npm_lock_refused")],
-            [good.replace(b"reason=eresolve", b"reason=eresolve extra=1")],
-            [good.replace(b"reason=eresolve", b"reason=")],
-            [good.replace(b"KD-FEEDBACK-NPM-DIAGNOSTIC ", b"KD-FEEDBACK-NPM-DIAGNOSTIC  ")],
-            [good.rstrip(b"\n") + b" \n"],
-            [b"KD-FEEDBACK-NPM-DIAGNOSTIC\n"],
-            [b"KD-FEEDBACK-NPM-DIAGNOSTIC-SUMMARY schema=1\n"],
-        ):
-            with self.subTest(lines=lines):
-                self.assertEqual(self._npm_diagnostic_phase(lines), "producer_evidence")
-
-    def test_the_diagnostic_line_is_refused_in_every_log_but_the_npm_producer_job(self):
-        for job in (101, 102):
-            with self.subTest(job=job):
-                self.assertEqual(self._npm_diagnostic_phase([self.NPM_DIAGNOSTIC], job=job), "producer_evidence")
-        for profile_name in MAIN_PROFILES:
-            if profile_name == self.NPM_PROFILE:
-                continue
-            with self.subTest(profile=profile_name):
-                self.assertEqual(
-                    self._npm_diagnostic_phase([self.NPM_DIAGNOSTIC], profile_name), "producer_evidence",
-                )
-
     def test_failed_producer_still_scans_jobs_checks_annotations_artifact_and_cache(self):
         request, key = _request()
         profile = feedback_request.PROFILES[request["concern"]]
@@ -945,7 +849,9 @@ class LiveProviderPipelineTests(unittest.TestCase):
             )
 
     def test_timestamped_cache_snapshot_log_uses_actual_provider_line_shape(self):
-        digest = macos_public_audit.cache_inventory_digest([])
+        digest = macos_public_audit.cache_inventory_baseline_digest(
+            macos_public_audit.cache_inventory_baseline([])
+        )
         log = (
             "2026-10-28T04:00:00Z KD-FEEDBACK-CACHE-SNAPSHOT schema=1 control-sha="
             + CONTROL_SHA + " run-id=8123 run-attempt=1 digest=" + digest + "\n"
@@ -1252,12 +1158,11 @@ class AuditWorkflowShellSyntaxTests(unittest.TestCase):
         self.assertIsNotNone(bash, "Bash is required on POSIX workflow test runners")
         repository_root = Path(__file__).resolve().parents[2]
         workflow_paths = (
-            repository_root / ".github/workflows/node-lock-return.yml",
             repository_root / ".github/workflows/core-rust-format-return.yml",
             repository_root / ".github/workflows/core-build-diagnostic-return.yml",
         )
         scripts = [self._audit_script(path) for path in workflow_paths]
-        self.assertEqual(len(scripts), 3)
+        self.assertEqual(len(scripts), 2)
         for script in scripts:
             result = subprocess.run(
                 [bash, "-n"], input=script, text=True, stdout=subprocess.PIPE,

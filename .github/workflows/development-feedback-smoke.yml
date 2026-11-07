@@ -1,13 +1,37 @@
 name: development-feedback-smoke
 on:
   push:
-    branches:
-      - "**"
   workflow_dispatch:
 permissions: {}
 jobs:
+  promotion-check-reuse:
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/main') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      checks: read
+      contents: read
+      statuses: read
+    outputs:
+      skip_checks: ${{ steps.decide.outputs.skip_checks }}
+    steps:
+      - name: Fetch the exact candidate SHA
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check prior workflow results for this exact SHA
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROMOTION_TARGET: ${{ github.ref_name }}
+          PROMOTION_SHA: ${{ github.sha }}
+          PROMOTION_WORKFLOW: development-feedback-smoke
+        run: timeout 1m python -B kit/promotion/branch_promotion.py --reuse-checks-if-green --target "$PROMOTION_TARGET" --sha "$PROMOTION_SHA" --workflow "$PROMOTION_WORKFLOW"
   feedback-smoke-producer:
     name: feedback-smoke-producer ${{ matrix.runner }}
+    needs: promotion-check-reuse
+    if: ${{ always() && (needs.promotion-check-reuse.result == 'skipped' || needs.promotion-check-reuse.outputs.skip_checks != 'true') }}
     strategy:
       fail-fast: true
       matrix:
@@ -63,7 +87,7 @@ jobs:
           set -euo pipefail
           [[ "$(node --version)" == "v24.22.1" ]]
           [[ "$(npm --version)" == "11.19.1" ]]
-          node --test kit/confinement/test_node_lock_envelope.mjs kit/confinement/test_node_lock_manifest.mjs kit/confinement/test_development_feedback.mjs kit/confinement/test_feedback_smoke.mjs kit/confinement/test_feedback_producer_crypto.mjs kit/confinement/test_feedback_admin_crypto.mjs kit/confinement/test_node_contract_validation.mjs
+          node --test kit/confinement/test_node_lock_envelope.mjs kit/confinement/test_node_lock_manifest.mjs kit/confinement/test_development_feedback.mjs kit/confinement/test_feedback_smoke.mjs kit/confinement/test_feedback_producer_crypto.mjs kit/confinement/test_feedback_admin_crypto.mjs
           python_command=python3
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             python_command=python
@@ -71,14 +95,8 @@ jobs:
           "$python_command" -B -m unittest discover -s kit/confinement -p "test_node_lock_receipt.py"
           "$python_command" -B -m unittest discover -s kit/confinement -p "test_feedback*.py"
           "$python_command" -B -m unittest discover -s kit/confinement -p "test_macos_feedback_producer.py"
-          if [[ "$RUNNER_OS" != "Windows" ]]; then
-            "$python_command" -B -m unittest discover -s kit/confinement -p "test_macos_node_contract.py"
-            "$python_command" -B -m unittest discover -s kit/confinement -p "test_foundation_node_feedback.py"
-          fi
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_feedback*.py"
-            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_macos_node_contract.py"
-            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_foundation_node_feedback.py"
           fi
       - name: Create and round-trip encrypted fixture
         id: smoke
@@ -91,7 +109,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: development-feedback-smoke-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/feedback-smoke/lock-return-v1.enc
+          path: ${{ runner.temp }}/feedback-smoke/build-diagnostic-return-v1.enc
           archive: true
           retention-days: 1
           compression-level: 0
@@ -125,7 +143,7 @@ jobs:
         run: |
           set -euo pipefail
           fixture_dir="${RUNNER_TEMP%/}/feedback-smoke"
-          fixture_file="$fixture_dir/lock-return-v1.enc"
+          fixture_file="$fixture_dir/build-diagnostic-return-v1.enc"
           if [[ -e "$fixture_file" || -L "$fixture_file" ]]; then
             if [[ ! -f "$fixture_file" || -L "$fixture_file" ]]; then
               exit 1
@@ -138,8 +156,8 @@ jobs:
             exit 1
           fi
   feedback-smoke-audit:
-    if: ${{ always() }}
-    needs: feedback-smoke-producer
+    if: ${{ always() && needs.promotion-check-reuse.outputs.skip_checks != 'true' }}
+    needs: [feedback-smoke-producer, promotion-check-reuse]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     defaults:

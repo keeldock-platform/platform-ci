@@ -12,9 +12,9 @@ from pathlib import Path
 from urllib.parse import quote, unquote
 
 try:
-    from . import cargo_lock_receipt as _cargo_lock_receipt
+    from . import cargo_lock_parser as _cargo_lock_parser
 except ImportError:
-    import cargo_lock_receipt as _cargo_lock_receipt
+    import cargo_lock_parser as _cargo_lock_parser
 
 
 NORMALIZER_VERSION = 1
@@ -205,7 +205,7 @@ def _valid_name(ecosystem, name):
         return False
     if ecosystem == "npm":
         return NPM_NAME_RE.fullmatch(name) is not None and ".." not in name
-    return _cargo_lock_receipt.PACKAGE_NAME_RE.fullmatch(name) is not None
+    return _cargo_lock_parser.PACKAGE_NAME_RE.fullmatch(name) is not None
 
 
 def _valid_version(version):
@@ -340,8 +340,8 @@ def _normalise_tools(value):
 
 def _cargo_inventory(lock_bytes):
     try:
-        lock = _cargo_lock_receipt.parse_cargo_lock(lock_bytes)
-    except _cargo_lock_receipt.Refusal:
+        lock = _cargo_lock_parser.parse_cargo_lock(lock_bytes)
+    except _cargo_lock_parser.Refusal:
         _refuse("sbom_lock_invalid")
     records = {}
     packages_by_name = {}

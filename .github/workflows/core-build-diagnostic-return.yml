@@ -16,13 +16,11 @@ on:
         required: true
         type: string
 permissions: {}
-cache-mode: none
 jobs:
   core-build-diagnostic-return-settings:
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    cache-mode: none
     permissions:
       actions: read
     outputs:
@@ -76,7 +74,6 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && needs.core-build-diagnostic-return-settings.result == 'success' }}
     runs-on: macos-15
     timeout-minutes: 25
-    cache-mode: none
     permissions: {}
     outputs:
       rust_smoke_digest: ${{ steps.prepare.outputs.rust_smoke_digest }}
@@ -118,12 +115,11 @@ jobs:
           set -euo pipefail
           [[ "$(node --version)" == "v24.22.1" ]] || exit 1
           [[ "$(npm --version)" == "11.19.1" ]] || exit 1
-          node --test kit/confinement/test_node_lock_envelope.mjs kit/confinement/test_node_lock_manifest.mjs kit/confinement/test_feedback_smoke.mjs kit/confinement/test_development_feedback.mjs kit/confinement/test_feedback_producer_crypto.mjs kit/confinement/test_feedback_admin_crypto.mjs kit/confinement/test_node_contract_validation.mjs
+          node --test kit/confinement/test_node_lock_envelope.mjs kit/confinement/test_node_lock_manifest.mjs kit/confinement/test_feedback_smoke.mjs kit/confinement/test_development_feedback.mjs kit/confinement/test_feedback_producer_crypto.mjs kit/confinement/test_feedback_admin_crypto.mjs
           python3 -B kit/bootstrap/test_policy.py
           python3 -B kit/bootstrap/test_public_tree.py
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_macos*.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_feedback*.py"
-          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_foundation_node_feedback.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_node_lock_receipt.py"
       - name: Record source-free preparation and Rust toolchain proof
         id: prepare
@@ -146,7 +142,8 @@ jobs:
             CI_SHA="$CI_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
             RUNNER_TEMP="$RUNNER_TEMP" RUNNER_HOME="$HOME" ImageOS="$ImageOS" ImageVersion="$ImageVersion" \
             /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
-            -I -S -B kit/confinement/macos_rust_toolchain.py --control-sha "$CI_SHA" >"$raw_file" 2>"$stderr_file"
+            -I -S -B kit/confinement/macos_rust_toolchain.py --control-sha "$CI_SHA" 2>"$stderr_file" \
+            | tee "$raw_file" >/dev/null
           smoke_status=$?
           set -e
           if [[ "$smoke_status" -ne 0 ]]; then printf 'KD-RUST-REFUSAL reason=smoke_failed\n'; exit 1; fi
@@ -183,7 +180,6 @@ jobs:
     runs-on: macos-15
     environment: source-read
     timeout-minutes: 75
-    cache-mode: none
     permissions: {}
     defaults:
       run:
@@ -234,12 +230,11 @@ jobs:
           [[ "$EXPECTED_PREPARE_RUST_SMOKE_DIGEST" =~ ^[a-f0-9]{64}$ ]] || exit 1
           [[ "$(node --version)" == "v24.22.1" ]] || exit 1
           [[ "$(npm --version)" == "11.19.1" ]] || exit 1
-          node --test kit/confinement/test_node_lock_envelope.mjs kit/confinement/test_node_lock_manifest.mjs kit/confinement/test_feedback_smoke.mjs kit/confinement/test_development_feedback.mjs kit/confinement/test_feedback_producer_crypto.mjs kit/confinement/test_feedback_admin_crypto.mjs kit/confinement/test_node_contract_validation.mjs
+          node --test kit/confinement/test_node_lock_envelope.mjs kit/confinement/test_node_lock_manifest.mjs kit/confinement/test_feedback_smoke.mjs kit/confinement/test_development_feedback.mjs kit/confinement/test_feedback_producer_crypto.mjs kit/confinement/test_feedback_admin_crypto.mjs
           python3 -B kit/bootstrap/test_policy.py
           python3 -B kit/bootstrap/test_public_tree.py
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_macos*.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_feedback*.py"
-          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_foundation_node_feedback.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_node_lock_receipt.py"
           [[ -n "${ImageOS:-}" && -n "${ImageVersion:-}" ]] || exit 1
           capture_dir="$(/usr/bin/mktemp -d "${RUNNER_TEMP%/}/feedback-rust-smoke.XXXXXX" 2>/dev/null)"
@@ -251,7 +246,8 @@ jobs:
             CI_SHA="$CI_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
             RUNNER_TEMP="$RUNNER_TEMP" RUNNER_HOME="$HOME" ImageOS="$ImageOS" ImageVersion="$ImageVersion" \
             /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
-            -I -S -B kit/confinement/macos_rust_toolchain.py --control-sha "$CI_SHA" >"$raw_file" 2>"$capture_dir/stderr"
+            -I -S -B kit/confinement/macos_rust_toolchain.py --control-sha "$CI_SHA" 2>"$capture_dir/stderr" \
+            | tee "$raw_file" >/dev/null
           smoke_status=$?
           set -e
           if [[ "$smoke_status" -ne 0 ]]; then printf 'KD-RUST-REFUSAL reason=smoke_failed\n'; exit 1; fi
@@ -339,7 +335,6 @@ jobs:
           CORE_CONTRACT_REVIEWED_BASE_BRANCH: ${{ vars.CORE_CONTRACT_REVIEWED_BASE_BRANCH }}
           CORE_CONTRACT_REVIEWED_CANDIDATE_REF: ${{ secrets.CORE_CONTRACT_REVIEWED_CANDIDATE_REF }}
           CORE_CONTRACT_REVIEWED_DIFF_SHA256: ${{ vars.CORE_CONTRACT_REVIEWED_DIFF_SHA256 }}
-          CORE_CONTRACT_ACCEPTED_NODE_LOCK_JSON: ${{ secrets.CORE_CONTRACT_ACCEPTED_NODE_LOCK_JSON }}
         run: |
           set -euo pipefail
           [[ -n "${ImageOS:-}" && -n "${ImageVersion:-}" && -n "${RUNNER_TEMP:-}" ]] || exit 1
@@ -375,20 +370,19 @@ jobs:
             CORE_CONTRACT_REVIEWED_BASE_BRANCH="$CORE_CONTRACT_REVIEWED_BASE_BRANCH" \
             CORE_CONTRACT_REVIEWED_CANDIDATE_REF="$CORE_CONTRACT_REVIEWED_CANDIDATE_REF" \
             CORE_CONTRACT_REVIEWED_DIFF_SHA256="$CORE_CONTRACT_REVIEWED_DIFF_SHA256" \
-            CORE_CONTRACT_ACCEPTED_NODE_LOCK_JSON="$CORE_CONTRACT_ACCEPTED_NODE_LOCK_JSON" \
             SOURCE_READER_INSTALLATION_ID="$SOURCE_READER_INSTALLATION_ID" \
             SOURCE_READER_CLIENT_ID="$SOURCE_READER_CLIENT_ID" SOURCE_REPOSITORY_ID="$SOURCE_REPOSITORY_ID" \
             SOURCE_REPOSITORY_OWNER="$SOURCE_REPOSITORY_OWNER" SOURCE_REPOSITORY_NAME="$SOURCE_REPOSITORY_NAME" \
             /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
             -I -S -B kit/confinement/macos_feedback_producer.py run --profile build_diagnostics --token-stdin \
             --source-sha "$REQUESTED_SOURCE_SHA" --base-sha "$REQUESTED_BASE_SHA" \
-            --base-branch "$REQUESTED_BASE_BRANCH" >"$stdout_file" 2>"$stderr_file"
+            --base-branch "$REQUESTED_BASE_BRANCH" 2>"$stderr_file" | tee "$stdout_file" >/dev/null
           driver_status=$?
           set -e
           if [[ "$driver_status" -ne 0 ]]; then
             set +e
             /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
-              -I -S -B kit/confinement/feedback_failure.py <"$stdout_file" >"$failure_file" 2>/dev/null
+              -I -S -B kit/confinement/feedback_failure.py <"$stdout_file" 2>/dev/null | tee "$failure_file" >/dev/null
             failure_status=$?
             set -e
             if [[ "$failure_status" -ne 0 || "$(wc -l < "$failure_file")" -ne 1 \
@@ -407,7 +401,7 @@ jobs:
             exit 1
           fi
           set +e
-          sudo -n -- /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/root LANG=C LC_ALL=C \
+          cat "$stdout_file" | sudo -n -- /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/root LANG=C LC_ALL=C \
             PYTHONDONTWRITEBYTECODE=1 CI_SHA="$CI_SHA" GITHUB_SHA="$GITHUB_SHA" \
             GITHUB_REPOSITORY="$CI_REPOSITORY" GITHUB_REPOSITORY_ID="$GITHUB_REPOSITORY_ID" \
             GITHUB_EVENT_NAME="$CI_EVENT_NAME" GITHUB_REF="$CI_REF" \
@@ -425,7 +419,7 @@ jobs:
             SOURCE_REPOSITORY_ID="$SOURCE_REPOSITORY_ID" \
             /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
             -I -S -B kit/confinement/macos_feedback_producer.py publish --profile build_diagnostics \
-            <"$stdout_file" >"$publish_file" 2>"$publish_stderr"
+            2>"$publish_stderr" | tee "$publish_file" >/dev/null
           publish_status=$?
           set -e
           if [[ "$publish_status" -ne 0 || "$(wc -l < "$publish_file")" -ne 1 \
@@ -506,7 +500,6 @@ jobs:
       - core-build-diagnostic-return
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    cache-mode: none
     permissions:
       actions: read
       checks: read

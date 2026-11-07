@@ -36,7 +36,6 @@ MAX_NODE_INPUT_BYTES = 8 * 1024 * 1024
 MAX_NODE_PUBLIC_OUTPUT_BYTES = 4096
 MAX_KEY_BYTES = 16 * 1024
 MAX_PLAINTEXT_BYTES = 4 * 1024 * 1024 - 64 * 1024
-NPM_DIAGNOSTICS_PREFIX = b"KD-NPM-DIAGNOSTICS "
 MAX_SAFE_INTEGER = feedback_request.MAX_SAFE_INTEGER
 REQUEST_INPUT_FIELDS = frozenset((
     "kind", "repository_id", "source_sha", "base_sha", "control_sha",
@@ -44,7 +43,7 @@ REQUEST_INPUT_FIELDS = frozenset((
 ))
 REQUEST_INPUT_FIELDS_WITH_WORKSPACE = REQUEST_INPUT_FIELDS | frozenset(("workspace",))
 PACKET_FIELDS = frozenset((
-    "schema_version", "request", "expected_manifest", "reviewed_rust_paths",
+    "schema_version", "request", "reviewed_rust_paths",
     "review_confirmed", "review_confirmed_at",
 ))
 SUMMARY_REVIEW_FIELDS = frozenset((
@@ -454,23 +453,15 @@ def _packet_from_bytes(raw, *, now):
         profile = feedback_request.validate_request(packet["request"], now=now)
     except Exception:
         _refuse()
-    if profile["kind"] == "lock":
-        if packet["expected_manifest"] is None or packet["reviewed_rust_paths"] != []:
-            _refuse()
-    elif profile["kind"] == "rust_patch":
-        if packet["expected_manifest"] is not None or type(packet["reviewed_rust_paths"]) is not list:
+    if profile["kind"] == "rust_patch":
+        if type(packet["reviewed_rust_paths"]) is not list:
             _refuse()
         paths = packet["reviewed_rust_paths"]
         if not _valid_reviewed_rust_paths(paths):
             _refuse()
-    elif packet["expected_manifest"] is not None or packet["reviewed_rust_paths"] != []:
+    elif packet["reviewed_rust_paths"] != []:
         _refuse()
     return packet, profile
-
-
-def _is_npm_diagnostic(profile, plaintext):
-    return (profile["kind"] == feedback_request.NPM_ADMISSION_KIND
-            and bytes(plaintext[:len(NPM_DIAGNOSTICS_PREFIX)]) == NPM_DIAGNOSTICS_PREFIX)
 
 
 def _quick_context(request, run_id):
@@ -1026,8 +1017,7 @@ class FeedbackAdmin:
             _unlink_named(dir_fd, key_name, mode=0o400, limit=MAX_KEY_BYTES)
             _refuse()
 
-    def create_request(self, reviewed_fields, *, expected_manifest=None,
-                       reviewed_rust_paths=None, confirm_reviewed=False):
+    def create_request(self, reviewed_fields, *, reviewed_rust_paths=None, confirm_reviewed=False):
         """Persist a fresh reviewed request and return only its canonical record and public key."""
         now = self._now()
         input_fields = (
@@ -1040,26 +1030,21 @@ class FeedbackAdmin:
         packet_limit_value = {
             "schema_version": 1,
             "reviewed_fields": reviewed_fields,
-            "expected_manifest": expected_manifest,
             "reviewed_rust_paths": [] if reviewed_rust_paths is None else reviewed_rust_paths,
             "review_confirmed": True,
             "review_confirmed_at": now,
         }
         packet_limit_value = _parse_json(_json_bytes(packet_limit_value, MAX_PACKET_BYTES), MAX_PACKET_BYTES)
         reviewed_fields = packet_limit_value["reviewed_fields"]
-        expected_manifest = packet_limit_value["expected_manifest"]
         reviewed_rust_paths = packet_limit_value["reviewed_rust_paths"]
         kind = reviewed_fields["kind"]
         profile = feedback_request.PROFILE_BY_KIND.get(kind) if type(kind) is str else None
         if profile is None:
             _refuse()
-        if kind == "lock":
-            if expected_manifest is None or reviewed_rust_paths != []:
+        if kind == "rust_patch":
+            if not _valid_reviewed_rust_paths(reviewed_rust_paths):
                 _refuse()
-        elif kind == "rust_patch":
-            if expected_manifest is not None or not _valid_reviewed_rust_paths(reviewed_rust_paths):
-                _refuse()
-        elif expected_manifest is not None or reviewed_rust_paths != []:
+        elif reviewed_rust_paths != []:
             _refuse()
         with self._locked_directory(create=True) as dir_fd:
             now = self._now_in_directory(dir_fd)
@@ -1098,7 +1083,6 @@ class FeedbackAdmin:
                 packet = {
                     "schema_version": 1,
                     "request": request,
-                    "expected_manifest": expected_manifest,
                     "reviewed_rust_paths": [] if reviewed_rust_paths is None else reviewed_rust_paths,
                     "review_confirmed": True,
                     "review_confirmed_at": now,
@@ -1244,13 +1228,8 @@ class FeedbackAdmin:
         if (type(profile.get("max_payload_bytes")) is not int
                 or len(plaintext) > profile["max_payload_bytes"]):
             _refuse()
-        suffix = (
-            "lock" if profile["kind"] == "lock" else "patch" if profile["kind"] == "rust_patch"
-            else "cargo-lock" if profile["kind"] == feedback_request.CARGO_LOCK_KIND
-            else "npm-diagnostics" if _is_npm_diagnostic(profile, plaintext)
-            else "npm-admission" if profile["kind"] == feedback_request.NPM_ADMISSION_KIND
-            else "linux-quick" if profile["kind"] == feedback_request.LINUX_QUICK_KIND
-            else "diagnostics"
+        suffix = "patch" if profile["kind"] == "rust_patch" else (
+            "linux-quick" if profile["kind"] == feedback_request.LINUX_QUICK_KIND else "diagnostics"
         )
         name = "return-" + request["request_id"] + "-" + suffix + ".payload"
         _create_named(dir_fd, name, plaintext, mode=0o600, limit=MAX_PLAINTEXT_BYTES)
@@ -1303,7 +1282,7 @@ class FeedbackAdmin:
                        rust_source_directory, run_id, state, entry, packet, profile):
         request = packet["request"]
         if (manual_summary_review is not None or rust_source_directory is not None
-                or packet["expected_manifest"] is not None or packet["reviewed_rust_paths"]
+                or packet["reviewed_rust_paths"]
                 or type(run_id) is not str or DECIMAL_RE.fullmatch(run_id) is None):
             _refuse()
         collection_time = self._clock_now()
@@ -1379,7 +1358,6 @@ class FeedbackAdmin:
                 "request_id": request_id,
                 "kind": profile["kind"],
                 "private_output_path": output_path,
-                "bootstrap_lock_consumed": state["bootstrap_lock_consumed"],
             }
             if screens_directory is not None:
                 result["screens_directory"] = screens_directory
@@ -1452,8 +1430,6 @@ class FeedbackAdmin:
                     "now": now,
                     "envelope_base64": base64.b64encode(trusted["ciphertext"]).decode("ascii"),
                 }
-                if packet["expected_manifest"] is not None:
-                    message["expected_manifest"] = packet["expected_manifest"]
                 if packet["reviewed_rust_paths"]:
                     message["reviewed_rust_paths"] = packet["reviewed_rust_paths"]
                 if rust_source_directory is not None:
@@ -1516,10 +1492,7 @@ class FeedbackAdmin:
                     "request_id": request_id,
                     "kind": profile["kind"],
                     "private_output_path": output_path,
-                    "bootstrap_lock_consumed": state["bootstrap_lock_consumed"],
                 }
-                if _is_npm_diagnostic(profile, plaintext):
-                    result["payload_variant"] = "npm_diagnostics"
                 return result
             except Exception:
                 try:

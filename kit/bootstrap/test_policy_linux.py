@@ -24,7 +24,8 @@ QUICK_WORKFLOW = ROOT / ".github/workflows/core-linux-quick-return.yml"
 QUICK_MODULE = ROOT / "core-ci/linux_quick_return.py"
 STANDIN = "kd-synthetic-standin-NOT-A-SECRET-0123456789abcdef0123456789abcd"
 ENVIRONMENT_LINE = "    environment: ${{ inputs.mode == 'source' && 'linux-source-read' || '' }}\n"
-LINUX_WORKFLOW_SHA256_BEFORE_SPLIT = "f7860a422e818f238232c395a100422ab32e5a6498737a8840d52a362b96b6ae"
+MAIN_ENVIRONMENT_LINE = "    environment: ${{ inputs.mode == 'source' && github.ref == 'refs/heads/main' && 'linux-source-read-main' || inputs.mode == 'source' && 'linux-source-read' || '' }}\n"
+LINUX_WORKFLOW_SHA256_BEFORE_SPLIT = "d185cbe6abd3a0caf5235c7521378bc0247f8f08de4adc5a43c2abff2158c5c3"
 LINUX_LANE_FILES = (
     ".github/workflows/linux-confinement.yml",
     "kit/bootstrap/policy_linux.py",
@@ -205,7 +206,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.assertIn("github.ref == 'refs/heads/untrusted'", source)
         self.assertIn("inputs.mode == 'source'", source)
         self.assertIn("inputs.mode == 'synthetic' && github.ref == 'refs/heads/main'", source)
-        self.assertIn(ENVIRONMENT_LINE, source)
+        self.assertIn(MAIN_ENVIRONMENT_LINE, source)
         self.assertIn("REQUESTED_ENVIRONMENT_NAME: ${{ inputs.environment_name }}", source)
         self.assertIn("LINUX_SOURCE_ENVIRONMENT_NAME: ${{ vars.LINUX_SOURCE_ENVIRONMENT_NAME }}", source)
         self.assertIn("LINUX_SOURCE_ENVIRONMENT_ID: ${{ vars.LINUX_SOURCE_ENVIRONMENT_ID }}", source)
@@ -215,7 +216,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.assertNotIn("pull_request:", self.text)
         self.assertNotIn("workflow_call:", self.text)
 
-    def test_five_jobs_with_least_privilege_and_cache_mode_none_everywhere(self):
+    def test_five_jobs_with_least_privilege_and_main_only_best_effort_cache_operations(self):
         jobs = self.jobs()
         self.assertEqual(
             list(jobs),
@@ -227,7 +228,15 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
                 "linux-source-admission-audit",
             ],
         )
-        self.assertEqual(self.text.count("cache-mode: none"), 6)
+        self.assertNotIn("cache-mode:", self.text)
+        cache_steps = [
+            block for block in re.split(r"(?m)^      - name: ", self.text)
+            if "actions/cache/" in block or "linux_source_build.py rust-cache-" in block
+        ]
+        self.assertEqual(len(cache_steps), 12)
+        for block in cache_steps:
+            self.assertIn("github.ref == 'refs/heads/main'", block)
+            self.assertIn("continue-on-error: true", block)
         for name in ("settings", "source-read", "verdict"):
             body = jobs["linux-source-admission-" + name]
             self.assertIn("      actions: read\n      contents: read\n", body)
@@ -299,7 +308,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
             with self.subTest(job=name):
                 self.assertIn("      SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}\n", body)
                 self.assertIn("      SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}\n", body)
-                self.assertIn(ENVIRONMENT_LINE, body)
+                self.assertIn(ENVIRONMENT_LINE if name == "settings" else MAIN_ENVIRONMENT_LINE, body)
         for name in ("unit", "audit"):
             body = jobs["linux-source-admission-" + name]
             self.assertNotIn("SOURCE_REPOSITORY_OWNER", body)
@@ -321,31 +330,41 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         for name in ("settings", "source-read", "verdict", "audit"):
             with self.subTest(job=name):
                 body = jobs["linux-source-admission-" + name]
-                self.assertEqual(body.count(ENVIRONMENT_LINE), 1)
+                expected_environment = MAIN_ENVIRONMENT_LINE if name in ("source-read", "verdict") else ENVIRONMENT_LINE
+                self.assertEqual(body.count(expected_environment), 1)
                 self.assertNotIn("environment_name ||", body)
         self.assertNotIn("environment:", jobs["linux-source-admission-unit"])
-        self.assertEqual(self.text.count(ENVIRONMENT_LINE), 4)
-        self.assertEqual(self.text.count("linux-source-read"), 5)
+        self.assertEqual(self.text.count(ENVIRONMENT_LINE), 2)
+        self.assertEqual(self.text.count(MAIN_ENVIRONMENT_LINE), 2)
+        self.assertEqual(self.text.count("linux-source-read"), 7)
         self.assertEqual(self.text.count("environment:"), 4)
-        self.assertNotIn("'none'", self.text)
+        self.assertIn("KD_RUST_CACHE_MODE: ${{ github.ref == 'refs/heads/main' &&", self.text)
         self.assertIn("        description: Protected source-read environment\n        required: false\n        type: string\n        default: linux-source-read\n", self.text)
         self.assertNotIn("default: source-read", self.text)
         self.assertIn("REQUESTED_ENVIRONMENT_NAME: ${{ inputs.environment_name }}", self.text)
         self.assertIn('ENVIRONMENT_NAME = "linux-source-read"', (ROOT / "kit/confinement/linux_source_build.py").read_text(encoding="utf-8"))
 
     def test_synthetic_runs_get_no_environment_and_source_runs_get_the_linux_environment(self):
-        expression = "${{ inputs.mode == 'source' && 'linux-source-read' || '' }}"
+        expressions = {
+            "settings": "${{ inputs.mode == 'source' && 'linux-source-read' || '' }}",
+            "source-read": "${{ inputs.mode == 'source' && github.ref == 'refs/heads/main' && 'linux-source-read-main' || inputs.mode == 'source' && 'linux-source-read' || '' }}",
+            "verdict": "${{ inputs.mode == 'source' && github.ref == 'refs/heads/main' && 'linux-source-read-main' || inputs.mode == 'source' && 'linux-source-read' || '' }}",
+            "audit": "${{ inputs.mode == 'source' && 'linux-source-read' || '' }}",
+        }
         for name in ("settings", "source-read", "verdict", "audit"):
             with self.subTest(job=name):
                 body = self.jobs()["linux-source-admission-" + name]
                 header = body.split("    steps:\n", 1)[0]
-                self.assertEqual(re.findall(r"(?m)^    environment: (.*)$", header), [expression])
-                self.assertNotIn("environment: linux-source-read", header)
+                self.assertEqual(re.findall(r"(?m)^    environment: (.*)$", header), [expressions[name]])
+                self.assertNotIn("    environment: linux-source-read\n", header)
         self.assertNotIn("environment:", self.jobs()["linux-source-admission-unit"])
-        self.assertEqual(re.findall(r"(?m)^\s+environment: (.*)$", self.text), [expression] * 4)
+        self.assertEqual(
+            re.findall(r"(?m)^\s+environment: (.*)$", self.text),
+            [expressions[name] for name in ("settings", "source-read", "verdict", "audit")],
+        )
         template = policy_linux.LINUX_SOURCE_ADMISSION_WORKFLOW_TEMPLATE
-        self.assertEqual(template.count("    environment: " + expression + "\n"), 4)
-        self.assertEqual(template.count("environment: linux-source-read"), 0)
+        self.assertEqual(template.count("    environment: " + expressions["settings"] + "\n"), 2)
+        self.assertEqual(template.count("    environment: " + expressions["source-read"] + "\n"), 2)
         for line in self.text.splitlines():
             if "secrets.KD_LINUX_LOG_CANARY" in line:
                 self.assertIn("inputs.mode == 'synthetic'", line)
@@ -368,16 +387,21 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
                 "Boundary self-test before source-reader mint",
                 "Mint scoped source-reader token",
                 "Verify selected installation identity",
-                "Fetch exact source and verify binding, tree, signatures and lock provenance",
+                "Fetch exact source and verify binding, tree, signatures and committed locks",
                 "Revoke source-reader token and verify rejection",
-                "Install pinned cargo-deny and prepare the RustSec database",
-                "Require trusted Rust licence admission",
+                "Derive Rust cache key",
+                "Prepare runner-local Rust cache staging",
+                "Restore exact Rust build cache",
+                "Import validated Rust build cache",
+                "Fetch Rust dependencies from the committed lockfiles",
                 "Fetch npm tarballs by committed lock integrity",
-                "Run trusted dependency audit",
                 "Prepare offline project inputs",
                 "Re-run positive controls immediately before the first project command",
                 "Run all offline project gates",
                 "Merge confinement phase records",
+                "Export validated Rust build cache after confined work",
+                "Package the Rust build cache",
+                "Save the exact Rust build cache",
                 "Forced faults must fail closed",
             ],
         )
@@ -395,6 +419,9 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         for name in ("settings", "unit", "source-read", "verdict"):
             self.assertIn("      - linux-source-admission-" + name + "\n", audit)
         self.assertIn("CONFINEMENT_AUDIT_EXPECTED: ${{ needs.linux-source-admission-settings.outputs.expected }}", audit)
+        self.assertIn("CONFINEMENT_AUDIT_CACHE_KEYS:", audit)
+        self.assertIn("needs.linux-source-admission-source-read.outputs.cache_key", audit)
+        self.assertIn("needs.linux-source-admission-verdict.outputs.cache_key", audit)
         self.assertIn("linux_source_build.py audit", audit)
         self.assertNotIn("sudo", audit)
         self.assertIn('"artifact_names": ()', (ROOT / "kit/confinement/linux_source_build.py").read_text(encoding="utf-8"))
@@ -407,11 +434,16 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         verdict = self.jobs()["linux-source-admission-verdict"]
         unit = self.jobs()["linux-source-admission-unit"]
         self.assertIn("python3 -B kit/confinement/test_linux_boundary.py", unit)
-        self.assertNotIn("    outputs:\n", source)
+        self.assertIn(
+            "    outputs:\n      cache_key: ${{ steps.rust-cache-key.outputs.cache_key }}\n", source,
+        )
+        self.assertIn(
+            "    outputs:\n      cache_key: ${{ steps.verifier-rust-cache-key.outputs.cache_key }}\n", verdict,
+        )
         self.assertNotIn("verdict_record", verdict)
         self.assertNotIn("needs.linux-source-admission-source-read.outputs", verdict)
         self.assertIn("PRODUCER_RESULT: ${{ needs.linux-source-admission-source-read.result }}", verdict)
-        self.assertIn(ENVIRONMENT_LINE, verdict)
+        self.assertIn(MAIN_ENVIRONMENT_LINE, verdict)
         self.assertIn("linux_boundary.py selftest", verdict)
         self.assertIn("linux_boundary.py recheck", verdict)
         self.assertIn("linux_boundary.py merge", verdict)
@@ -419,8 +451,10 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.assertIn("linux_source_build.py verify-handoff", verdict)
         self.assertIn("linux_source_build.py gates", verdict)
         self.assertIn("run: python3 -B kit/confinement/linux_source_build.py verdict", verdict)
-        self.assertNotIn("uses:", verdict)
-        self.assertEqual(verdict.count("      - name:"), 18)
+        self.assertEqual(verdict.count("      - name:"), 23)
+        self.assertEqual(verdict.count("uses: actions/cache/restore@"), 1)
+        self.assertEqual(verdict.count("uses: actions/cache/save@"), 1)
+        self.assertNotIn("uses: ./", verdict)
         self.assertEqual(verdict.count("--preserve-env=KD_CANARY_SECRET"), 2)
         self.assertNotIn("KD-CONFINEMENT" + "-VERDICT", self.text)
         self.assertNotIn("KD-CONFINEMENT" + "-VERDICT", verdict)
@@ -439,12 +473,9 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
 
     def test_mutations_of_the_workflow_are_refused_as_template_mismatches(self):
         mutations = (
-            self.text.replace("cache-mode: none\njobs:", "jobs:"),
             self.text.replace("runs-on: ubuntu-24.04", "runs-on: ubuntu-latest", 1),
-            self.text.replace("permissions: {}\ncache-mode", "permissions: write-all\ncache-mode", 1),
             self.text.replace("      - name: Publish confinement verdict\n", "      - name: Publish confinement verdict\n        uses: ./kit/bootstrap\n", 1),
             self.text.replace("      - name: Fetch exact public control\n", "      - name: Fetch exact public control\n        if: ${{ false }}\n", 1),
-            self.text.replace("cache-mode: none\n", "", 1),
             self.text.replace("workflow_dispatch:\n", "workflow_dispatch:\n  push:\n", 1),
             self.text + "  extra:\n    runs-on: ubuntu-24.04\n    steps: []\n",
         )
@@ -511,7 +542,8 @@ class LinuxQuickReturnWorkflowTests(unittest.TestCase):
             self.assertIn("github.ref == 'refs/heads/untrusted'", header)
         self.assertEqual(self.text.count('[[ "$CI_REF" == "refs/heads/untrusted" ]]'), 3)
         self.assertEqual(self.text.count("runs-on: ubuntu-24.04"), 4)
-        self.assertEqual(self.text.count("cache-mode: none"), 5)
+        self.assertNotIn("cache-mode:", self.text)
+        self.assertNotIn("actions/cache/", self.text)
         self.assertNotIn("latest", self.text)
         self.assertIn("    permissions: {}\n", jobs["core-linux-quick-return-unit"])
         for name in ("settings", "producer"):
@@ -552,9 +584,6 @@ class LinuxQuickReturnWorkflowTests(unittest.TestCase):
             ("LINUX_SOURCE_ENVIRONMENT_ID", "LINUX_QUICK_ENVIRONMENT_ID"),
             ("LINUX_SOURCE_MAIN_BRANCH_POLICY_ID", "LINUX_QUICK_MAIN_BRANCH_POLICY_ID"),
             ("LINUX_SOURCE_UNTRUSTED_BRANCH_POLICY_ID", "LINUX_QUICK_UNTRUSTED_BRANCH_POLICY_ID"),
-            ("LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256", "LINUX_QUICK_ACCEPTED_NODE_LOCK_SHA256"),
-            ("LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256", "LINUX_QUICK_ACCEPTED_MANIFEST_SHA256"),
-            ("LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON", "LINUX_QUICK_ACCEPTED_NODE_PROVENANCE_JSON"),
             ("KD_QUICK_ALLOWED_REQUEST_ID", "LINUX_QUICK_ALLOWED_REQUEST_ID"),
             ("KD_QUICK_ALLOWED_RECIPIENT_FINGERPRINT", "LINUX_QUICK_ALLOWED_RECIPIENT_FINGERPRINT"),
             ("KD_QUICK_ALLOWED_NONCE", "LINUX_QUICK_ALLOWED_NONCE"),
@@ -627,6 +656,7 @@ class LinuxQuickReturnWorkflowTests(unittest.TestCase):
             "SOURCE_REPOSITORY_OWNER", "SOURCE_REPOSITORY_NAME", "SOURCE_READER_PRIVATE_KEY",
             "KD_LINUX_LOG_CANARY",
         })
+        self.assertNotIn("RUST_CACHE_", self.text)
         in_run = False
         for line in self.text.splitlines():
             if re.match(r"^        run: ", line):
@@ -654,10 +684,11 @@ class LinuxQuickReturnWorkflowTests(unittest.TestCase):
         uses = re.findall(r"(?m)^\s+uses: (\S+)", self.text)
         self.assertEqual(len(uses), 2)
         for value in uses:
-            self.assertRegex(value, r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$")
+            self.assertRegex(value, r"^(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@[0-9a-f]{40}$")
         self.assertEqual(sorted(uses), sorted((self.PINNED_UPLOAD, self.PINNED_MINT)))
         self.assertNotIn("download-artifact", self.text)
-        self.assertNotIn("actions/cache", self.text)
+        self.assertNotIn("actions/cache/", self.text)
+        self.assertNotIn("RUST_CACHE_", self.text)
         self.assertNotIn("actions/checkout", self.text)
 
     def test_producer_steps_follow_the_required_order_and_encrypt_after_the_gates(self):
@@ -673,11 +704,10 @@ class LinuxQuickReturnWorkflowTests(unittest.TestCase):
                 "Boundary self-test before source-reader mint",
                 "Mint scoped source-reader token",
                 "Verify selected installation identity",
-                "Fetch exact source and verify binding, tree, signatures and lock provenance",
+                "Fetch exact source and verify binding, tree, signatures and committed locks",
                 "Revoke source-reader token and verify rejection",
-                "Require trusted Rust licence admission",
+                "Fetch Rust dependencies from the committed lockfiles",
                 "Fetch npm tarballs by committed lock integrity",
-                "Run trusted dependency audit",
                 "Prepare offline project inputs",
                 "Re-run positive controls immediately before the first project command",
                 "Run all offline project gates",
@@ -762,7 +792,6 @@ class LinuxQuickReturnWorkflowTests(unittest.TestCase):
             self.text.replace("    permissions: {}\n", "    permissions: write-all\n", 1),
             self.text.replace("      - name: Remove staged ciphertext\n", "      - name: Publish confinement verdict\n        run: echo verdict\n      - name: Remove staged ciphertext\n", 1),
             self.text.replace("vars.LINUX_QUICK_ALLOWED_SHA", "vars.LINUX_SOURCE_ALLOWED_SHA", 1),
-            self.text.replace("cache-mode: none\n", "", 1),
             self.text.replace("    environment: linux-source-read\n", "", 1),
             self.text.replace("workflow_dispatch:\n", "workflow_dispatch:\n  push:\n", 1),
             self.text + "  extra:\n    runs-on: ubuntu-24.04\n    steps: []\n",

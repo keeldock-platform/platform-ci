@@ -35,14 +35,10 @@ import policy
 import policy_baselines
 import policy_handoff
 import policy_linux
-import policy_npm
-import policy_rust
 import policy_windows
 from test_policy_baselines import *
 from test_policy_handoff import *
 from test_policy_linux import *
-from test_policy_npm import *
-from test_policy_rust import *
 from test_policy_windows import *
 
 
@@ -151,7 +147,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         return PLATFORM_WORKFLOW.read_text(encoding="utf-8")
 
     def test_feedback_return_workflows_require_exact_reviewed_platform_definitions(self):
-        for kind in ("node-lock-return", "core-rust-format-return", "core-build-diagnostic-return"):
+        for kind in ("core-rust-format-return", "core-build-diagnostic-return"):
             with self.subTest(workflow=kind):
                 path = Path(__file__).resolve().parents[2] / (".github/workflows/" + kind + ".yml")
                 workflow = path.read_text(encoding="utf-8")
@@ -271,7 +267,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         mutations = (
             base.replace("  workflow_dispatch:\n", "  pull_request:\n", 1),
             base.replace("  pull_request:\n", "", 1),
-            base.replace("      - \"**\"\n", "      - main\n", 1),
+            base.replace("        PROMOTION_WORKFLOW: node-lock-smoke\n", "        PROMOTION_WORKFLOW: other\n", 1),
             base.replace("permissions: {}\n", "permissions:\n  contents: read\n", 1),
             base.replace("          - macos-15\n", "          - macos-latest\n", 1),
             base.replace("      fail-fast: true\n", "      fail-fast: false\n", 1),
@@ -989,7 +985,8 @@ class WorkflowPolicyTests(unittest.TestCase):
                 self.assertTrue(workflow.startswith(
                     "name: " + workflow_kind + "\non:\n  workflow_dispatch:\n"
                 ))
-                self.assertIn("cache-mode: none\npermissions: {}", workflow)
+                self.assertNotIn("cache-mode:", workflow)
+                self.assertNotIn("actions/cache/", workflow)
                 self.assertIn("github.ref == 'refs/heads/main'", workflow)
                 self.assertIn("environment: " + environment, workflow)
                 self.assertEqual(workflow.count("environment:"), 1)
@@ -1028,8 +1025,6 @@ class WorkflowPolicyTests(unittest.TestCase):
                         "source_fetch_unavailable",
                         "revocation_unconfirmed",
                         "base_invalid",
-                        "signature_invalid",
-                        "revocation_policy_invalid",
                         "bootstrap_snapshot_invalid",
                         "bootstrap_not_approved",
                         "binding_invalid",
@@ -1130,7 +1125,8 @@ class WorkflowPolicyTests(unittest.TestCase):
                             "token-revocation=confirmed"
                         )
                     )
-                    self.assertIn("RULES_ID_DEFINITIONS", workflow)
+                    self.assertNotIn("RULES_ID_DEFINITIONS", workflow)
+                    self.assertIn('[[ "$REQUESTED_BASE_BRANCH" == main && "$REQUESTED_SOURCE_SHA" == "$REQUESTED_BASE_SHA" ]]', workflow)
                     self.assertIn("SOURCE_CANDIDATE_REF", workflow)
                     self.assertIn("Validate source-reader scope configuration", workflow)
                     self.assertIn("SOURCE_REPOSITORY_ID\" != \"1428198872\"", workflow)
@@ -1225,7 +1221,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                     self.assertNotIn("macos-core-source-binding=verified", workflow)
                     self.assertNotIn('{"metadata":', workflow)
                 for changed in (
-                    workflow.replace("cache-mode: none", "cache-mode: write", 1),
+                    workflow.replace("permissions: {}", "cache-mode: none\npermissions: {}", 1),
                     workflow.replace(environment, "invalid-environment", 1),
                     workflow.replace(MACOS_SOURCE_READER_ACTION_SHA, "0" * 40),
                     workflow.replace("actions: read\n      checks: read", "actions: write\n      checks: read"),
@@ -1337,17 +1333,7 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_consumer_workflow_requires_shared_platform_origin_and_full_sha(self):
         pin = "a" * 40
         shared_origin = "keeldock-platform/platform-ci/kit/bootstrap@" + pin
-        workflow = (
-            "name: public-policy\non:\n  push:\n    branches:\n      - \"**\"\n"
-            "  pull_request:\n  workflow_dispatch:\npermissions: {}\njobs:\n"
-            "  policy:\n    name: policy-${{ matrix.runner }}\n    strategy:\n"
-            "      fail-fast: true\n      matrix:\n        runner:\n"
-            "          - ubuntu-24.04\n          - macos-15\n          - windows-2025\n"
-            "    runs-on: ${{ matrix.runner }}\n    timeout-minutes: 10\n"
-            "    env:\n      CI_SHA: ${{ github.sha }}\n    steps:\n"
-            "      - name: Run source-free policy checks\n        uses: " + shared_origin + "\n"
-            "        with:\n          pool: connect\n"
-        )
+        workflow = policy.consumer_workflow_template("connect", pin)
         self.assertTrue(validate_workflow_text(workflow, "connect"))
         wrong_origins = (
             "keeldock" + "-" + "connect/connect" + "-ci/kit/bootstrap@" + pin,
@@ -1427,8 +1413,7 @@ class LaneRegistryTests(unittest.TestCase):
         self.assertEqual(
             policy.LANE_MODULES,
             (
-                policy_linux, policy_windows, policy_handoff, policy_rust, policy_baselines,
-                policy_npm,
+                policy_linux, policy_windows, policy_handoff, policy_baselines,
             ),
         )
         self.assertIs(type(policy.LANE_MODULES), tuple)
@@ -1437,8 +1422,7 @@ class LaneRegistryTests(unittest.TestCase):
         self.assertEqual(
             policy.LANE_MODULES,
             (
-                policy_linux, policy_windows, policy_handoff, policy_rust, policy_baselines,
-                policy_npm,
+                policy_linux, policy_windows, policy_handoff, policy_baselines,
             ),
         )
         self.assertEqual(
@@ -1463,13 +1447,9 @@ class LaneRegistryTests(unittest.TestCase):
                 "lane-h-capsule-attester",
                 "linux-source-admission",
                 "core-linux-quick-return",
-                "core-rust-lock-return",
-                "core-npm-admission-return",
                 "baselines-prepare",
             },
         )
-        self.assertIs(policy.WORKFLOW_KIND_LANES["core-rust-lock-return"], policy_rust)
-        self.assertIs(policy.WORKFLOW_KIND_LANES["core-npm-admission-return"], policy_npm)
         self.assertIs(policy.WORKFLOW_KIND_LANES["baselines-prepare"], policy_baselines)
         self.assertIs(policy.WORKFLOW_KIND_LANES["linux-confinement"], policy_linux)
         self.assertIs(policy.WORKFLOW_KIND_LANES["linux-source-admission"], policy_linux)
@@ -1542,19 +1522,9 @@ class LaneRegistryTests(unittest.TestCase):
                     "handoff-workflow-too-large",
                 ),
                 (
-                    ".github/workflows/core-rust-lock-return.yml",
-                    "core-rust-lock-return",
-                    "rust-lock-return-workflow-too-large",
-                ),
-                (
                     ".github/workflows/baselines-prepare.yml",
                     "baselines-prepare",
                     "baselines-workflow-too-large",
-                ),
-                (
-                    ".github/workflows/core-npm-admission-return.yml",
-                    "core-npm-admission-return",
-                    "npm-admission-return-workflow-too-large",
                 ),
             ),
         )
@@ -1671,7 +1641,7 @@ class LaneRegistryTests(unittest.TestCase):
     def test_moved_templates_keep_their_pre_split_digests_through_the_shared_module(self):
         self.assertEqual(
             hashlib.sha256(policy.LINUX_CONFINEMENT_WORKFLOW_TEMPLATE.encode("utf-8")).hexdigest(),
-            "f7860a422e818f238232c395a100422ab32e5a6498737a8840d52a362b96b6ae",
+            "d185cbe6abd3a0caf5235c7521378bc0247f8f08de4adc5a43c2abff2158c5c3",
         )
         self.assertEqual(
             hashlib.sha256(policy.WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE.encode("utf-8")).hexdigest(),
@@ -1694,7 +1664,6 @@ class LaneRegistryTests(unittest.TestCase):
             "macos-core-bootstrap": ".github/workflows/macos-core-bootstrap.yml",
             "macos-core-contract": ".github/workflows/macos-core-contract.yml",
             "development-feedback-smoke": ".github/workflows/development-feedback-smoke.yml",
-            "node-lock-return": ".github/workflows/node-lock-return.yml",
             "core-rust-format-return": ".github/workflows/core-rust-format-return.yml",
             "core-build-diagnostic-return": ".github/workflows/core-build-diagnostic-return.yml",
         }

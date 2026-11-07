@@ -39,7 +39,7 @@ def _archive(member):
 def _cipher_marker(runner, digest, size=128):
     return (
         "KD-FEEDBACK-CIPHERTEXT schema=1 control-sha={sha} run-id={run_id} "
-        "run-attempt=1 member=lock-return-v1.enc ciphertext-sha256={digest} "
+        "run-attempt=1 member=build-diagnostic-return-v1.enc ciphertext-sha256={digest} "
         "ciphertext-size={size} roundtrip=passed source=synthetic"
     ).format(sha=CONTROL_SHA, run_id=RUN_ID, digest=digest, size=size).encode("ascii")
 

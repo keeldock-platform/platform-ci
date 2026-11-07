@@ -329,7 +329,8 @@ class RustToolchainContractTests(unittest.TestCase):
             ), "capture_invalid", "capture_overflow"),
         )
         for stage in ("format", "api_feature_clippy", "api_feature_tests", "runtime_format",
-                      "runtime_clippy", "runtime_tests"):
+                      "runtime_clippy", "runtime_tests", "node_dependency_prepare",
+                      "typescript_typecheck", "typescript_tests"):
             self.assertIn(stage, rust.SOURCE_COMMAND_STAGES)
             for case_name, outcome, expected_reason, expected_check in cases:
                 calls = []
@@ -352,6 +353,30 @@ class RustToolchainContractTests(unittest.TestCase):
                 self.assertEqual(raised.exception.reason, expected_reason)
                 self.assertEqual(raised.exception.command_check, expected_check)
                 self.assertEqual(calls, [True])
+
+    def test_typescript_stages_allow_bounded_nonzero_diagnostic_capture(self):
+        frame = b"KD-CAPTURE 1 7 10 0 0 0\ntypecheck\n"
+        calls = []
+
+        def run_as_probe_user(argv, uid, **kwargs):
+            calls.append((argv, kwargs))
+            return SimpleNamespace(returncode=0, stdout=frame, stderr=b"")
+
+        capability = SimpleNamespace(_run_as_probe_user=run_as_probe_user)
+        for stage in ("node_dependency_prepare", "typescript_typecheck", "typescript_tests"):
+            with self.subTest(stage=stage):
+                result = rust._run_worker_command(
+                    ("node", "npm-cli.js", "run", stage), 502, {"PATH": "/usr/bin"},
+                    "/usr/bin/python3", capability, stage=stage,
+                    deadline=rust.time.monotonic() + 30, allow_nonzero_capture=True,
+                )
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (7, b"typecheck\n", b""))
+                argv, options = calls[-1]
+                self.assertTrue(options["command_diagnostics"])
+                self.assertEqual(argv[:6], (
+                    "/usr/bin/python3", "-I", "-S", "-B", "-c", rust.COMMAND_CAPTURE_SCRIPT,
+                ))
+                self.assertEqual(argv[6:], ("node", "npm-cli.js", "run", stage))
 
     def test_diagnostic_capture_decodes_only_bounded_worker_frame(self):
         output = b"KD-CAPTURE 1 7 4 4 0 0\nfmt\n"

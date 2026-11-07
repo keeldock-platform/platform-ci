@@ -12,6 +12,7 @@ from unittest import mock
 
 import confinement_public_audit as subject
 import confinement_verdict as verdict
+import feedback_api
 import log_canary
 
 
@@ -33,7 +34,7 @@ STAMP = b"2026-10-28T10:00:00.1234567Z "
 ACCEPTED = (
     "KD-CONFINEMENT-AUDIT schema=1 status=accepted os=linux mode=candidate control-sha=" + CONTROL
     + " run-id=5000123456 run-attempt=1 verdict=accepted log-canary=absent artifacts=expected"
-    " caches=unchanged"
+    " caches=verified"
 )
 ANNOTATION = {
     "path": "ci", "start_line": 1, "end_line": 1, "start_column": None, "end_column": None,
@@ -188,6 +189,79 @@ def make_cache(identifier):
     }
 
 
+def make_source_cache(identifier):
+    cache = make_cache(identifier)
+    source_sha = format(identifier, "040x")
+    cache["key"] = (
+        "kd-rust-v5-Linux-x64-linux-source-admission-primary-" + source_sha + "-" + CONTROL
+        + "-" + "a" * 64 + "-" + "b" * 64 + "-" + "c" * 64
+    )
+    return cache
+
+
+def make_runtime_cache(identifier):
+    cache = make_cache(identifier)
+    cache["key"] = (
+        "kd-rust-v5-Linux-x64-runtime-workspace-primary-" + format(identifier, "040x") + "-"
+        + CONTROL + "-" + "a" * 64 + "-" + "b" * 64 + "-" + "c" * 64
+    )
+    return cache
+
+
+def make_managed_cache(identifier, namespace):
+    cache = make_cache(identifier)
+    source_sha = format(identifier, "040x")
+    if namespace == "rust":
+        cache["key"] = (
+            "kd-rust-v5-Linux-x64-rust-primary-" + source_sha + "-" + CONTROL
+            + "-" + "a" * 64 + "-" + "b" * 64 + "-" + "c" * 64
+        )
+    elif namespace == "runtime-workspace":
+        cache["key"] = (
+            "kd-rust-v5-Linux-x64-runtime-workspace-primary-" + source_sha + "-" + CONTROL
+            + "-" + "a" * 64 + "-" + "b" * 64 + "-" + "c" * 64
+        )
+    elif namespace in ("linux-source-admission", "linux-source-verifier"):
+        trust_class = "primary" if namespace == "linux-source-admission" else "independent-verifier"
+        cache["key"] = (
+            "kd-rust-v5-Linux-x64-" + namespace + "-" + trust_class + "-" + source_sha + "-"
+            + CONTROL + "-" + "a" * 64 + "-" + "b" * 64 + "-" + "c" * 64
+        )
+    elif namespace == "macos-public-cache-seed":
+        cache["key"] = "macos-public-cache-seed-v1-88-1"
+    else:
+        raise AssertionError("unknown cache namespace")
+    return cache
+
+
+def managed_cache_rejections(namespace, cache):
+    cases = [
+        ("malformed key", dict(cache, key=cache["key"] + "-malformed")),
+        ("zero size", dict(cache, size_in_bytes=0)),
+    ]
+    if namespace == "linux-source-admission":
+        cases.append((
+            "wrong trust class",
+            dict(cache, key=cache["key"].replace(
+                "linux-source-admission-primary", "linux-source-admission-independent-verifier",
+            )),
+        ))
+    elif namespace == "linux-source-verifier":
+        cases.append((
+            "wrong trust class",
+            dict(cache, key=cache["key"].replace(
+                "linux-source-verifier-independent-verifier", "linux-source-verifier-primary",
+            )),
+        ))
+    return cases
+
+
+MANAGED_CACHE_NAMESPACES = (
+    "rust", "runtime-workspace", "linux-source-admission", "linux-source-verifier",
+    "macos-public-cache-seed",
+)
+
+
 class FakeApi:
     def __init__(self, os_name="linux", mode="candidate"):
         self.expected = {
@@ -200,7 +274,8 @@ class FakeApi:
             },
             "verdict_job": BUILD_JOB, "verdict_step": VERDICT_STEP, "auditor_job": AUDITOR_JOB,
             "artifact_names": (),
-            "cache_digest": subject.cache_inventory_digest([]),
+            "cache_digest": subject._cache_baseline_digest(subject.cache_inventory_baseline([])),
+            "cache_baseline": subject.cache_inventory_baseline([]),
         }
         self.run = {
             "id": RUN_ID, "run_attempt": 1, "head_sha": CONTROL, "path": WORKFLOW,
@@ -241,7 +316,9 @@ class FakeApi:
         self.checks[check_id]["output"]["annotations_count"] = len(items) if count is None else count
 
     def sync_cache_digest(self):
-        self.expected["cache_digest"] = subject.cache_inventory_digest(self.caches)
+        baseline = subject.cache_inventory_baseline(self.caches)
+        self.expected["cache_digest"] = subject._cache_baseline_digest(baseline)
+        self.expected["cache_baseline"] = baseline
 
     def _page(self, key, items, page):
         total = self.total_override.get(key, len(items))
@@ -355,19 +432,140 @@ class AcceptanceTests(AuditCase):
 
     def test_expected_caches_and_optional_steps_are_accepted(self):
         api = FakeApi()
-        api.caches = [make_cache(7)]
+        api.caches = [make_source_cache(7)]
         api.sync_cache_digest()
         api.jobs[1]["steps"][3]["conclusion"] = "skipped"
         self.assert_accepted(api)
 
     def test_cache_digest_ignores_access_times_only(self):
         api = FakeApi()
-        api.caches = [make_cache(7), make_cache(8)]
+        api.caches = [make_source_cache(7), make_source_cache(8)]
         api.sync_cache_digest()
         api.caches[0]["last_accessed_at"] = "2026-10-29T00:00:00Z"
         self.assert_accepted(api)
+        api.caches.pop(0)
+        self.assert_accepted(api)
+        api.caches = [make_source_cache(7), make_source_cache(8)]
         api.caches[0]["size_in_bytes"] += 1
         self.assert_refused(api, "cache_inventory")
+
+    def test_main_cache_additions_require_a_bound_key_or_a_valid_managed_key(self):
+        source_sha = "d" * 40
+        api = FakeApi()
+        api.expected["ci_ref"] = "main"
+        api.expected["display_title"] = "Linux admission source " + source_sha
+        api.run["head_branch"] = "main"
+        api.run["display_title"] = api.expected["display_title"]
+        baseline = make_source_cache(7)
+        api.caches = [baseline]
+        api.sync_cache_digest()
+        key = (
+            "kd-rust-v5-Linux-x64-linux-source-admission-primary-" + source_sha + "-" + CONTROL
+            + "-" + "a" * 64 + "-" + "b" * 64 + "-" + "c" * 64
+        )
+        verifier_key = key.replace(
+            "linux-source-admission-primary", "linux-source-verifier-independent-verifier",
+        )
+        added = dict(make_cache(8), key=key, ref="refs/heads/main")
+        verifier_added = dict(make_cache(9), key=verifier_key, ref="refs/heads/main")
+        api.caches.append(added)
+        api.caches.append(verifier_added)
+        allowed = (key, verifier_key)
+        self.assertEqual(subject.parse_allowed_cache_keys(",".join(allowed), api.expected), allowed)
+        self.assertEqual(subject.audit(api, api.expected, CONFIG, allowed), ACCEPTED)
+
+        api.caches = [added, verifier_added]
+        self.assertEqual(subject.audit(api, api.expected, CONFIG, allowed), ACCEPTED)
+
+        api.caches = [baseline, added, verifier_added]
+        api.caches[0] = dict(baseline, size_in_bytes=baseline["size_in_bytes"] + 1)
+        accepted, line = subject.audit_line(api, api.expected, CONFIG, allowed)
+        self.assertFalse(accepted)
+        self.assertEqual(subject.decode_audit_line(line), {
+            "status": "refused", "phase": "cache_inventory",
+        })
+
+        for bad in (
+            dict(added, ref="refs/pull/12/merge"),
+            dict(added, key=key.replace(source_sha, "E" * 40)),
+            dict(added, key=key.replace("linux-source-admission-primary", "linux-source-admission-independent-verifier")),
+        ):
+            api.caches = [baseline, bad, verifier_added]
+            with self.subTest(key=bad["key"], ref=bad["ref"]):
+                accepted, line = subject.audit_line(api, api.expected, CONFIG, allowed)
+                self.assertFalse(accepted)
+                self.assertEqual(subject.decode_audit_line(line), {
+                    "status": "refused", "phase": "cache_inventory",
+                })
+
+        unrelated = dict(added, key=key.replace("linux-source-admission-primary", "runtime-workspace-primary"))
+        api.caches = [baseline, unrelated]
+        self.assertEqual(subject.audit(api, api.expected, CONFIG, (key,)), ACCEPTED)
+
+        for invalid in (
+            dict(added, key="kd-rust-v999-exfil"),
+            dict(added, key="macos-public-cache-none-write-v1-88-1"),
+            dict(added, key="arbitrary-new-cache"),
+            dict(added, ref="refs/pull/8/merge"),
+        ):
+            api.caches = [baseline, invalid]
+            with self.subTest(invalid_key=invalid["key"], invalid_ref=invalid["ref"]):
+                accepted, line = subject.audit_line(api, api.expected, CONFIG, (key,))
+                self.assertFalse(accepted)
+                self.assertEqual(subject.decode_audit_line(line)["phase"], "cache_inventory")
+
+        with self.assertRaises(subject.AuditRefusal) as caught:
+            subject.parse_allowed_cache_keys(key, dict(api.expected, ci_ref="untrusted"))
+        self.assertEqual(caught.exception.phase, "request")
+        with self.assertRaises(subject.AuditRefusal):
+            subject.parse_allowed_cache_keys(key, dict(api.expected, control_sha="e" * 40))
+        with self.assertRaises(subject.AuditRefusal) as caught:
+            subject.parse_allowed_cache_keys(key.replace(source_sha, "e" * 40), api.expected)
+        self.assertEqual(caught.exception.phase, "request")
+        wrong_verifier_class = verifier_key.replace(
+            "linux-source-verifier-independent-verifier", "linux-source-verifier-primary",
+        )
+        with self.assertRaises(subject.AuditRefusal) as caught:
+            subject.parse_allowed_cache_keys(wrong_verifier_class, api.expected)
+        self.assertEqual(caught.exception.phase, "request")
+        for malformed in ("," + key, key + ",", key + ",," + key):
+            with self.subTest(raw=malformed), self.assertRaises(subject.AuditRefusal):
+                subject.parse_allowed_cache_keys(malformed, api.expected)
+
+    def test_concurrent_main_writes_cover_every_cache_namespace(self):
+        for index, namespace in enumerate(MANAGED_CACHE_NAMESPACES, start=10):
+            api = FakeApi()
+            baseline = make_cache(7)
+            concurrent = make_managed_cache(index, namespace)
+            api.caches = [baseline]
+            api.sync_cache_digest()
+            api.caches.append(concurrent)
+            self.assertEqual(subject.audit(api, api.expected, CONFIG), ACCEPTED)
+
+            api = FakeApi()
+            api.caches = [make_cache(7)]
+            api.sync_cache_digest()
+            non_main = dict(concurrent, id=8, ref="refs/heads/untrusted")
+            api.caches.append(non_main)
+            with self.subTest(namespace=namespace, rejection="non-main ref"):
+                self.assert_refused(api, "cache_inventory")
+
+            for label, malformed in managed_cache_rejections(namespace, concurrent):
+                api = FakeApi()
+                api.caches = [make_cache(7)]
+                api.sync_cache_digest()
+                api.caches.append(dict(malformed, id=8))
+                with self.subTest(namespace=namespace, rejection=label):
+                    self.assert_refused(api, "cache_inventory")
+
+    def test_cache_snapshot_carries_the_full_baseline_id_set(self):
+        api = FakeApi()
+        api.caches = [make_source_cache(9), make_cache(4)]
+        digest, baseline = subject.snapshot_cache_inventory(api, REPO)
+        self.assertEqual(digest, subject._cache_baseline_digest(baseline))
+        fingerprints = subject._decode_cache_baseline(baseline)
+        self.assertEqual(tuple(fingerprints), (4, 9))
+        self.assertEqual(fingerprints[4], subject._cache_entry_digest(api.caches[1]))
 
     def test_many_pages_are_read_completely(self):
         api = FakeApi()
@@ -979,15 +1177,15 @@ class SurfaceTests(AuditCase):
 
     def test_cache_changes_and_gaps_are_refused(self):
         api = FakeApi()
-        api.caches = [make_cache(7)]
+        api.caches = [dict(make_source_cache(7), ref="refs/heads/untrusted")]
         self.assert_refused(api, "cache_inventory")
         api = FakeApi()
-        api.caches = [make_cache(7)]
+        api.caches = [make_source_cache(7)]
         api.sync_cache_digest()
         api.caches = []
-        self.assert_refused(api, "cache_inventory")
+        self.assertEqual(subject.audit(api, api.expected, CONFIG), ACCEPTED)
         api = FakeApi()
-        api.caches = [make_cache(7)]
+        api.caches = [make_source_cache(7)]
         api.sync_cache_digest()
         api.caches[0]["key"] = "changed"
         self.assert_refused(api, "cache_inventory")
@@ -1002,14 +1200,26 @@ class SurfaceTests(AuditCase):
         api.caches = [bad]
         self.assert_refused(api, "cache_inventory")
 
-    def test_cache_digest_is_order_independent_and_snapshot_matches(self):
+    def test_source_audit_covers_other_cache_namespaces_and_detects_mutations(self):
+        api = FakeApi()
+        api.caches = [make_cache(7)]
+        api.sync_cache_digest()
+        api.caches[0]["size_in_bytes"] += 1
+        self.assert_refused(api, "cache_inventory")
+        api.sync_cache_digest()
+        api.caches[0]["version"] = None
+        self.assert_refused(api, "cache_inventory")
+
+    def test_cache_digest_is_order_independent_and_snapshot_carries_a_verified_baseline(self):
         entries = [make_cache(number) for number in range(1, 6)]
         self.assertEqual(
             subject.cache_inventory_digest(entries), subject.cache_inventory_digest(list(reversed(entries))),
         )
         api = FakeApi()
         api.caches = entries
-        self.assertEqual(subject.snapshot_cache_digest(api, REPO), subject.cache_inventory_digest(entries))
+        digest, baseline = subject.snapshot_cache_digest(api, REPO)
+        self.assertEqual(digest, subject._cache_baseline_digest(baseline))
+        self.assertEqual(subject._decode_cache_baseline(baseline).keys(), {1, 2, 3, 4, 5})
         for repository in ("", "no-slash", None, 5):
             with self.assertRaises(subject.AuditRefusal) as caught:
                 subject.snapshot_cache_digest(api, repository)
@@ -1101,6 +1311,7 @@ class ExpectedTests(AuditCase):
             changed(artifact_names=("bad name",)), changed(artifact_names=(5,)),
             changed(artifact_names=tuple("a" + str(number) for number in range(21))),
             changed(cache_digest="0" * 63), changed(cache_digest=None),
+            changed(cache_baseline="not-base64"), changed(cache_baseline=5),
             changed(jobs={SETTINGS_JOB: {"steps": (), "optional_steps": ()}}, verdict_job=SETTINGS_JOB),
             changed(jobs={SETTINGS_JOB: {"steps": ("a",), "optional_steps": ("b",)}}, verdict_job=SETTINGS_JOB),
             changed(jobs={SETTINGS_JOB: {"steps": ["a"], "optional_steps": ()}}, verdict_job=SETTINGS_JOB),
@@ -1115,6 +1326,9 @@ class ExpectedTests(AuditCase):
         absent = FakeApi()
         del absent.expected["cache_digest"]
         cases.append(absent)
+        absent_baseline = FakeApi()
+        del absent_baseline.expected["cache_baseline"]
+        cases.append(absent_baseline)
         for index, api in enumerate(cases):
             with self.subTest(case=index):
                 self.assert_refused(api, "request")
@@ -1175,7 +1389,7 @@ class LineTests(unittest.TestCase):
         bad = (
             "", "\n", ACCEPTED + " extra=1", ACCEPTED + "\n\n", ACCEPTED.replace("status=accepted", "status=ok"),
             ACCEPTED.replace("log-canary=absent", "log-canary=present"),
-            ACCEPTED.replace("caches=unchanged", "caches=changed"),
+            ACCEPTED.replace("caches=verified", "caches=changed"),
             ACCEPTED.replace("run-attempt=1", "run-attempt=0"),
             ACCEPTED.replace("mode=candidate", "mode=other"),
             ACCEPTED.replace("os=linux", "os=macos"),
@@ -1233,6 +1447,48 @@ class ParseAndMainTests(AuditCase):
             status = subject.main([], self.environment(api), lambda token, repository: api, output)
         self.assertEqual(status, 0)
         self.assertEqual(output.getvalue(), ACCEPTED + "\n")
+
+    def test_main_accepts_only_the_current_run_cache_keys_from_the_output_environment(self):
+        source_sha = "d" * 40
+        api = FakeApi()
+        api.expected["ci_ref"] = "main"
+        api.expected["display_title"] = "Linux admission source " + source_sha
+        api.run["head_branch"] = "main"
+        api.run["display_title"] = api.expected["display_title"]
+        baseline = make_cache(7)
+        api.caches = [baseline]
+        api.sync_cache_digest()
+        key = (
+            "kd-rust-v5-Linux-x64-linux-source-admission-primary-" + source_sha + "-" + CONTROL
+            + "-" + "a" * 64 + "-" + "b" * 64 + "-" + "c" * 64
+        )
+        verifier_key = key.replace(
+            "linux-source-admission-primary", "linux-source-verifier-independent-verifier",
+        )
+        api.caches.append(dict(make_cache(8), key=key, ref="refs/heads/main"))
+        api.caches.append(dict(make_cache(9), key=verifier_key, ref="refs/heads/main"))
+        allowed = key + "," + verifier_key
+        output = io.StringIO()
+        env = self.environment(api, **{subject.AUDIT_CACHE_KEYS_ENV: allowed})
+        with mock.patch.object(log_canary, "PINNED_CONFIG", CONFIG):
+            status = subject.main([], env, lambda token, repository: api, output)
+        self.assertEqual(status, 0)
+        self.assertEqual(output.getvalue(), ACCEPTED + "\n")
+
+        output = io.StringIO()
+        env = self.environment(api, **{subject.AUDIT_CACHE_KEYS_ENV: ""})
+        with mock.patch.object(log_canary, "PINNED_CONFIG", CONFIG):
+            status = subject.main([], env, lambda token, repository: api, output)
+        self.assertEqual(status, 1)
+        self.assertEqual(output.getvalue(), subject.refusal_line("cache_inventory") + "\n")
+
+        api.caches[-1] = dict(api.caches[-1], key="arbitrary-injected-cache")
+        output = io.StringIO()
+        env = self.environment(api, **{subject.AUDIT_CACHE_KEYS_ENV: allowed})
+        with mock.patch.object(log_canary, "PINNED_CONFIG", CONFIG):
+            status = subject.main([], env, lambda token, repository: api, output)
+        self.assertEqual(status, 1)
+        self.assertEqual(output.getvalue(), subject.refusal_line("cache_inventory") + "\n")
 
     def test_main_refuses_on_identity_mismatch_without_calling_the_api(self):
         for updates in (
@@ -1361,7 +1617,7 @@ QUICK_ARTIFACT_SIZE = subject.QUICK_FRAME_BYTES + 150
 QUICK_ACCEPTED = (
     "KD-CONFINEMENT-AUDIT schema=1 status=accepted os=linux mode=quick tier=quick admission=never"
     " control-sha=" + CONTROL + " run-id=5000123456 run-attempt=1 verdict=none log-canary=absent"
-    " artifacts=expected caches=unchanged"
+    " artifacts=expected caches=verified"
 )
 
 
@@ -1419,7 +1675,8 @@ class QuickApi(FakeApi):
             },
             "quick_job": QUICK_PRODUCER_JOB, "request_id": QUICK_REQUEST,
             "auditor_job": QUICK_AUDITOR_JOB, "artifact_names": ("linux-quick-" + QUICK_REQUEST,),
-            "cache_digest": subject.cache_inventory_digest([]),
+            "cache_digest": subject._cache_baseline_digest(subject.cache_inventory_baseline([])),
+            "cache_baseline": subject.cache_inventory_baseline([]),
         }
         self.run["path"] = subject.QUICK_WORKFLOW_PATH
         self.run["display_title"] = QUICK_TITLE
@@ -1463,6 +1720,10 @@ class QuickAcceptanceTests(QuickAuditCase):
         self.assertEqual(subject.audit_quick(api, api.expected, CONFIG), QUICK_ACCEPTED)
         self.assertEqual(subject.quick_audit_line(api, api.expected, CONFIG), (True, QUICK_ACCEPTED))
         self.assertEqual(subject.quick_accepted_line(api.expected), QUICK_ACCEPTED)
+        self.assertEqual(
+            subject.quick_accepted_line(api.expected).encode("ascii"),
+            feedback_api._quick_audit_line({"head_sha": CONTROL, "id": RUN_ID}),
+        )
         self.assertIn("admission=never", QUICK_ACCEPTED)
         self.assertNotIn("verdict=accepted", QUICK_ACCEPTED)
         with self.assertRaises(subject.AuditRefusal):
@@ -1714,11 +1975,33 @@ class QuickArtifactTests(QuickAuditCase):
         self.assertEqual(subject.QUICK_FRAME_BYTES, 4128768 + 486)
         self.assertLessEqual(subject.QUICK_FRAME_BYTES + subject.QUICK_ARTIFACT_SLACK_BYTES, 4 * 1024 * 1024 + 8192)
 
-    def test_any_cache_change_is_refused(self):
+    def test_concurrent_main_writes_cover_every_cache_namespace(self):
+        for index, namespace in enumerate(MANAGED_CACHE_NAMESPACES, start=10):
+            api = QuickApi()
+            api.caches = [make_cache(1)]
+            api.sync_cache_digest()
+            api.caches.append(make_managed_cache(index, namespace))
+            self.assertEqual(subject.audit_quick(api, api.expected, CONFIG), QUICK_ACCEPTED)
+
+            api = QuickApi()
+            api.caches = [make_cache(1)]
+            api.sync_cache_digest()
+            api.caches.append(dict(
+                make_managed_cache(index, namespace), id=2, ref="refs/heads/untrusted",
+            ))
+            with self.subTest(namespace=namespace, rejection="non-main ref"):
+                self.assert_refused(api, "cache_inventory")
+
+            for label, malformed in managed_cache_rejections(
+                    namespace, make_managed_cache(index, namespace)):
+                api = QuickApi()
+                api.caches = [make_cache(1)]
+                api.sync_cache_digest()
+                api.caches.append(dict(malformed, id=2))
+                with self.subTest(namespace=namespace, rejection=label):
+                    self.assert_refused(api, "cache_inventory")
+
         api = QuickApi()
-        api.caches = [make_cache(1)]
-        self.assert_refused(api, "cache_inventory")
-        api.sync_cache_digest()
         self.assertEqual(subject.audit_quick(api, api.expected, CONFIG), QUICK_ACCEPTED)
 
 
@@ -1769,7 +2052,7 @@ WINDOWS_SOURCE_SHA = "cd" * 20
 WINDOWS_ACCEPTED = (
     "KD-CONFINEMENT-AUDIT schema=1 status=accepted os=windows mode=candidate control-sha=" + CONTROL
     + " run-id=5000123456 run-attempt=1 verdict=accepted log-canary=absent artifacts=expected"
-    " caches=unchanged"
+    " caches=verified"
 )
 WINDOWS_SYNTHETIC_ACCEPTED = WINDOWS_ACCEPTED.replace("mode=candidate", "mode=synthetic")
 WINDOWS_JOB_ORDER = (
@@ -1839,7 +2122,10 @@ class WindowsApi(FakeApi):
     def __init__(self, mode="source"):
         super().__init__("windows", "candidate")
         self.mode = mode
-        self.expected = subject.windows_expected(windows_environment(mode), subject.cache_inventory_digest([]))
+        baseline = subject.cache_inventory_baseline([])
+        self.expected = subject.windows_expected(
+            windows_environment(mode), subject._cache_baseline_digest(baseline), baseline,
+        )
         branch = "untrusted" if mode == "source" else "main"
         self.run["path"] = subject.WINDOWS_WORKFLOW_PATH
         self.run["head_branch"] = branch
@@ -1990,7 +2276,8 @@ class WindowsExpectedTests(WindowsAuditCase):
         self.assert_refused(api, "request")
 
     def test_the_expected_builder_refuses_incomplete_environments(self):
-        digest = subject.cache_inventory_digest([])
+        baseline = subject.cache_inventory_baseline([])
+        digest = subject._cache_baseline_digest(baseline)
         for field, value in (
             ("CI_MODE", "other"), ("GITHUB_RUN_ID", "0"), ("GITHUB_RUN_ATTEMPT", "2"),
             ("CI_REF", "refs/heads/develop"), ("CI_SHA", "z" * 40), ("REQUESTED_SOURCE_SHA", ""),
@@ -1999,13 +2286,13 @@ class WindowsExpectedTests(WindowsAuditCase):
             env[field] = value
             with self.subTest(field=field):
                 with self.assertRaises(subject.AuditRefusal) as caught:
-                    subject.windows_expected(env, digest)
+                    subject.windows_expected(env, digest, baseline)
                 self.assertEqual(caught.exception.phase, "request")
-        expected = subject.windows_expected(windows_environment("synthetic"), digest)
+        expected = subject.windows_expected(windows_environment("synthetic"), digest, baseline)
         self.assertEqual(expected["display_title"], subject.WINDOWS_SYNTHETIC_TITLE)
         self.assertEqual(expected["mode"], "synthetic")
         self.assertEqual(expected["jobs"][subject.WINDOWS_LINUX_JOB]["optional_steps"], subject.WINDOWS_LINUX_SYNTHETIC_SKIPS)
-        source = subject.windows_expected(windows_environment(), digest)
+        source = subject.windows_expected(windows_environment(), digest, baseline)
         self.assertEqual(source["display_title"], subject.WINDOWS_TITLE_PREFIX + WINDOWS_SOURCE_SHA)
         self.assertEqual(source["jobs"][subject.WINDOWS_LINUX_JOB]["optional_steps"], ())
         self.assertEqual(source["artifact_names"], subject.windows_capsule_names(RUN_ID, 1))
@@ -2124,7 +2411,7 @@ class WindowsJobTests(WindowsAuditCase):
         api = with_skipped_step("Other skipped step")
         self.assert_refused(api, "job_steps")
 
-    def test_the_source_only_receiver_step_may_be_skipped_only_in_synthetic_producer_and_verifier_jobs(self):
+    def test_retired_receiver_dependency_step_cannot_reappear_as_a_skip(self):
         def with_skipped_step(job_name, mode, step_name):
             api = WindowsApi(mode)
             steps = api.job(job_name)["steps"]
@@ -2137,12 +2424,10 @@ class WindowsJobTests(WindowsAuditCase):
             return api
 
         for job_name in (subject.WINDOWS_PRODUCER_JOB, subject.WINDOWS_VERIFIER_JOB):
-            with self.subTest(job=job_name, mode="synthetic"):
-                api = with_skipped_step(job_name, "synthetic", subject.WINDOWS_SOURCE_ONLY_RECEIVER_STEP)
-                self.assertEqual(subject.audit_windows(api, api.expected, CONFIG), WINDOWS_SYNTHETIC_ACCEPTED)
-            with self.subTest(job=job_name, mode="source"):
-                api = with_skipped_step(job_name, "source", subject.WINDOWS_SOURCE_ONLY_RECEIVER_STEP)
-                self.assert_refused(api, "job_steps")
+            for mode in ("synthetic", "source"):
+                with self.subTest(job=job_name, mode=mode):
+                    api = with_skipped_step(job_name, mode, "Install pinned cargo-deny and prepare the RustSec database")
+                    self.assert_refused(api, "job_steps")
             with self.subTest(job=job_name, skipped_step="unrelated"):
                 api = with_skipped_step(job_name, "synthetic", "Other skipped step")
                 self.assert_refused(api, "job_steps")
@@ -2152,11 +2437,11 @@ class WindowsJobTests(WindowsAuditCase):
         )
         self.assertEqual(
             expected["jobs"][subject.WINDOWS_PRODUCER_JOB]["optional_steps"],
-            (subject.WINDOWS_VERDICT_STEP, subject.WINDOWS_SOURCE_ONLY_RECEIVER_STEP),
+            (subject.WINDOWS_VERDICT_STEP,),
         )
         self.assertEqual(
             expected["jobs"][subject.WINDOWS_VERIFIER_JOB]["optional_steps"],
-            (subject.WINDOWS_SOURCE_ONLY_RECEIVER_STEP,),
+            (),
         )
         source = subject.windows_expected(windows_environment(), subject.cache_inventory_digest([]))
         self.assertEqual(
@@ -2279,11 +2564,33 @@ class WindowsArtifactTests(WindowsAuditCase):
         api.artifacts[0]["workflow_run"]["head_branch"] = "untrusted"
         self.assert_refused(api, "artifact_inventory")
 
-    def test_any_cache_change_is_refused(self):
+    def test_concurrent_main_writes_cover_every_cache_namespace(self):
+        for index, namespace in enumerate(MANAGED_CACHE_NAMESPACES, start=10):
+            api = WindowsApi()
+            api.caches = [make_cache(1)]
+            api.sync_cache_digest()
+            api.caches.append(make_managed_cache(index, namespace))
+            self.assertEqual(subject.audit_windows(api, api.expected, CONFIG), WINDOWS_ACCEPTED)
+
+            api = WindowsApi()
+            api.caches = [make_cache(1)]
+            api.sync_cache_digest()
+            api.caches.append(dict(
+                make_managed_cache(index, namespace), id=2, ref="refs/heads/untrusted",
+            ))
+            with self.subTest(namespace=namespace, rejection="non-main ref"):
+                self.assert_refused(api, "cache_inventory")
+
+            for label, malformed in managed_cache_rejections(
+                    namespace, make_managed_cache(index, namespace)):
+                api = WindowsApi()
+                api.caches = [make_cache(1)]
+                api.sync_cache_digest()
+                api.caches.append(dict(malformed, id=2))
+                with self.subTest(namespace=namespace, rejection=label):
+                    self.assert_refused(api, "cache_inventory")
+
         api = WindowsApi()
-        api.caches = [make_cache(1)]
-        self.assert_refused(api, "cache_inventory")
-        api.sync_cache_digest()
         self.assertEqual(subject.audit_windows(api, api.expected, CONFIG), WINDOWS_ACCEPTED)
 
 
@@ -2380,10 +2687,11 @@ class WindowsMainTests(unittest.TestCase):
                 rows = dict(line.rstrip("\n").split("=", 1) for line in source)
         self.assertEqual(status, 0)
         self.assertEqual(output.getvalue(), "windows-source-audit-identity=prepared\n")
-        digest = subject.cache_inventory_digest(api.caches)
+        digest, baseline = subject.snapshot_cache_digest(api, REPO)
         self.assertEqual(rows["cache_digest"], digest)
         expected = subject.parse_expected(rows["expected"], False, True)
         self.assertEqual(expected["cache_digest"], digest)
+        self.assertEqual(expected["cache_baseline"], baseline)
         self.assertEqual(expected["display_title"], subject.WINDOWS_TITLE_PREFIX + WINDOWS_SOURCE_SHA)
 
     def test_windows_expected_refuses_without_an_output_file_or_a_valid_environment(self):

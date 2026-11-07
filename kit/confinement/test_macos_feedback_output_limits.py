@@ -258,21 +258,14 @@ class SuccessReceiptDiagnosticTests(Helpers, unittest.TestCase):
         self.assertLessEqual(
             audit.CORE_CONTRACT_SUCCESS_RECEIPT_DIAGNOSTICS, audit.CORE_CONTRACT_REFUSAL_DIAGNOSTICS)
 
-    def test_missing_manifest_reviewed_paths_and_encryptor_failures_have_fixed_details(self):
+    def test_reviewed_paths_and_encryptor_failures_have_fixed_details(self):
         core = load_module("macos_core_contract")
-        expected_details = (
-            "expected_manifest_invalid", "reviewed_paths_invalid", "encryptor_unavailable",
-        )
+        expected_details = ("reviewed_paths_invalid", "encryptor_unavailable")
         dispatch = self.dispatch()
         with self.assertRaises(producer.FeedbackRefusal) as missing_paths:
             producer.encrypt_after_cleanup(
                 dispatch, {"payload_bytes": b"diff"}, Path(NODE or "/usr/bin/node"))
         self.assertEqual(missing_paths.exception.detail, "reviewed_paths_invalid")
-        with self.assertRaises(producer.FeedbackRefusal) as missing_manifest:
-            producer.encrypt_after_cleanup(
-                self.dispatch(kind="lock"), {"payload_bytes": b"lock"},
-                Path(NODE or "/usr/bin/node"))
-        self.assertEqual(missing_manifest.exception.detail, "expected_manifest_invalid")
 
         original_resolve = Path.resolve
 

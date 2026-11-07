@@ -48,7 +48,6 @@ class GateSetTests(unittest.TestCase):
 
     def test_the_table_matches_the_macos_and_node_contract_names(self):
         try:
-            import foundation_node_feedback
             import macos_core_contract
         except ImportError:
             self.skipTest("the macOS contract modules are not importable here")
@@ -56,7 +55,6 @@ class GateSetTests(unittest.TestCase):
         self.assertEqual(gate_table.PARSER_GATE_NAMES, macos_core_contract.PARSER_GATE_NAMES)
         self.assertEqual(gate_table.RUNTIME_GATE_NAMES, macos_core_contract.RUNTIME_GATE_NAMES)
         self.assertEqual(gate_table.API_FEATURE_NAME, macos_core_contract.API_FEATURE_NAME)
-        self.assertEqual(gate_table.NODE_GATE_NAMES, foundation_node_feedback.NODE_GATE_NAMES)
 
     def test_selection_with_and_without_the_runtime_workspace(self):
         self.assertEqual(gate_table.selected_gate_names(False), gate_table.GATES)

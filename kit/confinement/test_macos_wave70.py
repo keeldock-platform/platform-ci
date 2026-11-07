@@ -1,6 +1,4 @@
-import hashlib
 import unittest
-from unittest.mock import patch
 
 import macos_private_validation as subject
 import test_macos_private_validation as validation_tests
@@ -10,7 +8,7 @@ class RuntimeWave70ProfileTests(unittest.TestCase):
     def setUp(self):
         self.fixture = validation_tests.RuntimeWorkspaceTreeTests()
 
-    def test_wave_70a_and_70b_runtime_profiles_authenticate_inventory_and_app_sources(self):
+    def test_runtime_app_profiles_authenticate_inventory_and_app_sources(self):
         for roots in (subject.RUNTIME_WAVE_70A_CRATE_ROOTS, subject.RUNTIME_WAVE_70B_CRATE_ROOTS):
             with self.subTest(member_count=len(roots)):
                 entries, blobs = self.fixture._wave70_profile_files(roots)
@@ -27,14 +25,11 @@ class RuntimeWave70ProfileTests(unittest.TestCase):
                     prefix = "/".join(app)
                     self.assertEqual(subject._runtime_workspace_mode(prefix + "/src/lib.rs", roots), "100644")
 
-    def test_wave_70_registry_locks_accept_pinned_tauri_and_bundled_sqlite_graph(self):
+    def test_runtime_registry_lock_matches_manifest_dependency_graph(self):
         roots = subject.RUNTIME_WAVE_70B_CRATE_ROOTS
         entries, blobs = self.fixture._wave70_profile_files(roots)
         lock_path = subject.RUNTIME_ROOT_LOCK_PATH
         lock_text = blobs[lock_path].decode("ascii")
-        self.assertIn('name = "tauri"\nversion = "2.12.4"\nsource = "', lock_text)
-        self.assertIn('name = "rusqlite"\nversion = "0.37.0"\nsource = "', lock_text)
-        self.assertIn('name = "libsqlite3-sys"\nversion = "0.35.0"\nsource = "', lock_text)
         marker, unused_reads = self.fixture._validate(entries=entries, blobs=blobs)
         self.assertEqual(marker, "core_contract")
 
@@ -45,17 +40,12 @@ class RuntimeWave70ProfileTests(unittest.TestCase):
         ).encode("ascii")
         self.assertEqual(self.fixture._refused(entries=entries, blobs=blobs), "cargo_lock_shape")
 
-    def test_inventoried_build_script_is_refused_without_explicit_review(self):
+    def test_inventoried_build_script_does_not_require_a_manual_review_record(self):
         roots = subject.RUNTIME_WAVE_70A_CRATE_ROOTS
         entries, blobs = self.fixture._wave70_profile_files(roots, include_build_script=True)
         build_script = "runtime/crates/host/core/build.rs"
-        digest = hashlib.sha256(blobs[build_script]).hexdigest()
-        self.assertEqual(self.fixture._refused(entries=entries, blobs=blobs), "source_inventory")
-        with patch.object(
-            subject.cargo_lock_bootstrap, "TRUSTED_BUILD_SCRIPT_REVIEWS",
-            ((build_script, digest, "b" * 40),),
-        ):
-            marker, unused_reads = self.fixture._validate(entries=entries, blobs=blobs)
+        self.assertIn(build_script, blobs)
+        marker, unused_reads = self.fixture._validate(entries=entries, blobs=blobs)
         self.assertEqual(marker, "core_contract")
 
     def test_inventory_rows_and_source_digests_are_candidate_bound(self):

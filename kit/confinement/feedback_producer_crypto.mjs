@@ -11,8 +11,8 @@ import { returnProfileForContext } from './node_lock_envelope.mjs';
 
 const MAX_INPUT_BYTES = 6 * 1024 * 1024;
 const REFUSAL_CODES = new Set([
-  'credential_like_content', 'envelope_rejected', 'exception_expired', 'invalid_cargo_lock',
-  'invalid_context', 'invalid_expectation', 'invalid_input', 'invalid_lock_manifest',
+  'credential_like_content', 'envelope_rejected', 'exception_expired',
+  'invalid_context', 'invalid_expectation', 'invalid_input',
   'invalid_payload', 'invalid_payload_bom', 'invalid_payload_c0', 'invalid_payload_c1',
   'invalid_payload_cr', 'invalid_payload_nul', 'invalid_payload_utf8',
   'invalid_recipient', 'invalid_rust_patch', 'limit_exceeded',
@@ -113,13 +113,13 @@ function originalRustFiles(value) {
 function validateInput(input) {
   const keys = [
     'schema_version', 'kind', 'payload_b64', 'context', 'recipient_spki_b64', 'now',
-    'expected_manifest', 'reviewed_rust_paths', 'original_rust_files_b64',
+    'reviewed_rust_paths', 'original_rust_files_b64',
   ];
   if (!exactObject(input, keys,
     ['schema_version', 'kind', 'payload_b64', 'context', 'recipient_spki_b64', 'now'])
       || input.schema_version !== 1
       || !Number.isSafeInteger(input.now) || input.now < 1
-      || !['lock', 'rust_patch', 'build_diagnostics', 'cargo_lock', 'npm_admission', 'linux_quick'].includes(input.kind)) {
+      || !['rust_patch', 'build_diagnostics', 'linux_quick'].includes(input.kind)) {
     reject('invalid_input');
   }
   let profile;
@@ -129,11 +129,8 @@ function validateInput(input) {
     reject('invalid_context');
   }
   if (profile.kind !== input.kind) reject('invalid_context');
-  const limit = input.kind === 'lock' ? 4 * 1024 * 1024 - 64 * 1024
-    : input.kind === 'rust_patch' ? 4 * 1024 * 1024 - 64 * 1024
-      : input.kind === 'cargo_lock' ? 1024 * 1024
-        : input.kind === 'npm_admission' ? 3 * 1024 * 1024 + 512 * 1024
-          : input.kind === 'linux_quick' ? 4 * 1024 * 1024 - 64 * 1024 : 512 * 1024;
+  const limit = input.kind === 'rust_patch' || input.kind === 'linux_quick'
+    ? 4 * 1024 * 1024 - 64 * 1024 : 512 * 1024;
   const payloadBytes = strictBytes(input.payload_b64, limit);
   const publicKey = publicKeyFromSpki(input.recipient_spki_b64, input.context);
   const options = {
@@ -143,21 +140,15 @@ function validateInput(input) {
     now: input.now,
   };
   let trustedOriginalRustFiles;
-  if (input.kind === 'lock') {
-    if (!Object.hasOwn(input, 'expected_manifest') || Object.hasOwn(input, 'reviewed_rust_paths')
-        || Object.hasOwn(input, 'original_rust_files_b64')) {
-      reject('invalid_expectation');
-    }
-    options.expectedManifest = input.expected_manifest;
-  } else if (input.kind === 'rust_patch') {
-    if (!Object.hasOwn(input, 'reviewed_rust_paths') || Object.hasOwn(input, 'expected_manifest')) {
+  if (input.kind === 'rust_patch') {
+    if (!Object.hasOwn(input, 'reviewed_rust_paths')) {
       reject('invalid_expectation');
     }
     options.reviewedRustPaths = input.reviewed_rust_paths;
     if (Object.hasOwn(input, 'original_rust_files_b64')) {
       trustedOriginalRustFiles = originalRustFiles(input.original_rust_files_b64);
     }
-  } else if (Object.hasOwn(input, 'expected_manifest') || Object.hasOwn(input, 'reviewed_rust_paths')) {
+  } else if (Object.hasOwn(input, 'reviewed_rust_paths')) {
     reject('invalid_expectation');
   } else if (Object.hasOwn(input, 'original_rust_files_b64')) {
     reject('invalid_expectation');

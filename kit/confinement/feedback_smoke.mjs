@@ -5,59 +5,10 @@ import { pathToFileURL } from 'node:url';
 
 import { decryptDevelopmentFeedback, encryptDevelopmentFeedback } from './development_feedback.mjs';
 
-const MEMBER_NAME = 'lock-return-v1.enc';
+const MEMBER_NAME = 'build-diagnostic-return-v1.enc';
 const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 const MAX_EXPIRY = 1_800_835_200;
 const CANARY = 'feedback-smoke-canary-7c49b2';
-
-const EXPECTED_MANIFEST = Object.freeze({
-  root: Object.freeze({
-    name: CANARY,
-    version: '1.0.0',
-    workspaces: Object.freeze(['packages/*']),
-    devDependencies: Object.freeze({ typescript: '6.0.3' }),
-  }),
-  workspaces: Object.freeze([
-    Object.freeze({
-      path: 'packages/client-api',
-      name: '@fixture/client-api',
-      version: '1.0.0',
-      dependencies: Object.freeze({ '@fixture/shared': 'workspace:*' }),
-    }),
-    Object.freeze({ path: 'packages/shared', name: '@fixture/shared', version: '1.0.0' }),
-  ]),
-});
-
-function lockBytes() {
-  const lock = {
-    name: CANARY,
-    version: '1.0.0',
-    lockfileVersion: 3,
-    requires: true,
-    packages: {
-      '': {
-        name: CANARY,
-        version: '1.0.0',
-        workspaces: ['packages/*'],
-        devDependencies: { typescript: '6.0.3' },
-      },
-      'packages/client-api': {
-        name: '@fixture/client-api',
-        version: '1.0.0',
-        dependencies: { '@fixture/shared': 'workspace:*' },
-      },
-      'packages/shared': { name: '@fixture/shared', version: '1.0.0' },
-      'node_modules/@fixture/client-api': { resolved: 'packages/client-api', link: true },
-      'node_modules/@fixture/shared': { resolved: 'packages/shared', link: true },
-      'node_modules/typescript': {
-        version: '6.0.3',
-        resolved: 'https://registry.npmjs.org/typescript/-/typescript-6.0.3.tgz',
-        integrity: `sha512-${'A'.repeat(86)}==`,
-      },
-    },
-  };
-  return Buffer.from(`${JSON.stringify(lock)}\n`, 'utf8');
-}
 
 function validEnvironment(env) {
   return env !== null && typeof env === 'object'
@@ -80,7 +31,8 @@ function buildContext(publicKey, env, now) {
     request_id: randomBytes(32).toString('hex'),
     nonce: randomBytes(32).toString('hex'),
     recipient_fingerprint: fingerprint,
-    concern: 'core-node-lock-return',
+    concern: 'core-build-diagnostic-return',
+    kind: 'build_diagnostics',
     repository_id: env.GITHUB_REPOSITORY_ID,
     source_sha: 'a'.repeat(40),
     base_sha: 'b'.repeat(40),
@@ -89,7 +41,7 @@ function buildContext(publicKey, env, now) {
     reviewed_diff_sha256: 'c'.repeat(64),
     workflow_ref: 'refs/heads/main',
     run_id: env.GITHUB_RUN_ID,
-    producer_job: 'node-lock-return',
+    producer_job: 'core-build-diagnostic-return',
     run_attempt: 1,
     expiry: now + 3600,
   };
@@ -122,14 +74,13 @@ export function createSmokeCiphertext({ env, outputRoot, outputFile, now = Math.
     mkdirSync(outputDirectory, { mode: 0o700 });
     directoryCreated = true;
     const pair = generateKeyPairSync('rsa', { modulusLength: 3072, publicExponent: 65537 });
-    const payload = lockBytes();
+    const payload = Buffer.from('feedback-smoke-canary-7c49b2\n', 'utf8');
     if (!payload.includes(Buffer.from(CANARY, 'utf8'))) throw new Error('fixture-invalid');
     const context = buildContext(pair.publicKey, env, now);
     const envelope = encryptDevelopmentFeedback({
       payloadBytes: payload,
       context,
       recipientPublicKey: pair.publicKey,
-      expectedManifest: EXPECTED_MANIFEST,
       now,
     });
     if (!(envelope instanceof Uint8Array) || envelope.byteLength > MAX_FRAME_BYTES) {
@@ -142,7 +93,6 @@ export function createSmokeCiphertext({ env, outputRoot, outputFile, now = Math.
       envelope,
       context,
       recipientPrivateKey: pair.privateKey,
-      expectedManifest: EXPECTED_MANIFEST,
       now,
     });
     if (!Buffer.from(plaintext).equals(payload)) throw new Error('roundtrip-failed');

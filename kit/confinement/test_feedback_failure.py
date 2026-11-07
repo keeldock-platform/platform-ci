@@ -72,53 +72,10 @@ class FeedbackFailureTests(unittest.TestCase):
                 self.assertEqual(output, subject._format_record(subject.UNAVAILABLE_RECORD))
                 self.assertNotIn(CANARY.encode("ascii"), output)
 
-    def test_node_substage_diagnostics_are_accepted_only_with_their_bound_stage_and_reason(self):
-        bound = core_contract.SOURCE_GATES_NODE_DIAGNOSTIC_REASONS
-        self.assertEqual(subject.NODE_BOUND_DIAGNOSTIC_REASONS, bound)
-        self.assertEqual(subject.NODE_BOUND_DIAGNOSTIC_STAGES, core_contract.SOURCE_GATES_NODE_DIAGNOSTIC_STAGES)
-        self.assertEqual(len(bound), 90)
-        unavailable = subject._format_record(subject.UNAVAILABLE_RECORD)
-        stage_by_substage = (
-            ("runtime_version", "node_dependency_prepare"), ("npm_version", "node_dependency_prepare"),
-            ("lock_generation", "node_dependency_prepare"), ("lock_validation", "node_dependency_prepare"),
-            ("bulk_audit", "node_dependency_audit"), ("npm_ci", "node_dependency_audit"),
-            ("typecheck", "typescript_typecheck"), ("tests", "typescript_tests"),
-        )
-        candidates = ("worker_setup", "node_dependency_prepare", "node_dependency_audit",
-                      "typescript_typecheck", "typescript_tests")
-        for diagnostic, reason in sorted(bound.items()):
-            stage = "worker_setup"
-            for substage, bound_stage in stage_by_substage:
-                if diagnostic.startswith("source_gates_node_" + substage + "_"):
-                    stage = bound_stage
-            raw = _line(_record(diagnostic=diagnostic, reason=reason, stage=stage))
-            with self.subTest(diagnostic=diagnostic):
-                self.assertEqual(subject.normalize_refusal(raw), raw)
-            other_reason = "capture_invalid" if reason == "runner_unavailable" else "runner_unavailable"
-            wrongs = [{"reason": other_reason}, {"stage": "cleanup"}, {"stage": "toolchain_install"},
-                      {"reason": "cleanup_incomplete", "stage": "cleanup"},
-                      {"reason": "internal_error"}]
-            wrongs += [{"stage": other} for other in candidates if other != stage]
-            for wrong in wrongs:
-                bad = _line(_record(diagnostic=diagnostic, **{"reason": reason, "stage": stage, **wrong}))
-                with self.subTest(diagnostic=diagnostic, wrong=wrong):
-                    self.assertEqual(subject.normalize_refusal(bad), unavailable)
-        for unlisted in (
-            "source_gates_node_" + CANARY, "source_gates_node_", "source_gates_node_none_command_failed_extra",
-            "source_gates_node_lock_validation_command_timeout",
-            "source_gates_node_lock_validation_contract_refused",
-        ):
-            output = subject.normalize_refusal(_line(_record(
-                diagnostic=unlisted, reason="runner_unavailable", stage="worker_setup",
-            )))
-            with self.subTest(unlisted=unlisted):
-                self.assertEqual(output, unavailable)
-                self.assertNotIn(CANARY.encode("ascii"), output)
-
     def test_step_diagnostics_are_accepted_only_with_their_bound_stage_and_reason(self):
         bound = core_contract.SOURCE_GATES_STEP_DIAGNOSTIC_REASONS
         self.assertEqual(subject.STEP_BOUND_DIAGNOSTIC_REASONS, bound)
-        self.assertEqual(len(bound), 66)
+        self.assertEqual(len(bound), 2)
         unavailable = subject._format_record(subject.UNAVAILABLE_RECORD)
         for diagnostic, reason in sorted(bound.items()):
             raw = _line(_record(diagnostic=diagnostic, reason=reason, stage="worker_setup"))
@@ -126,7 +83,6 @@ class FeedbackFailureTests(unittest.TestCase):
                 self.assertEqual(subject.normalize_refusal(raw), raw)
             other_reason = "capture_invalid" if reason == "runner_unavailable" else "runner_unavailable"
             for wrong in ({"reason": other_reason}, {"stage": "cleanup"}, {"stage": "toolchain_install"},
-                          {"stage": "typescript_tests"},
                           {"reason": "cleanup_incomplete", "stage": "cleanup"},
                           {"reason": "internal_error"}):
                 bad = _line(_record(diagnostic=diagnostic, **{"reason": reason, "stage": "worker_setup", **wrong}))
@@ -142,12 +98,7 @@ class FeedbackFailureTests(unittest.TestCase):
                 self.assertEqual(output, unavailable)
                 self.assertNotIn(CANARY.encode("ascii"), output)
 
-    def test_node_gate_stage_names_are_known_stages_and_encryptor_class_details_are_known(self):
-        for stage in ("node_dependency_prepare", "node_dependency_audit",
-                      "typescript_typecheck", "typescript_tests"):
-            raw = _line(_record(diagnostic="source_gates", reason="runner_unavailable", stage=stage))
-            with self.subTest(stage=stage):
-                self.assertEqual(subject.normalize_refusal(raw), raw)
+    def test_encryptor_class_details_are_known(self):
         for code in ("bom", "c0", "c1", "cr", "nul", "utf8"):
             raw = _line(_record(
                 diagnostic="success_receipt_node_invalid_payload_" + code,

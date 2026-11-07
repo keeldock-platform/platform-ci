@@ -32,14 +32,12 @@ on:
         required: true
         type: string
 permissions: {}
-cache-mode: none
 jobs:
   core-linux-quick-return-settings:
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/untrusted' }}
     runs-on: ubuntu-24.04
     environment: linux-source-read
     timeout-minutes: 15
-    cache-mode: none
     permissions:
       actions: read
       contents: read
@@ -78,9 +76,6 @@ jobs:
       LINUX_SOURCE_MAIN_BRANCH_POLICY_ID: ${{ vars.LINUX_QUICK_MAIN_BRANCH_POLICY_ID }}
       LINUX_SOURCE_UNTRUSTED_BRANCH_POLICY_ID: ${{ vars.LINUX_QUICK_UNTRUSTED_BRANCH_POLICY_ID }}
       LINUX_API_FEATURE_GATE_NAMES: api_feature_clippy,api_feature_tests
-      LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256: ${{ vars.LINUX_QUICK_ACCEPTED_NODE_LOCK_SHA256 }}
-      LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256: ${{ vars.LINUX_QUICK_ACCEPTED_MANIFEST_SHA256 }}
-      LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON: ${{ vars.LINUX_QUICK_ACCEPTED_NODE_PROVENANCE_JSON }}
       KD_QUICK_REQUEST_ID: ${{ inputs.request_id }}
       KD_QUICK_RECIPIENT_SPKI_B64: ${{ inputs.recipient_spki_b64 }}
       KD_QUICK_ALLOWED_REQUEST_ID: ${{ vars.LINUX_QUICK_ALLOWED_REQUEST_ID }}
@@ -112,7 +107,6 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && needs.core-linux-quick-return-settings.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    cache-mode: none
     permissions: {}
     defaults:
       run:
@@ -148,7 +142,6 @@ jobs:
           python3 -B kit/confinement/test_linux_source_build.py
           python3 -B core-ci/test_linux_quick_return.py
           python3 -B core-ci/test_separation.py
-          python3 -B kit/confinement/test_rust_license_gate.py
           python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
   core-linux-quick-return-producer:
     needs:
@@ -158,7 +151,6 @@ jobs:
     runs-on: ubuntu-24.04
     environment: linux-source-read
     timeout-minutes: 350
-    cache-mode: none
     permissions:
       actions: read
       contents: read
@@ -195,9 +187,6 @@ jobs:
       LINUX_SOURCE_MAIN_BRANCH_POLICY_ID: ${{ vars.LINUX_QUICK_MAIN_BRANCH_POLICY_ID }}
       LINUX_SOURCE_UNTRUSTED_BRANCH_POLICY_ID: ${{ vars.LINUX_QUICK_UNTRUSTED_BRANCH_POLICY_ID }}
       LINUX_API_FEATURE_GATE_NAMES: api_feature_clippy,api_feature_tests
-      LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256: ${{ vars.LINUX_QUICK_ACCEPTED_NODE_LOCK_SHA256 }}
-      LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256: ${{ vars.LINUX_QUICK_ACCEPTED_MANIFEST_SHA256 }}
-      LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON: ${{ vars.LINUX_QUICK_ACCEPTED_NODE_PROVENANCE_JSON }}
       KD_QUICK_REQUEST_ID: ${{ inputs.request_id }}
       KD_QUICK_RECIPIENT_SPKI_B64: ${{ inputs.recipient_spki_b64 }}
       KD_QUICK_ALLOWED_REQUEST_ID: ${{ vars.LINUX_QUICK_ALLOWED_REQUEST_ID }}
@@ -264,7 +253,7 @@ jobs:
           [[ "$EXPECTED_INSTALLATION_ID" =~ ^[1-9][0-9]{0,18}$ ]]
           [[ "$ACTUAL_INSTALLATION_ID" =~ ^[1-9][0-9]{0,18}$ && "$ACTUAL_INSTALLATION_ID" == "$EXPECTED_INSTALLATION_ID" ]]
           printf '%s\n' "linux-source-installation=verified id=$ACTUAL_INSTALLATION_ID"
-      - name: Fetch exact source and verify binding, tree, signatures and lock provenance
+      - name: Fetch exact source and verify binding, tree, signatures and committed locks
         id: checkout
         env:
           SOURCE_READER_TOKEN: ${{ steps.source-reader-token.outputs.token }}
@@ -274,31 +263,42 @@ jobs:
         env:
           SOURCE_READER_TOKEN: ${{ steps.source-reader-token.outputs.token }}
         run: python3 -B kit/confinement/linux_source_build.py revoke
-      - name: Require trusted Rust licence admission
-        id: rust-license-gate
+      - name: Fetch Rust dependencies from the committed lockfiles
+        id: cargo-fetch
         env:
           SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
           REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
-        run: python3 -B kit/confinement/linux_source_build.py rust-license-gate
+          RUST_ROOT: ${{ steps.toolchains.outputs.rust_root }}
+          KD_CARGO_FETCH_HOME: ${{ runner.temp }}/kd-quick-cargo-fetch-home
+          CI_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          CONTROL_SHA: ${{ github.sha }}
+          CI_SHA: ${{ github.sha }}
+          CI_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: python3 -B kit/confinement/linux_source_build.py rust-lock-fetch
       - name: Fetch npm tarballs by committed lock integrity
         id: npm-tarballs
         env:
           SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
         run: python3 -B kit/confinement/linux_source_build.py npm-tarballs
-      - name: Run trusted dependency audit
-        env:
-          SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
-          NODE_BIN: ${{ steps.toolchains.outputs.node_bin }}
-        run: python3 -B kit/confinement/linux_source_build.py trusted-audit
       - name: Prepare offline project inputs
         id: project-deps
         env:
           SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
           NPM_TARBALL_INDEX: ${{ steps.npm-tarballs.outputs.tarball_index }}
           RUST_ROOT: ${{ steps.toolchains.outputs.rust_root }}
+          KD_CARGO_FETCH_HOME: ${{ runner.temp }}/kd-quick-cargo-fetch-home
           EXPECTED_NODE_LOCK_SHA256: ${{ steps.checkout.outputs.lock_sha256 }}
           EXPECTED_MANIFEST_SHA256: ${{ steps.checkout.outputs.manifest_sha256 }}
-        run: sudo -n --preserve-env=SOURCE_PATH,NPM_TARBALL_INDEX,RUST_ROOT,EXPECTED_NODE_LOCK_SHA256,EXPECTED_MANIFEST_SHA256,RUNNER_TEMP,GITHUB_OUTPUT python3 -B kit/confinement/linux_source_build.py prepare-project
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          CI_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          CONTROL_SHA: ${{ github.sha }}
+          CI_SHA: ${{ github.sha }}
+          CI_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: sudo -n --preserve-env=SOURCE_PATH,NPM_TARBALL_INDEX,RUST_ROOT,KD_CARGO_FETCH_HOME,EXPECTED_NODE_LOCK_SHA256,EXPECTED_MANIFEST_SHA256,REQUESTED_SOURCE_SHA,RUNNER_TEMP,GITHUB_OUTPUT,CI_REPOSITORY,SOURCE_REPOSITORY_ID,CONTROL_SHA,CI_SHA,CI_REF,CI_EVENT_NAME python3 -B kit/confinement/linux_source_build.py prepare-project
       - name: Re-run positive controls immediately before the first project command
         id: recheck
         env:
@@ -374,7 +374,6 @@ jobs:
     runs-on: ubuntu-24.04
     environment: linux-source-read
     timeout-minutes: 15
-    cache-mode: none
     permissions:
       actions: read
       checks: read

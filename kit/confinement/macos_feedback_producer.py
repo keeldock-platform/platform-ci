@@ -13,7 +13,6 @@ import time
 
 try:
     from . import feedback_request
-    from . import rust_license_gate
 except ImportError:
     _request_path = Path(__file__).resolve(strict=True).parent / "feedback_request.py"
     _request_spec = importlib.util.spec_from_file_location("feedback_request", str(_request_path))
@@ -25,16 +24,6 @@ except ImportError:
         _request_spec.loader.exec_module(feedback_request)
     except BaseException:
         raise ImportError("feedback request unavailable") from None
-    _license_path = Path(__file__).resolve(strict=True).parent / "rust_license_gate.py"
-    _license_spec = importlib.util.spec_from_file_location("rust_license_gate", str(_license_path))
-    if _license_spec is None or _license_spec.loader is None:
-        raise ImportError("rust license gate unavailable")
-    rust_license_gate = importlib.util.module_from_spec(_license_spec)
-    sys.modules["rust_license_gate"] = rust_license_gate
-    try:
-        _license_spec.loader.exec_module(rust_license_gate)
-    except BaseException:
-        raise ImportError("rust license gate unavailable") from None
 
 
 SCHEMA_VERSION = 1
@@ -48,20 +37,16 @@ OUTPUT_OWNER_UID = 0
 OUTPUT_OWNER_GID = 0
 MAX_REQUEST_BYTES = 2048
 MAX_KEY_BYTES = 4096
-MAX_JSON_BYTES = 128 * 1024
 MAX_PACKAGE_JSON_BYTES = 256 * 1024
-MAX_LOCK_BYTES = 4 * 1024 * 1024 - 64 * 1024
+MAX_FEEDBACK_PAYLOAD_BYTES = 4 * 1024 * 1024 - 64 * 1024
 MAX_RUST_FILE_BYTES = 1024 * 1024
 MAX_RUST_PATHS = 512
-MAX_NODE_REVIEWED_FILES = 11 + 2 * (64 + 64)
 MAX_PATCH_BYTES = 4 * 1024 * 1024 - 64 * 1024
 MAX_NODE_INPUT_BYTES = 6 * 1024 * 1024
 MAX_CIPHERTEXT_BYTES = 4 * 1024 * 1024
 SHA1_RE = re.compile(r"[a-f0-9]{40}\Z")
 SHA256_RE = re.compile(r"[a-f0-9]{64}\Z")
 DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
-PACKAGE_NAME_RE = re.compile(r"^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$")
-VERSION_SPEC_RE = re.compile(r"^[0-9A-Za-z.*^~<>=|+ -]{1,128}$")
 PACKAGE_ROOTS = (
     Path("crates/host/api"), Path("crates/host/mock"), Path("crates/host/conformance"),
     Path("crates/kernel/i18n"),
@@ -115,21 +100,16 @@ DIAGNOSTIC_BASE_GATES = (
     "mock_tests", "conformance_tests",
 )
 DIAGNOSTIC_PARSER_GATES = ("parser_format", "parser_clippy", "parser_replay")
-DIAGNOSTIC_NODE_GATES = (
-    "node_dependency_prepare", "node_dependency_audit", "typescript_typecheck", "typescript_tests",
-)
-DIAGNOSTIC_GATE_SELECTIONS = (
-    DIAGNOSTIC_BASE_GATES, DIAGNOSTIC_BASE_GATES + DIAGNOSTIC_PARSER_GATES,
-    DIAGNOSTIC_BASE_GATES + DIAGNOSTIC_PARSER_GATES + DIAGNOSTIC_NODE_GATES,
+DIAGNOSTIC_NODE_GATES = ("node_dependency_prepare", "typescript_typecheck", "typescript_tests")
+DIAGNOSTIC_GATE_SELECTIONS = tuple(
+    selection + DIAGNOSTIC_NODE_GATES
+    for selection in (DIAGNOSTIC_BASE_GATES, DIAGNOSTIC_BASE_GATES + DIAGNOSTIC_PARSER_GATES)
 )
 UNSAFE_DIAGNOSTIC_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 DISPLAY_UNSAFE_DIAGNOSTIC_RE = re.compile(r"[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 DIAGNOSTIC_MAX_LINES = 8192
 DIAGNOSTIC_MAX_LINE_UNITS = 8192
 DIAGNOSTIC_STREAM_MAX_LINES = 4000
-WORKSPACE_PACKAGE_PATHS = ("packages/host-api", "packages/kernel-i18n")
-UI_KIT_WORKSPACE_PACKAGE_PATHS = ("packages/kernel-icons", "packages/kernel-ui-kit")
-DEPENDENCY_GROUPS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
 PROFILE_BY_KIND = feedback_request.PROFILE_BY_KIND
 PROFILE_BY_CONCERN = feedback_request.PROFILES
 
@@ -137,11 +117,11 @@ PROFILE_BY_CONCERN = feedback_request.PROFILES
 ENCRYPT_DETAILS = frozenset((
     "payload_missing", "tool_path", "input_size", "spawn", "node_exit", "output_size",
     "output_shape", "output_directory", "output_write", "output_member",
-    "expected_manifest_invalid", "reviewed_paths_invalid", "encryptor_unavailable",
+    "reviewed_paths_invalid", "encryptor_unavailable",
 ))
 NODE_REFUSAL_CODES = frozenset((
-    "credential_like_content", "envelope_rejected", "exception_expired", "invalid_cargo_lock",
-    "invalid_context", "invalid_expectation", "invalid_input", "invalid_lock_manifest",
+    "credential_like_content", "envelope_rejected", "exception_expired",
+    "invalid_context", "invalid_expectation", "invalid_input",
     "invalid_payload", "invalid_payload_bom", "invalid_payload_c0", "invalid_payload_c1",
     "invalid_payload_cr", "invalid_payload_nul", "invalid_payload_utf8",
     "invalid_recipient", "invalid_rust_patch", "limit_exceeded",
@@ -255,95 +235,6 @@ def _read_file(path, *, maximum, owner=0):
                 os.close(descriptor)
             except OSError:
                 pass
-
-
-ROOT_OVERRIDES = {"lightningcss": "1.33.0"}
-
-
-def _root_overrides(root):
-    if "overrides" not in root:
-        return None
-    value = root["overrides"]
-    if (type(value) is not dict or set(value) != set(ROOT_OVERRIDES)
-            or any(type(item) is not str or item != ROOT_OVERRIDES[name] for name, item in value.items())):
-        _refuse("manifest_invalid")
-    return dict(value)
-
-
-def _expected_manifest(source):
-    root = _strict_json(_read_file(source / "package.json", maximum=MAX_PACKAGE_JSON_BYTES),
-                        MAX_PACKAGE_JSON_BYTES)
-    if type(root) is not dict or type(root.get("name")) is not str or type(root.get("version")) is not str:
-        _refuse("manifest_invalid")
-    if any(key in root for key in ("resolutions", "bundleDependencies", "bundledDependencies")):
-        _refuse("manifest_invalid")
-    workspaces = root.get("workspaces")
-    if type(workspaces) is dict:
-        if set(workspaces) != {"packages"}:
-            _refuse("manifest_invalid")
-        workspaces = workspaces.get("packages")
-    if (type(workspaces) is not list or len(workspaces) != 1
-            or workspaces[0] != "packages/*"):
-        _refuse("manifest_invalid")
-    candidate_paths = WORKSPACE_PACKAGE_PATHS
-    if any(os.path.lexists(source / path) for path in UI_KIT_WORKSPACE_PACKAGE_PATHS):
-        candidate_paths = candidate_paths + UI_KIT_WORKSPACE_PACKAGE_PATHS
-    expected_paths = []
-    for path in candidate_paths:
-        if any(pattern == path or pattern == "packages/*" and path.startswith("packages/")
-               for pattern in workspaces):
-            expected_paths.append(path)
-    if len(expected_paths) != len(candidate_paths):
-        _refuse("manifest_invalid")
-    root_expected = {
-        "name": root["name"], "version": root["version"],
-        "workspaces": workspaces,
-    }
-    for group in DEPENDENCY_GROUPS:
-        if group in root:
-            root_expected[group] = root[group]
-    overrides = _root_overrides(root)
-    if overrides is not None:
-        root_expected["overrides"] = overrides
-    workspace_expected = []
-    for workspace_path in expected_paths:
-        package = _strict_json(
-            _read_file(source / workspace_path / "package.json", maximum=MAX_PACKAGE_JSON_BYTES),
-            MAX_PACKAGE_JSON_BYTES,
-        )
-        if type(package) is not dict or type(package.get("name")) is not str or type(package.get("version")) is not str:
-            _refuse("manifest_invalid")
-        if any(key in package for key in ("overrides", "resolutions", "bundleDependencies", "bundledDependencies")):
-            _refuse("manifest_invalid")
-        expected = {"path": workspace_path, "name": package["name"], "version": package["version"]}
-        for group in DEPENDENCY_GROUPS:
-            if group in package:
-                expected[group] = package[group]
-        workspace_expected.append(expected)
-    _validate_dependency_sources(root_expected, workspace_expected)
-    return {"root": root_expected, "workspaces": workspace_expected}
-
-
-def _validate_dependency_sources(root, workspaces):
-    workspace_names = {item["name"] for item in workspaces}
-    for manifest in (root, *workspaces):
-        for group in DEPENDENCY_GROUPS:
-            dependencies = manifest.get(group, {})
-            if type(dependencies) is not dict or len(dependencies) > 512:
-                _refuse("manifest_invalid")
-            for name, spec in dependencies.items():
-                if (type(name) is not str or len(name) > 214 or not PACKAGE_NAME_RE.fullmatch(name)
-                        or ".." in name or type(spec) is not str or len(spec) > 128):
-                    _refuse("manifest_invalid")
-                if name in workspace_names and spec.startswith("workspace:"):
-                    if re.fullmatch(r"workspace:(?:\*|\^|~|[0-9][0-9A-Za-z.+-]*)", spec) is None:
-                        _refuse("manifest_invalid")
-                elif not VERSION_SPEC_RE.fullmatch(spec):
-                    _refuse("manifest_invalid")
-        if any(key in manifest for key in ("resolutions", "bundleDependencies", "bundledDependencies")):
-            _refuse("manifest_invalid")
-        if "overrides" in manifest and (manifest is not root or manifest["overrides"] != ROOT_OVERRIDES):
-            _refuse("manifest_invalid")
 
 
 def _validated_fuzz_rust_paths(source):
@@ -821,19 +712,18 @@ def validate_dispatch(kind, environ, *, now=None):
         "run_attempt": 1,
         "expiry": request["expiry"],
     }
-    if profile["profile_id"] != 1:
-        context["kind"] = profile["kind"]
-        context = {
-            "request_id": context["request_id"], "nonce": context["nonce"],
-            "recipient_fingerprint": context["recipient_fingerprint"],
-            "concern": context["concern"], "kind": context["kind"],
-            **{name: value for name, value in context.items()
-               if name not in ("request_id", "nonce", "recipient_fingerprint", "concern", "kind")},
-        }
+    context["kind"] = profile["kind"]
+    context = {
+        "request_id": context["request_id"], "nonce": context["nonce"],
+        "recipient_fingerprint": context["recipient_fingerprint"],
+        "concern": context["concern"], "kind": context["kind"],
+        **{name: value for name, value in context.items()
+           if name not in ("request_id", "nonce", "recipient_fingerprint", "concern", "kind")},
+    }
     return {"profile": dict(profile), "request": request, "context": context, "spki_der": spki_der}
 
 
-def resolve_node(environ, *, require_npm=False):
+def resolve_node(environ):
     candidate = environ.get(NODE_ENV, "")
     cache = environ.get("RUNNER_TOOL_CACHE", "")
     try:
@@ -856,18 +746,7 @@ def resolve_node(environ, *, require_npm=False):
         _refuse("tool_unavailable")
     if result.returncode != 0 or result.stdout != b"v" + NODE_VERSION.encode("ascii") + b"\n" or result.stderr:
         _refuse("tool_unavailable")
-    if not require_npm:
-        return resolved, None
-    npm_cli = resolved.parent.parent / "lib/node_modules/npm/bin/npm-cli.js"
-    try:
-        npm_info = npm_cli.lstat()
-        resolved_npm = npm_cli.resolve(strict=True)
-    except OSError:
-        _refuse("tool_unavailable")
-    if (not stat.S_ISREG(npm_info.st_mode) or npm_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-            or root not in resolved_npm.parents):
-        _refuse("tool_unavailable")
-    return resolved, resolved_npm
+    return resolved
 
 
 def _encrypt_payload(encryptor, input_record, node):
@@ -1216,15 +1095,12 @@ def _rust_format_patch(source, formatted, reviewed_paths, worker_uid, deadline, 
 
 
 def run_source_profile(dispatch, source, worker_storage, worker_uid, environment, tools,
-                       host_toolchain, capability, rust, reviewed, deadline, node, npm_cli,
+                       host_toolchain, capability, rust, reviewed, deadline, node,
                        *, validated_fuzz_workspace=False):
     kind = dispatch["profile"]["kind"]
     if (type(validated_fuzz_workspace) is not bool
             or validated_fuzz_workspace and kind not in ("rust_patch", "build_diagnostics")):
         _refuse("manifest_invalid")
-    if kind == "lock":
-        _refuse("request_invalid")
-
     if kind == "rust_patch":
         reviewed_paths = _reviewed_rust_paths(source, include_fuzz=validated_fuzz_workspace)
         copy_paths = _source_root_files(include_fuzz=validated_fuzz_workspace) + reviewed_paths
@@ -1256,774 +1132,11 @@ def run_source_profile(dispatch, source, worker_storage, worker_uid, environment
         patch = _rust_format_patch(
             source, formatted, reviewed_paths, worker_uid, deadline, original_sources=original_sources,
         )
-        return {"payload_bytes": patch, "expected_manifest": None,
+        return {"payload_bytes": patch,
                 "reviewed_rust_paths": list(reviewed_paths), "original_rust_sources": original_sources,
                 "source_result": "command_completed"}
 
     _refuse("request_invalid")
-
-
-def _cargo_toolchain_hash(rust, bootstrap):
-    components = getattr(rust, "COMPONENTS", None)
-    target = getattr(rust, "TARGET", None)
-    if type(components) is not tuple or not components or type(target) is not str:
-        _refuse("tool_unavailable")
-    pairs = []
-    for component in components:
-        pairs.append((getattr(component, "name", None), getattr(component, "sha256", None)))
-    try:
-        return target, bootstrap.cargo.toolchain_hash(target, pairs)
-    except bootstrap.cargo.Refusal:
-        _refuse("tool_unavailable")
-
-
-def _cargo_bootstrap_refusal(bootstrap, error):
-    reason = getattr(error, "reason", None)
-    if reason == "bootstrap_network_refused":
-        _refuse("command_failed")
-    if reason in ("bootstrap_config_refused", "bootstrap_source_refused", "bootstrap_manifest_refused"):
-        _refuse("manifest_invalid")
-    if reason in ("bootstrap_environment_refused", "bootstrap_input_invalid"):
-        _refuse("tool_unavailable")
-    _refuse("payload_invalid")
-
-
-def run_cargo_lock_profile(dispatch, source, worker_storage, worker_uid, environment, tools,
-                           host_toolchain, capability, rust, deadline, bootstrap, source_environ,
-                           *, admitted_workspace_selector=None):
-    profile = dispatch["profile"]
-    if (profile["kind"] != feedback_request.CARGO_LOCK_KIND or type(source_environ) is not dict
-            or type(environment) is not dict or type(tools) is not dict):
-        _refuse("request_invalid")
-    request = dispatch["request"]
-    selector = feedback_request.request_workspace(request)
-    if (selector not in CARGO_WORKSPACE_ROOTS
-            or (admitted_workspace_selector is not None
-                and selector != admitted_workspace_selector)):
-        _refuse("request_invalid")
-    worker_gid = capability.PROBE_PRIMARY_GID
-    refusal_type = bootstrap.BootstrapRefusal
-    project = worker_storage / "feedback-cargo-lock"
-    cargo_home = worker_storage / "cargo-lock-home"
-    try:
-        bootstrap.refuse_cargo_config(source)
-        roots = _runtime_package_roots(source, selector)
-        candidate_files = None
-        inventory_paths = set()
-        authenticated_inventory_inputs = set()
-        if selector == "runtime" and any(root in roots for root in RUNTIME_WAVE_70_APP_ROOTS):
-            bootstrap.validate_runtime_source_inventory(source, request["source_sha"])
-            inventory_path = bootstrap.SOURCE_INVENTORY_PATH
-            inventory_payload = _read_file(
-                source / inventory_path, maximum=bootstrap.MAX_SOURCE_INVENTORY_BYTES,
-            )
-            inventory_rows, unused_inventory_digest = bootstrap.parse_runtime_source_inventory(
-                inventory_payload, request["source_sha"],
-            )
-            inventory_paths = set(bootstrap._source_inventory_required_paths(source))
-            authenticated_inventory_inputs = inventory_paths | {inventory_path}
-            candidate_files = _authenticated_candidate_files(source, request["source_sha"])
-            if not authenticated_inventory_inputs.issubset(candidate_files):
-                _refuse("manifest_invalid")
-            row_hashes = {row["path"]: row["sha256"] for row in inventory_rows}
-            for path in authenticated_inventory_inputs:
-                maximum = (bootstrap.MAX_SOURCE_INVENTORY_BYTES if path == inventory_path
-                           else bootstrap.MAX_INVENTORY_FILE_BYTES)
-                payload = inventory_payload if path == inventory_path else _read_file(
-                    source / path, maximum=maximum,
-                )
-                if path != inventory_path and hashlib.sha256(payload).hexdigest() != row_hashes[path]:
-                    _refuse("manifest_invalid")
-                git_blob = hashlib.sha1(
-                    b"blob " + str(len(payload)).encode("ascii") + b"\x00" + payload,
-                ).hexdigest()
-                if candidate_files[path] != ("100644", git_blob):
-                    _refuse("manifest_invalid")
-            try:
-                bootstrap._validate_runtime_wave70_app_trees(source, inventory_paths)
-                bootstrap._validate_runtime_profile_tree_files(
-                    source, roots, authenticated_inventory_inputs,
-                )
-            except bootstrap.BootstrapRefusal:
-                _refuse("manifest_invalid")
-        reviewed_paths = _reviewed_rust_paths(
-            source, roots=roots, inventory_paths=frozenset(inventory_paths),
-        )
-        root_manifest = bootstrap.workspace_root_manifest(selector)
-        manifests = (root_manifest,) + tuple((root / "Cargo.toml").as_posix() for root in roots)
-        manifest_bytes = {path: _read_file(source / path, maximum=MAX_PACKAGE_JSON_BYTES) for path in manifests}
-        member_paths = frozenset(root.as_posix() for root in roots)
-        package_names = (
-            bootstrap.check_manifests(manifest_bytes, member_paths) if selector == "contract"
-            else bootstrap.check_manifests(manifest_bytes, member_paths, selector)
-        )
-        package_identities = set(bootstrap.manifest_package_identities(manifest_bytes, selector))
-        dependency_rules = bootstrap.manifest_dependency_rules(manifest_bytes, selector)
-        if selector == "runtime":
-            api_source_paths = _reviewed_api_source_paths(source)
-            api_files = ("Cargo.toml", bootstrap.HOST_API_POLICY_API_MANIFEST_PATH)
-            copy_paths = (
-                api_files + api_source_paths + manifests + reviewed_paths
-                + tuple(sorted(authenticated_inventory_inputs))
-            )
-            api_manifest = _read_file(source / bootstrap.HOST_API_POLICY_API_MANIFEST_PATH, maximum=MAX_PACKAGE_JSON_BYTES)
-            try:
-                api_document = bootstrap._parse_manifest(api_manifest)
-            except BaseException:
-                _refuse("manifest_invalid")
-            api_package = api_document.get("package") if type(api_document) is dict else None
-            if type(api_package) is not dict or api_package.get("name") != bootstrap.HOST_API_POLICY_API_PACKAGE:
-                _refuse("manifest_invalid")
-            contract_identity_manifests = {
-                "Cargo.toml": _read_file(source / "Cargo.toml", maximum=bootstrap.MAX_MANIFEST_BYTES),
-                bootstrap.HOST_API_POLICY_API_MANIFEST_PATH: api_manifest,
-            }
-            contract_identities = bootstrap.manifest_package_identities(
-                contract_identity_manifests, "contract",
-            )
-            api_identity = next((identity for identity in contract_identities
-                                 if identity[0] == bootstrap.HOST_API_POLICY_API_PACKAGE), None)
-            if api_identity is None:
-                _refuse("manifest_invalid")
-            package_identities.add(api_identity)
-            dependency_rules.update(bootstrap.manifest_dependency_rules(
-                contract_identity_manifests, "contract",
-            ))
-            if candidate_files is None:
-                candidate_files = _authenticated_candidate_files(source, request["source_sha"])
-            tracked_api_sources = {
-                path for path in candidate_files
-                if path.startswith("crates/host/api/src/")
-            }
-            if tracked_api_sources != set(api_source_paths):
-                _refuse("manifest_invalid")
-            tracked_runtime_rust = {
-                path for path in candidate_files
-                if path.endswith(".rs") and path.rsplit("/", 1)[-1] != "build.rs"
-                and any(path.startswith(root.as_posix() + "/src/")
-                        or path.startswith(root.as_posix() + "/tests/") for root in roots)
-            }
-            if tracked_runtime_rust != set(reviewed_paths):
-                _refuse("manifest_invalid")
-        else:
-            copy_paths = manifests + reviewed_paths
-            candidate_files = None
-        _copy_reviewed_files(
-            source, project, tuple(dict.fromkeys(copy_paths)), worker_uid, worker_gid,
-            file_mode=0o644 if selector == "runtime" else 0o600,
-            candidate_files=candidate_files,
-            inventoried_paths=frozenset(inventory_paths),
-            inventory_file_max_bytes=bootstrap.MAX_INVENTORY_FILE_BYTES,
-        )
-        _make_worker_directory(cargo_home, worker_uid, worker_gid)
-        bootstrap.refuse_cargo_config(project)
-        bootstrap.require_fresh_directory(cargo_home)
-        cargo_environment = bootstrap.build_cargo_environment(
-            environment, cargo_home=str(cargo_home), home=environment.get("HOME"),
-            tmpdir=str(worker_storage / "tmp"), path=environment.get("PATH"),
-        )
-        command = bootstrap.generate_lockfile_command(
-            str(tools["cargo"]), str(project / root_manifest),
-        )
-    except refusal_type as error:
-        _cargo_bootstrap_refusal(bootstrap, error)
-    try:
-        os.chdir(project)
-        result = _run_worker(
-            rust, command, worker_uid, cargo_environment, host_toolchain["python"], capability,
-            "feedback_lock", deadline, allow_nonzero_capture=True,
-        )
-        if result.returncode != 0:
-            _refuse("command_failed")
-    finally:
-        try:
-            os.chdir(source)
-        except OSError:
-            _refuse("cleanup_incomplete")
-    lock_bytes = _read_worker_file(
-        (project / root_manifest).parent / "Cargo.lock", worker_uid, bootstrap.MAX_LOCK_BYTES,
-    )
-    toolchain_target, toolchain_hash = _cargo_toolchain_hash(rust, bootstrap)
-    try:
-        bootstrap.check_lock_members(
-            lock_bytes, package_names, package_identities, dependency_rules,
-        )
-    except refusal_type as error:
-        _cargo_bootstrap_refusal(bootstrap, error)
-    lock_root = (project / root_manifest).parent
-    identity = rust_license_gate.Identity(
-        request["source_sha"], selector, str(lock_root), hashlib.sha256(lock_bytes).hexdigest(),
-    )
-    prior_rust_root = os.environ.get("RUST_ROOT")
-    os.environ["RUST_ROOT"] = str(Path(tools["cargo"]).parent.parent)
-    try:
-        rust_license_gate.require_lock_admission(
-            lock_bytes, identity, rust_license_gate.TRUSTED_PORTS,
-        )
-    except rust_license_gate.LicenseGateRefusal:
-        _refuse("command_failed")
-    finally:
-        if prior_rust_root is None:
-            os.environ.pop("RUST_ROOT", None)
-        else:
-            os.environ["RUST_ROOT"] = prior_rust_root
-    if selector == "runtime" and os.path.lexists(project / "Cargo.lock"):
-        _refuse("manifest_invalid")
-    owner = source_environ.get("SOURCE_REPOSITORY_OWNER", "")
-    name = source_environ.get("SOURCE_REPOSITORY_NAME", "")
-    trusted_context = {
-        "repository": owner + "/" + name,
-        "workspace_path": bootstrap.workspace_directory(selector),
-        "source_sha": request["source_sha"],
-        "base_sha": request["base_sha"],
-        "base_branch": request["base_branch"],
-        "reviewed_diff_fingerprint": request["reviewed_diff_sha256"],
-        "dependency_policy_revision": bootstrap.DEPENDENCY_POLICY_REVISION,
-        "control_sha": request["control_sha"],
-        "toolchain_hash": toolchain_hash,
-    }
-    try:
-        bundle = bootstrap.produce_bundle(
-            lock_bytes, trusted_context, run_id=dispatch["context"]["run_id"], run_attempt=1,
-            now=int(time.time()), expiry=request["expiry"], build_inputs={},
-            fetcher=bootstrap.RegistryFetcher(), toolchain_target=toolchain_target,
-        )
-    except refusal_type as error:
-        _cargo_bootstrap_refusal(bootstrap, error)
-    return {"payload_bytes": bundle, "expected_manifest": None, "reviewed_rust_paths": None,
-            "source_result": "command_completed"}
-
-
-NPM_FIXTURE_REPOSITORY_ID_ENV = "NPM_FIXTURE_REPOSITORY_ID"
-NPM_PROJECT_DIRECTORY = "feedback-npm-admission"
-NPM_HOME_DIRECTORY = "npm-admission-home"
-NPM_RESOLVE_SECONDS = 900
-NPM_VERSION_SECONDS = 30
-
-
-NPM_ERROR_CODES = (
-    "ERESOLVE", "EBADENGINE", "ETARGET", "ENOTFOUND", "ETIMEDOUT", "ECONNRESET", "E404",
-    "EINTEGRITY", "ENOVERSIONS",
-)
-NPM_ERROR_CODE_RE = re.compile(rb"^npm (?:error|ERR!) code ([A-Z0-9_]{1,32})\r?$", re.MULTILINE)
-NPM_DIAGNOSTIC_STEPS = ("npm_resolve", "npm_lock", "npm_bundle")
-NPM_DIAGNOSTIC_KEY_RE = re.compile(r"[a-z0-9_]{1,40}\Z")
-NPM_DIAGNOSTIC_PREFIX = "KD-NPM-DIAGNOSTICS schema=1 step="
-NPM_DIAGNOSTIC_MAX_BYTES = 64 * 1024
-NPM_DIAGNOSTIC_MAX_LINES = 400
-NPM_DIAGNOSTIC_LINE_UNITS = 2000
-NPM_DIAGNOSTIC_STDERR_LINES = 200
-NPM_DIAGNOSTIC_STDERR_BYTES = 24 * 1024
-NPM_DIAGNOSTIC_REPORT_READ_BYTES = 1024 * 1024
-NPM_STDERR_LINE_RE = re.compile(r"npm (?:error|warn) ")
-NPM_CHECK_LINE_PREFIX = "  kd-check "
-NPM_CHECK_MAX_BYTES = 512
-NPM_CHECK_STEPS = ("npm_lock", "npm_bundle")
-NPM_CHECK_MAX_LINES = 20
-NPM_CHECK_GRAMMAR = (
-    r"[a-z_]{1,32}(?::[A-Za-z0-9._~@/_-]{1,214}){0,6}"
-    r"(?: [a-z]{1,16}:[A-Za-z0-9._~@/:,+-]{1,512})*\Z"
-)
-NPM_CHECK_RE = re.compile(NPM_CHECK_GRAMMAR)
-NPM_REPORT_NAME_RE = re.compile(r"[0-9A-Za-z_.-]{1,80}-eresolve-report\.txt\Z")
-NPM_PATH_LINE_RE = re.compile(
-    r"(?:^|[\s\"'=(\[,\x00-\x1f]|\x1b\[[0-9;]*[A-Za-z])(?:/|~/)[A-Za-z0-9._~@-]|\bfile:/{2}",
-    re.IGNORECASE,
-)
-NPM_CREDENTIAL_PATTERNS = (
-    re.compile(
-        r"(?:^|[^A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}"
-        r"|xox[baprs]-[A-Za-z0-9-]{16,}|npm_[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16}|ASIA[A-Z0-9]{16})"
-        r"(?:$|[^A-Za-z0-9])"
-    ),
-    re.compile(r"-----BEGIN [A-Z0-9 ]{0,64}PRIVATE KEY-----"),
-    re.compile(
-        r"\b(?:authorization|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|passwd"
-        r"|api[_-]?key|private[_-]?key|secret|token|credential)\b\s*[:=]\s*(?:Bearer\s+)?[^\s,;]{8,}",
-        re.IGNORECASE,
-    ),
-    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]{24,}={0,2}"),
-    re.compile(r"\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@", re.IGNORECASE),
-    re.compile(r"_auth(?:Token)?\s*=|_password\s*=", re.IGNORECASE),
-)
-
-
-def _npm_tag(error, step, key):
-    try:
-        if getattr(error, "source_gates_step", None) is None:
-            error.source_gates_step = step
-            error.source_gates_key = key
-    except BaseException:
-        pass
-
-
-def _npm_attach(error, payload):
-    try:
-        if type(payload) is bytes and payload:
-            error.npm_diagnostic = payload
-    except BaseException:
-        pass
-
-
-def _npm_refuse(step, key, reason, diagnostic=None):
-    refusal = FeedbackRefusal(reason)
-    _npm_tag(refusal, step, key)
-    _npm_attach(refusal, diagnostic)
-    raise refusal
-
-
-def _npm_credential_like(text):
-    return any(pattern.search(text) is not None for pattern in NPM_CREDENTIAL_PATTERNS)
-
-
-def _npm_section(raw, only_npm_lines, line_limit, byte_limit):
-    """Screen, escape and bound one diagnostic section.
-
-    Returns (lines, omitted, cut). Lines that name an absolute or home path or look like a
-    credential are dropped and counted. Every kept line is escaped by sanitize_diagnostic_stream
-    and clipped to NPM_DIAGNOSTIC_LINE_UNITS, and the section stops at line_limit lines or
-    byte_limit bytes (three bytes of layout per line included)."""
-    if type(raw) is not bytes or not raw:
-        return [], 0, False
-    lines = [line.rstrip("\r") for line in raw.decode("utf-8", "backslashreplace").split("\n")]
-    if lines and lines[-1] == "":
-        lines.pop()
-    if only_npm_lines:
-        lines = [line for line in lines if NPM_STDERR_LINE_RE.match(line) is not None]
-    kept = []
-    omitted = 0
-    for line in lines:
-        if NPM_PATH_LINE_RE.search(line) is not None or _npm_credential_like(line):
-            omitted += 1
-        else:
-            kept.append(line)
-    cut = False
-    if kept:
-        joined, cut = sanitize_diagnostic_stream("\n".join(kept).encode("utf-8"), False)
-        kept = joined.decode("utf-8").split("\n")
-    result = []
-    used = 0
-    for line in kept:
-        clipped = _clip_line_units(line, NPM_DIAGNOSTIC_LINE_UNITS)
-        size = len(clipped.encode("utf-8")) + 3
-        if len(result) >= line_limit or used + size > byte_limit:
-            cut = True
-            break
-        if clipped != line:
-            cut = True
-        result.append(clipped)
-        used += size
-    return result, omitted, cut
-
-
-def _npm_render_section(lines, omitted, cut):
-    rendered = ["  " + line for line in lines]
-    if omitted:
-        rendered.append("  [omitted " + str(omitted) + " lines]")
-    if cut:
-        rendered.append("  [truncated]")
-    return rendered
-
-
-def build_npm_diagnostic_payload(step, key, stderr, report, check=None):
-    """Build the bounded KD-NPM-DIAGNOSTICS payload for one failed npm admission step.
-
-    Layout, ASCII structure lines and two-space indented body lines:
-    header line, a stderr: line, the screened npm stderr lines, a report: line, the screened
-    eresolve report text. The header carries only the closed step tag and the closed reason.
-    For the npm_lock and npm_bundle steps an optional check identifier is the first stderr body line, in the
-    form two spaces, kd-check, one space, the identifier. It must be printable ASCII of the
-    closed token, npm name and semver shapes and at most 512 bytes, else the payload is refused.
-    For the npm_bundle step the check may instead be a list of one to twenty such identifiers,
-    rendered as that many first lines in the same order."""
-    if (type(step) is not str or step not in NPM_DIAGNOSTIC_STEPS or type(key) is not str
-            or NPM_DIAGNOSTIC_KEY_RE.match(key) is None):
-        _refuse("payload_invalid")
-    if check is None:
-        checks = []
-    elif type(check) is list and step == "npm_bundle":
-        checks = check
-        if not 1 <= len(checks) <= NPM_CHECK_MAX_LINES:
-            _refuse("payload_invalid")
-    else:
-        checks = [check]
-    if checks and step not in NPM_CHECK_STEPS:
-        _refuse("payload_invalid")
-    for item in checks:
-        if (type(item) is not str or not item.isascii() or len(item) > NPM_CHECK_MAX_BYTES
-                or NPM_CHECK_RE.match(item) is None):
-            _refuse("payload_invalid")
-    header = NPM_DIAGNOSTIC_PREFIX + step + " reason=" + key + "\n"
-    stderr_lines, stderr_omitted, stderr_cut = _npm_section(
-        stderr, True, NPM_DIAGNOSTIC_STDERR_LINES - len(checks),
-        NPM_DIAGNOSTIC_STDERR_BYTES - (NPM_CHECK_MAX_BYTES + 16) * len(checks),
-    )
-    stderr_rendered = _npm_render_section(stderr_lines, stderr_omitted, stderr_cut)
-    stderr_rendered[0:0] = [NPM_CHECK_LINE_PREFIX + item for item in checks]
-    used_bytes = len(header) + len("stderr:\nreport:\n") + sum(
-        len(line.encode("utf-8")) + 1 for line in stderr_rendered
-    )
-    report_lines, report_omitted, report_cut = _npm_section(
-        report, False,
-        max(0, NPM_DIAGNOSTIC_MAX_LINES - 5 - len(stderr_rendered)),
-        max(0, NPM_DIAGNOSTIC_MAX_BYTES - 128 - used_bytes),
-    )
-    report_rendered = _npm_render_section(report_lines, report_omitted, report_cut)
-    text = (header + "stderr:\n" + "".join(line + "\n" for line in stderr_rendered)
-            + "report:\n" + "".join(line + "\n" for line in report_rendered))
-    payload = text.encode("utf-8")
-    if (len(payload) > NPM_DIAGNOSTIC_MAX_BYTES or text.count("\n") > NPM_DIAGNOSTIC_MAX_LINES
-            or UNSAFE_DIAGNOSTIC_RE.search(text) is not None
-            or DISPLAY_UNSAFE_DIAGNOSTIC_RE.search(text) is not None
-            or _npm_credential_like(text)):
-        _refuse("payload_invalid")
-    return payload
-
-
-def _npm_read_prefix(path, worker_uid, limit):
-    nofollow = getattr(os, "O_NOFOLLOW", None)
-    if nofollow is None:
-        return None
-    descriptor = None
-    try:
-        before = path.lstat()
-        if (not stat.S_ISREG(before.st_mode) or before.st_uid != worker_uid or before.st_nlink != 1
-                or before.st_size <= 0):
-            return None
-        descriptor = os.open(path, os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0))
-        opened = os.fstat(descriptor)
-        if ((before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
-                or not stat.S_ISREG(opened.st_mode) or opened.st_uid != worker_uid
-                or opened.st_nlink != 1):
-            return None
-        chunks = []
-        total = 0
-        while total < limit:
-            chunk = os.read(descriptor, min(8192, limit - total))
-            if not chunk:
-                break
-            total += len(chunk)
-            chunks.append(chunk)
-        return b"".join(chunks)
-    except BaseException:
-        return None
-    finally:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-
-
-def _npm_read_report(npm_storage, worker_uid):
-    """Return the newest eresolve report under this run's own npm cache, or None."""
-    try:
-        cache = Path(npm_storage) / "cache"
-        cache_info = cache.lstat()
-        if (not stat.S_ISDIR(cache_info.st_mode) or stat.S_ISLNK(cache_info.st_mode)
-                or cache_info.st_uid != worker_uid):
-            return None
-        logs = cache / "_logs"
-        info = logs.lstat()
-        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != worker_uid:
-            return None
-        names = sorted(name for name in os.listdir(logs) if NPM_REPORT_NAME_RE.fullmatch(name) is not None)
-        if not names:
-            return None
-        return _npm_read_prefix(logs / names[-1], worker_uid, NPM_DIAGNOSTIC_REPORT_READ_BYTES)
-    except BaseException:
-        return None
-
-
-def _npm_capture_diagnostic(step, key, stderr, npm_storage, worker_uid, check=None):
-    try:
-        report = _npm_read_report(npm_storage, worker_uid)
-    except BaseException:
-        return None
-    for candidate in ((check, None) if check is not None else (None,)):
-        try:
-            return build_npm_diagnostic_payload(step, key, stderr, report, candidate)
-        except BaseException:
-            continue
-    return None
-
-
-def npm_diagnostic_result(error):
-    """Turn a failed npm step that captured a diagnostic into the producer result, else re-raise."""
-    payload = getattr(error, "npm_diagnostic", None)
-    step = getattr(error, "source_gates_step", None)
-    key = getattr(error, "source_gates_key", None)
-    if (not isinstance(error, FeedbackRefusal) or error.reason == "cleanup_incomplete"
-            or type(payload) is not bytes or not payload
-            or type(step) is not str or step not in NPM_DIAGNOSTIC_STEPS
-            or type(key) is not str or NPM_DIAGNOSTIC_KEY_RE.match(key) is None
-            or not payload.startswith((NPM_DIAGNOSTIC_PREFIX + step + " reason=" + key + "\n").encode("ascii"))):
-        raise error
-    return {"payload_bytes": payload, "expected_manifest": None, "reviewed_rust_paths": None,
-            "source_result": "npm_diagnostic", "npm_diagnostic": (step, key)}
-
-
-def _npm_resolve_reason(result):
-    stderr = getattr(result, "stderr", None)
-    if type(stderr) is not bytes:
-        return "other"
-    match = NPM_ERROR_CODE_RE.search(stderr)
-    if match is None:
-        return "other"
-    code = match.group(1).decode("ascii", "strict")
-    return code.lower() if code in NPM_ERROR_CODES else "other"
-
-
-def _npm_run_worker(step, *arguments, **keywords):
-    try:
-        return _run_worker(*arguments, **keywords)
-    except FeedbackRefusal as error:
-        if error.reason == "capture_invalid":
-            _npm_tag(error, step, "capture_invalid")
-        elif error.reason == "command_failed":
-            check = getattr(error, "command_check", None)
-            _npm_tag(
-                error, step,
-                "timeout" if check == "timeout" else "spawn" if check == "spawn_failure" else "runner",
-            )
-        raise
-
-
-def _npm_mapped_reason(reason):
-    if reason in (
-        "npm_input_invalid", "npm_manifest_refused", "npm_request_refused", "npm_request_mismatch",
-        "npm_policy_refused",
-    ):
-        return "manifest_invalid"
-    if reason == "npm_environment_refused":
-        return "tool_unavailable"
-    if reason in ("npm_network_refused", "npm_stale"):
-        return "command_failed"
-    return "payload_invalid"
-
-
-def _npm_check_allowed(step, reason, check=None):
-    if step == "npm_bundle":
-        return True
-    if type(check) is list:
-        return False
-    return (step, reason) == ("npm_lock", "npm_lock_refused")
-
-
-def _npm_check_of(error, step, reason):
-    """The check carried by a bootstrap refusal for this step: a list of up to twenty identifiers
-    for npm_bundle, else the single identifier, else None."""
-    if not _npm_check_allowed(step, reason):
-        return None
-    details = getattr(error, "details", None)
-    if step == "npm_bundle" and type(details) in (tuple, list) and details:
-        items = list(details)[:NPM_CHECK_MAX_LINES]
-        if all(type(item) is str and item for item in items):
-            return items
-    check = getattr(error, "detail", None)
-    return check if type(check) is str and check else None
-
-
-def _npm_bootstrap_refusal(error, step=None, capture=None):
-    reason = getattr(error, "reason", None)
-    refusal = FeedbackRefusal(_npm_mapped_reason(reason))
-    if step is not None and type(reason) is str:
-        _npm_tag(refusal, step, reason)
-        if capture is not None:
-            check = _npm_check_of(error, step, reason)
-            if check is not None:
-                _npm_attach(refusal, capture(step, reason, check))
-            else:
-                _npm_attach(refusal, capture(step, reason))
-    raise refusal
-
-
-def _write_project_files(destination, files, relative_paths, worker_uid, primary_gid):
-    _make_worker_directory(destination, worker_uid, primary_gid)
-    for relative in relative_paths:
-        rel = Path(relative)
-        if rel.is_absolute() or any(part in ("", ".", "..") for part in rel.parts) or relative not in files:
-            _refuse("manifest_invalid")
-        current = destination
-        for part in rel.parts[:-1]:
-            current = current / part
-            try:
-                current.lstat()
-            except FileNotFoundError:
-                _make_worker_directory(current, worker_uid, primary_gid)
-            except OSError:
-                _refuse("output_unavailable")
-        _write_worker_file(current / rel.name, files[relative], worker_uid, primary_gid)
-
-
-def _npm_config_unchanged(contract, npm_environment, npm_storage, worker_uid, worker_gid):
-    try:
-        contract._validate_npm_config_files(
-            npm_environment, npm_storage, worker_uid, worker_gid,
-            stage="node_dependency_prepare", substage="lock_generation",
-        )
-    except Exception:
-        _refuse("tool_unavailable")
-
-
-def _npm_lock_absent(contract, project):
-    try:
-        contract._ensure_absent(contract._lock_path(project), reason="lock_already_present")
-    except Exception as error:
-        _refuse("manifest_invalid" if getattr(error, "reason", None) == "lock_already_present"
-                else "tool_unavailable")
-
-
-def _npm_root_lock_path(project, filing):
-    relative = filing.get("root_lock", "package-lock.json")
-    if type(relative) is not str or relative.startswith("/") or "\\" in relative:
-        _refuse("request_invalid")
-    parts = relative.split("/")
-    if any(part in ("", ".", "..") for part in parts):
-        _refuse("request_invalid")
-    return Path(project).joinpath(*parts)
-
-
-def run_npm_admission_profile(dispatch, source, worker_storage, worker_uid, environment,
-                              host_toolchain, capability, rust, deadline, bootstrap, contract,
-                              node, npm_cli, source_environ):
-    profile = dispatch["profile"]
-    if (profile["kind"] != feedback_request.NPM_ADMISSION_KIND or type(source_environ) is not dict
-            or type(environment) is not dict or type(host_toolchain) is not dict
-            or node is None or npm_cli is None):
-        _refuse("request_invalid")
-    request = dispatch["request"]
-    selector = feedback_request.request_filing(request)
-    fixture_repository = source_environ.get(NPM_FIXTURE_REPOSITORY_ID_ENV, "")
-    fixture_profile = (
-        type(fixture_repository) is str and fixture_repository != ""
-        and request.get("repository_id") == fixture_repository
-    )
-    if (selector == bootstrap.FIXTURE_FILING) != fixture_profile:
-        _refuse("request_invalid")
-    worker_gid = capability.PROBE_PRIMARY_GID
-    refusal_type = bootstrap.BootstrapRefusal
-    project = worker_storage / NPM_PROJECT_DIRECTORY
-    npm_storage = worker_storage / NPM_HOME_DIRECTORY
-    python_executable = host_toolchain["python"]
-    step = "npm_inputs"
-    try:
-        filing = bootstrap.filing_for(selector)
-        root_project = project / filing.get("project_root", "")
-        paths = bootstrap.input_paths(selector)
-        files = {path: _read_file(source / path, maximum=bootstrap.MAX_INPUT_BYTES) for path in paths}
-        candidate_files = _authenticated_candidate_files(source, request["source_sha"])
-        for path, payload in files.items():
-            git_blob = hashlib.sha1(
-                b"blob " + str(len(payload)).encode("ascii") + b"\x00" + payload,
-            ).hexdigest()
-            if candidate_files.get(path) != ("100644", git_blob):
-                _refuse("manifest_invalid")
-        plan = bootstrap.check_inputs(files, selector)
-        now = int(time.time())
-        bootstrap.check_policy_time(plan, now)
-        step = "npm_config"
-        _write_project_files(project, files, bootstrap.project_paths(selector), worker_uid, worker_gid)
-        _make_worker_directory(npm_storage, worker_uid, worker_gid)
-        for name in ("home", "tmp", "cache"):
-            _make_worker_directory(npm_storage / name, worker_uid, worker_gid)
-        user_config = npm_storage / contract.USER_CONFIG_NAME
-        global_config = npm_storage / contract.GLOBAL_CONFIG_NAME
-        _write_worker_file(user_config, contract.EMPTY_CONFIG_BYTES, worker_uid, worker_gid)
-        _write_worker_file(global_config, contract.EMPTY_CONFIG_BYTES, worker_uid, worker_gid)
-        npm_environment = bootstrap.build_npm_environment(
-            node, home=npm_storage / "home", tmpdir=npm_storage / "tmp", cache=npm_storage / "cache",
-            user_config=user_config, global_config=global_config,
-            node_options=contract.NODE_OPTIONS_VALUE,
-        )
-        command = bootstrap.resolve_command(
-            node, npm_cli, plan["cutoff_epoch_ms"], user_config, global_config,
-        )
-    except refusal_type as error:
-        _npm_bootstrap_refusal(error, step)
-    except FeedbackRefusal as error:
-        _npm_tag(error, step, error.reason)
-        raise
-    step = "npm_config"
-    resolve_stderr = None
-
-    def capture(step_name, key, check=None):
-        return _npm_capture_diagnostic(step_name, key, resolve_stderr, npm_storage, worker_uid, check)
-
-    try:
-        os.chdir(root_project)
-        _npm_config_unchanged(contract, npm_environment, npm_storage, worker_uid, worker_gid)
-        step = "npm_version"
-        probe = _npm_run_worker(
-            step, rust, (str(node), str(npm_cli), "--version"), worker_uid, npm_environment,
-            python_executable, capability, "feedback_lock", deadline,
-            allow_nonzero_capture=True, timeout=NPM_VERSION_SECONDS,
-        )
-        if probe.returncode != 0:
-            _npm_refuse(step, "nonzero_exit", "tool_unavailable")
-        if probe.stdout != (bootstrap.NPM_VERSION + "\n").encode("ascii"):
-            _npm_refuse(step, "mismatch", "tool_unavailable")
-        step = "npm_config"
-        _npm_config_unchanged(contract, npm_environment, npm_storage, worker_uid, worker_gid)
-        _npm_lock_absent(contract, root_project)
-        step = "npm_resolve"
-        result = _npm_run_worker(
-            step, rust, command, worker_uid, npm_environment, python_executable, capability,
-            "feedback_lock", deadline, allow_nonzero_capture=True, timeout=NPM_RESOLVE_SECONDS,
-        )
-        resolve_stderr = getattr(result, "stderr", None)
-        step = "npm_config"
-        _npm_config_unchanged(contract, npm_environment, npm_storage, worker_uid, worker_gid)
-        step = "npm_resolve"
-        if result.returncode != 0:
-            code = _npm_resolve_reason(result)
-            _npm_refuse(step, code, "command_failed", capture(step, code))
-    except FeedbackRefusal as error:
-        _npm_tag(error, step, error.reason)
-        if step == "npm_resolve" and getattr(error, "source_gates_key", None) == "capture_invalid":
-            _npm_attach(error, capture(step, "capture_invalid"))
-        raise
-    finally:
-        try:
-            os.chdir(source)
-        except OSError:
-            _refuse("cleanup_incomplete")
-    step = "npm_lock"
-    try:
-        lock_bytes = _read_worker_file(
-            _npm_root_lock_path(project, filing),
-            worker_uid, bootstrap.MAX_LOCK_BYTES,
-        )
-        bootstrap.check_lock(lock_bytes, plan)
-    except refusal_type as error:
-        _npm_bootstrap_refusal(error, step, capture)
-    except FeedbackRefusal as error:
-        _npm_tag(error, step, error.reason)
-        if error.reason == "capture_invalid":
-            _npm_attach(error, capture(step, "capture_invalid"))
-        raise
-    step = "npm_bundle"
-    owner = source_environ.get("SOURCE_REPOSITORY_OWNER", "")
-    name = source_environ.get("SOURCE_REPOSITORY_NAME", "")
-    trusted_context = {
-        "repository": owner + "/" + name,
-        "filing": selector,
-        "source_sha": request["source_sha"],
-        "base_sha": request["base_sha"],
-        "base_branch": request["base_branch"],
-        "reviewed_diff_fingerprint": request["reviewed_diff_sha256"],
-        "control_sha": request["control_sha"],
-    }
-    try:
-        bundle = bootstrap.produce_bundle(
-            lock_bytes, plan, trusted_context, run_id=dispatch["context"]["run_id"], run_attempt=1,
-            now=now, expiry=request["expiry"],
-            fetcher=bootstrap.RegistryFetcher(deadline=deadline),
-        )
-    except refusal_type as error:
-        _npm_bootstrap_refusal(error, step, capture)
-    return {"payload_bytes": bundle, "expected_manifest": None, "reviewed_rust_paths": None,
-            "source_result": "command_completed"}
 
 
 def build_diagnostic_payload(outcome):
@@ -2042,19 +1155,7 @@ def build_diagnostic_payload(outcome):
                 or outcome.get("stdout_truncated") is not False
                 or outcome.get("stderr_truncated") is not False):
             _refuse("capture_invalid")
-        reviewed_count = outcome.get("node_reviewed_file_count")
-        reviewed_digest = outcome.get("node_reviewed_paths_sha256")
-        if selected == DIAGNOSTIC_GATE_SELECTIONS[-1]:
-            if (type(reviewed_count) is not int or not 5 <= reviewed_count <= MAX_NODE_REVIEWED_FILES
-                    or type(reviewed_digest) is not str
-                    or SHA256_RE.fullmatch(reviewed_digest) is None):
-                _refuse("capture_invalid")
-            reviewed_evidence = (" node_reviewed_file_count=" + str(reviewed_count)
-                                 + " node_reviewed_paths_sha256=" + reviewed_digest)
-        elif reviewed_count is not None or reviewed_digest is not None:
-            _refuse("capture_invalid")
-        else:
-            reviewed_evidence = ""
+        reviewed_evidence = ""
         return (
             "KD-BUILD-DIAGNOSTICS schema=1 selected_gates=" + ",".join(selected)
             + " completed_gates=" + ",".join(completed)
@@ -2173,12 +1274,7 @@ def encrypt_after_cleanup(dispatch, result, node):
         "recipient_spki_b64": base64.b64encode(dispatch["spki_der"]).decode("ascii"),
         "now": int(time.time()),
     }
-    if profile["kind"] == "lock":
-        expected = result.get("expected_manifest")
-        if type(expected) is not dict:
-            _refuse("manifest_invalid", "expected_manifest_invalid")
-        record["expected_manifest"] = expected
-    elif profile["kind"] == "rust_patch":
+    if profile["kind"] == "rust_patch":
         paths = result.get("reviewed_rust_paths")
         if type(paths) is not list or not paths:
             _refuse("manifest_invalid", "reviewed_paths_invalid")

@@ -16,13 +16,37 @@ code that the candidate checker validates when the pool is platform.
 LINUX_CONFINEMENT_WORKFLOW_TEMPLATE = """name: linux-confinement
 on:
   push:
-    branches:
-      - "**"
   pull_request:
   workflow_dispatch:
 permissions: {}
 jobs:
+  promotion-check-reuse:
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/main') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      checks: read
+      contents: read
+      statuses: read
+    outputs:
+      skip_checks: ${{ steps.decide.outputs.skip_checks }}
+    steps:
+      - name: Fetch the exact candidate SHA
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check prior workflow results for this exact SHA
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROMOTION_TARGET: ${{ github.ref_name }}
+          PROMOTION_SHA: ${{ github.sha }}
+          PROMOTION_WORKFLOW: linux-confinement
+        run: timeout 1m python -B kit/promotion/branch_promotion.py --reuse-checks-if-green --target "$PROMOTION_TARGET" --sha "$PROMOTION_SHA" --workflow "$PROMOTION_WORKFLOW"
   linux-policy:
+    needs: promotion-check-reuse
+    if: ${{ always() && (needs.promotion-check-reuse.result == 'skipped' || needs.promotion-check-reuse.outputs.skip_checks != 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     defaults:
@@ -164,14 +188,15 @@ on:
         type: string
         default: linux-source-read
 permissions: {}
-cache-mode: none
+concurrency:
+  group: ${{ github.repository == 'keeldock-platform/platform-ci' && 'platform-rust-cache-inventory' || format('platform-ci-run-{0}-{1}-{2}', github.workflow, github.run_id, github.run_attempt) }}
+  cancel-in-progress: false
 jobs:
   linux-source-admission-settings:
     if: ${{ github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted') && (inputs.mode == 'source' || (inputs.mode == 'synthetic' && github.ref == 'refs/heads/main')) }}
     runs-on: ubuntu-24.04
     environment: ${{ inputs.mode == 'source' && 'linux-source-read' || '' }}
     timeout-minutes: 15
-    cache-mode: none
     permissions:
       actions: read
       contents: read
@@ -210,9 +235,6 @@ jobs:
       LINUX_SOURCE_MAIN_BRANCH_POLICY_ID: ${{ vars.LINUX_SOURCE_MAIN_BRANCH_POLICY_ID }}
       LINUX_SOURCE_UNTRUSTED_BRANCH_POLICY_ID: ${{ vars.LINUX_SOURCE_UNTRUSTED_BRANCH_POLICY_ID }}
       LINUX_API_FEATURE_GATE_NAMES: api_feature_clippy,api_feature_tests
-      LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256: ${{ vars.LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256 }}
-      LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256: ${{ vars.LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256 }}
-      LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON: ${{ vars.LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON }}
     steps:
       - name: Fetch exact public control
         run: |
@@ -239,7 +261,6 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && needs.linux-source-admission-settings.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    cache-mode: none
     permissions: {}
     defaults:
       run:
@@ -278,17 +299,17 @@ jobs:
           python3 -B kit/confinement/test_linux_canaries.py
           python3 -B kit/confinement/test_linux_channels.py
           python3 -B kit/confinement/test_linux_source_build.py
-          python3 -B kit/confinement/test_rust_license_gate.py
           python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
   linux-source-admission-source-read:
     needs:
       - linux-source-admission-settings
       - linux-source-admission-unit
     if: ${{ github.event_name == 'workflow_dispatch' && needs.linux-source-admission-settings.result == 'success' && needs.linux-source-admission-unit.result == 'success' && (inputs.mode == 'source' || (inputs.mode == 'synthetic' && github.ref == 'refs/heads/main')) && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted') }}
+    outputs:
+      cache_key: ${{ steps.rust-cache-key.outputs.cache_key }}
     runs-on: ubuntu-24.04
-    environment: ${{ inputs.mode == 'source' && 'linux-source-read' || '' }}
+    environment: ${{ inputs.mode == 'source' && github.ref == 'refs/heads/main' && 'linux-source-read-main' || inputs.mode == 'source' && 'linux-source-read' || '' }}
     timeout-minutes: 350
-    cache-mode: none
     permissions:
       actions: read
       contents: read
@@ -324,9 +345,6 @@ jobs:
       LINUX_SOURCE_MAIN_BRANCH_POLICY_ID: ${{ vars.LINUX_SOURCE_MAIN_BRANCH_POLICY_ID }}
       LINUX_SOURCE_UNTRUSTED_BRANCH_POLICY_ID: ${{ vars.LINUX_SOURCE_UNTRUSTED_BRANCH_POLICY_ID }}
       LINUX_API_FEATURE_GATE_NAMES: api_feature_clippy,api_feature_tests
-      LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256: ${{ vars.LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256 }}
-      LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256: ${{ vars.LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256 }}
-      LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON: ${{ vars.LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON }}
     steps:
       - name: Fetch exact public control
         run: |
@@ -402,7 +420,7 @@ jobs:
           [[ "$EXPECTED_INSTALLATION_ID" =~ ^[1-9][0-9]{0,18}$ ]]
           [[ "$ACTUAL_INSTALLATION_ID" =~ ^[1-9][0-9]{0,18}$ && "$ACTUAL_INSTALLATION_ID" == "$EXPECTED_INSTALLATION_ID" ]]
           printf '%s\n' "linux-source-installation=verified id=$ACTUAL_INSTALLATION_ID"
-      - name: Fetch exact source and verify binding, tree, signatures and lock provenance
+      - name: Fetch exact source and verify binding, tree, signatures and committed locks
         id: checkout
         if: ${{ inputs.mode == 'source' }}
         env:
@@ -413,52 +431,88 @@ jobs:
         env:
           SOURCE_READER_TOKEN: ${{ steps.source-reader-token.outputs.token }}
         run: python3 -B kit/confinement/linux_source_build.py revoke
-      - name: Install pinned cargo-deny and prepare the RustSec database
-        id: rust-license-tools
-        if: ${{ inputs.mode == 'source' }}
+      - name: Derive Rust cache key
+        continue-on-error: true
+        id: rust-cache-key
+        if: ${{ inputs.mode == 'source' && github.ref == 'refs/heads/main' }}
         env:
-          RUST_ROOT: ${{ steps.toolchains.outputs.rust_root }}
-        run: |
-          set -euo pipefail
-          control_root="$RUNNER_TEMP/kd-rust-license-control"
-          cargo_deny_root="$control_root/cargo-deny"
-          cargo_home="$control_root/cargo-home"
-          mkdir -m 700 -p "$control_root"
-          python3 -B kit/confinement/cargo_deny_installer.py install --destination "$cargo_deny_root" > "$control_root/install-record"
-          python3 -B kit/confinement/cargo_deny_installer.py prepare-advisories --cargo-home "$cargo_home" > "$control_root/advisory-record"
-          [[ -x "$RUST_ROOT/bin/cargo" ]]
-          cargo_deny_path="$cargo_deny_root/cargo-deny"
-          receipt_path="$cargo_deny_root/cargo-deny-install.json"
-          advisory_path="$cargo_home/advisory-dbs/advisory-db-3157b0e258782691"
-          [[ -x "$cargo_deny_path" && -f "$receipt_path" && -d "$advisory_path" ]]
-          printf 'cargo_deny_path=%s\n' "$cargo_deny_path" >> "$GITHUB_OUTPUT"
-          printf 'cargo_deny_receipt_path=%s\n' "$receipt_path" >> "$GITHUB_OUTPUT"
-          printf 'cargo_deny_home=%s\n' "$cargo_home" >> "$GITHUB_OUTPUT"
-          printf 'advisory_database_path=%s\n' "$advisory_path" >> "$GITHUB_OUTPUT"
-      - name: Require trusted Rust licence admission
-        id: rust-license-gate
+          SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
+          RUST_CACHE_OS: ${{ runner.os }}-${{ runner.arch }}
+          RUST_CACHE_SCOPE: linux-source-admission
+          RUST_CACHE_TRUST_CLASS: primary
+          CI_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          CONTROL_SHA: ${{ github.sha }}
+          CI_SHA: ${{ github.sha }}
+          CI_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: timeout 1m python3 -B kit/confinement/linux_source_build.py rust-cache-key
+      - name: Prepare runner-local Rust cache staging
+        continue-on-error: true
+        if: ${{ inputs.mode == 'source' && github.ref == 'refs/heads/main' && steps.rust-cache-key.outcome == 'success' }}
+        run: timeout 1m install -d -m 755 "$RUNNER_TEMP/kd-rust-cache/target" "$RUNNER_TEMP/kd-rust-cache/cargo-home/registry" "$RUNNER_TEMP/kd-rust-cache/cargo-home/git"
+      - name: Restore exact Rust build cache
+        continue-on-error: true
+        id: rust-cache
+        if: ${{ inputs.mode == 'source' && github.ref == 'refs/heads/main' && steps.rust-cache-key.outcome == 'success' }}
+        timeout-minutes: 5
+        uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/kd-rust-cache/rust-cache.tar
+          key: ${{ steps.rust-cache-key.outputs.cache_key }}
+      - name: Import validated Rust build cache
+        id: rust-cache-import
+        if: ${{ inputs.mode == 'source' && github.ref == 'refs/heads/main' && steps.rust-cache-key.outcome == 'success' && steps.rust-cache.outputs.cache-hit == 'true' }}
+        continue-on-error: true
+        timeout-minutes: 45
+        env:
+          SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
+          RUNNER_TEMP: ${{ runner.temp }}
+          KD_RUST_CACHE_MODE: read
+          KD_RUST_CACHE_DIR: ${{ runner.temp }}/kd-rust-cache
+          KD_RUST_CACHE_KEY: ${{ steps.rust-cache-key.outputs.cache_key }}
+          KD_RUST_CACHE_HIT: true
+          RUST_CACHE_OS: ${{ runner.os }}-${{ runner.arch }}
+          RUST_CACHE_SCOPE: linux-source-admission
+          RUST_CACHE_TRUST_CLASS: primary
+          CI_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          CONTROL_SHA: ${{ github.sha }}
+          CI_SHA: ${{ github.sha }}
+          CI_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+          KD_RUST_CACHE_ENCRYPTION_KEY_B64: ${{ secrets.RUST_CACHE_ENCRYPTION_KEY }}
+        run: timeout 45m python3 -B kit/confinement/linux_source_build.py rust-cache-import
+      - name: Fetch Rust dependencies from the committed lockfiles
+        id: cargo-fetch
         if: ${{ inputs.mode == 'source' }}
         env:
           SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
           REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
           RUST_ROOT: ${{ steps.toolchains.outputs.rust_root }}
-          KD_CARGO_DENY_PATH: ${{ steps.rust-license-tools.outputs.cargo_deny_path }}
-          KD_CARGO_DENY_RECEIPT_PATH: ${{ steps.rust-license-tools.outputs.cargo_deny_receipt_path }}
-          KD_CARGO_DENY_HOME: ${{ steps.rust-license-tools.outputs.cargo_deny_home }}
-          KD_RUSTSEC_ADVISORY_DB_PATH: ${{ steps.rust-license-tools.outputs.advisory_database_path }}
-        run: python3 -B kit/confinement/linux_source_build.py rust-license-gate
+          KD_CARGO_FETCH_HOME: ${{ runner.temp }}/kd-cargo-fetch-home
+          KD_RUST_CACHE_MODE: ${{ github.ref == 'refs/heads/main' && steps.rust-cache-key.outcome == 'success' && 'read' || 'none' }}
+          KD_RUST_CACHE_DIR: ${{ github.ref == 'refs/heads/main' && steps.rust-cache-key.outcome == 'success' && format('{0}/kd-rust-cache', runner.temp) || '' }}
+          KD_RUST_CACHE_KEY: ${{ github.ref == 'refs/heads/main' && steps.rust-cache-key.outcome == 'success' && steps.rust-cache-key.outputs.cache_key || '' }}
+          KD_RUST_CACHE_HIT: ${{ github.ref == 'refs/heads/main' && steps.rust-cache-key.outcome == 'success' && (steps.rust-cache.outputs.cache-hit == 'true' && steps.rust-cache-import.outcome == 'success' && 'true' || 'false') || '' }}
+          RUST_CACHE_OS: ${{ github.ref == 'refs/heads/main' && steps.rust-cache-key.outcome == 'success' && format('{0}-{1}', runner.os, runner.arch) || '' }}
+          RUST_CACHE_SCOPE: ${{ github.ref == 'refs/heads/main' && steps.rust-cache-key.outcome == 'success' && 'linux-source-admission' || '' }}
+          RUST_CACHE_TRUST_CLASS: ${{ github.ref == 'refs/heads/main' && steps.rust-cache-key.outcome == 'success' && 'primary' || '' }}
+          CI_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          CONTROL_SHA: ${{ github.sha }}
+          CI_SHA: ${{ github.sha }}
+          CI_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: python3 -B kit/confinement/linux_source_build.py rust-lock-fetch
       - name: Fetch npm tarballs by committed lock integrity
         id: npm-tarballs
         if: ${{ inputs.mode == 'source' }}
         env:
           SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
         run: python3 -B kit/confinement/linux_source_build.py npm-tarballs
-      - name: Run trusted dependency audit
-        if: ${{ inputs.mode == 'source' }}
-        env:
-          SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
-          NODE_BIN: ${{ steps.toolchains.outputs.node_bin }}
-        run: python3 -B kit/confinement/linux_source_build.py trusted-audit
       - name: Prepare offline project inputs
         id: project-deps
         if: ${{ inputs.mode == 'source' }}
@@ -466,10 +520,24 @@ jobs:
           SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
           NPM_TARBALL_INDEX: ${{ steps.npm-tarballs.outputs.tarball_index }}
           RUST_ROOT: ${{ steps.toolchains.outputs.rust_root }}
+          KD_CARGO_FETCH_HOME: ${{ runner.temp }}/kd-cargo-fetch-home
           EXPECTED_NODE_LOCK_SHA256: ${{ steps.checkout.outputs.lock_sha256 }}
           EXPECTED_MANIFEST_SHA256: ${{ steps.checkout.outputs.manifest_sha256 }}
           REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
-        run: sudo -n --preserve-env=SOURCE_PATH,NPM_TARBALL_INDEX,RUST_ROOT,EXPECTED_NODE_LOCK_SHA256,EXPECTED_MANIFEST_SHA256,REQUESTED_SOURCE_SHA,RUNNER_TEMP,GITHUB_OUTPUT python3 -B kit/confinement/linux_source_build.py prepare-project
+          KD_RUST_CACHE_MODE: ${{ github.ref == 'refs/heads/main' && steps.rust-cache-key.outcome == 'success' && 'read' || 'none' }}
+          KD_RUST_CACHE_DIR: ${{ github.ref == 'refs/heads/main' && steps.rust-cache-key.outcome == 'success' && format('{0}/kd-rust-cache', runner.temp) || '' }}
+          KD_RUST_CACHE_KEY: ${{ github.ref == 'refs/heads/main' && steps.rust-cache-key.outcome == 'success' && steps.rust-cache-key.outputs.cache_key || '' }}
+          KD_RUST_CACHE_HIT: ${{ github.ref == 'refs/heads/main' && steps.rust-cache-key.outcome == 'success' && (steps.rust-cache.outputs.cache-hit == 'true' && steps.rust-cache-import.outcome == 'success' && 'true' || 'false') || '' }}
+          RUST_CACHE_OS: ${{ github.ref == 'refs/heads/main' && steps.rust-cache-key.outcome == 'success' && format('{0}-{1}', runner.os, runner.arch) || '' }}
+          RUST_CACHE_SCOPE: ${{ github.ref == 'refs/heads/main' && steps.rust-cache-key.outcome == 'success' && 'linux-source-admission' || '' }}
+          RUST_CACHE_TRUST_CLASS: ${{ github.ref == 'refs/heads/main' && steps.rust-cache-key.outcome == 'success' && 'primary' || '' }}
+          CI_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          CONTROL_SHA: ${{ github.sha }}
+          CI_SHA: ${{ github.sha }}
+          CI_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: sudo -n --preserve-env=SOURCE_PATH,NPM_TARBALL_INDEX,RUST_ROOT,KD_CARGO_FETCH_HOME,EXPECTED_NODE_LOCK_SHA256,EXPECTED_MANIFEST_SHA256,REQUESTED_SOURCE_SHA,RUNNER_TEMP,GITHUB_OUTPUT,KD_RUST_CACHE_MODE,KD_RUST_CACHE_DIR,KD_RUST_CACHE_KEY,KD_RUST_CACHE_HIT,RUST_CACHE_OS,RUST_CACHE_SCOPE,RUST_CACHE_TRUST_CLASS,CI_REPOSITORY,SOURCE_REPOSITORY_ID,CONTROL_SHA,CI_SHA,CI_REF,CI_EVENT_NAME python3 -B kit/confinement/linux_source_build.py prepare-project
       - name: Re-run positive controls immediately before the first project command
         id: recheck
         env:
@@ -484,6 +552,7 @@ jobs:
           fi
           sudo -n --preserve-env=KD_CANARY_SECRET python3 -B kit/confinement/linux_boundary.py recheck "${arguments[@]}" --record "$RUNNER_TEMP/kd-records/recheck.json"
       - name: Run all offline project gates
+        id: gates
         if: ${{ inputs.mode == 'source' }}
         env:
           SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
@@ -494,17 +563,66 @@ jobs:
           CARGO_HOME: ${{ steps.project-deps.outputs.cargo_home }}
           BROWSER_ROOT: ${{ steps.toolchains.outputs.browser_root }}
           REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
-          KD_CARGO_DENY_PATH: ${{ steps.rust-license-tools.outputs.cargo_deny_path }}
-          KD_CARGO_DENY_RECEIPT_PATH: ${{ steps.rust-license-tools.outputs.cargo_deny_receipt_path }}
-          KD_CARGO_DENY_HOME: ${{ steps.rust-license-tools.outputs.cargo_deny_home }}
-          KD_RUSTSEC_ADVISORY_DB_PATH: ${{ steps.rust-license-tools.outputs.advisory_database_path }}
-          KD_STAGED_INVENTORY_RECEIPT: ${{ steps.project-deps.outputs.staged_inventory_receipt }}
-        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA,BROWSER_ROOT,CI_SHA,KD_CARGO_DENY_PATH,KD_CARGO_DENY_RECEIPT_PATH,KD_CARGO_DENY_HOME,KD_RUSTSEC_ADVISORY_DB_PATH,KD_STAGED_INVENTORY_RECEIPT python3 -B kit/confinement/linux_source_build.py gates
+        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA,BROWSER_ROOT,CI_SHA python3 -B kit/confinement/linux_source_build.py gates
       - name: Merge confinement phase records
         if: ${{ always() && steps.selftest.outcome != 'skipped' && steps.recheck.outcome != 'skipped' }}
         run: |
           set -euo pipefail
           sudo -n python3 -B kit/confinement/linux_boundary.py merge --selftest "$RUNNER_TEMP/kd-records/selftest.json" --recheck "$RUNNER_TEMP/kd-records/recheck.json" --out "$RUNNER_TEMP/kd-records/merged.json"
+      - name: Export validated Rust build cache after confined work
+        id: rust-cache-export
+        if: ${{ success() && steps.gates.outcome == 'success' && (steps.rust-cache.outputs.cache-hit != 'true' || steps.rust-cache-import.outcome != 'success') && steps.rust-cache-key.outcome == 'success' && inputs.mode == 'source' && github.ref == 'refs/heads/main' }}
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
+          WORKER_PATH: ${{ steps.project-deps.outputs.worker_path }}
+          CARGO_HOME: ${{ steps.project-deps.outputs.cargo_home }}
+          KD_RUST_CACHE_MODE: read
+          KD_RUST_CACHE_DIR: ${{ runner.temp }}/kd-rust-cache
+          KD_RUST_CACHE_KEY: ${{ steps.rust-cache-key.outputs.cache_key }}
+          KD_RUST_CACHE_HIT: false
+          RUST_CACHE_OS: ${{ runner.os }}-${{ runner.arch }}
+          RUST_CACHE_SCOPE: linux-source-admission
+          RUST_CACHE_TRUST_CLASS: ${{ github.ref == 'refs/heads/main' && 'primary' || 'untrusted' }}
+          CI_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          CONTROL_SHA: ${{ github.sha }}
+          CI_SHA: ${{ github.sha }}
+          CI_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: timeout 10m sudo -n --preserve-env=SOURCE_PATH,WORKER_PATH,CARGO_HOME,RUNNER_TEMP,KD_RUST_CACHE_MODE,KD_RUST_CACHE_DIR,KD_RUST_CACHE_KEY,KD_RUST_CACHE_HIT,RUST_CACHE_OS,RUST_CACHE_SCOPE,RUST_CACHE_TRUST_CLASS,CI_REPOSITORY,SOURCE_REPOSITORY_ID,REQUESTED_SOURCE_SHA,CONTROL_SHA,CI_SHA,CI_REF,CI_EVENT_NAME python3 -B kit/confinement/linux_source_build.py rust-cache-export
+      - name: Package the Rust build cache
+        id: rust-cache-package
+        if: ${{ success() && steps.gates.outcome == 'success' && (steps.rust-cache.outputs.cache-hit != 'true' || steps.rust-cache-import.outcome != 'success') && steps.rust-cache-export.outcome == 'success' && steps.rust-cache-key.outcome == 'success' && inputs.mode == 'source' && github.ref == 'refs/heads/main' }}
+        continue-on-error: true
+        timeout-minutes: 50
+        env:
+          SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
+          KD_RUST_CACHE_MODE: read
+          KD_RUST_CACHE_DIR: ${{ runner.temp }}/kd-rust-cache
+          KD_RUST_CACHE_KEY: ${{ steps.rust-cache-key.outputs.cache_key }}
+          KD_RUST_CACHE_HIT: false
+          RUST_CACHE_OS: ${{ runner.os }}-${{ runner.arch }}
+          RUST_CACHE_SCOPE: linux-source-admission
+          RUST_CACHE_TRUST_CLASS: ${{ github.ref == 'refs/heads/main' && 'primary' || 'untrusted' }}
+          CI_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          CONTROL_SHA: ${{ github.sha }}
+          CI_SHA: ${{ github.sha }}
+          CI_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+          KD_RUST_CACHE_ENCRYPTION_KEY_B64: ${{ secrets.RUST_CACHE_ENCRYPTION_KEY }}
+        run: timeout 45m python3 -B kit/confinement/linux_source_build.py rust-cache-package
+      - name: Save the exact Rust build cache
+        continue-on-error: true
+        if: ${{ success() && steps.gates.outcome == 'success' && steps.rust-cache-package.outcome == 'success' && (steps.rust-cache.outputs.cache-hit != 'true' || steps.rust-cache-import.outcome != 'success') && inputs.mode == 'source' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/kd-rust-cache/rust-cache.tar
+          key: ${{ steps.rust-cache-key.outputs.cache_key }}
       - name: Forced faults must fail closed
         if: ${{ inputs.mode == 'synthetic' }}
         env:
@@ -519,11 +637,12 @@ jobs:
       - linux-source-admission-settings
       - linux-source-admission-unit
       - linux-source-admission-source-read
+    outputs:
+      cache_key: ${{ steps.verifier-rust-cache-key.outputs.cache_key }}
     if: ${{ always() && github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted') }}
     runs-on: ubuntu-24.04
-    environment: ${{ inputs.mode == 'source' && 'linux-source-read' || '' }}
+    environment: ${{ inputs.mode == 'source' && github.ref == 'refs/heads/main' && 'linux-source-read-main' || inputs.mode == 'source' && 'linux-source-read' || '' }}
     timeout-minutes: 350
-    cache-mode: none
     permissions:
       actions: read
       contents: read
@@ -560,9 +679,6 @@ jobs:
       LINUX_SOURCE_MAIN_BRANCH_POLICY_ID: ${{ vars.LINUX_SOURCE_MAIN_BRANCH_POLICY_ID }}
       LINUX_SOURCE_UNTRUSTED_BRANCH_POLICY_ID: ${{ vars.LINUX_SOURCE_UNTRUSTED_BRANCH_POLICY_ID }}
       LINUX_API_FEATURE_GATE_NAMES: api_feature_clippy,api_feature_tests
-      LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256: ${{ vars.LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256 }}
-      LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256: ${{ vars.LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256 }}
-      LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON: ${{ vars.LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON }}
     steps:
       - name: Fetch exact public control
         run: |
@@ -627,51 +743,87 @@ jobs:
         env:
           SOURCE_READER_TOKEN: ${{ steps.verifier-token.outputs.token }}
         run: python3 -B kit/confinement/linux_source_build.py revoke
-      - name: Install independent pinned cargo-deny and prepare RustSec database
-        id: verifier-rust-license-tools
-        if: ${{ inputs.mode == 'source' }}
+      - name: Derive independent verifier Rust cache key
+        continue-on-error: true
+        id: verifier-rust-cache-key
+        if: ${{ inputs.mode == 'source' && github.ref == 'refs/heads/main' }}
         env:
-          RUST_ROOT: ${{ steps.verifier-toolchain.outputs.rust_root }}
-        run: |
-          set -euo pipefail
-          control_root="$RUNNER_TEMP/kd-rust-license-control"
-          cargo_deny_root="$control_root/cargo-deny"
-          cargo_home="$control_root/cargo-home"
-          mkdir -m 700 -p "$control_root"
-          python3 -B kit/confinement/cargo_deny_installer.py install --destination "$cargo_deny_root" > "$control_root/install-record"
-          python3 -B kit/confinement/cargo_deny_installer.py prepare-advisories --cargo-home "$cargo_home" > "$control_root/advisory-record"
-          [[ -x "$RUST_ROOT/bin/cargo" ]]
-          cargo_deny_path="$cargo_deny_root/cargo-deny"
-          receipt_path="$cargo_deny_root/cargo-deny-install.json"
-          advisory_path="$cargo_home/advisory-dbs/advisory-db-3157b0e258782691"
-          [[ -x "$cargo_deny_path" && -f "$receipt_path" && -d "$advisory_path" ]]
-          printf 'cargo_deny_path=%s\n' "$cargo_deny_path" >> "$GITHUB_OUTPUT"
-          printf 'cargo_deny_receipt_path=%s\n' "$receipt_path" >> "$GITHUB_OUTPUT"
-          printf 'cargo_deny_home=%s\n' "$cargo_home" >> "$GITHUB_OUTPUT"
-          printf 'advisory_database_path=%s\n' "$advisory_path" >> "$GITHUB_OUTPUT"
-      - name: Require trusted Rust licence admission independently
+          SOURCE_PATH: ${{ steps.verifier-checkout.outputs.source_path }}
+          RUST_CACHE_OS: ${{ runner.os }}-${{ runner.arch }}
+          RUST_CACHE_SCOPE: linux-source-verifier
+          RUST_CACHE_TRUST_CLASS: independent-verifier
+          CI_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          CONTROL_SHA: ${{ github.sha }}
+          CI_SHA: ${{ github.sha }}
+          CI_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: timeout 1m python3 -B kit/confinement/linux_source_build.py rust-cache-key
+      - name: Prepare independent verifier Rust cache staging
+        continue-on-error: true
+        if: ${{ inputs.mode == 'source' && github.ref == 'refs/heads/main' && steps.verifier-rust-cache-key.outcome == 'success' }}
+        run: timeout 1m install -d -m 755 "$RUNNER_TEMP/kd-rust-cache/target" "$RUNNER_TEMP/kd-rust-cache/cargo-home/registry" "$RUNNER_TEMP/kd-rust-cache/cargo-home/git"
+      - name: Restore the independent verifier Rust build cache
+        continue-on-error: true
+        id: verifier-rust-cache
+        if: ${{ inputs.mode == 'source' && github.ref == 'refs/heads/main' && steps.verifier-rust-cache-key.outcome == 'success' }}
+        timeout-minutes: 5
+        uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/kd-rust-cache/rust-cache.tar
+          key: ${{ steps.verifier-rust-cache-key.outputs.cache_key }}
+      - name: Import the independent verifier Rust cache
+        id: verifier-rust-cache-import
+        if: ${{ inputs.mode == 'source' && github.ref == 'refs/heads/main' && steps.verifier-rust-cache-key.outcome == 'success' && steps.verifier-rust-cache.outputs.cache-hit == 'true' }}
+        continue-on-error: true
+        timeout-minutes: 45
+        env:
+          SOURCE_PATH: ${{ steps.verifier-checkout.outputs.source_path }}
+          KD_RUST_CACHE_MODE: read
+          KD_RUST_CACHE_DIR: ${{ runner.temp }}/kd-rust-cache
+          KD_RUST_CACHE_KEY: ${{ steps.verifier-rust-cache-key.outputs.cache_key }}
+          KD_RUST_CACHE_HIT: true
+          RUST_CACHE_OS: ${{ runner.os }}-${{ runner.arch }}
+          RUST_CACHE_SCOPE: linux-source-verifier
+          RUST_CACHE_TRUST_CLASS: independent-verifier
+          CI_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          CONTROL_SHA: ${{ github.sha }}
+          CI_SHA: ${{ github.sha }}
+          CI_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+          KD_RUST_CACHE_ENCRYPTION_KEY_B64: ${{ secrets.RUST_CACHE_ENCRYPTION_KEY }}
+        run: timeout 45m python3 -B kit/confinement/linux_source_build.py rust-cache-import
+      - name: Fetch verifier Rust dependencies from committed lockfiles
+        id: verifier-cargo-fetch
         if: ${{ inputs.mode == 'source' }}
         env:
           SOURCE_PATH: ${{ steps.verifier-checkout.outputs.source_path }}
           REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
           RUST_ROOT: ${{ steps.verifier-toolchain.outputs.rust_root }}
-          KD_CARGO_DENY_PATH: ${{ steps.verifier-rust-license-tools.outputs.cargo_deny_path }}
-          KD_CARGO_DENY_RECEIPT_PATH: ${{ steps.verifier-rust-license-tools.outputs.cargo_deny_receipt_path }}
-          KD_CARGO_DENY_HOME: ${{ steps.verifier-rust-license-tools.outputs.cargo_deny_home }}
-          KD_RUSTSEC_ADVISORY_DB_PATH: ${{ steps.verifier-rust-license-tools.outputs.advisory_database_path }}
-        run: python3 -B kit/confinement/linux_source_build.py rust-license-gate
+          KD_CARGO_FETCH_HOME: ${{ runner.temp }}/kd-verifier-cargo-fetch-home
+          KD_RUST_CACHE_MODE: ${{ github.ref == 'refs/heads/main' && steps.verifier-rust-cache-key.outcome == 'success' && 'read' || 'none' }}
+          KD_RUST_CACHE_DIR: ${{ github.ref == 'refs/heads/main' && steps.verifier-rust-cache-key.outcome == 'success' && format('{0}/kd-rust-cache', runner.temp) || '' }}
+          KD_RUST_CACHE_KEY: ${{ github.ref == 'refs/heads/main' && steps.verifier-rust-cache-key.outcome == 'success' && steps.verifier-rust-cache-key.outputs.cache_key || '' }}
+          KD_RUST_CACHE_HIT: ${{ github.ref == 'refs/heads/main' && steps.verifier-rust-cache-key.outcome == 'success' && (steps.verifier-rust-cache.outputs.cache-hit == 'true' && steps.verifier-rust-cache-import.outcome == 'success' && 'true' || 'false') || '' }}
+          RUST_CACHE_OS: ${{ github.ref == 'refs/heads/main' && steps.verifier-rust-cache-key.outcome == 'success' && format('{0}-{1}', runner.os, runner.arch) || '' }}
+          RUST_CACHE_SCOPE: ${{ github.ref == 'refs/heads/main' && steps.verifier-rust-cache-key.outcome == 'success' && 'linux-source-verifier' || '' }}
+          RUST_CACHE_TRUST_CLASS: ${{ github.ref == 'refs/heads/main' && steps.verifier-rust-cache-key.outcome == 'success' && 'independent-verifier' || '' }}
+          CI_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          CONTROL_SHA: ${{ github.sha }}
+          CI_SHA: ${{ github.sha }}
+          CI_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: python3 -B kit/confinement/linux_source_build.py rust-lock-fetch
       - name: Fetch independent npm tarballs by lock integrity
         id: verifier-npm
         if: ${{ inputs.mode == 'source' }}
         env:
           SOURCE_PATH: ${{ steps.verifier-checkout.outputs.source_path }}
         run: python3 -B kit/confinement/linux_source_build.py npm-tarballs
-      - name: Run independent trusted dependency audit
-        if: ${{ inputs.mode == 'source' }}
-        env:
-          SOURCE_PATH: ${{ steps.verifier-checkout.outputs.source_path }}
-          NODE_BIN: ${{ steps.verifier-toolchain.outputs.node_bin }}
-        run: python3 -B kit/confinement/linux_source_build.py trusted-audit
       - name: Prepare independent offline project inputs
         id: verifier-project
         if: ${{ inputs.mode == 'source' }}
@@ -679,10 +831,24 @@ jobs:
           SOURCE_PATH: ${{ steps.verifier-checkout.outputs.source_path }}
           NPM_TARBALL_INDEX: ${{ steps.verifier-npm.outputs.tarball_index }}
           RUST_ROOT: ${{ steps.verifier-toolchain.outputs.rust_root }}
+          KD_CARGO_FETCH_HOME: ${{ runner.temp }}/kd-verifier-cargo-fetch-home
           EXPECTED_NODE_LOCK_SHA256: ${{ steps.verifier-checkout.outputs.lock_sha256 }}
           EXPECTED_MANIFEST_SHA256: ${{ steps.verifier-checkout.outputs.manifest_sha256 }}
           REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
-        run: sudo -n --preserve-env=SOURCE_PATH,NPM_TARBALL_INDEX,RUST_ROOT,EXPECTED_NODE_LOCK_SHA256,EXPECTED_MANIFEST_SHA256,REQUESTED_SOURCE_SHA,RUNNER_TEMP,GITHUB_OUTPUT python3 -B kit/confinement/linux_source_build.py prepare-project
+          KD_RUST_CACHE_MODE: ${{ github.ref == 'refs/heads/main' && steps.verifier-rust-cache-key.outcome == 'success' && 'read' || 'none' }}
+          KD_RUST_CACHE_DIR: ${{ github.ref == 'refs/heads/main' && steps.verifier-rust-cache-key.outcome == 'success' && format('{0}/kd-rust-cache', runner.temp) || '' }}
+          KD_RUST_CACHE_KEY: ${{ github.ref == 'refs/heads/main' && steps.verifier-rust-cache-key.outcome == 'success' && steps.verifier-rust-cache-key.outputs.cache_key || '' }}
+          KD_RUST_CACHE_HIT: ${{ github.ref == 'refs/heads/main' && steps.verifier-rust-cache-key.outcome == 'success' && (steps.verifier-rust-cache.outputs.cache-hit == 'true' && steps.verifier-rust-cache-import.outcome == 'success' && 'true' || 'false') || '' }}
+          RUST_CACHE_OS: ${{ github.ref == 'refs/heads/main' && steps.verifier-rust-cache-key.outcome == 'success' && format('{0}-{1}', runner.os, runner.arch) || '' }}
+          RUST_CACHE_SCOPE: ${{ github.ref == 'refs/heads/main' && steps.verifier-rust-cache-key.outcome == 'success' && 'linux-source-verifier' || '' }}
+          RUST_CACHE_TRUST_CLASS: ${{ github.ref == 'refs/heads/main' && steps.verifier-rust-cache-key.outcome == 'success' && 'independent-verifier' || '' }}
+          CI_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          CONTROL_SHA: ${{ github.sha }}
+          CI_SHA: ${{ github.sha }}
+          CI_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: sudo -n --preserve-env=SOURCE_PATH,NPM_TARBALL_INDEX,RUST_ROOT,KD_CARGO_FETCH_HOME,EXPECTED_NODE_LOCK_SHA256,EXPECTED_MANIFEST_SHA256,REQUESTED_SOURCE_SHA,RUNNER_TEMP,GITHUB_OUTPUT,KD_RUST_CACHE_MODE,KD_RUST_CACHE_DIR,KD_RUST_CACHE_KEY,KD_RUST_CACHE_HIT,RUST_CACHE_OS,RUST_CACHE_SCOPE,RUST_CACHE_TRUST_CLASS,CI_REPOSITORY,SOURCE_REPOSITORY_ID,CONTROL_SHA,CI_SHA,CI_REF,CI_EVENT_NAME python3 -B kit/confinement/linux_source_build.py prepare-project
       - name: Re-run independent positive controls before project execution
         id: verifier-recheck
         env:
@@ -697,6 +863,7 @@ jobs:
           fi
           sudo -n --preserve-env=KD_CANARY_SECRET python3 -B kit/confinement/linux_boundary.py recheck "${arguments[@]}" --record "$RUNNER_TEMP/kd-records/recheck.json"
       - name: Run independent offline project gates
+        id: verifier-gates
         if: ${{ inputs.mode == 'source' }}
         env:
           WORKER_PATH: ${{ steps.verifier-project.outputs.worker_path }}
@@ -706,17 +873,66 @@ jobs:
           NODE_BIN: ${{ steps.verifier-toolchain.outputs.node_bin }}
           REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
           CI_SHA: ${{ github.sha }}
-          KD_CARGO_DENY_PATH: ${{ steps.verifier-rust-license-tools.outputs.cargo_deny_path }}
-          KD_CARGO_DENY_RECEIPT_PATH: ${{ steps.verifier-rust-license-tools.outputs.cargo_deny_receipt_path }}
-          KD_CARGO_DENY_HOME: ${{ steps.verifier-rust-license-tools.outputs.cargo_deny_home }}
-          KD_RUSTSEC_ADVISORY_DB_PATH: ${{ steps.verifier-rust-license-tools.outputs.advisory_database_path }}
-          KD_STAGED_INVENTORY_RECEIPT: ${{ steps.verifier-project.outputs.staged_inventory_receipt }}
-        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA,BROWSER_ROOT,CI_SHA,KD_CARGO_DENY_PATH,KD_CARGO_DENY_RECEIPT_PATH,KD_CARGO_DENY_HOME,KD_RUSTSEC_ADVISORY_DB_PATH,KD_STAGED_INVENTORY_RECEIPT python3 -B kit/confinement/linux_source_build.py gates
+        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA,BROWSER_ROOT,CI_SHA python3 -B kit/confinement/linux_source_build.py gates
       - name: Merge independent confinement records
         if: ${{ always() && steps.verifier-selftest.outcome != 'skipped' && steps.verifier-recheck.outcome != 'skipped' }}
         run: |
           set -euo pipefail
           sudo -n python3 -B kit/confinement/linux_boundary.py merge --selftest "$RUNNER_TEMP/kd-records/selftest.json" --recheck "$RUNNER_TEMP/kd-records/recheck.json" --out "$RUNNER_TEMP/kd-records/merged.json" --reader-uid "$(id -u)" --reader-gid "$(id -g)"
+      - name: Export the independent verifier Rust cache after confined work
+        id: verifier-rust-cache-export
+        if: ${{ success() && steps.verifier-gates.outcome == 'success' && (steps.verifier-rust-cache.outputs.cache-hit != 'true' || steps.verifier-rust-cache-import.outcome != 'success') && steps.verifier-rust-cache-key.outcome == 'success' && inputs.mode == 'source' && github.ref == 'refs/heads/main' }}
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          SOURCE_PATH: ${{ steps.verifier-checkout.outputs.source_path }}
+          WORKER_PATH: ${{ steps.verifier-project.outputs.worker_path }}
+          CARGO_HOME: ${{ steps.verifier-project.outputs.cargo_home }}
+          KD_RUST_CACHE_MODE: read
+          KD_RUST_CACHE_DIR: ${{ runner.temp }}/kd-rust-cache
+          KD_RUST_CACHE_KEY: ${{ steps.verifier-rust-cache-key.outputs.cache_key }}
+          KD_RUST_CACHE_HIT: false
+          RUST_CACHE_OS: ${{ runner.os }}-${{ runner.arch }}
+          RUST_CACHE_SCOPE: linux-source-verifier
+          RUST_CACHE_TRUST_CLASS: independent-verifier
+          CI_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          CONTROL_SHA: ${{ github.sha }}
+          CI_SHA: ${{ github.sha }}
+          CI_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: timeout 10m sudo -n --preserve-env=SOURCE_PATH,WORKER_PATH,CARGO_HOME,RUNNER_TEMP,KD_RUST_CACHE_MODE,KD_RUST_CACHE_DIR,KD_RUST_CACHE_KEY,KD_RUST_CACHE_HIT,RUST_CACHE_OS,RUST_CACHE_SCOPE,RUST_CACHE_TRUST_CLASS,CI_REPOSITORY,SOURCE_REPOSITORY_ID,REQUESTED_SOURCE_SHA,CONTROL_SHA,CI_SHA,CI_REF,CI_EVENT_NAME python3 -B kit/confinement/linux_source_build.py rust-cache-export
+      - name: Package the independent verifier Rust cache
+        id: verifier-rust-cache-package
+        if: ${{ success() && steps.verifier-gates.outcome == 'success' && (steps.verifier-rust-cache.outputs.cache-hit != 'true' || steps.verifier-rust-cache-import.outcome != 'success') && steps.verifier-rust-cache-export.outcome == 'success' && steps.verifier-rust-cache-key.outcome == 'success' && inputs.mode == 'source' && github.ref == 'refs/heads/main' }}
+        continue-on-error: true
+        timeout-minutes: 50
+        env:
+          SOURCE_PATH: ${{ steps.verifier-checkout.outputs.source_path }}
+          KD_RUST_CACHE_MODE: read
+          KD_RUST_CACHE_DIR: ${{ runner.temp }}/kd-rust-cache
+          KD_RUST_CACHE_KEY: ${{ steps.verifier-rust-cache-key.outputs.cache_key }}
+          KD_RUST_CACHE_HIT: false
+          RUST_CACHE_OS: ${{ runner.os }}-${{ runner.arch }}
+          RUST_CACHE_SCOPE: linux-source-verifier
+          RUST_CACHE_TRUST_CLASS: independent-verifier
+          CI_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          CONTROL_SHA: ${{ github.sha }}
+          CI_SHA: ${{ github.sha }}
+          CI_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+          KD_RUST_CACHE_ENCRYPTION_KEY_B64: ${{ secrets.RUST_CACHE_ENCRYPTION_KEY }}
+        run: timeout 45m python3 -B kit/confinement/linux_source_build.py rust-cache-package
+      - name: Save the independent verifier Rust cache
+        continue-on-error: true
+        if: ${{ success() && steps.verifier-gates.outcome == 'success' && steps.verifier-rust-cache-package.outcome == 'success' && (steps.verifier-rust-cache.outputs.cache-hit != 'true' || steps.verifier-rust-cache-import.outcome != 'success') && inputs.mode == 'source' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/kd-rust-cache/rust-cache.tar
+          key: ${{ steps.verifier-rust-cache-key.outputs.cache_key }}
       - name: Verify unprivileged proof handoff
         if: ${{ always() && steps.verifier-selftest.outcome != 'skipped' && steps.verifier-recheck.outcome != 'skipped' }}
         run: python3 -B kit/confinement/linux_source_build.py verify-handoff
@@ -733,7 +949,6 @@ jobs:
     runs-on: ubuntu-24.04
     environment: ${{ inputs.mode == 'source' && 'linux-source-read' || '' }}
     timeout-minutes: 15
-    cache-mode: none
     permissions:
       actions: read
       checks: read
@@ -743,6 +958,7 @@ jobs:
     env:
       CI_MODE: ${{ inputs.mode }}
       CONFINEMENT_AUDIT_EXPECTED: ${{ needs.linux-source-admission-settings.outputs.expected }}
+      CONFINEMENT_AUDIT_CACHE_KEYS: ${{ (needs.linux-source-admission-source-read.outputs.cache_key != '' && needs.linux-source-admission-verdict.outputs.cache_key != '' && format('{0},{1}', needs.linux-source-admission-source-read.outputs.cache_key, needs.linux-source-admission-verdict.outputs.cache_key)) || needs.linux-source-admission-source-read.outputs.cache_key || needs.linux-source-admission-verdict.outputs.cache_key || '' }}
     steps:
       - name: Fetch exact public control
         run: |
@@ -794,14 +1010,12 @@ on:
         required: true
         type: string
 permissions: {}
-cache-mode: none
 jobs:
   core-linux-quick-return-settings:
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/untrusted' }}
     runs-on: ubuntu-24.04
     environment: linux-source-read
     timeout-minutes: 15
-    cache-mode: none
     permissions:
       actions: read
       contents: read
@@ -840,9 +1054,6 @@ jobs:
       LINUX_SOURCE_MAIN_BRANCH_POLICY_ID: ${{ vars.LINUX_QUICK_MAIN_BRANCH_POLICY_ID }}
       LINUX_SOURCE_UNTRUSTED_BRANCH_POLICY_ID: ${{ vars.LINUX_QUICK_UNTRUSTED_BRANCH_POLICY_ID }}
       LINUX_API_FEATURE_GATE_NAMES: api_feature_clippy,api_feature_tests
-      LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256: ${{ vars.LINUX_QUICK_ACCEPTED_NODE_LOCK_SHA256 }}
-      LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256: ${{ vars.LINUX_QUICK_ACCEPTED_MANIFEST_SHA256 }}
-      LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON: ${{ vars.LINUX_QUICK_ACCEPTED_NODE_PROVENANCE_JSON }}
       KD_QUICK_REQUEST_ID: ${{ inputs.request_id }}
       KD_QUICK_RECIPIENT_SPKI_B64: ${{ inputs.recipient_spki_b64 }}
       KD_QUICK_ALLOWED_REQUEST_ID: ${{ vars.LINUX_QUICK_ALLOWED_REQUEST_ID }}
@@ -874,7 +1085,6 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && needs.core-linux-quick-return-settings.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    cache-mode: none
     permissions: {}
     defaults:
       run:
@@ -910,7 +1120,6 @@ jobs:
           python3 -B kit/confinement/test_linux_source_build.py
           python3 -B core-ci/test_linux_quick_return.py
           python3 -B core-ci/test_separation.py
-          python3 -B kit/confinement/test_rust_license_gate.py
           python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
   core-linux-quick-return-producer:
     needs:
@@ -920,7 +1129,6 @@ jobs:
     runs-on: ubuntu-24.04
     environment: linux-source-read
     timeout-minutes: 350
-    cache-mode: none
     permissions:
       actions: read
       contents: read
@@ -957,9 +1165,6 @@ jobs:
       LINUX_SOURCE_MAIN_BRANCH_POLICY_ID: ${{ vars.LINUX_QUICK_MAIN_BRANCH_POLICY_ID }}
       LINUX_SOURCE_UNTRUSTED_BRANCH_POLICY_ID: ${{ vars.LINUX_QUICK_UNTRUSTED_BRANCH_POLICY_ID }}
       LINUX_API_FEATURE_GATE_NAMES: api_feature_clippy,api_feature_tests
-      LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256: ${{ vars.LINUX_QUICK_ACCEPTED_NODE_LOCK_SHA256 }}
-      LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256: ${{ vars.LINUX_QUICK_ACCEPTED_MANIFEST_SHA256 }}
-      LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON: ${{ vars.LINUX_QUICK_ACCEPTED_NODE_PROVENANCE_JSON }}
       KD_QUICK_REQUEST_ID: ${{ inputs.request_id }}
       KD_QUICK_RECIPIENT_SPKI_B64: ${{ inputs.recipient_spki_b64 }}
       KD_QUICK_ALLOWED_REQUEST_ID: ${{ vars.LINUX_QUICK_ALLOWED_REQUEST_ID }}
@@ -1026,7 +1231,7 @@ jobs:
           [[ "$EXPECTED_INSTALLATION_ID" =~ ^[1-9][0-9]{0,18}$ ]]
           [[ "$ACTUAL_INSTALLATION_ID" =~ ^[1-9][0-9]{0,18}$ && "$ACTUAL_INSTALLATION_ID" == "$EXPECTED_INSTALLATION_ID" ]]
           printf '%s\n' "linux-source-installation=verified id=$ACTUAL_INSTALLATION_ID"
-      - name: Fetch exact source and verify binding, tree, signatures and lock provenance
+      - name: Fetch exact source and verify binding, tree, signatures and committed locks
         id: checkout
         env:
           SOURCE_READER_TOKEN: ${{ steps.source-reader-token.outputs.token }}
@@ -1036,31 +1241,42 @@ jobs:
         env:
           SOURCE_READER_TOKEN: ${{ steps.source-reader-token.outputs.token }}
         run: python3 -B kit/confinement/linux_source_build.py revoke
-      - name: Require trusted Rust licence admission
-        id: rust-license-gate
+      - name: Fetch Rust dependencies from the committed lockfiles
+        id: cargo-fetch
         env:
           SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
           REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
-        run: python3 -B kit/confinement/linux_source_build.py rust-license-gate
+          RUST_ROOT: ${{ steps.toolchains.outputs.rust_root }}
+          KD_CARGO_FETCH_HOME: ${{ runner.temp }}/kd-quick-cargo-fetch-home
+          CI_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          CONTROL_SHA: ${{ github.sha }}
+          CI_SHA: ${{ github.sha }}
+          CI_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: python3 -B kit/confinement/linux_source_build.py rust-lock-fetch
       - name: Fetch npm tarballs by committed lock integrity
         id: npm-tarballs
         env:
           SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
         run: python3 -B kit/confinement/linux_source_build.py npm-tarballs
-      - name: Run trusted dependency audit
-        env:
-          SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
-          NODE_BIN: ${{ steps.toolchains.outputs.node_bin }}
-        run: python3 -B kit/confinement/linux_source_build.py trusted-audit
       - name: Prepare offline project inputs
         id: project-deps
         env:
           SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
           NPM_TARBALL_INDEX: ${{ steps.npm-tarballs.outputs.tarball_index }}
           RUST_ROOT: ${{ steps.toolchains.outputs.rust_root }}
+          KD_CARGO_FETCH_HOME: ${{ runner.temp }}/kd-quick-cargo-fetch-home
           EXPECTED_NODE_LOCK_SHA256: ${{ steps.checkout.outputs.lock_sha256 }}
           EXPECTED_MANIFEST_SHA256: ${{ steps.checkout.outputs.manifest_sha256 }}
-        run: sudo -n --preserve-env=SOURCE_PATH,NPM_TARBALL_INDEX,RUST_ROOT,EXPECTED_NODE_LOCK_SHA256,EXPECTED_MANIFEST_SHA256,RUNNER_TEMP,GITHUB_OUTPUT python3 -B kit/confinement/linux_source_build.py prepare-project
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          CI_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          CONTROL_SHA: ${{ github.sha }}
+          CI_SHA: ${{ github.sha }}
+          CI_REF: ${{ github.ref }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: sudo -n --preserve-env=SOURCE_PATH,NPM_TARBALL_INDEX,RUST_ROOT,KD_CARGO_FETCH_HOME,EXPECTED_NODE_LOCK_SHA256,EXPECTED_MANIFEST_SHA256,REQUESTED_SOURCE_SHA,RUNNER_TEMP,GITHUB_OUTPUT,CI_REPOSITORY,SOURCE_REPOSITORY_ID,CONTROL_SHA,CI_SHA,CI_REF,CI_EVENT_NAME python3 -B kit/confinement/linux_source_build.py prepare-project
       - name: Re-run positive controls immediately before the first project command
         id: recheck
         env:
@@ -1136,7 +1352,6 @@ jobs:
     runs-on: ubuntu-24.04
     environment: linux-source-read
     timeout-minutes: 15
-    cache-mode: none
     permissions:
       actions: read
       checks: read

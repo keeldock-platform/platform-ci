@@ -837,7 +837,7 @@ class QuickProviderAPI(ProviderShapedAPI):
             "KD-CONFINEMENT-AUDIT schema=1 status=accepted os=linux mode=quick tier=quick"
             + " admission=never control-sha=" + self.request_record["control_sha"]
             + " run-id=" + str(self.run_id)
-            + " run-attempt=1 verdict=none log-canary=absent artifacts=expected caches=unchanged"
+            + " run-attempt=1 verdict=none log-canary=absent artifacts=expected caches=verified"
         )
 
     def _logs(self):

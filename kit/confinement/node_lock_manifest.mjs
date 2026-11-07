@@ -1,5 +1,9 @@
+import { spawn } from 'node:child_process';
 import { TextDecoder } from 'node:util';
 import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 export const LOCK_MANIFEST_LIMITS = Object.freeze({
   inputBytes: (4 * 1024 * 1024) - (64 * 1024),
@@ -20,6 +24,7 @@ const OVERRIDE_PLATFORM_BINARIES = Object.freeze({
   ].map((suffix) => `lightningcss-${suffix}`)),
 });
 const PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/u;
+const LOCAL_PACKAGE_PATH = /^(?:\.\.\/)?packages\/(?:[A-Za-z0-9_-][A-Za-z0-9._-]*\/)*[A-Za-z0-9_-][A-Za-z0-9._-]*$/u;
 const NUMERIC_IDENTIFIER = '(?:0|[1-9][0-9]*)';
 const PRE_RELEASE_IDENTIFIER = '(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)';
 const EXACT_VERSION = new RegExp(`^${NUMERIC_IDENTIFIER}\\.${NUMERIC_IDENTIFIER}\\.${NUMERIC_IDENTIFIER}`
@@ -27,9 +32,9 @@ const EXACT_VERSION = new RegExp(`^${NUMERIC_IDENTIFIER}\\.${NUMERIC_IDENTIFIER}
   + '(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$', 'u');
 const VERSION_SPEC = /^[0-9A-Za-z.*^~<>=|+ -]{1,128}$/u;
 const FUNDING_FRAGMENT = /^\x23[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
-const WORKSPACE_PATH = /^packages\/(?:[A-Za-z0-9_-][A-Za-z0-9._-]*\/)*[A-Za-z0-9_-][A-Za-z0-9._-]*$/u;
+const WORKSPACE_PATH = /^(?:packages|apps)\/(?:[A-Za-z0-9_-][A-Za-z0-9._-]*\/)*[A-Za-z0-9_-][A-Za-z0-9._-]*$/u;
 const LOCK_ENTRY_FIELDS = new Set([
-  'name', 'version', 'workspaces', 'resolved', 'integrity', 'link', 'inBundle', 'hasInstallScript',
+  'name', 'version', 'workspaces', 'resolved', 'tarball', 'integrity', 'link', 'inBundle', 'hasInstallScript',
   'hasShrinkwrap', 'funding',
   'dev', 'devOptional', 'optional', 'peer', 'dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies',
   'peerDependenciesMeta', 'bin', 'license', 'engines', 'os', 'cpu', 'libc', 'deprecated',
@@ -42,6 +47,144 @@ export class LockManifestError extends Error {
     this.name = 'LockManifestError';
     this.code = code;
   }
+}
+
+const ADVISORY_ID = /(?<![A-Za-z0-9-])(?:RUSTSEC-[0-9]{4}-[0-9]{4}|GHSA-[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}|CVE-[0-9]{4}-[0-9]{4,19})(?![A-Za-z0-9-])/gu;
+const MAX_REPORTED_ADVISORY_IDS = 25;
+const MAX_PRIVATE_OUTPUT_SCAN_BYTES = 64 * 1024 * 1024;
+
+function collectAdvisoryIds(file) {
+  const descriptor = fs.openSync(file, 'r');
+  const buffer = Buffer.alloc(64 * 1024);
+  const ids = new Set();
+  let position = 0;
+  let tail = '';
+  let scanned = 0;
+  try {
+    while (scanned < MAX_PRIVATE_OUTPUT_SCAN_BYTES) {
+      const length = fs.readSync(descriptor, buffer, 0,
+        Math.min(buffer.length, MAX_PRIVATE_OUTPUT_SCAN_BYTES - scanned), position);
+      if (length === 0) break;
+      position += length;
+      scanned += length;
+      const text = tail + buffer.toString('utf8', 0, length);
+      for (const match of text.matchAll(ADVISORY_ID)) ids.add(match[0]);
+      tail = text.slice(-64);
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  return [...ids].sort();
+}
+
+function safeCheckName(value) {
+  return typeof value === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/u.test(value);
+}
+
+function terminateProcess(child) {
+  try {
+    if (process.platform === 'win32') child.kill('SIGKILL');
+    else process.kill(-child.pid, 'SIGKILL');
+  } catch {
+    try { child.kill('SIGKILL'); } catch { /* already exited */ }
+  }
+}
+
+/** Run a dependency check with private output files and return an allowlisted summary. */
+export async function captureDependencyCheck({
+  check,
+  command,
+  args = [],
+  cwd,
+  env = process.env,
+  timeoutMs = 60_000,
+  tempRoot = os.tmpdir(),
+}) {
+  if (!safeCheckName(check) || typeof command !== 'string' || command.length === 0
+      || !Array.isArray(args) || args.some((item) => typeof item !== 'string')
+      || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 3_600_000
+      || env === null || typeof env !== 'object' || Array.isArray(env)) {
+    return Object.freeze({ check: safeCheckName(check) ? check : 'invalid-check', status: 'failed',
+      exitCode: 2, advisoryCount: 0, advisoryIds: [] });
+  }
+
+  let privateDirectory;
+  let stdoutPath;
+  let stderrPath;
+  let stdoutFd = -1;
+  let stderrFd = -1;
+  try {
+    privateDirectory = fs.mkdtempSync(path.join(tempRoot, 'kd-private-dependency-check-'));
+    fs.chmodSync(privateDirectory, 0o700);
+    stdoutPath = path.join(privateDirectory, 'stdout');
+    stderrPath = path.join(privateDirectory, 'stderr');
+    stdoutFd = fs.openSync(stdoutPath, 'wx', 0o600);
+    stderrFd = fs.openSync(stderrPath, 'wx', 0o600);
+    const result = await new Promise((resolve) => {
+      let child;
+      let timedOut = false;
+      let settled = false;
+      let timer;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      };
+      try {
+        child = spawn(command, args, {
+          cwd,
+          env: { ...env },
+          stdio: ['ignore', stdoutFd, stderrFd],
+          detached: process.platform !== 'win32',
+          windowsHide: true,
+        });
+      } catch {
+        finish({ exitCode: 127, timedOut: false });
+        return;
+      }
+      child.once('error', () => finish({ exitCode: 127, timedOut: false }));
+      child.once('close', (code) => finish({
+        exitCode: timedOut ? 124 : (Number.isInteger(code) ? code : 127),
+        timedOut,
+      }));
+      timer = setTimeout(() => {
+        timedOut = true;
+        terminateProcess(child);
+      }, timeoutMs);
+    });
+    fs.closeSync(stdoutFd);
+    stdoutFd = -1;
+    fs.closeSync(stderrFd);
+    stderrFd = -1;
+    const advisoryIds = [...new Set([
+      ...collectAdvisoryIds(stdoutPath),
+      ...collectAdvisoryIds(stderrPath),
+    ])].sort();
+    const status = result.exitCode === 0 && !result.timedOut ? 'passed' : 'failed';
+    return Object.freeze({ check, status, exitCode: result.exitCode,
+      advisoryCount: advisoryIds.length, advisoryIds: advisoryIds.slice(0, MAX_REPORTED_ADVISORY_IDS) });
+  } catch {
+    return Object.freeze({ check, status: 'failed', exitCode: 127, advisoryCount: 0, advisoryIds: [] });
+  } finally {
+    if (stdoutFd >= 0) { try { fs.closeSync(stdoutFd); } catch { /* already closed */ } }
+    if (stderrFd >= 0) { try { fs.closeSync(stderrFd); } catch { /* already closed */ } }
+    if (privateDirectory) { try { fs.rmSync(privateDirectory, { recursive: true, force: true }); } catch { /* private temp cleanup */ } }
+  }
+}
+
+export function formatDependencyCheckSummary(result) {
+  const check = safeCheckName(result?.check) ? result.check : 'invalid-check';
+  const status = result?.status === 'passed' ? 'passed' : 'failed';
+  const advisoryCount = Number.isSafeInteger(result?.advisoryCount) && result.advisoryCount >= 0
+    ? result.advisoryCount : 0;
+  const advisoryIds = Array.isArray(result?.advisoryIds)
+    ? result.advisoryIds.filter((item) => typeof item === 'string'
+      && /^(?:RUSTSEC-[0-9]{4}-[0-9]{4}|GHSA-[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}|CVE-[0-9]{4}-[0-9]{4,19})$/u.test(item))
+      .slice(0, MAX_REPORTED_ADVISORY_IDS)
+    : [];
+  const uniqueIds = [...new Set(advisoryIds)].sort();
+  return `KD-DEPENDENCY-RESULT check=${check} status=${status} advisory-count=${advisoryCount} advisory-ids=${uniqueIds.join(',') || 'none'}`;
 }
 
 function reject(code = 'invalid_manifest') {
@@ -82,6 +225,19 @@ function safeDependencySpec(value, exact) {
   return !exact || exactVersion(value);
 }
 
+function validLocalPackagePath(value) {
+  return typeof value === 'string' && value.length <= 512 && LOCAL_PACKAGE_PATH.test(value)
+    && !value.slice(value.startsWith('../') ? 3 : 0).split('/').some((part) => part === '.' || part === '..');
+}
+
+function localTargetForSpec(ownerPath, spec) {
+  if (typeof ownerPath !== 'string' || typeof spec !== 'string' || !spec.startsWith('file:')) return null;
+  const relative = spec.slice('file:'.length);
+  if (!relative || relative.includes('\\') || path.posix.isAbsolute(relative)) return null;
+  const target = path.posix.normalize(path.posix.join(ownerPath || '.', relative));
+  return validLocalPackagePath(target) ? target : null;
+}
+
 function exactVersion(value) {
   return typeof value === 'string' && value.length <= 128 && EXACT_VERSION.test(value);
 }
@@ -100,11 +256,15 @@ function normalizeOverrides(value) {
 }
 
 function normalizeExpectation(input) {
-  const expected = dataObject(input, ['root', 'workspaces'], ['root', 'workspaces']);
+  const expected = dataObject(input, ['root', 'workspaces', 'localPackages'], ['root', 'workspaces']);
   if (!Array.isArray(expected.workspaces) || expected.workspaces.length > 256) reject('invalid_expectation');
+  if (expected.localPackages !== undefined
+      && (!Array.isArray(expected.localPackages) || expected.localPackages.length > 256)) reject('invalid_expectation');
   const root = dataObject(expected.root,
     ['name', 'version', 'workspaces', 'overrides', ...DEPENDENCY_GROUPS], ['name', 'version', 'workspaces']);
   const workspaces = expected.workspaces.map((value) => dataObject(value,
+    ['path', 'name', 'version', ...DEPENDENCY_GROUPS], ['path', 'name', 'version']));
+  const localPackages = (expected.localPackages ?? []).map((value) => dataObject(value,
     ['path', 'name', 'version', ...DEPENDENCY_GROUPS], ['path', 'name', 'version']));
   if (!packageName(root.name) || !exactVersion(root.version)
       || !Array.isArray(root.workspaces) || root.workspaces.length === 0 || root.workspaces.length > 16
@@ -126,7 +286,18 @@ function normalizeExpectation(input) {
     paths.add(item.path);
   }
   const versionByName = new Map(workspaces.map((item) => [item.name, item.version]));
-  for (const item of [root, ...workspaces]) {
+  const localByPath = new Map();
+  const localByName = new Map();
+  for (const item of localPackages) {
+    if (!validLocalPackagePath(item.path) || !packageName(item.name) || !exactVersion(item.version)
+        || paths.has(item.path) || names.has(item.name) || localByPath.has(item.path) || localByName.has(item.name)) {
+      reject('invalid_expectation');
+    }
+    localByPath.set(item.path, item);
+    localByName.set(item.name, item.path);
+  }
+  for (const item of [root, ...workspaces, ...localPackages]) {
+    const ownerPath = item === root ? '' : item.path;
     for (const group of DEPENDENCY_GROUPS) {
       const map = item[group] === undefined ? Object.create(null) : item[group];
       const pins = dataObject(map, Object.keys(map), [], 'invalid_expectation');
@@ -135,11 +306,15 @@ function normalizeExpectation(input) {
       for (const [name, spec] of Object.entries(pins)) {
         const workspaceSpec = names.has(name) && typeof spec === 'string'
           && /^workspace:(?:\*|\^|~|[0-9][0-9A-Za-z.+-]*)$/u.test(spec);
-        if (!packageName(name) || (!workspaceSpec && !safeDependencySpec(spec, !names.has(name)))
+        const localPath = localTargetForSpec(ownerPath, spec);
+        const localFileSpec = localPath !== null && localByPath.has(localPath)
+          && localByPath.get(localPath).name === name;
+        if (!packageName(name) || (!workspaceSpec && !localFileSpec
+            && !safeDependencySpec(spec, !names.has(name) && group !== 'peerDependencies'))
             || (!names.has(name) && typeof spec === 'string' && spec.startsWith('workspace:'))) {
           reject('invalid_expectation');
         }
-        if (names.has(name) && !workspaceSpec
+        if (names.has(name) && !workspaceSpec && group !== 'peerDependencies'
             && (item === root || item.name === name || spec !== versionByName.get(name))) {
           reject('invalid_expectation');
         }
@@ -155,7 +330,7 @@ function normalizeExpectation(input) {
       }
     }
   }
-  return { root, workspaces };
+  return { root, workspaces, localPackages };
 }
 
 function parseJsonStrict(text) {
@@ -256,7 +431,7 @@ function exactMap(actual, expected) {
   return keys.length === expectedKeys.length && expectedKeys.every((key) => actual[key] === expected[key]);
 }
 
-function validateDependencyMap(map, workspaceNames) {
+function validateDependencyMap(map, workspaceNames, localByPath, ownerPath) {
   if (map === undefined) return;
   if (map === null || typeof map !== 'object' || Array.isArray(map) || Object.keys(map).length > 512) {
     reject('invalid_package');
@@ -264,7 +439,12 @@ function validateDependencyMap(map, workspaceNames) {
   for (const [name, spec] of Object.entries(map)) {
     const workspaceSpec = workspaceNames.has(name) && typeof spec === 'string'
       && /^workspace:(?:\*|\^|~|[0-9][0-9A-Za-z.+-]*)$/u.test(spec);
-    if (!packageName(name) || (!workspaceSpec && !safeDependencySpec(spec, false))) reject('invalid_package');
+    const localPath = localTargetForSpec(ownerPath, spec);
+    const localFileSpec = localPath !== null && localByPath.has(localPath)
+      && localByPath.get(localPath).name === name;
+    if (!packageName(name) || (!workspaceSpec && !localFileSpec && !safeDependencySpec(spec, false))) {
+      reject('invalid_package');
+    }
   }
 }
 
@@ -355,9 +535,9 @@ function nodeModulesPackageName(path, workspaceDirectories) {
   return null;
 }
 
-function workspaceDirectorySet(workspaces) {
+function workspaceDirectorySet(workspaces, localPackages = []) {
   const directories = new Set(['packages']);
-  for (const workspace of workspaces) {
+  for (const workspace of [...workspaces, ...localPackages]) {
     const parts = workspace.path.split('/');
     for (let index = 1; index <= parts.length; index += 1) {
       directories.add(parts.slice(0, index).join('/'));
@@ -367,14 +547,19 @@ function workspaceDirectorySet(workspaces) {
 }
 
 function validRegistryUrl(value, name, version) {
-  if (typeof value !== 'string' || value.length > 4096 || value.includes('%')) return false;
+  if (typeof value !== 'string' || value.length > 4096) return false;
   let url;
   try { url = new URL(value); } catch { return false; }
   if (url.protocol !== 'https:' || url.hostname !== 'registry.npmjs.org' || url.port
       || url.username || url.password || url.search || url.hash || !url.pathname.startsWith('/')) return false;
   if (url.pathname.includes('//') || url.pathname.split('/').some((part) => part === '.' || part === '..')) return false;
-  const packagePath = `/${name}/-/${name.split('/').at(-1)}-${version}.tgz`;
-  return url.href === value && url.pathname === packagePath;
+  const packageTail = `/-/${name.split('/').at(-1)}-${version}.tgz`;
+  const packagePaths = [`/${name}${packageTail}`];
+  if (name.startsWith('@')) {
+    const [scope, packageName] = name.split('/');
+    packagePaths.push(`/${scope}%2f${packageName}${packageTail}`, `/${scope}%2F${packageName}${packageTail}`);
+  }
+  return url.href === value && packagePaths.includes(url.pathname);
 }
 
 function validSha512Integrity(value) {
@@ -421,7 +606,7 @@ function bundledChildAllowed(packages, key, entry, workspaceDirectories) {
       || parent.inBundle === true || Object.hasOwn(parent, 'link')) return false;
   const names = inertBundledNames(parent);
   if (names === null || !names.has(name)) return false;
-  if (['resolved', 'integrity', 'link', 'hasInstallScript', ...BUNDLED_FIELDS]
+  if (['resolved', 'tarball', 'integrity', 'link', 'hasInstallScript', ...BUNDLED_FIELDS]
     .some((field) => Object.hasOwn(entry, field))) return false;
   return exactVersion(entry.version) && (entry.name === undefined || entry.name === name);
 }
@@ -432,7 +617,7 @@ function compareDirectPins(actual, expected) {
   }
 }
 
-function validateDirectPin(packages, name, spec, parentPath, workspaceByName) {
+function validateDirectPin(packages, name, spec, parentPath, workspaceByName, localByName, includeInventory) {
   const candidates = parentPath ? workspaceResolutionCandidates(parentPath, name) : [`node_modules/${name}`];
   const key = candidates.find((candidate) => Object.hasOwn(packages, candidate));
   if (!key) reject('direct_pin_mismatch');
@@ -445,8 +630,17 @@ function validateDirectPin(packages, name, spec, parentPath, workspaceByName) {
     }
     return;
   }
+  if (typeof spec === 'string' && spec.startsWith('file:')) {
+    const localPath = localByName.get(name);
+    if (!localPath || !entry || entry.link !== true || entry.resolved !== localPath
+        || entry.integrity !== undefined) reject('direct_pin_mismatch');
+    return;
+  }
   if (!entry || entry.link === true || entry.version !== spec
-      || !validRegistryUrl(entry.resolved, name, spec) || !validSha512Integrity(entry.integrity)) {
+      || (entry.resolved !== undefined && !validRegistryUrl(entry.resolved, name, spec))
+      || (entry.tarball !== undefined && !validRegistryUrl(entry.tarball, name, spec))
+      || (entry.integrity !== undefined && !validSha512Integrity(entry.integrity))
+      || (includeInventory && (entry.resolved === undefined || !validSha512Integrity(entry.integrity)))) {
     reject('direct_pin_mismatch');
   }
 }
@@ -473,20 +667,21 @@ function packageResolutionCandidates(packagePath, name) {
   return candidates;
 }
 
-function validateExpectedDirectPins(packages, expected, workspaceByName) {
+function validateExpectedDirectPins(packages, expected, workspaceByName, localByName, includeInventory) {
   for (const group of DEPENDENCY_GROUPS) {
+    if (group === 'peerDependencies') continue;
     for (const [name, spec] of Object.entries(expected.root[group] ?? {})) {
-      validateDirectPin(packages, name, spec, null, workspaceByName);
+      validateDirectPin(packages, name, spec, null, workspaceByName, localByName, includeInventory);
     }
     for (const workspace of expected.workspaces) {
       for (const [name, spec] of Object.entries(workspace[group] ?? {})) {
-        validateDirectPin(packages, name, spec, workspace.path, workspaceByName);
+        validateDirectPin(packages, name, spec, workspace.path, workspaceByName, localByName, includeInventory);
       }
     }
   }
 }
 
-function buildLockInventory(packages, expected, workspaceByPath, workspaceDirectories) {
+function buildLockInventory(packages, expected, workspaceByPath, localByPath, workspaceDirectories) {
   const records = Object.create(null);
   const packageKeys = Object.keys(packages);
   for (const key of packageKeys) {
@@ -504,6 +699,11 @@ function buildLockInventory(packages, expected, workspaceByPath, workspaceDirect
       const workspace = workspaceByPath.get(key);
       name = workspace.name;
       version = workspace.version;
+      kind = 'workspace';
+    } else if (localByPath.has(key)) {
+      const localPackage = localByPath.get(key);
+      name = localPackage.name;
+      version = localPackage.version;
       kind = 'workspace';
     } else {
       name = nodeModulesPackageName(key, workspaceDirectories);
@@ -540,7 +740,7 @@ function buildLockInventory(packages, expected, workspaceByPath, workspaceDirect
       if (bundledNames !== null && bundledNames.has(name)) continue;
       const candidates = key === ''
         ? [`node_modules/${name}`]
-        : (workspaceByPath.has(key)
+        : (workspaceByPath.has(key) || localByPath.has(key)
           ? workspaceResolutionCandidates(key, name)
           : packageResolutionCandidates(key, name));
       let targetPath = candidates.find((candidate) => Object.hasOwn(packages, candidate));
@@ -554,6 +754,7 @@ function buildLockInventory(packages, expected, workspaceByPath, workspaceDirect
           && entry.peerDependenciesMeta[name].optional === true;
         if (entry.optionalDependencies && Object.hasOwn(entry.optionalDependencies, name)
             || optionalPeer) continue;
+        if (localByPath.has(key)) continue;
         reject('invalid_package');
       }
       dependencies.push({ name: target.name, version: target.version });
@@ -616,16 +817,32 @@ function validateLockManifestUnchecked(lockBytes, expectedInput, includeInventor
     }
     compareDirectPins(actual, workspace);
   }
-  const workspaceDirectories = [...workspaceDirectorySet(expected.workspaces)]
+  const localByPath = new Map();
+  const localByName = new Map();
+  for (const localPackage of expected.localPackages) {
+    if (!validLocalPackagePath(localPackage.path) || workspaceByPath.has(localPackage.path)
+        || localByPath.has(localPackage.path) || workspaceByName.has(localPackage.name)
+        || localByName.has(localPackage.name)) reject('invalid_expectation');
+    const actual = packages[localPackage.path];
+    if (!actual || actual.link === true || actual.name !== localPackage.name
+        || actual.version !== localPackage.version) reject('workspace_mismatch');
+    localByPath.set(localPackage.path, localPackage);
+    localByName.set(localPackage.name, localPackage.path);
+    compareDirectPins(actual, localPackage);
+  }
+  const workspaceDirectories = [...workspaceDirectorySet(expected.workspaces, expected.localPackages)]
     .sort((left, right) => right.length - left.length);
-  validateExpectedDirectPins(packages, expected, workspaceByName);
+  validateExpectedDirectPins(packages, expected, workspaceByName, localByName, includeInventory);
   for (const key of packageKeys) {
     const entry = packages[key];
     if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) reject('invalid_package');
     validateEntryMetadata(entry, key === '');
-    for (const group of DEPENDENCY_GROUPS) validateDependencyMap(entry[group], workspaceByName);
-    if (key === '' || workspaceByPath.has(key)) {
-      if (entry.resolved !== undefined || entry.integrity !== undefined || entry.link === true) {
+    const ownerPath = key === '' ? '' : (workspaceByPath.has(key) || localByPath.has(key) ? key : null);
+    for (const group of DEPENDENCY_GROUPS) {
+      validateDependencyMap(entry[group], workspaceByName, localByPath, ownerPath);
+    }
+    if (key === '' || workspaceByPath.has(key) || localByPath.has(key)) {
+      if (entry.resolved !== undefined || entry.tarball !== undefined || entry.integrity !== undefined || entry.link === true) {
         reject('workspace_mismatch');
       }
       continue;
@@ -633,15 +850,22 @@ function validateLockManifestUnchecked(lockBytes, expectedInput, includeInventor
     const moduleName = nodeModulesPackageName(key, workspaceDirectories);
     if (!moduleName) reject('invalid_package_path');
     if (entry.link === true) {
-      const target = workspaceByName.get(moduleName);
+      const target = workspaceByName.get(moduleName) ?? localByName.get(moduleName);
       if (!target || entry.resolved !== target || entry.integrity !== undefined) reject('workspace_link_invalid');
       continue;
     }
     const bundledChild = bundledChildAllowed(packages, key, entry, workspaceDirectories);
+    const registrySourceValid = entry.resolved === undefined
+      ? !includeInventory
+      : validRegistryUrl(entry.resolved, moduleName, entry.version);
+    const registryTarballValid = entry.tarball === undefined
+      || validRegistryUrl(entry.tarball, moduleName, entry.version);
+    const registryIntegrityValid = entry.integrity === undefined
+      ? !includeInventory
+      : validSha512Integrity(entry.integrity);
     if ((entry.link !== undefined && entry.link !== false)
         || !exactVersion(entry.version)
-        || (!bundledChild && (!validRegistryUrl(entry.resolved, moduleName, entry.version)
-          || !validSha512Integrity(entry.integrity)))) {
+        || (!bundledChild && (!registrySourceValid || !registryTarballValid || !registryIntegrityValid))) {
       reject('package_source_invalid');
     }
     if (entry.name !== undefined && entry.name !== moduleName) reject('invalid_package');
@@ -659,7 +883,7 @@ function validateLockManifestUnchecked(lockBytes, expectedInput, includeInventor
     lockfileVersion: 3,
   };
   if (includeInventory) {
-    result.packages = buildLockInventory(packages, expected, workspaceByPath, workspaceDirectories);
+    result.packages = buildLockInventory(packages, expected, workspaceByPath, localByPath, workspaceDirectories);
   }
   return Object.freeze(result);
 }
@@ -688,4 +912,197 @@ export function validateLockManifestInventory(lockBytes, expectedInput) {
     lockSha256: createHash('sha256').update(lockBytes).digest('hex'),
     packages: result.packages,
   });
+}
+
+/** Reject npm-shrinkwrap.json because npm gives it precedence over package-lock.json. */
+export function validateNoNpmShrinkwrap(projectDirectory) {
+  if (typeof projectDirectory !== 'string' || projectDirectory.length === 0) reject('invalid_project');
+  let directory;
+  try { directory = fs.lstatSync(projectDirectory); } catch { reject('invalid_project'); }
+  if (!directory.isDirectory() || directory.isSymbolicLink()) reject('invalid_project');
+  try {
+    fs.lstatSync(path.join(projectDirectory, 'npm-shrinkwrap.json'));
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return true;
+    reject('invalid_project');
+  }
+  reject('npm_shrinkwrap_present');
+}
+
+function regularFileBytes(file) {
+  let info;
+  try { info = fs.lstatSync(file); } catch { reject('invalid_project'); }
+  if (!info.isFile() || info.isSymbolicLink() || info.size > LOCK_MANIFEST_LIMITS.inputBytes) {
+    reject('invalid_project');
+  }
+  try { return fs.readFileSync(file); } catch { reject('invalid_project'); }
+}
+
+function regularJson(file) {
+  const bytes = regularFileBytes(file);
+  let value;
+  try { value = parseJsonStrict(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); } catch { reject('invalid_project'); }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) reject('invalid_project');
+  return value;
+}
+
+function realDirectory(directory) {
+  let info;
+  try { info = fs.lstatSync(directory); } catch { reject('invalid_project'); }
+  if (!info.isDirectory() || info.isSymbolicLink()) reject('invalid_project');
+}
+
+function realDirectoryBelow(root, target) {
+  realDirectory(root);
+  const relative = path.relative(root, target);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    reject('invalid_project');
+  }
+  let cursor = root;
+  for (const component of relative.split(path.sep).filter(Boolean)) {
+    cursor = path.join(cursor, component);
+    realDirectory(cursor);
+  }
+}
+
+function expectedWorkspacePaths(project, patterns) {
+  if (!Array.isArray(patterns) || patterns.length < 1 || patterns.length > 16) reject('invalid_project');
+  const found = [];
+  for (const pattern of patterns) {
+    if (pattern === 'packages/*') {
+      const directory = path.join(project, 'packages');
+      realDirectory(directory);
+      let entries;
+      try { entries = fs.readdirSync(directory, { withFileTypes: true }); } catch { reject('invalid_project'); }
+      for (const item of entries) {
+        if (item.isSymbolicLink()) reject('invalid_project');
+        if (!item.isDirectory()) continue;
+        const relative = `packages/${item.name}`;
+        if (!validWorkspacePath(relative)) reject('invalid_project');
+        const workspaceDirectory = path.join(project, relative);
+        realDirectory(workspaceDirectory);
+        try {
+          fs.lstatSync(path.join(workspaceDirectory, 'package.json'));
+          found.push(relative);
+        } catch (error) {
+          if (!error || error.code !== 'ENOENT') reject('invalid_project');
+        }
+      }
+      continue;
+    }
+    if (typeof pattern !== 'string' || pattern.length > 512 || pattern.includes('*')
+        || pattern.includes('\\') || path.isAbsolute(pattern)
+        || pattern.split('/').some((part) => !part || part === '.' || part === '..')
+        || !validWorkspacePath(pattern)) reject('invalid_project');
+    found.push(pattern);
+  }
+  const unique = [...new Set(found)].sort();
+  if (unique.length > 256) reject('limit_exceeded');
+  return unique;
+}
+
+function dependencyPins(manifest) {
+  const pins = {};
+  for (const group of DEPENDENCY_GROUPS) {
+    if (Object.hasOwn(manifest, group)) pins[group] = manifest[group];
+  }
+  return pins;
+}
+
+function localPackageFromFileSpec(sourceRoot, project, ownerDirectory, dependencyName, spec) {
+  if (typeof spec !== 'string' || !spec.startsWith('file:')) return null;
+  const relative = spec.slice('file:'.length);
+  if (!relative || relative.includes('\\') || path.isAbsolute(relative)) reject('invalid_expectation');
+  const target = path.resolve(ownerDirectory, relative);
+  const sourceRelative = path.relative(sourceRoot, target).split(path.sep).join('/');
+  if (!/^packages\/[A-Za-z0-9_-][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$/u.test(sourceRelative)) {
+    reject('invalid_expectation');
+  }
+  realDirectoryBelow(sourceRoot, target);
+  const lockPath = path.relative(project, target).split(path.sep).join('/');
+  if (!validLocalPackagePath(lockPath)) reject('invalid_expectation');
+  const manifest = regularJson(path.join(target, 'package.json'));
+  if (manifest.name !== dependencyName) reject('invalid_expectation');
+  return { path: lockPath, directory: target, manifest };
+}
+
+/** Build the exact npm lock expectation from a checked-out root or runtime project. */
+export function deriveNpmLockExpectation(sourceRoot, projectDirectory) {
+  if (typeof sourceRoot !== 'string' || typeof projectDirectory !== 'string') reject('invalid_project');
+  const source = path.resolve(sourceRoot);
+  const project = path.resolve(projectDirectory);
+  const projectRelative = path.relative(source, project);
+  if (projectRelative !== '' && projectRelative !== 'runtime') reject('invalid_project');
+  realDirectoryBelow(source, project);
+  validateNoNpmShrinkwrap(project);
+
+  const rootManifest = regularJson(path.join(project, 'package.json'));
+  const workspacePaths = expectedWorkspacePaths(project, rootManifest.workspaces);
+  const workspaces = workspacePaths.map((workspace) => {
+    const directory = path.join(project, workspace);
+    realDirectoryBelow(project, directory);
+    const manifest = regularJson(path.join(directory, 'package.json'));
+    return { path: workspace, name: manifest.name, version: manifest.version, ...dependencyPins(manifest) };
+  });
+  const localPackagesByPath = new Map();
+  const pending = [
+    { path: '', directory: project, manifest: rootManifest },
+    ...workspaces.map((workspace) => ({
+      path: workspace.path,
+      directory: path.join(project, workspace.path),
+      manifest: regularJson(path.join(project, workspace.path, 'package.json')),
+    })),
+  ];
+  while (pending.length > 0) {
+    const owner = pending.shift();
+    for (const group of DEPENDENCY_GROUPS) {
+      const dependencies = owner.manifest[group];
+      if (dependencies === undefined) continue;
+      if (dependencies === null || typeof dependencies !== 'object' || Array.isArray(dependencies)) {
+        reject('invalid_expectation');
+      }
+      for (const [name, spec] of Object.entries(dependencies)) {
+        if (typeof spec !== 'string' || !spec.startsWith('file:')) continue;
+        const localPackage = localPackageFromFileSpec(source, project, owner.directory, name, spec);
+        const prior = localPackagesByPath.get(localPackage.path);
+        if (prior) {
+          if (prior.name !== localPackage.manifest.name || prior.version !== localPackage.manifest.version) {
+            reject('invalid_expectation');
+          }
+          continue;
+        }
+        if (localPackagesByPath.size >= 256) reject('limit_exceeded');
+        const expected = {
+          path: localPackage.path,
+          name: localPackage.manifest.name,
+          version: localPackage.manifest.version,
+          ...dependencyPins(localPackage.manifest),
+        };
+        localPackagesByPath.set(localPackage.path, expected);
+        pending.push({ path: localPackage.path, directory: localPackage.directory, manifest: localPackage.manifest });
+      }
+    }
+  }
+
+  const expected = {
+    root: {
+      name: rootManifest.name,
+      version: rootManifest.version,
+      workspaces: rootManifest.workspaces,
+      ...dependencyPins(rootManifest),
+    },
+    workspaces,
+    localPackages: [...localPackagesByPath.values()].sort((left, right) => (
+      left.path < right.path ? -1 : (left.path > right.path ? 1 : 0)
+    )),
+  };
+  if (Object.hasOwn(rootManifest, 'overrides')) expected.root.overrides = rootManifest.overrides;
+  return expected;
+}
+
+/** Validate a package-lock after rejecting npm-shrinkwrap precedence and unsafe local package links. */
+export function validateNpmProjectLock(sourceRoot, projectDirectory) {
+  const expected = deriveNpmLockExpectation(sourceRoot, projectDirectory);
+  const lockBytes = regularFileBytes(path.join(path.resolve(projectDirectory), 'package-lock.json'));
+  return validateLockManifest(lockBytes, expected);
 }

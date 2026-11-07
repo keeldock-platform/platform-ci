@@ -1,5 +1,4 @@
 import base64
-import contextvars
 import hashlib
 import hmac
 import json
@@ -10,6 +9,7 @@ import shlex
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -19,16 +19,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+import zlib
 from pathlib import Path
 
 import cargo_lock_bootstrap
-import cargo_rust_admission
 import gate_table
 import linux_harness
 import linux_channels
 import linux_probes
 import linux_session
-import rust_license_gate
 
 
 REPOSITORY = "keeldock-platform/platform-ci"
@@ -82,6 +81,24 @@ BROWSER_WORKSPACE_PATHS = ("packages", "packages/kernel-ui-kit", "packages/kerne
 SYNTHETIC_LOG_CANARY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 SOURCE_SHA_RE = re.compile(r"[a-f0-9]{40}\Z")
 HEX64_RE = re.compile(r"[a-f0-9]{64}\Z")
+RUST_CACHE_SCOPE_RE = re.compile(
+    r"(?:rust|runtime-workspace|linux-source-admission|linux-source-verifier|linux-quick-return)\Z"
+)
+RUST_CACHE_OS_RE = re.compile(r"[A-Za-z0-9._-]{1,32}\Z")
+RUST_CACHE_ARCHIVE_NAME = "rust-cache.tar"
+RUST_CACHE_ARCHIVE_MAX_BYTES = 9 * 1024 * 1024 * 1024
+RUST_CACHE_ENCRYPTED_OVERHEAD_MAX_BYTES = 1024 * 1024
+RUST_CACHE_CORE_REPOSITORY = ("Moh-Bakr/" + "keeldock" + "-core")
+RUST_CACHE_ENCRYPTION_KEY_RE = re.compile(r"[A-Za-z0-9+/]{42,44}={0,2}\Z")
+RUST_CACHE_REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}\Z")
+RUST_CACHE_TRUST_CLASSES = ("primary", "independent-verifier", "untrusted")
+RUST_CACHE_KEY_RE = re.compile(
+    r"kd-rust-v5-(?:Linux|macOS|Windows)-(?:x64|arm64)-"
+    r"(?:rust|runtime-workspace|linux-source-admission|linux-source-verifier|linux-quick-return)-"
+    r"(?:primary|independent-verifier|untrusted)-[a-f0-9]{40}-[a-f0-9]{40}-"
+    r"[a-f0-9]{64}-[a-f0-9]{64}-[a-f0-9]{64}\Z"
+)
+RUST_CACHE_PRIMARY_REPOSITORY = REPOSITORY
 IMAGE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 FINGERPRINT_RE = re.compile(r"SHA256:[A-Za-z0-9+/]{43}\Z")
 OWNER_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}\Z")
@@ -109,6 +126,7 @@ RUNTIME_GATE_NAMES = gate_table.RUNTIME_GATE_NAMES
 BROWSER_GATE_NAMES = gate_table.BROWSER_GATE_NAMES
 RUNTIME_ROOT_FILES = gate_table.RUNTIME_ROOT_FILES
 MAX_LOCK_DIRECTORIES = 100000
+MAX_CARGO_LOCK_BYTES = 4 * 1024 * 1024
 MAX_DIRECTORY_ENTRIES = 8192
 MAX_TREE_ENTRIES = 1000000
 MAX_PENDING_DIRECTORIES = 8192
@@ -119,43 +137,10 @@ RUST_COMPONENTS = (
     ("rustfmt-preview", "https://static.rust-lang.org/dist/2026-10-15/rustfmt-1.99.1-x86_64-unknown-linux-gnu.tar.gz", "e3a88008061f485126fe24569c4d3e5a0f49462a06ee6339920f8f202124b13a"),
     ("clippy-preview", "https://static.rust-lang.org/dist/2026-10-15/clippy-1.99.1-x86_64-unknown-linux-gnu.tar.gz", "3c6d008544b6e456cc785c86f8ce3713f0d845b94be3a6c8a34662b8504561b5"),
 )
-PROVENANCE_FIELDS = frozenset((
-    "schema_version", "receipt_sha256", "evidence_sha256", "lock_sha256", "context", "resolver",
-    "minimum_age_seconds", "policy_epoch_ms", "cutoff_epoch_ms", "generated_at", "expiry",
-    "advisory",
-))
-PROVENANCE_CONTEXT_FIELDS = frozenset((
-    "repository", "filing", "source_sha", "base_sha", "base_branch", "reviewed_diff_fingerprint",
-    "control_sha",
-))
-PROVENANCE_ADVISORY_FIELDS = frozenset((
-    "endpoint", "fetched_at", "valid_until", "request_sha256", "response_sha256", "package_count",
-    "finding_count", "status", "findings",
-))
-PROVENANCE_FINDING_FIELDS = frozenset((
-    "name", "version", "severity", "advisory_id", "range", "allow_justification_sha256",
-    "allow_expires_at_ms", "allow_removal_condition",
-))
-PROVENANCE_RESOLVER_FIELDS = frozenset(("node_version", "npm_version"))
-AUDIT_ENDPOINT = "npm-bulk-advisory-v1"
-MINIMUM_AGE_SECONDS = 7 * 24 * 60 * 60
-MAX_ALLOW_TTL_MS = 90 * 24 * 60 * 60 * 1000
-MAX_PROVENANCE_BYTES = 32 * 1024
-MAX_ALLOWED_FINDINGS = 64
-SEVERITY_RANK = {"info": 0, "low": 1, "moderate": 2, "high": 3, "critical": 4}
-ALLOWABLE_SEVERITIES = ("info", "low", "moderate")
-CONTEXT_TEXT_RE = re.compile(r"[A-Za-z0-9._/:-]{1,256}\Z")
-IDENTIFIER_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}\Z")
-LOCKED_VERSION_RE = re.compile(r"[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}(?:[-+][0-9A-Za-z.+-]{1,64})?\Z")
-ADVISORY_URL_PREFIX = "https:" + chr(47) * 2 + "github.com" + chr(47) + "advisories" + chr(47)
 NPM_USER_CONFIG_NAME = "user.npmrc"
 NPM_GLOBAL_CONFIG_NAME = "global.npmrc"
 GATE_CONFIG_UID = 0
 GATE_CONFIG_GID = 0
-MAX_AUDIT_VULNERABILITIES = 4096
-MAX_AUDIT_VIA = 64
-MAX_AUDIT_NODES = 1024
-MAX_AUDIT_TEXT = 512
 MANIFEST_WORKSPACE_PATHS = gate_table.MANIFEST_WORKSPACE_PATHS
 MANIFEST_GROUPS = gate_table.MANIFEST_GROUPS
 MANIFEST_PACKAGE_RE = gate_table.MANIFEST_PACKAGE_RE
@@ -170,16 +155,21 @@ SOURCE_STEP_NAMES = (
     "Boundary self-test before source-reader mint",
     "Mint scoped source-reader token",
     "Verify selected installation identity",
-    "Fetch exact source and verify binding, tree, signatures and lock provenance",
+    "Fetch exact source and verify binding, tree, signatures and committed locks",
     "Revoke source-reader token and verify rejection",
-    "Install pinned cargo-deny and prepare the RustSec database",
-    "Require trusted Rust licence admission",
+    "Derive Rust cache key",
+    "Prepare runner-local Rust cache staging",
+    "Restore exact Rust build cache",
+    "Import validated Rust build cache",
+    "Fetch Rust dependencies from the committed lockfiles",
     "Fetch npm tarballs by committed lock integrity",
-    "Run trusted dependency audit",
     "Prepare offline project inputs",
     "Re-run positive controls immediately before the first project command",
     "Run all offline project gates",
     "Merge confinement phase records",
+    "Export validated Rust build cache after confined work",
+    "Package the Rust build cache",
+    "Save the exact Rust build cache",
     "Forced faults must fail closed",
 )
 VERDICT_STEP_NAMES = (
@@ -191,14 +181,19 @@ VERDICT_STEP_NAMES = (
     "Mint verifier scoped source-reader token",
     "Verify source independently against binding, tree, signatures and lock",
     "Revoke verifier token and verify rejection",
-    "Install independent pinned cargo-deny and prepare RustSec database",
-    "Require trusted Rust licence admission independently",
+    "Derive independent verifier Rust cache key",
+    "Prepare independent verifier Rust cache staging",
+    "Restore the independent verifier Rust build cache",
+    "Import the independent verifier Rust cache",
+    "Fetch verifier Rust dependencies from committed lockfiles",
     "Fetch independent npm tarballs by lock integrity",
-    "Run independent trusted dependency audit",
     "Prepare independent offline project inputs",
     "Re-run independent positive controls before project execution",
     "Run independent offline project gates",
     "Merge independent confinement records",
+    "Export the independent verifier Rust cache after confined work",
+    "Package the independent verifier Rust cache",
+    "Save the independent verifier Rust cache",
     "Verify unprivileged proof handoff",
     "Publish confinement verdict",
 )
@@ -206,12 +201,26 @@ OPTIONAL_VERDICT_SYNTHETIC_STEPS = (
     "Mint verifier scoped source-reader token",
     "Verify source independently against binding, tree, signatures and lock",
     "Revoke verifier token and verify rejection",
-    "Install independent pinned cargo-deny and prepare RustSec database",
-    "Require trusted Rust licence admission independently",
+    "Derive independent verifier Rust cache key",
+    "Prepare independent verifier Rust cache staging",
+    "Restore the independent verifier Rust build cache",
+    "Import the independent verifier Rust cache",
+    "Fetch verifier Rust dependencies from committed lockfiles",
     "Fetch independent npm tarballs by lock integrity",
-    "Run independent trusted dependency audit",
     "Prepare independent offline project inputs",
     "Run independent offline project gates",
+    "Export the independent verifier Rust cache after confined work",
+    "Package the independent verifier Rust cache",
+    "Save the independent verifier Rust cache",
+)
+CACHE_VERDICT_STEPS = (
+    "Derive independent verifier Rust cache key",
+    "Prepare independent verifier Rust cache staging",
+    "Restore the independent verifier Rust build cache",
+    "Import the independent verifier Rust cache",
+    "Export the independent verifier Rust cache after confined work",
+    "Package the independent verifier Rust cache",
+    "Save the independent verifier Rust cache",
 )
 SETTINGS_STEP_NAMES = (
     "Fetch exact public control",
@@ -246,11 +255,10 @@ QUICK_PRODUCER_STEP_NAMES = (
     "Boundary self-test before source-reader mint",
     "Mint scoped source-reader token",
     "Verify selected installation identity",
-    "Fetch exact source and verify binding, tree, signatures and lock provenance",
+    "Fetch exact source and verify binding, tree, signatures and committed locks",
     "Revoke source-reader token and verify rejection",
-    "Require trusted Rust licence admission",
+    "Fetch Rust dependencies from the committed lockfiles",
     "Fetch npm tarballs by committed lock integrity",
-    "Run trusted dependency audit",
     "Prepare offline project inputs",
     "Re-run positive controls immediately before the first project command",
     "Run all offline project gates",
@@ -265,53 +273,44 @@ QUICK_PRODUCER_STEP_NAMES = (
 OPTIONAL_SOURCE_STEPS = frozenset((
     "Mint scoped source-reader token",
     "Verify selected installation identity",
-    "Fetch exact source and verify binding, tree, signatures and lock provenance",
+    "Fetch exact source and verify binding, tree, signatures and committed locks",
     "Revoke source-reader token and verify rejection",
-    "Install pinned cargo-deny and prepare the RustSec database",
-    "Require trusted Rust licence admission",
+    "Derive Rust cache key",
+    "Prepare runner-local Rust cache staging",
+    "Restore exact Rust build cache",
+    "Import validated Rust build cache",
+    "Fetch Rust dependencies from the committed lockfiles",
     "Fetch npm tarballs by committed lock integrity",
-    "Run trusted dependency audit",
     "Prepare offline project inputs",
     "Run all offline project gates",
+    "Export validated Rust build cache after confined work",
+    "Package the Rust build cache",
+    "Save the exact Rust build cache",
     "Forced faults must fail closed",
 ))
-
-
-AUDIT_DETAILS = frozenset((
-    "audit_toolchain", "audit_provenance", "audit_run", "audit_exit",
-    "audit_json_empty", "audit_json_empty_stderr_json", "audit_json_empty_stderr_text",
-    "audit_json_encoding", "audit_json_prefix", "audit_json_trailing",
-    "audit_json_duplicate", "audit_json_syntax", "audit_json_not_object",
-    "audit_top_keys", "audit_version", "audit_meta", "audit_count", "audit_high",
-    "audit_limit", "audit_entry_shape", "audit_key_name", "audit_severity",
-    "audit_via_shape", "audit_via_unknown", "audit_advisory_unmatched",
-    "audit_allow_expired", "audit_advisory_severity", "audit_nodes_shape", "audit_nondev",
-    "audit_version_not_allowed", "audit_consumer_over_ceiling", "audit_consumer_unreached",
-    "audit_exit_mismatch", "audit_lock_changed", "audit_advisory_expired",
-    "audit_unclassified", "audit_unexpected",
-))
-AUDIT_DETAIL_PHASE = "trusted-audit"
-MAX_DETAIL_COUNT = 99
+CACHE_SOURCE_STEPS = (
+    "Derive Rust cache key",
+    "Prepare runner-local Rust cache staging",
+    "Restore exact Rust build cache",
+    "Import validated Rust build cache",
+    "Export validated Rust build cache after confined work",
+    "Package the Rust build cache",
+    "Save the exact Rust build cache",
+)
 
 
 class SourceBuildRefusal(Exception):
-    def __init__(self, reason="invalid", detail=None, count=None):
+    def __init__(self, reason="invalid"):
         self.reason = reason if reason in {
             "identity", "freshness", "untrusted", "source", "binding", "duplicate",
             "cache", "toolchain", "hash_mismatch", "token", "checkout", "signature",
             "revocation", "lock", "registry", "network", "gate", "boundary", "audit",
         } else "invalid"
-        self.detail = detail if detail in AUDIT_DETAILS else None
-        self.count = min(count, MAX_DETAIL_COUNT) if type(count) is int and count >= 0 else None
         super().__init__(self.reason)
 
 
 def _refusal_line(command, error):
     line = "linux-source-build=refused phase=" + command + " reason=" + error.reason
-    if command == AUDIT_DETAIL_PHASE:
-        line += " detail=" + (error.detail or "audit_unclassified")
-        if error.count is not None:
-            line += " count=" + str(error.count)
     return line + "\n"
 
 
@@ -359,6 +358,39 @@ def _api_request(path, token, method="GET", payload=None, expected=(200,)):
     except (UnicodeError, ValueError):
         raise SourceBuildRefusal("network") from None
     return status, value
+
+
+def _verify_reusable_dependency_caller(token, repository, source_sha, control_sha):
+    if (type(repository) is not str or repository.casefold() != RUST_CACHE_CORE_REPOSITORY.casefold()
+            or SOURCE_SHA_RE.fullmatch(source_sha) is None
+            or SOURCE_SHA_RE.fullmatch(control_sha) is None):
+        raise SourceBuildRefusal("identity")
+    path = (
+        "/repos/" + repository + "/contents/.github/workflows/dependency-checks.yml?ref="
+        + urllib.parse.quote(source_sha, safe="")
+    )
+    unused_status, payload = _api_request(path, token)
+    if (type(payload) is not dict or payload.get("path") != ".github/workflows/dependency-checks.yml"
+            or payload.get("encoding") != "base64" or type(payload.get("content")) is not str
+            or len(payload["content"]) > 180000):
+        raise SourceBuildRefusal("identity")
+    compact = re.sub(r"\s", "", payload["content"])
+    if re.fullmatch(r"[A-Za-z0-9+/]*={0,2}", compact) is None:
+        raise SourceBuildRefusal("identity")
+    try:
+        content = base64.b64decode(compact, validate=True).decode("utf-8")
+    except (ValueError, UnicodeError):
+        raise SourceBuildRefusal("identity") from None
+    workflow_pins = re.findall(
+        r"(?m)^\s*uses:\s*keeldock-platform/platform-ci/\.github/workflows/"
+        r"core-dependency-checks\.yml@([a-f0-9]{40})\s*$", content,
+    )
+    control_pins = re.findall(r"(?m)^\s*control_sha:\s*([a-f0-9]{40})\s*$", content)
+    if (workflow_pins != [control_sha] or control_pins != [control_sha]
+            or content.count("source_sha: ${{ github.sha }}") != 1
+            or content.count("secrets: inherit") != 1):
+        raise SourceBuildRefusal("identity")
+    return True
 
 
 def _reference_sha(token, repository, branch):
@@ -421,14 +453,7 @@ def _request_binding(environ, prefix):
     }
     if any(environ.get(name) != value for name, value in values.items()):
         raise SourceBuildRefusal("binding")
-    for name in (
-        prefix + "_ACCEPTED_NODE_LOCK_SHA256", prefix + "_ACCEPTED_MANIFEST_SHA256",
-        prefix + "_ACCEPTED_NODE_PROVENANCE_JSON", prefix + "_ENVIRONMENT_NAME",
-    ):
-        if not environ.get(name):
-            raise SourceBuildRefusal("binding")
-    if (HEX64_RE.fullmatch(environ[prefix + "_ACCEPTED_NODE_LOCK_SHA256"]) is None
-            or HEX64_RE.fullmatch(environ[prefix + "_ACCEPTED_MANIFEST_SHA256"]) is None):
+    if not environ.get(prefix + "_ENVIRONMENT_NAME"):
         raise SourceBuildRefusal("binding")
     if (environ.get("REQUESTED_ENVIRONMENT_NAME") != environ[prefix + "_ENVIRONMENT_NAME"]
             or environ[prefix + "_ENVIRONMENT_NAME"] != ENVIRONMENT_NAME):
@@ -470,7 +495,6 @@ def _source_inputs(environ, prefix=None):
     identity["repository_id"] = environ["SOURCE_REPOSITORY_ID"]
     identity["owner"] = environ["SOURCE_REPOSITORY_OWNER"]
     identity["name"] = environ["SOURCE_REPOSITORY_NAME"]
-    _validate_provenance_binding(identity, environ, prefix)
     return identity
 
 
@@ -522,11 +546,265 @@ def _verify_environment(token, name=ENVIRONMENT_NAME, environ=None):
         raise SourceBuildRefusal("binding")
 
 
+def _untrusted_core_pull_request(env):
+    repository = env.get("CI_REPOSITORY", "")
+    event = env.get("CI_EVENT_NAME", "")
+    ref = env.get("CI_REF", "")
+    base_ref = env.get("CI_BASE_REF", "")
+    return (
+        type(repository) is str
+        and repository.casefold() == RUST_CACHE_CORE_REPOSITORY.casefold()
+        and event == "pull_request"
+        and base_ref in ("develop", "uat", "main")
+        and re.fullmatch(r"refs/pull/[1-9][0-9]{0,18}/merge", ref) is not None
+    )
+
+
+def _source_reader_caller_allowed(env):
+    repository = env.get("CI_REPOSITORY", "")
+    event = env.get("CI_EVENT_NAME", "")
+    ref = env.get("CI_REF", "")
+    base_ref = env.get("CI_BASE_REF", "")
+    if type(repository) is not str or type(event) is not str or type(ref) is not str:
+        return False
+    if repository.casefold() == REPOSITORY.casefold():
+        return event == "workflow_dispatch" and ref in (
+            "refs/heads/main", "refs/heads/untrusted",
+        )
+    if repository.casefold() != RUST_CACHE_CORE_REPOSITORY.casefold():
+        return False
+    if event == "push":
+        return ref in (
+            "refs/heads/develop", "refs/heads/uat", "refs/heads/main",
+        ) and base_ref == ""
+    if event == "pull_request":
+        return _untrusted_core_pull_request(env)
+    return False
+
+
 def _tier(environ):
     tier = environ.get("KD_LINUX_TIER", "admission")
     if type(tier) is not str or tier not in TIERS:
         raise SourceBuildRefusal("identity")
     return tier
+
+
+def _rust_cache_identity(env):
+    repository = env.get("CI_REPOSITORY", "")
+    repository_id = env.get("SOURCE_REPOSITORY_ID", "")
+    source_sha = env.get("REQUESTED_SOURCE_SHA", "")
+    control_sha = env.get("CONTROL_SHA", "")
+    ci_sha = env.get("CI_SHA", "")
+    trust_class = env.get("RUST_CACHE_TRUST_CLASS", "")
+    if (type(repository) is not str or RUST_CACHE_REPOSITORY_RE.fullmatch(repository) is None
+            or type(repository_id) is not str or DECIMAL_RE.fullmatch(repository_id) is None
+            or type(source_sha) is not str or SOURCE_SHA_RE.fullmatch(source_sha) is None
+            or type(control_sha) is not str or SOURCE_SHA_RE.fullmatch(control_sha) is None
+            or type(ci_sha) is not str or SOURCE_SHA_RE.fullmatch(ci_sha) is None
+            or trust_class not in RUST_CACHE_TRUST_CLASSES):
+        raise SourceBuildRefusal("cache")
+    return {
+        "repository": repository,
+        "repository_id": repository_id,
+        "trust_class": trust_class,
+        "source_sha": source_sha,
+        "control_sha": control_sha,
+    }
+
+
+def _rust_cache_key(source, runner_os, scope, *, repository, repository_id, trust_class, source_sha, control_sha):
+    if (type(runner_os) is not str or RUST_CACHE_OS_RE.fullmatch(runner_os) is None
+            or type(scope) is not str or RUST_CACHE_SCOPE_RE.fullmatch(scope) is None):
+        raise SourceBuildRefusal("cache")
+    if (type(repository) is not str or RUST_CACHE_REPOSITORY_RE.fullmatch(repository) is None
+            or type(repository_id) is not str or DECIMAL_RE.fullmatch(repository_id) is None
+            or trust_class not in RUST_CACHE_TRUST_CLASSES
+            or type(source_sha) is not str or SOURCE_SHA_RE.fullmatch(source_sha) is None
+            or type(control_sha) is not str or SOURCE_SHA_RE.fullmatch(control_sha) is None):
+        raise SourceBuildRefusal("cache")
+    os_name, separator, architecture = runner_os.partition("-")
+    if (separator != "-" or os_name not in ("Linux", "macOS", "Windows")
+            or architecture.lower() not in ("x64", "arm64")):
+        raise SourceBuildRefusal("cache")
+    runner_key = os_name + "-" + architecture.lower()
+    root = Path(source)
+    toolchain = root / "rust-toolchain.toml"
+    try:
+        toolchain_info = toolchain.lstat()
+        if not stat.S_ISREG(toolchain_info.st_mode) or toolchain_info.st_nlink != 1:
+            raise SourceBuildRefusal("cache")
+        toolchain_hash = hashlib.sha256(toolchain.read_bytes()).hexdigest()
+        locks_hash = hashlib.sha256()
+        lock_count = 0
+        for relative in ("Cargo.lock", "fuzz/Cargo.lock", "runtime/Cargo.lock"):
+            path = root / relative
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise SourceBuildRefusal("cache")
+            content = path.read_bytes()
+            locks_hash.update(relative.encode("ascii") + bytes((0,)) + content + bytes((0,)))
+            lock_count += 1
+        if lock_count == 0:
+            raise SourceBuildRefusal("cache")
+    except SourceBuildRefusal:
+        raise
+    except OSError:
+        raise SourceBuildRefusal("cache") from None
+    identity = {"repository": repository, "repository_id": repository_id, "trust_class": trust_class}
+    identity_hash = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("ascii")
+    ).hexdigest()
+    return (
+        "kd-rust-v5-" + runner_key + "-" + scope + "-" + trust_class + "-"
+        + source_sha + "-" + control_sha + "-" + toolchain_hash + "-"
+        + locks_hash.hexdigest() + "-" + identity_hash
+    )
+
+def _rust_cache_read_allowed(env):
+    repository = env.get("CI_REPOSITORY", "")
+    trust_class = env.get("RUST_CACHE_TRUST_CLASS", "")
+    if (type(repository) is not str or RUST_CACHE_REPOSITORY_RE.fullmatch(repository) is None
+            or trust_class not in RUST_CACHE_TRUST_CLASSES):
+        return False
+    event = env.get("CI_EVENT_NAME", "")
+    ref = env.get("CI_REF", "")
+    if event == "pull_request":
+        return (trust_class in ("primary", "independent-verifier")
+                and bool(re.fullmatch(r"refs/pull/[1-9][0-9]{0,18}/merge", ref)))
+    if event == "push":
+        if trust_class == "untrusted":
+            return ref == "refs/heads/untrusted"
+        return ref in ("refs/heads/develop", "refs/heads/uat", "refs/heads/main")
+    if event == "workflow_dispatch":
+        return ((ref == "refs/heads/main" and trust_class in ("primary", "independent-verifier"))
+                or (ref == "refs/heads/untrusted" and trust_class == "untrusted"))
+    return False
+
+
+def _rust_cache_write_allowed(env):
+    repository = env.get("CI_REPOSITORY", "")
+    trust_class = env.get("RUST_CACHE_TRUST_CLASS", "")
+    if (type(repository) is not str or RUST_CACHE_REPOSITORY_RE.fullmatch(repository) is None
+            or trust_class not in ("primary", "independent-verifier")):
+        return False
+    return _rust_cache_write_context(env)
+
+
+def _rust_cache_write_context(env):
+    event = env.get("CI_EVENT_NAME", "")
+    ref = env.get("CI_REF", "")
+    return (
+        (event == "push" and ref in ("refs/heads/develop", "refs/heads/uat", "refs/heads/main"))
+        or (event == "workflow_dispatch" and ref == "refs/heads/main")
+    )
+
+
+def _rust_cache_requires_encryption(env):
+    repository = env.get("CI_REPOSITORY", "")
+    if type(repository) is not str or RUST_CACHE_REPOSITORY_RE.fullmatch(repository) is None:
+        raise SourceBuildRefusal("cache")
+    return repository.casefold() != RUST_CACHE_CORE_REPOSITORY.casefold()
+
+
+def _rust_cache_encryption_key(env):
+    value = env.get("KD_RUST_CACHE_ENCRYPTION_KEY_B64", "")
+    if type(value) is not str or RUST_CACHE_ENCRYPTION_KEY_RE.fullmatch(value) is None:
+        raise SourceBuildRefusal("cache")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, base64.binascii.Error):
+        raise SourceBuildRefusal("cache") from None
+    if len(decoded) != 32:
+        raise SourceBuildRefusal("cache")
+    return value
+
+
+def _validate_rust_cache(env, source, expected_scope=None):
+    mode = env.get("KD_RUST_CACHE_MODE", "none")
+    if mode in ("", "none"):
+        if any(env.get(name) for name in (
+                "KD_RUST_CACHE_KEY", "KD_RUST_CACHE_DIR", "KD_RUST_CACHE_HIT", "RUST_CACHE_OS",
+                "RUST_CACHE_SCOPE", "RUST_CACHE_TRUST_CLASS")):
+            raise SourceBuildRefusal("cache")
+        return None
+    if mode != "read":
+        raise SourceBuildRefusal("cache")
+    key = env.get("KD_RUST_CACHE_KEY", "")
+    cache_dir = env.get("KD_RUST_CACHE_DIR", "")
+    runner_temp = env.get("RUNNER_TEMP", "")
+    runner_os = env.get("RUST_CACHE_OS", "")
+    scope = env.get("RUST_CACHE_SCOPE", "")
+    hit = env.get("KD_RUST_CACHE_HIT", "")
+    identity = _rust_cache_identity(env)
+    if (RUST_CACHE_KEY_RE.fullmatch(key) is None or not Path(cache_dir).is_absolute()
+            or not Path(runner_temp).is_absolute() or Path(cache_dir) != Path(runner_temp) / "kd-rust-cache"
+            or hit not in ("true", "false")
+            or not _rust_cache_read_allowed(env)
+            or (expected_scope is not None and scope != expected_scope)
+            or _rust_cache_key(source, runner_os, scope, **identity) != key):
+        raise SourceBuildRefusal("cache")
+    try:
+        cache_info = Path(cache_dir).lstat()
+        runner_uid = int(env.get("SUDO_UID", os.getuid())) if os.geteuid() == 0 else os.getuid()
+        runner_gid = int(env.get("SUDO_GID", os.getgid())) if os.geteuid() == 0 else os.getgid()
+        if (not stat.S_ISDIR(cache_info.st_mode)
+                or (cache_info.st_uid, cache_info.st_gid) != (runner_uid, runner_gid)):
+            raise SourceBuildRefusal("cache")
+    except OSError:
+        raise SourceBuildRefusal("cache") from None
+    return {"directory": Path(cache_dir), "hit": hit == "true", "key": key}
+
+
+def _optional_rust_cache(env, source, expected_scope=None):
+    try:
+        return _validate_rust_cache(env, source, expected_scope)
+    except (SourceBuildRefusal, OSError, TypeError, ValueError):
+        return None
+
+
+def _discard_optional_cache_path(path):
+    path = Path(path)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise SourceBuildRefusal("cache") from None
+    try:
+        if stat.S_ISDIR(info.st_mode):
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except OSError:
+        raise SourceBuildRefusal("cache") from None
+
+
+def write_rust_cache_key(environ=None):
+    env = os.environ if environ is None else environ
+    try:
+        if not _rust_cache_read_allowed(env):
+            raise SourceBuildRefusal("cache")
+        identity = _rust_cache_identity(env)
+        key = _rust_cache_key(
+            env.get("SOURCE_PATH", ""), env.get("RUST_CACHE_OS", ""),
+            env.get("RUST_CACHE_SCOPE", ""), **identity,
+        )
+        output = env.get("GITHUB_OUTPUT")
+        if not output:
+            raise SourceBuildRefusal("cache")
+        with open(output, "at", encoding="ascii") as sink:
+            sink.write("cache_key=" + key + "\n")
+        sys.stdout.write("linux-rust-cache-key=verified\n")
+        return 0
+    except SourceBuildRefusal as error:
+        sys.stdout.write("linux-rust-cache-key=refused reason=" + error.reason + "\n")
+        return 1
+    except BaseException:
+        sys.stdout.write("linux-rust-cache-key=refused reason=invalid\n")
+        return 1
 
 
 def validate_dispatch(environ, api_token=None, prefix=LINUX_SOURCE_PREFIX, source_identity=True):
@@ -633,7 +911,7 @@ def _audit_modules():
     return confinement_public_audit, confinement_verdict, log_canary
 
 
-def _expected_quick_run(environ, cache_digest):
+def _expected_quick_run(environ, cache_digest, cache_baseline=""):
     audit, unused_verdict, unused_canary = _audit_modules()
     request_id = environ.get("KD_QUICK_REQUEST_ID", "")
     source_sha = environ.get("REQUESTED_SOURCE_SHA", "")
@@ -657,6 +935,7 @@ def _expected_quick_run(environ, cache_digest):
         "auditor_job": QUICK_JOB_PREFIX + "-audit",
         "artifact_names": ("linux-quick-" + request_id,),
         "cache_digest": cache_digest if HEX64_RE.fullmatch(cache_digest or "") else "0" * 64,
+        "cache_baseline": cache_baseline,
     }
     audit.validate_expected_quick(expected)
     return expected
@@ -666,9 +945,9 @@ def _job_edges(names):
     return ("Set up job",) + tuple(names) + ("Complete job",)
 
 
-def _expected_run(environ, cache_digest):
+def _expected_run(environ, cache_digest, cache_baseline=""):
     if _tier(environ) == "quick":
-        return _expected_quick_run(environ, cache_digest)
+        return _expected_quick_run(environ, cache_digest, cache_baseline)
     audit, unused_verdict, unused_canary = _audit_modules()
     mode = environ.get("CI_MODE", "")
     if mode not in ("source", "synthetic"):
@@ -681,7 +960,7 @@ def _expected_run(environ, cache_digest):
     all_steps = ["Set up job"] + list(SOURCE_STEP_NAMES)
     if mode == "source":
         all_steps.append("Post Mint scoped source-reader token")
-        optional = ("Forced faults must fail closed",)
+        optional = tuple(sorted((*CACHE_SOURCE_STEPS, "Forced faults must fail closed")))
     else:
         optional = tuple(sorted(OPTIONAL_SOURCE_STEPS - {"Forced faults must fail closed"}))
     all_steps.append("Complete job")
@@ -701,7 +980,10 @@ def _expected_run(environ, cache_digest):
             "linux-source-admission-source-read": {"steps": tuple(all_steps), "optional_steps": tuple(optional)},
             "linux-source-admission-verdict": {
                 "steps": _job_edges(VERDICT_STEP_NAMES),
-                "optional_steps": OPTIONAL_VERDICT_SYNTHETIC_STEPS if mode == "synthetic" else (),
+                "optional_steps": (
+                    OPTIONAL_VERDICT_SYNTHETIC_STEPS if mode == "synthetic"
+                    else CACHE_VERDICT_STEPS
+                ),
             },
         },
         "verdict_job": "linux-source-admission-verdict",
@@ -709,6 +991,7 @@ def _expected_run(environ, cache_digest):
         "auditor_job": "linux-source-admission-audit",
         "artifact_names": (),
         "cache_digest": cache_digest if HEX64_RE.fullmatch(cache_digest or "") else "0" * 64,
+        "cache_baseline": cache_baseline,
     }
     audit.validate_expected(expected)
     return expected
@@ -935,9 +1218,8 @@ def snapshot_and_preflight(environ=None):
         _write_output(env, {"expected": json.dumps(expected, sort_keys=True, separators=(",", ":"))})
         token = env.get("GITHUB_TOKEN", "")
         api = audit._default_api_factory(token, REPOSITORY)
-        caches = audit._collect_caches(api, REPOSITORY)
-        digest = audit.cache_inventory_digest(caches)
-        expected = _expected_run(env, digest)
+        digest, cache_baseline = audit.snapshot_cache_inventory(api, REPOSITORY)
+        expected = _expected_run(env, digest, cache_baseline)
         _write_output(env, {
             "cache_digest": digest,
             "expected": json.dumps(expected, sort_keys=True, separators=(",", ":")),
@@ -985,7 +1267,7 @@ def windows_snapshot(environ=None):
         audit, unused_verdict, unused_canary = _audit_modules()
         token = env.get("GITHUB_TOKEN", "")
         api = audit._default_api_factory(token, REPOSITORY)
-        digest = audit.cache_inventory_digest(audit._collect_caches(api, REPOSITORY))
+        digest, cache_baseline = audit.snapshot_cache_digest(api, REPOSITORY)
         _write_output(env, {"cache_digest": digest})
         state = validate_dispatch(env, token, WINDOWS_SOURCE_PREFIX, source_identity=False)
         sys.stdout.write("windows-source-settings=verified mode=" + state + " cache=snapped\n")
@@ -1354,166 +1636,12 @@ def _signer_keys(payload):
     return b"".join(accepted), fingerprints
 
 
-class _DuplicateJsonKey(ValueError):
-    pass
-
-
-JSON_WHITESPACE = " \t\n\r"
-
-
-JSON_NON_OBJECT_STARTS = '["-0123456789tfn'
-
-
-def _lines_before_object(text):
-    count = 0
-    for line in text.split("\n"):
-        if line.lstrip(JSON_WHITESPACE).startswith("{"):
-            return min(count, MAX_DETAIL_COUNT)
-        if line.strip():
-            count += 1
-    return 0
-
-
-def _reject_json_constant(unused):
-    raise ValueError
-
-
-def _nonempty_lines(data, separator):
-    return min(sum(1 for line in data.split(separator) if line.strip()), MAX_DETAIL_COUNT)
-
-
-def _unique_json_pairs(items):
-    result = {}
-    for key, value in items:
-        if key in result:
-            raise _DuplicateJsonKey
-        result[key] = value
-    return result
-
-
-def _strict_json_loads(text):
-    return json.loads(
-        text,
-        object_pairs_hook=_unique_json_pairs,
-        parse_constant=_reject_json_constant,
-    )
-
-
-def _is_count(value):
-    return type(value) is int and value >= 0
-
-
-def _check_provenance_finding(finding, policy_epoch, fetched_at):
-    if type(finding) is not dict or set(finding) != PROVENANCE_FINDING_FIELDS:
-        raise SourceBuildRefusal("lock")
-    name = finding["name"]
-    version = finding["version"]
-    expires = finding["allow_expires_at_ms"]
-    if (type(name) is not str or len(name) > 214 or MANIFEST_PACKAGE_RE.fullmatch(name) is None
-            or type(version) is not str or LOCKED_VERSION_RE.fullmatch(version) is None
-            or type(finding["severity"]) is not str or finding["severity"] not in ALLOWABLE_SEVERITIES
-            or type(finding["advisory_id"]) is not str
-            or IDENTIFIER_RE.fullmatch(finding["advisory_id"]) is None
-            or type(finding["range"]) is not str or not 0 < len(finding["range"]) <= 1024
-            or type(finding["allow_removal_condition"]) is not str
-            or IDENTIFIER_RE.fullmatch(finding["allow_removal_condition"]) is None
-            or type(finding["allow_justification_sha256"]) is not str
-            or HEX64_RE.fullmatch(finding["allow_justification_sha256"]) is None
-            or type(expires) is not int
-            or not policy_epoch < expires <= policy_epoch + MAX_ALLOW_TTL_MS
-            or expires <= fetched_at * 1000):
-        raise SourceBuildRefusal("lock")
-
-
-def _validate_provenance_binding(identity, environ, prefix=None):
-    """Check the accepted provenance record against the dispatch identity.
-
-    The record repository must equal the dispatch owner and name, ignoring ASCII case. The record source, base and
-    control SHAs are shape-checked only, because one admitted lock is refreshed across later
-    revisions by design and the lock and manifest digests carry the binding to the content."""
-    if prefix is None:
-        prefix = _environment_prefix(environ)
-    if type(prefix) is not str or prefix not in SOURCE_PREFIXES:
-        raise SourceBuildRefusal("lock")
-    text = environ.get(prefix + "_ACCEPTED_NODE_PROVENANCE_JSON", "")
-    if type(text) is not str or not 0 < len(text) <= MAX_PROVENANCE_BYTES:
-        raise SourceBuildRefusal("lock")
-    try:
-        record = _strict_json_loads(text)
-    except (ValueError, TypeError, RecursionError):
-        raise SourceBuildRefusal("lock") from None
-    if type(record) is not dict or set(record) != PROVENANCE_FIELDS:
-        raise SourceBuildRefusal("lock")
-    context = record["context"]
-    resolver = record["resolver"]
-    advisory = record["advisory"]
-    if (type(context) is not dict or set(context) != PROVENANCE_CONTEXT_FIELDS
-            or type(resolver) is not dict or set(resolver) != PROVENANCE_RESOLVER_FIELDS
-            or type(advisory) is not dict or set(advisory) != PROVENANCE_ADVISORY_FIELDS):
-        raise SourceBuildRefusal("lock")
-    for name in ("repository", "filing"):
-        if type(context[name]) is not str or CONTEXT_TEXT_RE.fullmatch(context[name]) is None:
-            raise SourceBuildRefusal("lock")
-    if context["repository"].lower() != (identity["owner"] + "/" + identity["name"]).lower():
-        raise SourceBuildRefusal("binding")
-    for name in ("source_sha", "base_sha", "control_sha"):
-        if type(context[name]) is not str or SOURCE_SHA_RE.fullmatch(context[name]) is None:
-            raise SourceBuildRefusal("lock")
-    if (type(context["reviewed_diff_fingerprint"]) is not str
-            or HEX64_RE.fullmatch(context["reviewed_diff_fingerprint"]) is None
-            or context["base_branch"] not in ("main", "develop", "uat")):
-        raise SourceBuildRefusal("lock")
-    policy_epoch = record["policy_epoch_ms"]
-    generated = record["generated_at"]
-    expiry = record["expiry"]
-    now = time.time()
-    if (type(record["schema_version"]) is not int or record["schema_version"] != 1
-            or any(type(record[name]) is not str or HEX64_RE.fullmatch(record[name]) is None
-                   for name in ("receipt_sha256", "evidence_sha256", "lock_sha256"))
-            or record["lock_sha256"] != environ.get(prefix + "_ACCEPTED_NODE_LOCK_SHA256")
-            or resolver["node_version"] != NODE_VERSION or resolver["npm_version"] != NPM_VERSION
-            or type(record["minimum_age_seconds"]) is not int
-            or record["minimum_age_seconds"] != MINIMUM_AGE_SECONDS
-            or type(policy_epoch) is not int or policy_epoch < 1
-            or record["cutoff_epoch_ms"] != policy_epoch - MINIMUM_AGE_SECONDS * 1000
-            or type(generated) is not int or type(expiry) is not int
-            or not policy_epoch <= generated * 1000 <= now * 1000 < expiry * 1000):
-        raise SourceBuildRefusal("lock")
-    findings = advisory["findings"]
-    fetched = advisory["fetched_at"]
-    if (advisory["endpoint"] != AUDIT_ENDPOINT
-            or advisory["status"] not in ("clear", "allowed_findings")
-            or type(findings) is not list or len(findings) > MAX_ALLOWED_FINDINGS
-            or not _is_count(advisory["finding_count"]) or advisory["finding_count"] != len(findings)
-            or (advisory["status"] == "clear") != (not findings)
-            or not _is_count(fetched) or not _is_count(advisory["valid_until"])
-            or not _is_count(advisory["package_count"])
-            or not policy_epoch <= fetched * 1000 <= now * 1000
-            or advisory["valid_until"] <= fetched
-            or any(type(advisory[name]) is not str or HEX64_RE.fullmatch(advisory[name]) is None
-                   for name in ("request_sha256", "response_sha256"))):
-        raise SourceBuildRefusal("lock")
-    seen = set()
-    for finding in findings:
-        _check_provenance_finding(finding, policy_epoch, fetched)
-        key = (finding["name"], finding["version"], finding["advisory_id"])
-        if key in seen:
-            raise SourceBuildRefusal("lock")
-        seen.add(key)
-    return record
-
-
-def _check_lock_provenance(lock_bytes, identity, environ, source_root):
+def _check_committed_node_lock(lock_bytes, source_root):
     if len(lock_bytes) > 4 * 1024 * 1024 - 64 * 1024:
         raise SourceBuildRefusal("lock")
+    _locked_packages(lock_bytes)
     lock_sha = hashlib.sha256(lock_bytes).hexdigest()
-    prefix = _environment_prefix(environ)
-    record = _validate_provenance_binding(identity, environ, prefix)
     manifest_digest = _manifest_digest(source_root)
-    if (lock_sha != environ.get(prefix + "_ACCEPTED_NODE_LOCK_SHA256")
-            or record.get("lock_sha256") != lock_sha
-            or manifest_digest != environ.get(prefix + "_ACCEPTED_MANIFEST_SHA256")):
-        raise SourceBuildRefusal("lock")
     return lock_sha, manifest_digest
 
 
@@ -1647,7 +1775,7 @@ def checkout_source(environ=None):
         lock_bytes = lock_path.read_bytes()
     except OSError:
         raise SourceBuildRefusal("lock") from None
-    lock_sha, manifest_sha = _check_lock_provenance(lock_bytes, identity, env, repo)
+    lock_sha, manifest_sha = _check_committed_node_lock(lock_bytes, repo)
     _validate_cargo_lock_sources(repo)
     _neutralize_config_files(repo)
     write_out = env.get("GITHUB_OUTPUT")
@@ -1657,7 +1785,7 @@ def checkout_source(environ=None):
             sink.write("source_tree=" + tree + "\n")
             sink.write("lock_sha256=" + lock_sha + "\n")
             sink.write("manifest_sha256=" + manifest_sha + "\n")
-    sys.stdout.write("linux-source-checkout=verified source-sha=" + head + " tree=" + tree + " signatures=verified lock=accepted\n")
+    sys.stdout.write("linux-source-checkout=verified source-sha=" + head + " tree=" + tree + " signatures=verified lock=committed\n")
     return 0
 
 
@@ -1685,6 +1813,135 @@ def revoke_token(environ=None):
     }
     (records / "revocation.json").write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
     sys.stdout.write("linux-source-token=revoked rejection=verified receipt=positive\n")
+    return 0
+
+
+def verify_dependency_preflight(environ=None):
+    env = os.environ if environ is None else environ
+    source_sha = env.get("REQUESTED_SOURCE_SHA", "")
+    control_sha = env.get("CONTROL_SHA", "")
+    ci_sha = env.get("CI_SHA", "")
+    ci_ref = env.get("CI_REF", "")
+    if env.get("CI_REUSABLE_CALL") == "true":
+        repository = env.get("CI_REPOSITORY", "")
+        event = env.get("CI_EVENT_NAME", "")
+        base_ref = env.get("CI_BASE_REF", "")
+        branch_allowed = (
+            (event == "push" and ci_ref in (
+                "refs/heads/develop", "refs/heads/uat", "refs/heads/main",
+            ) and base_ref == "")
+            or (event == "pull_request" and base_ref in ("develop", "uat", "main")
+                and re.fullmatch(r"refs/pull/[1-9][0-9]{0,18}/merge", ci_ref) is not None)
+        )
+        if (type(repository) is not str or repository.casefold() != RUST_CACHE_CORE_REPOSITORY.casefold()
+                or env.get("CI_SERVER_URL") != "https://github.com"
+                or env.get("CACHE_MODE") != "none"
+                or ci_sha != env.get("GITHUB_SHA")
+                or SOURCE_SHA_RE.fullmatch(ci_sha) is None
+                or source_sha != ci_sha
+                or SOURCE_SHA_RE.fullmatch(control_sha) is None
+                or not branch_allowed):
+            raise SourceBuildRefusal("identity")
+        if not env.get("GITHUB_TOKEN"):
+            raise SourceBuildRefusal("identity")
+        _verify_reusable_dependency_caller(
+            env["GITHUB_TOKEN"], repository, source_sha, control_sha,
+        )
+        sys.stdout.write("linux-dependency-preflight=verified cache=none mode=reusable\n")
+        return 0
+    if (env.get("CI_EVENT_NAME") != "workflow_dispatch"
+            or env.get("CI_REPOSITORY") != REPOSITORY
+            or env.get("CI_SERVER_URL") != "https://github.com"
+            or env.get("CACHE_MODE") != "none"
+            or env.get("CI_SHA") != env.get("GITHUB_SHA")
+            or SOURCE_SHA_RE.fullmatch(source_sha) is None
+            or SOURCE_SHA_RE.fullmatch(control_sha) is None
+            or control_sha != ci_sha
+            or ci_ref not in ("refs/heads/main", "refs/heads/untrusted")):
+        raise SourceBuildRefusal("identity")
+    token = env.get("GITHUB_TOKEN", "")
+    if type(token) is not str or not token:
+        raise SourceBuildRefusal("identity")
+    live_main = _reference_sha(token, REPOSITORY, "main")
+    live_untrusted = _reference_sha(token, REPOSITORY, "untrusted")
+    if live_main is None:
+        raise SourceBuildRefusal("freshness")
+    if ci_ref == "refs/heads/main" and live_main != ci_sha:
+        raise SourceBuildRefusal("freshness")
+    if (live_untrusted is None
+            or _comparison(token, REPOSITORY, live_untrusted, live_main) not in ("ahead", "identical")):
+        raise SourceBuildRefusal("untrusted")
+    if ci_ref == "refs/heads/untrusted" and live_untrusted != ci_sha:
+        raise SourceBuildRefusal("freshness")
+    _verify_environment(token)
+    sys.stdout.write("linux-dependency-preflight=verified cache=none\n")
+    return 0
+
+
+def verify_source_reader(environ=None):
+    env = os.environ if environ is None else environ
+    if _untrusted_core_pull_request(env):
+        source_sha = env.get("REQUESTED_SOURCE_SHA", "")
+        control_sha = env.get("CONTROL_SHA", "")
+        ci_sha = env.get("CI_SHA", "")
+        ci_ref = env.get("CI_REF", "")
+        ci_base_ref = env.get("CI_BASE_REF", "")
+        github_token = env.get("GITHUB_TOKEN", "")
+        repository = RUST_CACHE_CORE_REPOSITORY
+        if (SOURCE_SHA_RE.fullmatch(source_sha) is None
+                or SOURCE_SHA_RE.fullmatch(control_sha) is None
+                or ci_sha != source_sha or ci_sha != env.get("GITHUB_SHA")
+                or ci_ref != env.get("GITHUB_REF")
+                or ci_base_ref != env.get("GITHUB_BASE_REF")
+                or not github_token or any(name in env for name in SOURCE_HELD_NAMES)):
+            raise SourceBuildRefusal("token")
+        status, details = _api_request("/repos/" + repository, github_token)
+        if (status != 200 or type(details) is not dict or details.get("private") is not True
+                or type(details.get("full_name")) is not str
+                or details["full_name"].casefold() != repository.casefold()):
+            raise SourceBuildRefusal("source")
+        status, commit = _api_request(
+            "/repos/" + repository + "/commits/" + source_sha, github_token,
+        )
+        if status != 200 or type(commit) is not dict or commit.get("sha") != source_sha:
+            raise SourceBuildRefusal("source")
+        sys.stdout.write(
+            "linux-source-reader=verified repository=core pull_request=untrusted secret_reader=none\n"
+        )
+        return 0
+    token = env.get("SOURCE_READER_TOKEN", "")
+    repository_id = env.get("SOURCE_REPOSITORY_ID", "")
+    owner = env.get("SOURCE_REPOSITORY_OWNER", "")
+    name = env.get("SOURCE_REPOSITORY_NAME", "")
+    source_sha = env.get("REQUESTED_SOURCE_SHA", "")
+    if (not _valid_source_token(token) or DECIMAL_RE.fullmatch(repository_id) is None
+            or OWNER_RE.fullmatch(owner) is None or OWNER_RE.fullmatch(name) is None
+            or SOURCE_SHA_RE.fullmatch(source_sha) is None
+            or not _source_reader_caller_allowed(env)):
+        raise SourceBuildRefusal("token")
+    ci_ref = env.get("CI_REF", "")
+    repository = owner + "/" + name
+    path = "/repos/" + urllib.parse.quote(owner, safe="") + "/" + urllib.parse.quote(name, safe="")
+    status, details = _api_request(path, token)
+    if (status != 200 or type(details) is not dict or details.get("id") != int(repository_id)
+            or details.get("private") is not True or details.get("full_name") != repository):
+        raise SourceBuildRefusal("source")
+    status, installation = _api_request("/installation/repositories?per_page=100", token)
+    entries = installation.get("repositories") if type(installation) is dict else None
+    if (status != 200 or type(entries) is not list or len(entries) != 1
+            or installation.get("total_count") != 1 or type(entries[0]) is not dict
+            or entries[0].get("id") != int(repository_id) or entries[0].get("full_name") != repository):
+        raise SourceBuildRefusal("token")
+    if ci_ref == "refs/heads/main":
+        eligible = False
+        for branch in ("develop", "uat", "main"):
+            tip = _reference_sha(token, repository, branch)
+            if tip is not None and _comparison(token, repository, source_sha, tip) in ("ahead", "identical"):
+                eligible = True
+                break
+        if not eligible:
+            raise SourceBuildRefusal("source")
+    sys.stdout.write("linux-source-reader=verified repository=one-private-source permission=contents-read\n")
     return 0
 
 
@@ -1784,9 +2041,29 @@ def fetch_npm_tarballs(environ=None):
     if not source.is_dir():
         raise SourceBuildRefusal("checkout")
     lock_bytes = (source / "package-lock.json").read_bytes()
-    identity = _source_inputs(env)
-    lock_sha, manifest_sha = _check_lock_provenance(lock_bytes, identity, env, source)
-    lock, packages = _locked_packages(lock_bytes)
+    if env.get("KD_DEPENDENCY_ONLY") == "true":
+        if SOURCE_SHA_RE.fullmatch(env.get("REQUESTED_SOURCE_SHA", "")) is None:
+            raise SourceBuildRefusal("binding")
+    else:
+        _source_inputs(env)
+    lock_sha, manifest_sha = _check_committed_node_lock(lock_bytes, source)
+    unused_lock, packages = _locked_packages(lock_bytes)
+    if env.get("KD_INCLUDE_RUNTIME_NPM_LOCK") == "true":
+        runtime_lock = source / "runtime" / "package-lock.json"
+        try:
+            runtime_info = runtime_lock.lstat()
+            runtime_lock_bytes = runtime_lock.read_bytes()
+        except OSError:
+            raise SourceBuildRefusal("lock") from None
+        runtime_lock_sha = hashlib.sha256(runtime_lock_bytes).hexdigest()
+        if (not stat.S_ISREG(runtime_info.st_mode) or runtime_info.st_nlink != 1
+                or runtime_lock_sha != env.get("EXPECTED_RUNTIME_NODE_LOCK_SHA256")):
+            raise SourceBuildRefusal("lock")
+        unused_runtime_lock, runtime_packages = _locked_packages(runtime_lock_bytes)
+        for url, integrity in runtime_packages.items():
+            if url in packages and packages[url] != integrity:
+                raise SourceBuildRefusal("lock")
+            packages[url] = integrity
     records = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-records"
     cache = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-npm-tarballs"
     records.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1976,9 +2253,7 @@ def _prepare_worker_tree(source, tarball_index, environ):
                 path.unlink()
             elif path.parent.name == ".cargo" and name.startswith("config"):
                 path.unlink()
-    lock_path = worker / "package-lock.json"
     try:
-        lock = json.loads(lock_path.read_text(encoding="utf-8"))
         mapping = json.loads(Path(tarball_index).read_text(encoding="ascii"))
     except (OSError, UnicodeError, ValueError):
         raise SourceBuildRefusal("lock") from None
@@ -1991,39 +2266,47 @@ def _prepare_worker_tree(source, tarball_index, environ):
         raise SourceBuildRefusal("gate") from None
     copied = {}
     package_integrities = {}
-    for entry in lock.get("packages", {}).values():
-        if type(entry) is not dict:
-            continue
-        url = entry.get("resolved")
-        if url not in mapping:
-            continue
-        integrity = _npm_integrity(entry.get("integrity"))
-        if url not in copied:
-            source_tarball = Path(mapping[url])
-            if source_tarball.is_symlink() or not source_tarball.is_file():
+    lock_paths = [worker / "package-lock.json"]
+    if environ.get("KD_INCLUDE_RUNTIME_NPM_LOCK") == "true":
+        lock_paths.append(worker / "runtime" / "package-lock.json")
+    for lock_path in lock_paths:
+        try:
+            lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            raise SourceBuildRefusal("lock") from None
+        for entry in lock.get("packages", {}).values():
+            if type(entry) is not dict:
+                continue
+            url = entry.get("resolved")
+            if url not in mapping:
+                continue
+            integrity = _npm_integrity(entry.get("integrity"))
+            if url not in copied:
+                source_tarball = Path(mapping[url])
+                if source_tarball.is_symlink() or not source_tarball.is_file():
+                    raise SourceBuildRefusal("lock")
+                destination = tarball_root / (str(len(copied)) + ".tgz")
+                shutil.copyfile(source_tarball, destination)
+                digest = hashlib.sha512()
+                with open(destination, "rb") as copied_file:
+                    while True:
+                        block = copied_file.read(1024 * 1024)
+                        if not block:
+                            break
+                        digest.update(block)
+                if digest.digest() != integrity:
+                    destination.unlink()
+                    raise SourceBuildRefusal("hash_mismatch")
+                os.chown(destination, linux_harness.CHILD_UID, linux_harness.CHILD_GID)
+                os.chmod(destination, 0o444)
+                copied[url] = destination.resolve().as_uri()
+            elif package_integrities[url] != integrity:
                 raise SourceBuildRefusal("lock")
-            destination = tarball_root / (str(len(copied)) + ".tgz")
-            shutil.copyfile(source_tarball, destination)
-            digest = hashlib.sha512()
-            with open(destination, "rb") as copied_file:
-                while True:
-                    block = copied_file.read(1024 * 1024)
-                    if not block:
-                        break
-                    digest.update(block)
-            if digest.digest() != integrity:
-                destination.unlink()
-                raise SourceBuildRefusal("hash_mismatch")
-            os.chown(destination, linux_harness.CHILD_UID, linux_harness.CHILD_GID)
-            os.chmod(destination, 0o444)
-            copied[url] = destination.resolve().as_uri()
-        elif package_integrities[url] != integrity:
-            raise SourceBuildRefusal("lock")
-        package_integrities[url] = integrity
-        entry["resolved"] = copied[url]
+            package_integrities[url] = integrity
+            entry["resolved"] = copied[url]
+        lock_path.write_text(json.dumps(lock, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     if set(copied) != set(mapping):
         raise SourceBuildRefusal("lock")
-    lock_path.write_text(json.dumps(lock, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     for current, directories, files in os.walk(worker, followlinks=False):
         os.chown(current, linux_harness.CHILD_UID, linux_harness.CHILD_GID)
         os.chmod(current, 0o755)
@@ -2069,31 +2352,6 @@ def _prepare_worker_tree(source, tarball_index, environ):
         inventory_path.write_bytes(staged_inventory)
         os.chown(inventory_path, linux_harness.CHILD_UID, linux_harness.CHILD_GID)
         os.chmod(inventory_path, 0o444)
-        receipt = {
-            "schema_version": 1,
-            "source_sha": source_sha,
-            "original_inventory_sha256": original_inventory_sha256,
-            "sanitized_inventory_sha256": hashlib.sha256(staged_inventory).hexdigest(),
-            "deleted_paths": deleted_paths,
-            "modified_paths": modified_paths,
-        }
-        receipt_bytes = cargo_lock_bootstrap._canonical(receipt, "bootstrap_manifest_refused") + b"\n"
-        records_root = Path(environ.get("RUNNER_TEMP", "/tmp")) / "kd-records"
-        records_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        receipt_path = records_root / "runtime-inventory-stage.json"
-        try:
-            descriptor = os.open(
-                receipt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                0o400,
-            )
-            try:
-                os.write(descriptor, receipt_bytes)
-                os.fchmod(descriptor, 0o400)
-            finally:
-                os.close(descriptor)
-        except OSError:
-            raise SourceBuildRefusal("gate") from None
-        environ["KD_STAGED_INVENTORY_RECEIPT"] = str(receipt_path)
     return worker
 
 
@@ -2111,7 +2369,7 @@ def _validate_cargo_lock_sources(project):
             payload = (Path(current) / "Cargo.lock").read_bytes()
         except OSError:
             raise SourceBuildRefusal("lock") from None
-        if len(payload) > rust_license_gate.MAX_LOCK_BYTES:
+        if len(payload) > MAX_CARGO_LOCK_BYTES:
             raise SourceBuildRefusal("lock")
         try:
             cargo_lock_bootstrap.cargo.parse_cargo_lock(payload)
@@ -2281,7 +2539,7 @@ def _read_bounded_cargo_lock(root_fd, candidate):
         lock_name = relative_parts[-1]
         before = os.stat(lock_name, dir_fd=parent_fd, follow_symlinks=False)
         if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
-                or before.st_size > rust_license_gate.MAX_LOCK_BYTES):
+                or before.st_size > MAX_CARGO_LOCK_BYTES):
             raise SourceBuildRefusal("lock")
         if discovered_identity != _stat_identity(before):
             raise SourceBuildRefusal("lock")
@@ -2294,15 +2552,15 @@ def _read_bounded_cargo_lock(root_fd, candidate):
                 or not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1):
             raise SourceBuildRefusal("lock")
         content = bytearray()
-        while len(content) <= rust_license_gate.MAX_LOCK_BYTES:
+        while len(content) <= MAX_CARGO_LOCK_BYTES:
             chunk = os.read(
                 descriptor,
-                min(65536, rust_license_gate.MAX_LOCK_BYTES + 1 - len(content)),
+                min(65536, MAX_CARGO_LOCK_BYTES + 1 - len(content)),
             )
             if not chunk:
                 break
             content.extend(chunk)
-        if len(content) > rust_license_gate.MAX_LOCK_BYTES:
+        if len(content) > MAX_CARGO_LOCK_BYTES:
             raise SourceBuildRefusal("lock")
         after = os.fstat(descriptor)
         path_after = os.stat(lock_name, dir_fd=parent_fd, follow_symlinks=False)
@@ -2457,264 +2715,11 @@ def _require_confined_manifests(root_fd):
         _require_confined_manifest(root_fd, candidate[0][:-1], document)
 
 
-def _check_d145_runtime_batch_seven_tree(root_fd):
-    prefixes = cargo_lock_bootstrap.RUNTIME_BATCH_SEVEN_CRATE_ROOTS
-    required_files = {
-        prefix: {"Cargo.toml", "README.md", "CONTRACT.md", "CHANGELOG.md", "src/lib.rs"}
-        for prefix in prefixes
-    }
-    found_files = {prefix: set() for prefix in prefixes}
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    descriptors = []
-    identities = [_directory_identity(os.fstat(root_fd))]
-    current = os.dup(root_fd)
-    descriptors.append(current)
-    try:
-        for component in ("runtime", "crates"):
-            before = os.stat(component, dir_fd=current, follow_symlinks=False)
-            if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
-                raise SourceBuildRefusal("lock")
-            child = os.open(component, directory_flags, dir_fd=current)
-            opened = os.fstat(child)
-            if _directory_identity(opened) != _directory_identity(before):
-                os.close(child)
-                raise SourceBuildRefusal("lock")
-            descriptors.append(child)
-            current = child
-            identities.append(_directory_identity(opened))
-    except SourceBuildRefusal:
-        for descriptor in reversed(descriptors):
-            os.close(descriptor)
-        raise
-    except OSError:
-        for descriptor in reversed(descriptors):
-            os.close(descriptor)
-        raise SourceBuildRefusal("lock") from None
-    for descriptor in reversed(descriptors[:-1]):
-        os.close(descriptor)
-    pending = [(('runtime', 'crates'), tuple(identities))]
-    total_entries = 0
-    doc_names = {"README.md", "CONTRACT.md", "CHANGELOG.md"}
-    while pending:
-        parts, ancestry = pending.pop()
-        opened_directories = _open_verified_directory(root_fd, parts, ancestry)
-        current_fd = opened_directories[-1]
-        try:
-            with os.scandir(current_fd) as iterator:
-                entries = sorted(iterator, key=lambda item: item.name)
-            for entry in entries:
-                total_entries += 1
-                if total_entries > MAX_TREE_ENTRIES:
-                    raise SourceBuildRefusal("lock")
-                child_parts = parts + (entry.name,)
-                relative = "/".join(child_parts)
-                prefix = next((item for item in prefixes
-                               if relative == item or relative.startswith(item + "/")), None)
-                try:
-                    metadata = os.stat(entry.name, dir_fd=current_fd, follow_symlinks=False)
-                except OSError:
-                    raise SourceBuildRefusal("lock") from None
-                if entry.name in doc_names:
-                    previous_service_path = (
-                        relative in {
-                            cargo_lock_bootstrap.RUNTIME_EXISTING_SERVICE_DOC_ROOT + "/" + name
-                            for name in cargo_lock_bootstrap.RUNTIME_EXISTING_SERVICE_DOC_FILES
-                        }
-                    )
-                    batch_document_path = (
-                        prefix is not None
-                        and relative[len(prefix) + 1:] in cargo_lock_bootstrap.RUNTIME_BATCH_SEVEN_DOC_FILES
-                    )
-                    if (not previous_service_path and not batch_document_path
-                            or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1):
-                        raise SourceBuildRefusal("lock")
-                if stat.S_ISLNK(metadata.st_mode):
-                    if prefix is not None:
-                        raise SourceBuildRefusal("lock")
-                    continue
-                if stat.S_ISDIR(metadata.st_mode):
-                    if prefix is not None and relative != prefix:
-                        within = relative[len(prefix) + 1:]
-                        if not (within == "src" or within.startswith("src/") or within == "tests"):
-                            raise SourceBuildRefusal("lock")
-                    child_fd = os.open(entry.name, directory_flags, dir_fd=current_fd)
-                    child_metadata = os.fstat(child_fd)
-                    if _directory_identity(child_metadata) != _directory_identity(metadata):
-                        os.close(child_fd)
-                        raise SourceBuildRefusal("lock")
-                    os.close(child_fd)
-                    pending.append((child_parts, ancestry + (_directory_identity(metadata),)))
-                    continue
-                if prefix is not None:
-                    within = relative[len(prefix) + 1:]
-                    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
-                            or not cargo_lock_bootstrap._runtime_batch_seven_file_allowed(within)):
-                        raise SourceBuildRefusal("lock")
-                    found_files[prefix].add(within)
-        except SourceBuildRefusal:
-            raise
-        except OSError:
-            raise SourceBuildRefusal("lock") from None
-        finally:
-            for descriptor in reversed(opened_directories):
-                os.close(descriptor)
-    for prefix, required in required_files.items():
-        if not required.issubset(found_files[prefix]):
-            raise SourceBuildRefusal("lock")
-
-
-def _check_d145_runtime_profile(root_fd, source=None, source_sha=None, staged_inventory_receipt=None):
-    manifest_candidates = _rust_lock_paths(
-        root_fd, "Cargo.toml", MAX_MANIFEST_FILES, False, True,
-    )
-    lock_candidates = _rust_lock_paths(root_fd, "Cargo.lock", 32, False, True)
-    manifests_by_path = {"/".join(item[0]): item for item in manifest_candidates}
-    locks_by_path = {"/".join(item[0]): item for item in lock_candidates}
-    runtime_root = cargo_lock_bootstrap.workspace_root_manifest("runtime")
-    runtime_lock = "runtime/Cargo.lock"
-    if runtime_root not in manifests_by_path and runtime_lock not in locks_by_path:
-        if any(path.startswith("runtime/") for path in manifests_by_path | locks_by_path):
-            raise SourceBuildRefusal("lock")
-        return False
-    if runtime_root not in manifests_by_path or runtime_lock not in locks_by_path:
-        raise SourceBuildRefusal("lock")
-    try:
-        runtime_root_bytes = _read_bounded_cargo_lock(root_fd, manifests_by_path[runtime_root])
-        runtime_document = cargo_lock_bootstrap._parse_manifest(runtime_root_bytes)
-        workspace = runtime_document.get("workspace")
-        listed = workspace.get("members") if type(workspace) is dict else None
-        if type(listed) is not list or any(type(item) is not str for item in listed):
-            raise ValueError
-        runtime_members = frozenset(
-            posixpath.normpath(posixpath.join("runtime", item)) for item in listed
-        )
-        runtime_manifest_paths = {runtime_root}
-        runtime_manifest_paths.update(member + "/Cargo.toml" for member in runtime_members)
-        runtime_manifests = {
-            path: _read_bounded_cargo_lock(root_fd, manifests_by_path[path])
-            for path in runtime_manifest_paths
-        }
-        runtime_names = cargo_lock_bootstrap.check_manifests(
-            runtime_manifests, runtime_members, cargo_lock_bootstrap.RUNTIME_WORKSPACE,
-        )
-        batch_seven_profile = frozenset(
-            cargo_lock_bootstrap.RUNTIME_BATCH_SEVEN_CRATE_ROOTS
-        ) <= runtime_members
-        if batch_seven_profile:
-            _check_d145_runtime_batch_seven_tree(root_fd)
-        wave70a_profile = frozenset(
-            cargo_lock_bootstrap.HOST_API_POLICY_RUNTIME_WAVE_70A_REQUIRED_MEMBER_ROOTS
-        ) <= runtime_members
-        wave70b_profile = frozenset(
-            cargo_lock_bootstrap.HOST_API_POLICY_RUNTIME_WAVE_70B_REQUIRED_MEMBER_ROOTS
-        ) <= runtime_members
-        runtime_identities = set(cargo_lock_bootstrap.manifest_package_identities(
-            runtime_manifests, cargo_lock_bootstrap.RUNTIME_WORKSPACE,
-        ))
-        contract_root_bytes = _read_bounded_cargo_lock(root_fd, manifests_by_path["Cargo.toml"])
-        contract_members = cargo_lock_bootstrap._contract_members_from_root_bytes(contract_root_bytes)
-        if wave70a_profile or wave70b_profile:
-            cargo_lock_bootstrap._validate_contract_wave70_trees(source, contract_members)
-        contract_manifest_paths = {"Cargo.toml"}
-        contract_manifest_paths.update(member + "/Cargo.toml" for member in contract_members)
-        contract_manifests = {
-            path: _read_bounded_cargo_lock(root_fd, manifests_by_path[path])
-            for path in contract_manifest_paths
-        }
-        contract_names = cargo_lock_bootstrap.check_manifests(
-            contract_manifests, contract_members, cargo_lock_bootstrap.CONTRACT_WORKSPACE,
-            require_first_batch=False,
-        )
-        contract_identities = cargo_lock_bootstrap.manifest_package_identities(
-            contract_manifests, cargo_lock_bootstrap.CONTRACT_WORKSPACE,
-        )
-        api_identity = next((identity for identity in contract_identities
-                             if identity[0] == cargo_lock_bootstrap.HOST_API_POLICY_API_PACKAGE), None)
-        if batch_seven_profile:
-            if api_identity is None or cargo_lock_bootstrap.HOST_API_POLICY_API_PACKAGE not in runtime_names:
-                raise ValueError
-            runtime_identities.add(api_identity)
-        runtime_rules = cargo_lock_bootstrap.manifest_dependency_rules(
-            runtime_manifests, cargo_lock_bootstrap.RUNTIME_WORKSPACE,
-        )
-        if batch_seven_profile:
-            api_rules = cargo_lock_bootstrap.manifest_dependency_rules(
-                {"Cargo.toml": contract_manifests["Cargo.toml"],
-                 cargo_lock_bootstrap.HOST_API_POLICY_API_MANIFEST_PATH:
-                     contract_manifests[cargo_lock_bootstrap.HOST_API_POLICY_API_MANIFEST_PATH]},
-                cargo_lock_bootstrap.CONTRACT_WORKSPACE,
-            )
-            runtime_rules.update(api_rules)
-        runtime_lock_bytes = _read_bounded_cargo_lock(root_fd, locks_by_path[runtime_lock])
-        cargo_lock_bootstrap.check_lock_members(
-            runtime_lock_bytes, runtime_names, runtime_identities, runtime_rules,
-        )
-        contract_lock_bytes = _read_bounded_cargo_lock(root_fd, locks_by_path["Cargo.lock"])
-        cargo_lock_bootstrap.check_lock_members(
-            contract_lock_bytes, contract_names, contract_identities,
-            cargo_lock_bootstrap.manifest_dependency_rules(
-                contract_manifests, cargo_lock_bootstrap.CONTRACT_WORKSPACE,
-            ),
-        )
-        api_path = cargo_lock_bootstrap.HOST_API_POLICY_API_PATH
-        if posixpath.normpath(posixpath.join("runtime", api_path)) != "crates/host/api":
-            raise ValueError
-        _require_physical_manifest_path(root_fd, ("runtime",), api_path)
-        _require_confined_manifest_path(root_fd, ("crates", "host", "api"), "src/lib.rs")
-        if wave70a_profile or wave70b_profile:
-            if source is None or SOURCE_SHA_RE.fullmatch(source_sha or "") is None:
-                raise ValueError
-            cargo_lock_bootstrap.validate_runtime_profile_source_tree(
-                source, source_sha, staged_inventory_receipt=staged_inventory_receipt,
-            )
-    except (KeyError, TypeError, ValueError, cargo_lock_bootstrap.BootstrapRefusal):
-        raise SourceBuildRefusal("lock") from None
-    return True
-
-
-def _read_staged_inventory_receipt(environ):
-    supplied = environ.get("KD_STAGED_INVENTORY_RECEIPT", "")
-    if not supplied:
-        return None
-    expected = Path(environ.get("RUNNER_TEMP", "/tmp")) / "kd-records" / "runtime-inventory-stage.json"
-    path = Path(supplied)
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
-    if path != expected or not path.is_absolute():
-        raise SourceBuildRefusal("gate")
-    try:
-        descriptor = os.open(path, flags)
-        try:
-            details = os.fstat(descriptor)
-            if (not stat.S_ISREG(details.st_mode) or details.st_uid != 0
-                    or details.st_nlink != 1 or stat.S_IMODE(details.st_mode) != 0o400
-                    or details.st_size <= 0 or details.st_size > 65536):
-                raise SourceBuildRefusal("gate")
-            chunks = []
-            total = 0
-            while True:
-                block = os.read(descriptor, min(8192, 65537 - total))
-                if not block:
-                    break
-                total += len(block)
-                if total > 65536:
-                    raise SourceBuildRefusal("gate")
-                chunks.append(block)
-            return b"".join(chunks)
-        finally:
-            os.close(descriptor)
-    except OSError:
-        raise SourceBuildRefusal("gate") from None
-
-
-_RUST_VENDOR_ADMISSIONS = contextvars.ContextVar("rust_vendor_admissions", default=None)
-
-
-def run_rust_license_gate(environ=None):
-    _RUST_VENDOR_ADMISSIONS.set(None)
+def fetch_cargo_locks(environ=None):
+    """Fetch Cargo sources named by committed locks before the confined offline build."""
     env = os.environ if environ is None else environ
     source = Path(env.get("SOURCE_PATH", ""))
     source_sha = env.get("REQUESTED_SOURCE_SHA", "")
-    staged_inventory_receipt = _read_staged_inventory_receipt(env)
     if SOURCE_SHA_RE.fullmatch(source_sha) is None:
         raise SourceBuildRefusal("binding")
     try:
@@ -2722,69 +2727,196 @@ def run_rust_license_gate(environ=None):
     except SourceBuildRefusal:
         raise SourceBuildRefusal("binding") from None
     root_identity = _directory_identity(os.fstat(root_fd))
-    lock_count = 0
-    all_registry_free = True
-    vendor_admissions = {}
+    manifests = []
     try:
         _require_source_root_identity(source, root_identity)
         _require_confined_manifests(root_fd)
-        _check_d145_runtime_profile(
-            root_fd, source, source_sha, staged_inventory_receipt,
-        )
         for candidate in _rust_lock_paths(root_fd):
             try:
                 lock_bytes = _read_bounded_cargo_lock(root_fd, candidate)
                 relative_parts = candidate[0][:-1]
-                profile = "/".join(relative_parts) or "."
-                lock_relative = (profile + "/" if profile != "." else "") + "Cargo.lock"
-                if len(profile) > 64 or len(lock_relative) > 512:
-                    raise SourceBuildRefusal("lock")
                 _require_source_root_identity(source, root_identity)
             except (OSError, ValueError):
                 raise SourceBuildRefusal("lock") from None
-            if not lock_bytes or len(lock_bytes) > rust_license_gate.MAX_LOCK_BYTES:
+            if not lock_bytes or len(lock_bytes) > MAX_CARGO_LOCK_BYTES:
                 raise SourceBuildRefusal("lock")
-            identity = rust_license_gate.Identity(
-                source_sha, profile, str(source.joinpath(*relative_parts)),
-                hashlib.sha256(lock_bytes).hexdigest(),
-            )
             try:
-                parsed_lock = cargo_lock_bootstrap.cargo.parse_cargo_lock(lock_bytes)
+                cargo_lock_bootstrap.cargo.parse_cargo_lock(lock_bytes)
             except cargo_lock_bootstrap.cargo.Refusal:
-                raise rust_license_gate.LicenseGateRefusal("lock") from None
-            if any(item.get("source") == cargo_lock_bootstrap.cargo.REGISTRY_SOURCE
-                   for item in parsed_lock["packages"]):
-                try:
-                    vendor_admissions[lock_relative] = cargo_rust_admission.admit_authenticated_lock(
-                        lock_bytes, source, source_sha, profile, lock_relative,
-                        env.get("KD_CARGO_LOCK_EVIDENCE_DIR", ""),
-                        env.get("RUNNER_TEMP", "/tmp"), env.get("RUST_ROOT", ""),
-                        rust_license_gate.TRUSTED_PORTS,
-                    )
-                except (cargo_rust_admission.RustAdmissionRefusal,
-                        rust_license_gate.LicenseGateRefusal):
-                    raise SourceBuildRefusal("gate") from None
-                receipt = vendor_admissions[lock_relative]["license_gate_receipt"]
-            else:
-                receipt = rust_license_gate.require_lock_admission(
-                    lock_bytes, identity, rust_license_gate.TRUSTED_PORTS,
-                )
-            lock_count += 1
-            if type(receipt) is not rust_license_gate.RegistryFreeReceipt:
-                all_registry_free = False
+                raise SourceBuildRefusal("lock") from None
+            relative = Path(*relative_parts) if relative_parts else Path()
+            manifest = source / relative / "Cargo.toml"
+            try:
+                info = manifest.lstat()
+            except OSError:
+                raise SourceBuildRefusal("lock") from None
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise SourceBuildRefusal("lock")
+            manifests.append(manifest)
     finally:
         os.close(root_fd)
-    if lock_count == 0:
+    if not manifests:
         raise SourceBuildRefusal("lock")
-    if all_registry_free:
-        sys.stdout.write("linux-rust-licence=registry-free locks=" + str(lock_count) + "\n")
-    _RUST_VENDOR_ADMISSIONS.set(vendor_admissions)
+    cache = _optional_rust_cache(env, source, env.get("RUST_CACHE_SCOPE"))
+    cargo = Path(env.get("RUST_ROOT", "")) / "bin" / "cargo"
+    fetch_home = Path(env.get("KD_CARGO_FETCH_HOME", ""))
+    runner_temp = Path(env.get("RUNNER_TEMP", "/tmp"))
+    try:
+        if (not cargo.is_file() or not fetch_home.is_absolute() or fetch_home.is_symlink()
+                or fetch_home.parent.resolve(strict=True) != runner_temp.resolve(strict=True)
+                or fetch_home.exists()):
+            raise SourceBuildRefusal("toolchain")
+        fetch_home.mkdir(mode=0o700)
+        config = fetch_home / "config.toml"
+        config.write_text("\n", encoding="ascii")
+        os.chmod(config, 0o600)
+        if cache is not None and cache["hit"]:
+            try:
+                with tempfile.TemporaryDirectory(
+                    prefix="kd-rust-cache-seed-", dir=runner_temp,
+                ) as seed:
+                    seed_home = Path(seed)
+                    _copy_cargo_registry_cache(cache["directory"] / "cargo-home", seed_home)
+                    for name in ("registry", "git"):
+                        seeded = seed_home / name
+                        if seeded.exists() or seeded.is_symlink():
+                            shutil.move(str(seeded), str(fetch_home / name))
+            except (OSError, shutil.Error, SourceBuildRefusal, ValueError):
+                for name in ("registry", "git"):
+                    _discard_optional_cache_path(fetch_home / name)
+    except (OSError, ValueError):
+        raise SourceBuildRefusal("toolchain") from None
+    fetch_env = {
+        "PATH": str(cargo.parent) + ":/usr/bin:/bin",
+        "HOME": str(fetch_home),
+        "TMPDIR": str(fetch_home),
+        "CARGO_HOME": str(fetch_home),
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_TERM_COLOR": "never",
+        "LANG": "C",
+        "LC_ALL": "C",
+    }
+    for manifest in sorted(manifests, key=lambda item: item.relative_to(source).as_posix()):
+        result = _run(
+            (str(cargo), "fetch", "--locked", "--manifest-path", str(manifest)),
+            fetch_home,
+            fetch_env,
+            timeout=300,
+            maximum=4 * 1024 * 1024,
+        )
+        if result.returncode != 0:
+            raise SourceBuildRefusal("lock")
+    output = env.get("GITHUB_OUTPUT")
+    if output:
+        with open(output, "at", encoding="ascii") as sink:
+            sink.write("cargo_fetch_home=" + str(fetch_home) + "\n")
+    sys.stdout.write("linux-cargo-fetch=committed-locks locks=" + str(len(manifests)) + " offline-build=ready\n")
     return 0
+
+
+def _copy_cargo_registry_cache(source_home, destination_home, owner=None):
+    entries = 0
+    for name in ("registry", "git"):
+        source_path = Path(source_home) / name
+        destination_path = Path(destination_home) / name
+        if not source_path.exists() and not source_path.is_symlink():
+            continue
+        entries += _copy_validated_cache_tree(
+            source_path, destination_path, owner=owner,
+            allow_existing_empty=True,
+        )
+    return entries
+
+
+def _copy_validated_cache_tree(source, destination, owner=None, allow_existing_empty=False):
+    source = Path(source)
+    destination = Path(destination)
+    try:
+        root_info = source.lstat()
+        if not stat.S_ISDIR(root_info.st_mode):
+            raise SourceBuildRefusal("cache")
+    except OSError:
+        raise SourceBuildRefusal("cache") from None
+    root_resolved = source.resolve(strict=True)
+    entries = 0
+    hardlink_counts = {}
+    hardlink_totals = {}
+    for current, directories, files in os.walk(source, followlinks=False):
+        current_path = Path(current)
+        for name in list(directories):
+            item = current_path / name
+            info = item.lstat()
+            entries += 1
+            if entries > MAX_TREE_ENTRIES:
+                raise SourceBuildRefusal("cache")
+            if stat.S_ISLNK(info.st_mode):
+                link = os.readlink(item)
+                resolved = (item.parent / link).resolve(strict=False)
+                if os.path.isabs(link) or os.path.commonpath((str(root_resolved), str(resolved))) != str(root_resolved):
+                    raise SourceBuildRefusal("cache")
+                directories.remove(name)
+            elif not stat.S_ISDIR(info.st_mode):
+                raise SourceBuildRefusal("cache")
+        for name in files:
+            item = current_path / name
+            info = item.lstat()
+            entries += 1
+            if entries > MAX_TREE_ENTRIES:
+                raise SourceBuildRefusal("cache")
+            if stat.S_ISLNK(info.st_mode):
+                link = os.readlink(item)
+                resolved = (item.parent / link).resolve(strict=False)
+                if os.path.isabs(link) or os.path.commonpath((str(root_resolved), str(resolved))) != str(root_resolved):
+                    raise SourceBuildRefusal("cache")
+            elif not stat.S_ISREG(info.st_mode):
+                raise SourceBuildRefusal("cache")
+            else:
+                inode = (info.st_dev, info.st_ino)
+                hardlink_counts[inode] = hardlink_counts.get(inode, 0) + 1
+                hardlink_totals[inode] = info.st_nlink
+    if any(hardlink_counts[inode] != total for inode, total in hardlink_totals.items()):
+        raise SourceBuildRefusal("cache")
+    if destination.exists() or destination.is_symlink():
+        try:
+            info = destination.lstat()
+            if (not allow_existing_empty or not stat.S_ISDIR(info.st_mode)
+                    or any(destination.iterdir())):
+                raise SourceBuildRefusal("cache")
+        except OSError:
+            raise SourceBuildRefusal("cache") from None
+    else:
+        try:
+            destination.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        except OSError:
+            raise SourceBuildRefusal("cache") from None
+    try:
+        shutil.copytree(source, destination, symlinks=True, dirs_exist_ok=allow_existing_empty)
+        if owner is not None:
+            for current, directories, files in os.walk(destination, followlinks=False):
+                os.chown(current, owner[0], owner[1])
+                os.chmod(current, 0o755)
+                for name in directories + files:
+                    item = Path(current) / name
+                    if item.is_symlink():
+                        continue
+                    info = item.lstat()
+                    if stat.S_ISDIR(info.st_mode):
+                        os.chown(item, owner[0], owner[1])
+                        os.chmod(item, 0o755)
+                    elif stat.S_ISREG(info.st_mode):
+                        os.chown(item, owner[0], owner[1])
+                        os.chmod(item, 0o755 if info.st_mode & stat.S_IXUSR else 0o644)
+                    else:
+                        raise SourceBuildRefusal("cache")
+    except (OSError, shutil.Error):
+        raise SourceBuildRefusal("cache") from None
+    return entries
 
 
 def prepare_project(environ=None):
     env = os.environ if environ is None else environ
     source = Path(env.get("SOURCE_PATH", ""))
+    cache = _optional_rust_cache(env, source, env.get("RUST_CACHE_SCOPE"))
     rust_root = Path(env.get("RUST_ROOT", ""))
     tarball_index = env.get("NPM_TARBALL_INDEX", "")
     cargo = rust_root / "bin" / "cargo"
@@ -2794,8 +2926,20 @@ def prepare_project(environ=None):
     if (hashlib.sha256(lock_bytes).hexdigest() != env.get("EXPECTED_NODE_LOCK_SHA256")
             or _manifest_digest(source) != env.get("EXPECTED_MANIFEST_SHA256")):
         raise SourceBuildRefusal("lock")
+    if env.get("KD_INCLUDE_RUNTIME_NPM_LOCK") == "true":
+        runtime_lock = source / "runtime" / "package-lock.json"
+        try:
+            runtime_info = runtime_lock.lstat()
+            runtime_lock_sha = hashlib.sha256(runtime_lock.read_bytes()).hexdigest()
+        except OSError:
+            raise SourceBuildRefusal("lock") from None
+        if (not stat.S_ISREG(runtime_info.st_mode) or runtime_info.st_nlink != 1
+                or runtime_lock_sha != env.get("EXPECTED_RUNTIME_NODE_LOCK_SHA256")):
+            raise SourceBuildRefusal("lock")
     _validate_cargo_lock_sources(source)
     worker = _prepare_worker_tree(source, tarball_index, env)
+    if env.get("KD_INCLUDE_RUNTIME_NPM_LOCK") == "true":
+        _ensure_test_shell_icons(worker)
     cargo_home = worker / ".kd-cargo-home"
     try:
         cargo_home.mkdir(mode=0o755)
@@ -2803,299 +2947,418 @@ def prepare_project(environ=None):
         raise SourceBuildRefusal("gate") from None
     config = cargo_home / "config.toml"
     config.write_text("\n", encoding="ascii")
+    _copy_cargo_registry_cache(
+        env.get("KD_CARGO_FETCH_HOME", ""), cargo_home,
+        owner=(linux_harness.CHILD_UID, linux_harness.CHILD_GID),
+    )
     os.chown(config, linux_harness.CHILD_UID, linux_harness.CHILD_GID)
     os.chmod(config, 0o444)
     os.chown(cargo_home, linux_harness.CHILD_UID, linux_harness.CHILD_GID)
     os.chmod(cargo_home, 0o755)
     _project_gate_directories(worker, create=True)
+    if cache is not None and cache["hit"]:
+        try:
+            _copy_validated_cache_tree(
+                cache["directory"] / "target", worker / "target",
+                owner=(linux_harness.CHILD_UID, linux_harness.CHILD_GID), allow_existing_empty=True,
+            )
+        except (OSError, shutil.Error, SourceBuildRefusal, ValueError):
+            target = worker / "target"
+            _discard_optional_cache_path(target)
+            target.mkdir(mode=0o700)
+            os.chown(target, linux_harness.CHILD_UID, linux_harness.CHILD_GID)
     output = env.get("GITHUB_OUTPUT")
     if output:
         with open(output, "at", encoding="ascii") as sink:
             sink.write("worker_path=" + str(worker) + "\n")
             sink.write("cargo_home=" + str(cargo_home) + "\n")
-            if env.get("KD_STAGED_INVENTORY_RECEIPT"):
-                sink.write("staged_inventory_receipt=" + env["KD_STAGED_INVENTORY_RECEIPT"] + "\n")
-    sys.stdout.write("linux-project-inputs=prepared cargo=registry-free npm=integrity\n")
+    sys.stdout.write("linux-project-inputs=prepared cargo=locked-cache npm=integrity\n")
     return 0
 
 
-def _locked_node_name(path):
-    marker = "node_modules/"
-    index = path.rfind(marker)
-    return path[index + len(marker):] if index >= 0 else None
-
-
-def _audit_refuse(detail, count=None):
-    return SourceBuildRefusal("lock", detail, count)
-
-
-def _audit_nodes_are_dev_only(nodes, packages, name, versions):
-    if type(nodes) is not list or not 0 < len(nodes) <= MAX_AUDIT_NODES:
-        raise _audit_refuse("audit_nodes_shape")
-    for node in nodes:
-        if type(node) is not str or len(node) > 1024:
-            raise _audit_refuse("audit_nodes_shape")
-        entry = packages.get(node)
-        if type(entry) is not dict or _locked_node_name(node) != name:
-            raise _audit_refuse("audit_nodes_shape")
-        if entry.get("dev") is not True:
-            raise _audit_refuse("audit_nondev")
-        if versions is not None and (type(entry.get("version")) is not str or entry["version"] not in versions):
-            raise _audit_refuse("audit_version_not_allowed")
-
-
-def _audit_versions_are_dev_only(packages, name, versions):
-    for path, entry in packages.items():
-        if type(entry) is not dict or _locked_node_name(path) != name:
-            continue
-        if type(entry.get("version")) is not str:
-            raise _audit_refuse("audit_version_not_allowed")
-        if entry["version"] in versions and entry.get("dev") is not True:
-            raise _audit_refuse("audit_nondev")
-
-
-def _audit_advisory_candidates(item, name, allows, now_ms):
-    source = item.get("source")
-    severity = item.get("severity")
-    if (item.get("name") != name or type(severity) is not str or severity not in SEVERITY_RANK
-            or type(source) not in (int, str)):
-        raise _audit_refuse("audit_via_shape")
-    identifiers = {str(source)}
-    url = item.get("url")
-    if type(url) is str and len(url) <= MAX_AUDIT_TEXT and url.startswith(ADVISORY_URL_PREFIX):
-        tail = url[len(ADVISORY_URL_PREFIX):]
-        if IDENTIFIER_RE.fullmatch(tail) is not None:
-            identifiers.add(tail)
-    named = [
-        allow for allow in allows
-        if allow["name"] == name and allow["advisory_id"] in identifiers
-        and allow["severity"] in ALLOWABLE_SEVERITIES
-    ]
-    if not named:
-        raise _audit_refuse("audit_advisory_unmatched")
-    live = [allow for allow in named if allow["allow_expires_at_ms"] > now_ms]
-    if not live:
-        raise _audit_refuse("audit_allow_expired")
-    fitting = [allow for allow in live if SEVERITY_RANK[severity] <= SEVERITY_RANK[allow["severity"]]]
-    if not fitting:
-        raise _audit_refuse("audit_advisory_severity")
-    return fitting
-
-
-def _audit_reached_from_advisories(rooted, consumers):
-    dependents = {}
-    for name, targets in consumers.items():
-        for target in targets:
-            dependents.setdefault(target, []).append(name)
-    reached = set(rooted)
-    queue = list(rooted)
-    while queue:
-        for name in dependents.get(queue.pop(), ()):
-            if name not in reached:
-                reached.add(name)
-                queue.append(name)
-    return reached
-
-
-def _check_audit_report(stdout, allows, packages, now_ms, stderr=b""):
-    """Match one strict npm audit report against the findings the trusted run allowed.
-
-    Every vulnerability that names an advisory must match an allowed finding on the locked
-    name, the advisory id, a severity no higher than the recorded one and an unexpired allow,
-    and all its locked nodes must be development-only entries of an allowed version. A
-    vulnerability that only lists other vulnerable packages must point at listed ones, be
-    development-only, and reach an advisory-matched vulnerability through those listings.
-    Anything else refuses with a fixed detail token and never a name or value. Returns the
-    counts of vulnerabilities and matched advisories and the exit code npm gives such a
-    report: one when any low, moderate, high or critical count is above zero, else zero."""
-    if not stdout.strip():
-        if not stderr.strip():
-            raise _audit_refuse("audit_json_empty")
-        detail = "audit_json_empty_stderr_json" if stderr.lstrip(b" \t\n\r")[:1] == b"{" else "audit_json_empty_stderr_text"
-        raise _audit_refuse(detail, _nonempty_lines(stderr, b"\n"))
-    try:
-        text = stdout.decode("utf-8", "strict")
-    except UnicodeError:
-        raise _audit_refuse("audit_json_encoding") from None
-    start = len(text) - len(text.lstrip(JSON_WHITESPACE))
-    decoder = json.JSONDecoder(object_pairs_hook=_unique_json_pairs, parse_constant=_reject_json_constant)
-    first = text[start:start + 1]
-    if first and first in JSON_NON_OBJECT_STARTS:
-        try:
-            unused, end = decoder.raw_decode(text, start)
-        except (ValueError, RecursionError, TypeError):
-            pass
-        else:
-            if not text[end:].strip(JSON_WHITESPACE):
-                raise _audit_refuse("audit_json_not_object")
-    if first != "{":
-        raise _audit_refuse("audit_json_prefix", _lines_before_object(text))
-    try:
-        report, end = decoder.raw_decode(text, start)
-    except _DuplicateJsonKey:
-        raise _audit_refuse("audit_json_duplicate") from None
-    except (ValueError, RecursionError, TypeError):
-        raise _audit_refuse("audit_json_syntax") from None
-    if text[end:].strip(JSON_WHITESPACE):
-        raise _audit_refuse("audit_json_trailing", _nonempty_lines(text[end:], "\n"))
-    if type(report) is not dict:
-        raise _audit_refuse("audit_json_not_object")
-    unexpected = set(report) - {"auditReportVersion", "vulnerabilities", "metadata"}
-    if unexpected:
-        raise _audit_refuse("audit_top_keys", len(unexpected))
-    if type(report.get("auditReportVersion")) is not int or report["auditReportVersion"] != 2:
-        raise _audit_refuse("audit_version")
-    if type(report.get("vulnerabilities")) is not dict:
-        raise _audit_refuse("audit_entry_shape")
-    if type(report.get("metadata")) is not dict or type(report["metadata"].get("vulnerabilities")) is not dict:
-        raise _audit_refuse("audit_meta")
-    vulnerabilities = report["vulnerabilities"]
-    if len(vulnerabilities) > MAX_AUDIT_VULNERABILITIES:
-        raise _audit_refuse("audit_limit")
-    counts = report["metadata"]["vulnerabilities"]
-    for severity in SEVERITY_RANK:
-        count = counts.get(severity, 0)
-        if type(count) is not int or count < 0:
-            raise _audit_refuse("audit_count")
-    if "total" in counts and (type(counts["total"]) is not int or counts["total"] < 0):
-        raise _audit_refuse("audit_count")
-    if counts.get("high", 0) != 0 or counts.get("critical", 0) != 0:
-        raise _audit_refuse("audit_high")
-    if (len(vulnerabilities) == 0) != (sum(counts.get(severity, 0) for severity in SEVERITY_RANK) == 0):
-        raise _audit_refuse("audit_count")
-    expected_exit = 1 if counts.get("low", 0) + counts.get("moderate", 0) > 0 else 0
-    ceiling = max((SEVERITY_RANK[allow["severity"]] for allow in allows), default=-1)
-    matched = 0
-    rooted = set()
-    consumers = {}
-    tally = dict.fromkeys(SEVERITY_RANK, 0)
-    for key, entry in vulnerabilities.items():
-        if type(entry) is not dict:
-            raise _audit_refuse("audit_entry_shape")
-        severity = entry.get("severity")
-        via = entry.get("via")
-        if (type(key) is not str or len(key) > 214 or MANIFEST_PACKAGE_RE.fullmatch(key) is None
-                or entry.get("name") != key):
-            raise _audit_refuse("audit_key_name")
-        if type(severity) is not str or severity not in ALLOWABLE_SEVERITIES:
-            raise _audit_refuse("audit_severity")
-        tally[severity] += 1
-        if type(via) is not list or not 0 < len(via) <= MAX_AUDIT_VIA:
-            raise _audit_refuse("audit_via_shape")
-        advisory_versions = set()
-        listed = set()
-        for item in via:
-            if type(item) is str:
-                if len(item) > MAX_AUDIT_TEXT or item == key:
-                    raise _audit_refuse("audit_via_shape")
-                if item not in vulnerabilities:
-                    raise _audit_refuse("audit_via_unknown")
-                listed.add(item)
-                continue
-            if type(item) is not dict:
-                raise _audit_refuse("audit_via_shape")
-            candidates = _audit_advisory_candidates(item, key, allows, now_ms)
-            if SEVERITY_RANK[severity] > min(SEVERITY_RANK[allow["severity"]] for allow in candidates):
-                raise _audit_refuse("audit_advisory_severity")
-            advisory_versions |= {allow["version"] for allow in candidates}
-            matched += 1
-        if advisory_versions:
-            _audit_nodes_are_dev_only(entry.get("nodes"), packages, key, advisory_versions)
-            _audit_versions_are_dev_only(packages, key, advisory_versions)
-            rooted.add(key)
-        else:
-            if SEVERITY_RANK[severity] > ceiling:
-                raise _audit_refuse("audit_consumer_over_ceiling")
-            _audit_nodes_are_dev_only(entry.get("nodes"), packages, key, None)
-            consumers[key] = listed
-    if not consumers.keys() <= _audit_reached_from_advisories(rooted, consumers):
-        raise _audit_refuse("audit_consumer_unreached")
-    if (any(counts.get(severity, 0) != tally[severity] for severity in SEVERITY_RANK)
-            or counts.get("total", len(vulnerabilities)) != len(vulnerabilities)):
-        raise _audit_refuse("audit_count")
-    return len(vulnerabilities), matched, expected_exit
-
-
-def _audit_config_files(private):
-    paths = []
-    identities = set()
-    try:
-        fresh = Path(tempfile.mkdtemp(prefix="npm-config-", dir=str(private)))
-        for name in (NPM_USER_CONFIG_NAME, NPM_GLOBAL_CONFIG_NAME):
-            path = fresh / name
-            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-            try:
-                details = os.fstat(descriptor)
-            finally:
-                os.close(descriptor)
-            if (not stat.S_ISREG(details.st_mode) or details.st_size != 0 or details.st_nlink != 1
-                    or stat.S_IMODE(details.st_mode) != 0o600 or details.st_uid != os.geteuid()):
-                raise _audit_refuse("audit_run")
-            identities.add((details.st_dev, details.st_ino))
-            paths.append(str(path))
-    except OSError:
-        raise _audit_refuse("audit_run") from None
-    if len(set(paths)) != 2 or len(identities) != 2:
-        raise _audit_refuse("audit_run")
-    return paths[0], paths[1]
-
-
-def run_trusted_audit(environ=None):
+def export_rust_cache(environ=None):
     env = os.environ if environ is None else environ
-    source = Path(env.get("SOURCE_PATH", ""))
-    node = Path(env.get("NODE_BIN", "")) / "node"
-    npm = Path(env.get("NODE_BIN", "")) / "npm"
-    if not source.is_dir() or not node.is_file() or not npm.exists():
-        raise SourceBuildRefusal("toolchain", "audit_toolchain")
     try:
-        _neutralize_config_files(source)
-        identity = _source_inputs(env)
-        lock_bytes = (source / "package-lock.json").read_bytes()
-        _check_lock_provenance(lock_bytes, identity, env, source)
-        record = _validate_provenance_binding(identity, env)
-        allows = record["advisory"]["findings"]
-        valid_until = record["advisory"]["valid_until"]
-    except SourceBuildRefusal as refusal:
-        raise SourceBuildRefusal(refusal.reason, "audit_provenance") from None
-    except (OSError, ValueError, KeyError, TypeError):
-        raise _audit_refuse("audit_provenance") from None
-    if time.time() * 1000 >= valid_until * 1000:
-        raise _audit_refuse("audit_advisory_expired")
-    private = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-audit"
-    private.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        user_config, global_config = _audit_config_files(private)
-        result = _run(
-            (str(node), str(npm), "audit", "--package-lock-only", "--json"), source,
-            {"PATH": str(node.parent) + ":/usr/bin:/bin", "HOME": str(private), "TMPDIR": str(private),
-             "LANG": "C", "LC_ALL": "C", "NPM_CONFIG_USERCONFIG": user_config,
-             "NPM_CONFIG_GLOBALCONFIG": global_config, "NPM_CONFIG_UPDATE_NOTIFIER": "false",
-             "NPM_CONFIG_CACHE": str(private / "cache")},
-            timeout=120, maximum=4 * 1024 * 1024,
+        if os.geteuid() != 0:
+            raise SourceBuildRefusal("cache")
+        runner_uid_text = env.get("SUDO_UID", "")
+        runner_gid_text = env.get("SUDO_GID", "")
+        if (type(runner_uid_text) is not str or DECIMAL_RE.fullmatch(runner_uid_text) is None
+                or type(runner_gid_text) is not str or DECIMAL_RE.fullmatch(runner_gid_text) is None):
+            raise SourceBuildRefusal("cache")
+        runner_owner = (int(runner_uid_text), int(runner_gid_text))
+        source = Path(env.get("SOURCE_PATH", ""))
+        cache = _validate_rust_cache(env, source, env.get("RUST_CACHE_SCOPE"))
+        if cache is None or not _rust_cache_write_allowed(env):
+            raise SourceBuildRefusal("cache")
+        if cache["hit"]:
+            sys.stdout.write("linux-rust-cache=existing\n")
+            return 0
+        runner_temp = Path(env.get("RUNNER_TEMP", ""))
+        try:
+            temp_info = runner_temp.lstat()
+            cache_info = cache["directory"].lstat()
+            if ((temp_info.st_uid, temp_info.st_gid) != runner_owner
+                    or (cache_info.st_uid, cache_info.st_gid) != runner_owner
+                    or not stat.S_ISDIR(temp_info.st_mode)
+                    or not stat.S_ISDIR(cache_info.st_mode)):
+                raise SourceBuildRefusal("cache")
+        except OSError:
+            raise SourceBuildRefusal("cache") from None
+        worker = Path(env.get("WORKER_PATH", ""))
+        cargo_home = Path(env.get("CARGO_HOME", ""))
+        if (not worker.is_absolute() or worker != PROJECT_ROOT / "source"
+                or cargo_home != worker / ".kd-cargo-home"):
+            raise SourceBuildRefusal("cache")
+        try:
+            worker_info = worker.lstat()
+            target_info = (worker / "target").lstat()
+            cargo_home_info = cargo_home.lstat()
+            if (not stat.S_ISDIR(worker_info.st_mode)
+                    or (worker_info.st_uid, worker_info.st_gid)
+                    != (linux_harness.CHILD_UID, linux_harness.CHILD_GID)
+                    or not stat.S_ISDIR(target_info.st_mode)
+                    or (target_info.st_uid, target_info.st_gid)
+                    != (linux_harness.CHILD_UID, linux_harness.CHILD_GID)
+                    or target_info.st_mode & 0o077
+                    or not stat.S_ISDIR(cargo_home_info.st_mode)
+                    or (cargo_home_info.st_uid, cargo_home_info.st_gid)
+                    != (linux_harness.CHILD_UID, linux_harness.CHILD_GID)):
+                raise SourceBuildRefusal("cache")
+        except OSError:
+            raise SourceBuildRefusal("cache") from None
+        target = cache["directory"] / "target"
+        cargo_cache = cache["directory"] / "cargo-home"
+        try:
+            for staging in (target, cargo_cache):
+                staging_info = staging.lstat()
+                if (not stat.S_ISDIR(staging_info.st_mode)
+                        or (staging_info.st_uid, staging_info.st_gid) != runner_owner):
+                    raise SourceBuildRefusal("cache")
+        except OSError:
+            raise SourceBuildRefusal("cache") from None
+        _copy_validated_cache_tree(
+            worker / "target", target, owner=runner_owner, allow_existing_empty=True,
         )
-    except Exception:
-        raise _audit_refuse("audit_run") from None
-    (private / "audit.stdout").write_bytes(result.stdout)
-    (private / "audit.stderr").write_bytes(result.stderr)
-    if result.returncode not in (0, 1):
-        raise _audit_refuse("audit_exit")
+        _copy_cargo_registry_cache(cargo_home, cargo_cache, owner=runner_owner)
+        sys.stdout.write("linux-rust-cache=prepared\n")
+        return 0
+    except SourceBuildRefusal as error:
+        sys.stdout.write("linux-rust-cache=refused reason=" + error.reason + "\n")
+        return 1
+    except BaseException:
+        sys.stdout.write("linux-rust-cache=refused reason=invalid\n")
+        return 1
+
+
+def _cache_archive_members(archive):
     try:
-        lock_after = (source / "package-lock.json").read_bytes()
-        _check_lock_provenance(lock_after, identity, env, source)
-        locked, unused = _locked_packages(lock_after)
-    except (SourceBuildRefusal, OSError, ValueError, KeyError, TypeError):
-        raise _audit_refuse("audit_lock_changed") from None
-    found, matched, expected_exit = _check_audit_report(
-        result.stdout, allows, locked["packages"], int(time.time() * 1000), result.stderr,
-    )
-    if result.returncode != expected_exit:
-        raise _audit_refuse("audit_exit_mismatch")
-    (private / "audit.json").write_bytes(result.stdout)
-    sys.stdout.write(
-        "linux-node-audit=verified phase=trusted findings=" + str(found)
-        + " allowed=" + str(matched) + "\n"
-    )
-    return 0
+        members = archive.getmembers()
+    except (OSError, tarfile.TarError):
+        raise SourceBuildRefusal("cache") from None
+    if not members or len(members) > MAX_TREE_ENTRIES:
+        raise SourceBuildRefusal("cache")
+    names = set()
+    kinds = {}
+    total_bytes = 0
+    roots = {"target": False, "cargo-home": False}
+    for member in members:
+        if type(member.name) is not str or not member.name or member.name.startswith("/"):
+            raise SourceBuildRefusal("cache")
+        name = member.name.rstrip("/")
+        parts = name.split("/")
+        if (not name or any(part in ("", ".", "..") for part in parts)
+                or parts[0] not in roots or name in names):
+            raise SourceBuildRefusal("cache")
+        names.add(name)
+        if member.isdir() and member.type == tarfile.DIRTYPE:
+            kind = "directory"
+        elif member.isreg() and member.type in (tarfile.REGTYPE, tarfile.AREGTYPE):
+            if member.size < 0:
+                raise SourceBuildRefusal("cache")
+            kind = "file"
+            total_bytes += member.size
+            if total_bytes > RUST_CACHE_ARCHIVE_MAX_BYTES:
+                raise SourceBuildRefusal("cache")
+        elif member.issym() and member.type == tarfile.SYMTYPE:
+            link = member.linkname
+            resolved = posixpath.normpath(posixpath.join(posixpath.dirname(name), link))
+            if (not link or posixpath.isabs(link) or resolved in (".", "..")
+                    or resolved.startswith("../") or resolved.split("/", 1)[0] != parts[0]):
+                raise SourceBuildRefusal("cache")
+            kind = "symlink"
+        else:
+            raise SourceBuildRefusal("cache")
+        kinds[name] = kind
+        if len(parts) == 1 and kind == "directory":
+            roots[name] = True
+    if not all(roots.values()):
+        raise SourceBuildRefusal("cache")
+    for name, kind in kinds.items():
+        parts = name.split("/")
+        for length in range(1, len(parts)):
+            ancestor = "/".join(parts[:length])
+            if kinds.get(ancestor) != "directory":
+                raise SourceBuildRefusal("cache")
+    return members
+
+
+def _run_rust_cache_gpg(operation, source, destination, key, homedir):
+    if operation not in ("encrypt", "decrypt") or type(key) is not str:
+        raise SourceBuildRefusal("cache")
+    source = Path(source)
+    destination = Path(destination)
+    homedir = Path(homedir)
+    try:
+        homedir.mkdir(mode=0o700, parents=True, exist_ok=False)
+    except OSError:
+        raise SourceBuildRefusal("cache") from None
+    arguments = [
+        "gpg", "--batch", "--yes", "--no-tty", "--pinentry-mode", "loopback",
+        "--homedir", str(homedir), "--passphrase-fd", "0",
+    ]
+    if operation == "encrypt":
+        arguments.extend(("--symmetric", "--cipher-algo", "AES256"))
+    else:
+        arguments.append("--decrypt")
+    arguments.extend(("--output", str(destination), str(source)))
+    try:
+        result = subprocess.run(
+            arguments, input=key.encode("ascii") + b"\n", stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=2700, check=False,
+        )
+        output_info = destination.lstat()
+    except (OSError, subprocess.TimeoutExpired):
+        raise SourceBuildRefusal("cache") from None
+    if result.returncode != 0 or not stat.S_ISREG(output_info.st_mode) or output_info.st_nlink != 1:
+        raise SourceBuildRefusal("cache")
+
+
+def _extract_rust_cache_archive(archive_path, cache_directory):
+    try:
+        archive = tarfile.open(archive_path, mode="r:")
+    except (OSError, tarfile.TarError):
+        raise SourceBuildRefusal("cache") from None
+    with archive:
+        members = _cache_archive_members(archive)
+        directories = [member for member in members if member.isdir()]
+        regular_files = [member for member in members if member.isreg()]
+        symlinks = [member for member in members if member.issym()]
+        for member in sorted(directories, key=lambda item: (item.name.count("/"), item.name)):
+            path = cache_directory.joinpath(*member.name.rstrip("/").split("/"))
+            try:
+                path.mkdir(mode=0o755, parents=True, exist_ok=True)
+                info = path.lstat()
+                if not stat.S_ISDIR(info.st_mode):
+                    raise SourceBuildRefusal("cache")
+                os.chmod(path, 0o755)
+            except OSError:
+                raise SourceBuildRefusal("cache") from None
+        for member in regular_files:
+            path = cache_directory.joinpath(*member.name.split("/"))
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                source = archive.extractfile(member)
+                if source is None:
+                    raise SourceBuildRefusal("cache")
+                descriptor = os.open(path, flags, 0o755 if member.mode & 0o111 else 0o644)
+                with os.fdopen(descriptor, "wb") as sink, source:
+                    remaining = member.size
+                    while remaining:
+                        block = source.read(min(1024 * 1024, remaining))
+                        if not block:
+                            raise SourceBuildRefusal("cache")
+                        sink.write(block)
+                        remaining -= len(block)
+            except SourceBuildRefusal:
+                raise
+            except (OSError, tarfile.TarError):
+                raise SourceBuildRefusal("cache") from None
+        for member in symlinks:
+            path = cache_directory.joinpath(*member.name.split("/"))
+            try:
+                os.symlink(member.linkname, path)
+            except OSError:
+                raise SourceBuildRefusal("cache") from None
+
+
+def import_rust_cache(environ=None):
+    env = os.environ if environ is None else environ
+    try:
+        source = Path(env.get("SOURCE_PATH", ""))
+        cache = _validate_rust_cache(env, source, env.get("RUST_CACHE_SCOPE"))
+        if cache is None or not cache["hit"]:
+            raise SourceBuildRefusal("cache")
+        archive_path = cache["directory"] / RUST_CACHE_ARCHIVE_NAME
+        runner_temp = Path(env.get("RUNNER_TEMP", ""))
+        try:
+            runner_owner = (os.getuid(), os.getgid())
+            temp_info = runner_temp.lstat()
+            archive_info = archive_path.lstat()
+            if (not stat.S_ISDIR(temp_info.st_mode) or (temp_info.st_uid, temp_info.st_gid) != runner_owner
+                    or not stat.S_ISREG(archive_info.st_mode) or archive_info.st_nlink != 1
+                    or (archive_info.st_uid, archive_info.st_gid) != runner_owner
+                    or archive_info.st_size <= 0
+                    or archive_info.st_size > RUST_CACHE_ARCHIVE_MAX_BYTES + RUST_CACHE_ENCRYPTED_OVERHEAD_MAX_BYTES):
+                raise SourceBuildRefusal("cache")
+        except OSError:
+            raise SourceBuildRefusal("cache") from None
+        if _rust_cache_requires_encryption(env):
+            key = _rust_cache_encryption_key(env)
+            with tempfile.TemporaryDirectory(prefix="kd-rust-cache-import-", dir=runner_temp) as temporary:
+                archive_plain = Path(temporary) / RUST_CACHE_ARCHIVE_NAME
+                _run_rust_cache_gpg(
+                    "decrypt", archive_path, archive_plain, key, Path(temporary) / "gnupg",
+                )
+                plain_info = archive_plain.lstat()
+                if (plain_info.st_size <= 0 or plain_info.st_size > RUST_CACHE_ARCHIVE_MAX_BYTES
+                        or not stat.S_ISREG(plain_info.st_mode) or plain_info.st_nlink != 1):
+                    raise SourceBuildRefusal("cache")
+                _extract_rust_cache_archive(archive_plain, cache["directory"])
+        else:
+            _extract_rust_cache_archive(archive_path, cache["directory"])
+        sys.stdout.write("linux-rust-cache=imported\n")
+        return 0
+    except SourceBuildRefusal as error:
+        sys.stdout.write("linux-rust-cache=refused reason=" + error.reason + "\n")
+        return 1
+    except BaseException:
+        sys.stdout.write("linux-rust-cache=refused reason=invalid\n")
+        return 1
+
+
+def package_rust_cache(environ=None):
+    env = os.environ if environ is None else environ
+    try:
+        source = Path(env.get("SOURCE_PATH", ""))
+        cache = _validate_rust_cache(env, source, env.get("RUST_CACHE_SCOPE"))
+        if cache is None or cache["hit"] or not _rust_cache_write_allowed(env):
+            raise SourceBuildRefusal("cache")
+        cache_directory = cache["directory"]
+        runner_temp = Path(env.get("RUNNER_TEMP", ""))
+        owner = (os.getuid(), os.getgid())
+        staging_paths = (cache_directory / "target", cache_directory / "cargo-home")
+        for path in staging_paths:
+            try:
+                info = path.lstat()
+                if (not stat.S_ISDIR(info.st_mode) or (info.st_uid, info.st_gid) != owner):
+                    raise SourceBuildRefusal("cache")
+            except OSError:
+                raise SourceBuildRefusal("cache") from None
+        try:
+            temp_info = runner_temp.lstat()
+            temp_owner = (temp_info.st_uid, temp_info.st_gid)
+        except FileNotFoundError:
+            raise SourceBuildRefusal("cache") from None
+        except OSError:
+            raise SourceBuildRefusal("cache") from None
+        cache_archive = cache_directory / RUST_CACHE_ARCHIVE_NAME
+        try:
+            archive_info = cache_archive.lstat()
+        except FileNotFoundError:
+            archive_info = None
+        except OSError:
+            raise SourceBuildRefusal("cache") from None
+        if (not stat.S_ISDIR(temp_info.st_mode) or temp_owner != owner
+                or (archive_info is not None
+                    and (not stat.S_ISREG(archive_info.st_mode) or archive_info.st_nlink != 1
+                         or (archive_info.st_uid, archive_info.st_gid) != owner))):
+            raise SourceBuildRefusal("cache")
+        with tempfile.TemporaryDirectory(prefix="kd-rust-cache-package-", dir=runner_temp) as temporary:
+            archive_plain = Path(temporary) / RUST_CACHE_ARCHIVE_NAME
+            with tarfile.open(archive_plain, mode="w", format=tarfile.PAX_FORMAT) as tar_writer:
+                tar_writer.dereference = True
+                for name in ("target", "cargo-home"):
+                    tar_writer.add(str(cache_directory / name), arcname=name, recursive=True)
+            if archive_plain.stat().st_size > RUST_CACHE_ARCHIVE_MAX_BYTES:
+                raise SourceBuildRefusal("cache")
+            if _rust_cache_requires_encryption(env):
+                key = _rust_cache_encryption_key(env)
+                archive_path = Path(temporary) / (RUST_CACHE_ARCHIVE_NAME + ".gpg")
+                _run_rust_cache_gpg(
+                    "encrypt", archive_plain, archive_path, key, Path(temporary) / "gnupg",
+                )
+            else:
+                archive_path = archive_plain
+            if archive_path.stat().st_size > RUST_CACHE_ARCHIVE_MAX_BYTES + RUST_CACHE_ENCRYPTED_OVERHEAD_MAX_BYTES:
+                raise SourceBuildRefusal("cache")
+            os.chmod(archive_path, 0o600)
+            os.replace(archive_path, cache_archive)
+        for path in staging_paths:
+            shutil.rmtree(path)
+        sys.stdout.write("linux-rust-cache=packaged\n")
+        return 0
+    except SourceBuildRefusal as error:
+        sys.stdout.write("linux-rust-cache=refused reason=" + error.reason + "\n")
+        return 1
+    except BaseException:
+        sys.stdout.write("linux-rust-cache=refused reason=invalid\n")
+        return 1
+
+
+def _png_chunk(kind, data):
+    content = kind + data
+    return struct.pack(">I", len(data)) + content + struct.pack(">I", zlib.crc32(content) & 0xFFFFFFFF)
+
+
+def _test_shell_icon_png():
+    width = height = 32
+    rows = bytearray()
+    background = (18, 36, 58, 255)
+    mark = (100, 218, 235, 255)
+    for y in range(height):
+        rows.append(0)
+        for x in range(width):
+            upper = 7 <= y <= 16 and abs(x - (12 + 16 - y)) <= 2
+            lower = 16 <= y <= 25 and abs(x - (12 + y - 16)) <= 2
+            color = mark if (7 <= x <= 10 and 7 <= y <= 25) or upper or lower else background
+            rows.extend(color)
+    header = struct.pack(">2I5B", width, height, 8, 6, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", header) + _png_chunk(
+        b"IDAT", zlib.compress(bytes(rows), level=9)
+    ) + _png_chunk(b"IEND", b"")
+
+
+def _ensure_test_shell_icons(worker):
+    icon_bytes = _test_shell_icon_png()
+    for shell in ("test-shell-desktop", "test-shell-mobile"):
+        tauri_root = worker / "runtime" / "apps" / shell / "src-tauri"
+        try:
+            tauri_info = tauri_root.lstat()
+        except OSError:
+            raise SourceBuildRefusal("gate") from None
+        if not stat.S_ISDIR(tauri_info.st_mode):
+            raise SourceBuildRefusal("gate")
+        icon_dir = tauri_root / "icons"
+        try:
+            icon_dir_info = icon_dir.lstat()
+        except FileNotFoundError:
+            try:
+                icon_dir.mkdir(mode=0o755)
+            except OSError:
+                raise SourceBuildRefusal("gate") from None
+        except OSError:
+            raise SourceBuildRefusal("gate") from None
+        else:
+            if not stat.S_ISDIR(icon_dir_info.st_mode):
+                raise SourceBuildRefusal("gate")
+        icon = icon_dir / "icon.png"
+        try:
+            icon_info = icon.lstat()
+        except FileNotFoundError:
+            try:
+                descriptor = os.open(
+                    icon, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644
+                )
+                with os.fdopen(descriptor, "wb") as output:
+                    output.write(icon_bytes)
+            except OSError:
+                raise SourceBuildRefusal("gate") from None
+        except OSError:
+            raise SourceBuildRefusal("gate") from None
+        else:
+            if not stat.S_ISREG(icon_info.st_mode) or icon_info.st_nlink != 1:
+                raise SourceBuildRefusal("gate")
 
 
 def _runtime_workspace_present(project):
@@ -3161,14 +3424,40 @@ def _gate_commands(project, rust_root, node_bin, browser=False):
     return commands
 
 
+def _locked_build_commands(project, rust_root, include_runtime=True):
+    cargo = str(Path(rust_root) / "bin" / "cargo")
+    workspaces = (("root", "Cargo.toml"), ("fuzz", "fuzz/Cargo.toml"))
+    if include_runtime:
+        workspaces += (("runtime", "runtime/Cargo.toml"),)
+    commands = []
+    for name, manifest in workspaces:
+        if not (project / manifest).is_file():
+            if name == "root":
+                raise SourceBuildRefusal("gate")
+            continue
+        scope = ("--manifest-path", manifest)
+        if name != "fuzz":
+            scope += ("--workspace",)
+        for verb in ("build", "test"):
+            arguments = (cargo, verb, "--locked", "--offline") + scope
+            if name == "root":
+                arguments += ("--all-targets",)
+            commands.append((name + "_" + verb, arguments))
+    return tuple(commands)
+
+
 def _api_feature_gate_readback(environ):
     return environ.get("LINUX_API_FEATURE_GATE_NAMES") == ",".join(API_FEATURE_GATE_NAMES)
 
 
 PROJECT_GATE_LIMITS = "project"
+RUNTIME_GATE_LIMITS = "runtime"
 PROJECT_GATE_TIMEOUT_SECONDS = 1800
 GATE_CAUSES = ("timeout", "limit", "signal", "exit", "launch", "deadline")
 PROJECT_GATE_BUDGET_SECONDS = 330 * 60
+RUNTIME_WORKSPACE_TIMEOUT_SECONDS = 5400
+LOCKED_BUILD_TIMEOUT_SECONDS = 1800
+LOCKED_BUILD_BUDGET_SECONDS = 6900
 LIMIT_SIGNALS = (signal.SIGXCPU, signal.SIGXFSZ, signal.SIGKILL)
 JOB_WORKER_NAME = "Runner.Worker"
 JOB_ANCESTOR_LIMIT = 32
@@ -3220,54 +3509,6 @@ def _gate_refusal_line(completed, failed, gate, cause):
     return line + "\n"
 
 
-def _cargo_lock_for_command(argv, worker):
-    manifest = None
-    try:
-        index = argv.index("--manifest-path")
-        manifest = Path(argv[index + 1])
-    except (ValueError, IndexError):
-        manifest = Path(worker) / "Cargo.toml"
-    try:
-        relative_parent = manifest.parent.resolve(strict=True).relative_to(Path(worker).resolve(strict=True))
-    except (OSError, ValueError):
-        raise SourceBuildRefusal("gate") from None
-    current = relative_parent
-    while True:
-        candidate = (current / "Cargo.lock").as_posix() if current.parts else "Cargo.lock"
-        if (Path(worker) / candidate).is_file():
-            return candidate
-        if not current.parts:
-            break
-        current = current.parent
-    raise SourceBuildRefusal("gate")
-
-
-def _apply_vendor_arguments(commands, vendor_admissions, worker, cargo_path):
-    updated = []
-    for name, argv in commands:
-        arguments = tuple(argv)
-        if arguments and os.path.realpath(arguments[0]) == os.path.realpath(cargo_path):
-            lock_relative = _cargo_lock_for_command(arguments, worker)
-            admission = vendor_admissions.get(lock_relative)
-            if admission is not None:
-                vendor_arguments = admission.get("cargo_arguments")
-                required = admission.get("required_flags")
-                if (type(vendor_arguments) is not list or len(vendor_arguments) % 2
-                        or type(required) is not tuple or "--locked" not in required
-                        or "--offline" not in required):
-                    raise SourceBuildRefusal("gate")
-                for index in range(0, len(vendor_arguments), 2):
-                    if vendor_arguments[index] != "--config":
-                        raise SourceBuildRefusal("gate")
-                try:
-                    split = arguments.index("--")
-                except ValueError:
-                    split = len(arguments)
-                arguments = arguments[:split] + tuple(vendor_arguments) + arguments[split:]
-        updated.append((name, arguments))
-    return tuple(updated)
-
-
 def run_project_gates(environ=None):
     env = os.environ if environ is None else environ
     worker = Path(env.get("WORKER_PATH", ""))
@@ -3276,12 +3517,7 @@ def run_project_gates(environ=None):
     node_bin = env.get("NODE_BIN", "")
     if not rust_root or not node_bin or cargo_home != worker / ".kd-cargo-home":
         raise SourceBuildRefusal("gate")
-    license_environment = dict(env)
-    license_environment["SOURCE_PATH"] = str(worker)
-    run_rust_license_gate(license_environment)
-    vendor_admissions = _RUST_VENDOR_ADMISSIONS.get()
-    if type(vendor_admissions) is not dict:
-        raise SourceBuildRefusal("gate")
+    _validate_cargo_lock_sources(worker)
     records = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-records"
     records.mkdir(mode=0o700, parents=True, exist_ok=True)
     browser_root = env.get(BROWSER_ROOT_ENV, "")
@@ -3291,9 +3527,6 @@ def run_project_gates(environ=None):
     if browser and not browser_root:
         raise SourceBuildRefusal("gate")
     commands = _gate_commands(worker, rust_root, node_bin, browser)
-    commands = _apply_vendor_arguments(
-        commands, vendor_admissions, worker, str(Path(rust_root) / "bin" / "cargo"),
-    )
     selected_gates = tuple(name for name, unused_argv in commands)
     expected_gates = GATES + (RUNTIME_GATE_NAMES if _runtime_workspace_present(worker) else ())
     expected_gates += BROWSER_GATE_NAMES if browser else ()
@@ -3370,6 +3603,114 @@ def run_project_gates(environ=None):
         sys.stdout.write(_gate_refusal_line(result["gate_count"], result["failed"], failure[0], failure[1]))
         return 1
     sys.stdout.write("linux-project-gates=passed gates=" + str(len(selected_gates)) + " failed=0 offline=true\n")
+    return 0
+
+
+def run_locked_builds(environ=None, include_runtime=True):
+    """Build and test every supported Rust workspace in the no-network project sandbox."""
+    env = os.environ if environ is None else environ
+    worker = Path(env.get("WORKER_PATH", ""))
+    cargo_home = Path(env.get("CARGO_HOME", ""))
+    rust_root = env.get("RUST_ROOT", "")
+    if not rust_root or cargo_home != worker / ".kd-cargo-home":
+        raise SourceBuildRefusal("gate")
+    _validate_cargo_lock_sources(worker)
+    commands = _locked_build_commands(worker, rust_root, include_runtime=include_runtime)
+    records = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-locked-build-records"
+    records.mkdir(mode=0o700, parents=True, exist_ok=True)
+    project_env = {
+        "PATH": str(Path(rust_root) / "bin") + ":/usr/bin:/bin",
+        "LANG": "C", "LC_ALL": "C", "HOME": str(worker / ".home"),
+        "TMPDIR": str(worker / ".tmp"), "CARGO_HOME": str(cargo_home),
+        "RUSTUP_HOME": str(Path(rust_root) / "rustup"),
+        "CARGO_TARGET_DIR": str(worker / "target"), "CARGO_NET_OFFLINE": "true",
+        "CARGO_INCREMENTAL": "0", "PYTHONDONTWRITEBYTECODE": "1", "CI": "true",
+    }
+    _project_gate_directories(worker)
+    started = time.monotonic()
+    outcomes = []
+    for index, (name, argv) in enumerate(commands):
+        if LOCKED_BUILD_BUDGET_SECONDS - (time.monotonic() - started) < LOCKED_BUILD_TIMEOUT_SECONDS:
+            sys.stdout.write("linux-locked-builds=refused completed=" + str(len(outcomes)) + " reason=deadline\n")
+            return 1
+        nonce = os.urandom(12).hex()
+        try:
+            launch = ("/usr/bin/python3", "-B", "-c", linux_probes.LAUNCHER_SOURCE, *argv)
+            result = linux_session.run_host(
+                str(env.get("RUNNER_TEMP", "/tmp")), nonce, launch, project_env, {},
+                limits=PROJECT_GATE_LIMITS, timeout=LOCKED_BUILD_TIMEOUT_SECONDS, cwd=str(worker),
+            )
+        except BaseException:
+            sys.stdout.write("linux-locked-builds=refused completed=" + str(len(outcomes)) + " reason=launch\n")
+            return 1
+        (records / (str(index) + ".stdout")).write_bytes(result.stdout)
+        (records / (str(index) + ".stderr")).write_bytes(result.stderr)
+        if result.exit_code != 0 or result.timed_out:
+            sys.stdout.write("linux-locked-builds=refused completed=" + str(len(outcomes)) + " failed=" + name + "\n")
+            return 1
+        outcomes.append(name)
+    sys.stdout.write("linux-locked-builds=passed workspaces=" + str(len(commands) // 2) + " network=disabled locked=true\n")
+    return 0
+
+
+def run_dependency_locked_builds(environ=None):
+    """Build root and fuzz Rust workspaces; the prepared runtime job owns runtime builds."""
+    return run_locked_builds(environ, include_runtime=False)
+
+
+def run_runtime_workspace(environ=None):
+    """Run the caller-owned runtime suite inside the no-network, bounded project sandbox."""
+    env = os.environ if environ is None else environ
+    worker = Path(env.get("WORKER_PATH", ""))
+    cargo_home = Path(env.get("CARGO_HOME", ""))
+    rust_root = env.get("RUST_ROOT", "")
+    node_bin = env.get("NODE_BIN", "")
+    npm_bin = env.get("NPM_BIN", "")
+    if (not rust_root or not node_bin or not npm_bin or cargo_home != worker / ".kd-cargo-home"
+            or not (worker / "runtime" / "Cargo.lock").is_file()
+            or not (worker / "runtime" / "package-lock.json").is_file()
+            or not (worker / "runtime" / "scripts" / "check-workspace.mjs").is_file()):
+        raise SourceBuildRefusal("gate")
+    _validate_cargo_lock_sources(worker)
+    _project_gate_directories(worker)
+    project_env = {
+        "PATH": str(Path(npm_bin)) + ":" + str(Path(node_bin)) + ":" + str(Path(rust_root) / "bin") + ":/usr/bin:/bin",
+        "LANG": "C", "LC_ALL": "C", "HOME": str(worker / ".home"),
+        "TMPDIR": str(worker / ".tmp"), "CARGO_HOME": str(cargo_home),
+        "RUSTUP_HOME": str(Path(rust_root) / "rustup"),
+        "CARGO_TARGET_DIR": str(worker / "target"), "CARGO_NET_OFFLINE": "true",
+        "CARGO_INCREMENTAL": "0", "NPM_CONFIG_OFFLINE": "true",
+        "NPM_CONFIG_CACHE": str(worker / ".npm-cache"),
+        "NPM_CONFIG_USERCONFIG": str(worker / ".home" / NPM_USER_CONFIG_NAME),
+        "NPM_CONFIG_GLOBALCONFIG": str(worker / ".home" / NPM_GLOBAL_CONFIG_NAME),
+        "NPM_CONFIG_UPDATE_NOTIFIER": "false", "npm_config_offline": "true",
+        "npm_config_cache": str(worker / ".npm-cache"),
+        "npm_config_userconfig": str(worker / ".home" / NPM_USER_CONFIG_NAME),
+        "npm_config_globalconfig": str(worker / ".home" / NPM_GLOBAL_CONFIG_NAME),
+        "npm_config_update_notifier": "false", "PYTHONDONTWRITEBYTECODE": "1", "CI": "true",
+    }
+    node = Path(node_bin) / "node"
+    argv = (str(node), "runtime/scripts/check-workspace.mjs")
+    nonce = os.urandom(12).hex()
+    try:
+        result = linux_session.run_host(
+            str(env.get("RUNNER_TEMP", "/tmp")), nonce,
+            ("/usr/bin/python3", "-B", "-c", linux_probes.LAUNCHER_SOURCE, *argv),
+            project_env, {}, limits=RUNTIME_GATE_LIMITS,
+            timeout=RUNTIME_WORKSPACE_TIMEOUT_SECONDS, cwd=str(worker),
+        )
+    except BaseException:
+        sys.stdout.write("linux-runtime-workspace=refused reason=launch\n")
+        return 1
+    records = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-runtime-workspace-records"
+    records.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (records / "runtime.stdout").write_bytes(result.stdout)
+    (records / "runtime.stderr").write_bytes(result.stderr)
+    if result.exit_code != 0 or result.timed_out:
+        reason = "timeout" if result.timed_out else _gate_cause(result)
+        sys.stdout.write("linux-runtime-workspace=refused reason=" + reason + "\n")
+        return 1
+    sys.stdout.write("linux-runtime-workspace=passed network=disabled output=bounded\n")
     return 0
 
 
@@ -3532,9 +3873,14 @@ def run_audit(environ=None):
 
 def _dispatch(command):
     actions = {
+        "rust-cache-key": write_rust_cache_key,
+        "rust-cache-export": export_rust_cache,
+        "rust-cache-import": import_rust_cache,
+        "rust-cache-package": package_rust_cache,
         "snapshot": snapshot_and_preflight,
         "audit-expected": write_audit_identity,
         "preflight": repeat_preflight,
+        "dependency-preflight": verify_dependency_preflight,
         "windows-snapshot": windows_snapshot,
         "windows-preflight": windows_preflight,
         "toolchains": prepare_toolchains,
@@ -3542,10 +3888,12 @@ def _dispatch(command):
         "checkout": checkout_source,
         "revoke": revoke_token,
         "npm-tarballs": fetch_npm_tarballs,
-        "trusted-audit": run_trusted_audit,
-        "rust-license-gate": run_rust_license_gate,
+        "rust-lock-fetch": fetch_cargo_locks,
         "prepare-project": prepare_project,
+        "verify-source-reader": verify_source_reader,
+        "dependency-locked-builds": run_dependency_locked_builds,
         "gates": run_project_gates,
+        "runtime-workspace": run_runtime_workspace,
         "verify-handoff": verify_proof_handoff,
         "verdict": emit_verdict,
         "audit": run_audit,
@@ -3558,13 +3906,8 @@ def _dispatch(command):
     except SourceBuildRefusal as error:
         sys.stdout.write(_refusal_line(command, error))
         return 1
-    except rust_license_gate.LicenseGateRefusal as error:
-        refusal = "linux-source-build=refused phase=" + command
-        refusal += " reason=license_" + error.reason + "\n"
-        sys.stdout.write(refusal)
-        return 1
     except BaseException:
-        sys.stdout.write(_refusal_line(command, SourceBuildRefusal("invalid", "audit_unexpected")))
+        sys.stdout.write(_refusal_line(command, SourceBuildRefusal("invalid")))
         return 1
 
 

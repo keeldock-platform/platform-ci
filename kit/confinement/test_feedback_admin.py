@@ -28,7 +28,7 @@ PRIVATE_KEY = b"synthetic private key fixture"
 PLAINTEXT = b"synthetic reviewed payload\n"
 
 
-def _fields(kind="lock", expiry=NOW + 3600):
+def _fields(kind="rust_patch", expiry=NOW + 3600):
     profile = feedback_request.PROFILE_BY_KIND[kind]
     return {
         "kind": kind,
@@ -42,20 +42,6 @@ def _fields(kind="lock", expiry=NOW + 3600):
     }
 
 
-def _expectation():
-    return {
-        "root": {
-            "name": "fixture-root",
-            "version": "1.0.0",
-            "workspaces": ["packages/*"],
-            "devDependencies": {"typescript": "6.0.3"},
-        },
-        "workspaces": [{
-            "path": "packages/client-api",
-            "name": "@fixture/client-api",
-            "version": "1.0.0",
-        }],
-    }
 
 
 def _spki_for_key_path(path):
@@ -116,21 +102,16 @@ class FeedbackAdminTests(unittest.TestCase):
         self.clock_patch.stop()
         self.temporary.cleanup()
 
-    def create(self, kind="lock", expiry=NOW + 3600):
+    def create(self, kind="rust_patch", expiry=NOW + 3600):
         return self.admin.create_request(
             _fields(kind, expiry),
-            expected_manifest=_expectation() if kind == "lock" else None,
             reviewed_rust_paths=["src/lib.rs"] if kind == "rust_patch" else None,
             confirm_reviewed=True,
         )
 
     def evidence_for(self, request, *, run_id=RUN_ID, artifact_id=ARTIFACT_ID):
         profile = feedback_request.PROFILE_BY_KIND[request["kind"]]
-        context_fields = (
-            __import__("node_lock_receipt").CONTEXT_FIELDS
-            if request["kind"] == "lock"
-            else __import__("node_lock_receipt").FEEDBACK_CONTEXT_FIELDS
-        )
+        context_fields = __import__("node_lock_receipt").FEEDBACK_CONTEXT_FIELDS
         context = {name: request[name] for name in context_fields if name in request}
         context.update({
             "run_id": str(run_id),
@@ -200,12 +181,6 @@ class FeedbackAdminTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(info.st_mode), 0o400)
         self.assertEqual(info.st_nlink, 1)
 
-    def test_request_expectation_is_bounded_before_private_state_or_key_creation(self):
-        oversized = _expectation()
-        oversized["root"]["name"] = "x" * (subject.MAX_PACKET_BYTES + 1)
-        with self.assertRaises(subject.FeedbackAdminRefusal):
-            self.admin.create_request(_fields(), expected_manifest=oversized, confirm_reviewed=True)
-        self.assertFalse(os.path.exists(self.directory))
 
     def test_protocol_size_budget_accepts_large_ascii_payloads_below_wire_limit(self):
         protocol = {"payload_base64": "A" * 1_400_000}
@@ -257,7 +232,7 @@ class FeedbackAdminTests(unittest.TestCase):
                 mock.patch.object(self.admin, "_run_helper", side_effect=delayed_keygen):
             with self.assertRaises(subject.FeedbackAdminRefusal):
                 self.admin.create_request(
-                    _fields(expiry=expiry), expected_manifest=_expectation(), confirm_reviewed=True,
+                    _fields(expiry=expiry), reviewed_rust_paths=["src/lib.rs"], confirm_reviewed=True,
                 )
 
         self.assertEqual([name for name in os.listdir(self.directory) if name.startswith("key-")], [])
@@ -279,7 +254,7 @@ class FeedbackAdminTests(unittest.TestCase):
         def create():
             return self.admin.create_request(
                 _fields(expiry=feedback_request.EXCEPTION_END),
-                expected_manifest=_expectation(), confirm_reviewed=True,
+                reviewed_rust_paths=["src/lib.rs"], confirm_reviewed=True,
             )
 
         executor = ThreadPoolExecutor(max_workers=1)
@@ -318,7 +293,7 @@ class FeedbackAdminTests(unittest.TestCase):
         state = self._state()
         self.assertEqual(state["requests"][0]["status"], feedback_request.ACTIVE_STATUS)
         self.assertFalse(os.path.exists(os.path.join(self.directory,
-                         "return-" + result["request"]["request_id"] + "-lock.payload")))
+                         "return-" + result["request"]["request_id"] + "-patch.payload")))
 
     def test_collector_receives_the_canonical_run_id_and_complete_evidence_contract(self):
         result = self.create()
@@ -387,12 +362,10 @@ class FeedbackAdminTests(unittest.TestCase):
                 mock.patch.object(subject.node_lock_receipt, "validate_receipt", return_value=trusted):
             returned = self.admin.consume_return(request["request_id"], object(),
                                                  manual_summary_review=gate)
-        self.assertEqual(returned["kind"], "lock")
-        self.assertTrue(returned["bootstrap_lock_consumed"])
+        self.assertEqual(returned["kind"], "rust_patch")
         with open(returned["private_output_path"], "rb") as output:
             self.assertEqual(output.read(), PLAINTEXT)
         state = self._state()
-        self.assertTrue(state["bootstrap_lock_consumed"])
         self.assertEqual(state["requests"][0]["status"], "consumed")
         self.assertEqual(state["requests"][0]["key_state"], "retired")
         self.assertFalse(os.path.exists(os.path.join(self.directory, "key-" + request["nonce"] + ".der")))
@@ -401,63 +374,14 @@ class FeedbackAdminTests(unittest.TestCase):
             with self.assertRaises(subject.FeedbackAdminRefusal):
                 self.admin.consume_return(request["request_id"], object(),
                                           manual_summary_review=gate)
-        with self.assertRaises(subject.FeedbackAdminRefusal):
-            self.create()
+        fresh = self.create()
+        self.assertEqual(fresh["request"]["kind"], "rust_patch")
 
-    def consume_npm_return(self, plaintext):
-        request = self.create("npm_admission")["request"]
-        evidence, trusted = self.evidence_for(request)
-        gate = self.summary_gate(request)
 
-        self.helper_calls = 0
 
-        def helper(message, *, plaintext_pipe=False):
-            self.helper_calls += 1
-            if message["operation"] == "decrypt":
-                return b'{"schema_version":1,"ok":true}\n', bytearray(plaintext)
-            return _fake_helper(message, plaintext_pipe=plaintext_pipe)
 
-        with self.install_collector(evidence), \
-                mock.patch.object(subject.node_lock_receipt, "validate_receipt", return_value=trusted), \
-                mock.patch.object(self.admin, "_run_helper", side_effect=helper):
-            returned = self.admin.consume_return(request["request_id"], object(), manual_summary_review=gate)
-        return request, returned
 
-    def test_an_npm_diagnostic_return_is_written_as_a_diagnostic_and_never_as_an_admission(self):
-        diagnostic = (b"KD-NPM-DIAGNOSTICS schema=1 step=npm_resolve reason=eresolve\n"
-                      b"stderr:\n  npm error code ERESOLVE\nreport:\n  Found: y@2.0.0\n")
-        request, returned = self.consume_npm_return(diagnostic)
-        self.assertEqual(returned["kind"], "npm_admission")
-        self.assertEqual(returned["payload_variant"], "npm_diagnostics")
-        self.assertFalse(returned["bootstrap_lock_consumed"])
-        self.assertTrue(returned["private_output_path"].endswith("-npm-diagnostics.payload"))
-        self.assertEqual(os.path.basename(returned["private_output_path"]),
-                         "return-" + request["request_id"] + "-npm-diagnostics.payload")
-        with open(returned["private_output_path"], "rb") as output:
-            self.assertEqual(output.read(), diagnostic)
-        self.assertFalse(os.path.exists(os.path.join(
-            self.directory, "return-" + request["request_id"] + "-npm-admission.payload")))
-        entry = self._state()["requests"][0]
-        self.assertEqual((entry["status"], entry["key_state"]), ("consumed", "retired"))
 
-    def check_admission_payload(self, plaintext):
-        request, returned = self.consume_npm_return(plaintext)
-        self.assertNotIn("payload_variant", returned)
-        self.assertEqual(set(returned), {
-            "request_id", "kind", "private_output_path", "bootstrap_lock_consumed",
-        })
-        self.assertTrue(returned["private_output_path"].endswith("-npm-admission.payload"))
-        with open(returned["private_output_path"], "rb") as output:
-            self.assertEqual(output.read(), plaintext)
-
-    def test_an_npm_admission_payload_is_still_written_as_an_admission_payload(self):
-        self.check_admission_payload(PLAINTEXT)
-
-    def test_only_a_payload_that_starts_with_the_closed_prefix_is_a_diagnostic(self):
-        self.check_admission_payload(b" KD-NPM-DIAGNOSTICS schema=1 step=npm_resolve reason=eresolve\n")
-
-    def test_a_bundle_shaped_payload_is_written_as_an_admission_payload(self):
-        self.check_admission_payload(b'{"evidence_b64":"AA==","lock_b64":"AA==","receipt_b64":"AA==","schema_version":1}')
 
     def test_summary_job_set_is_ordered_and_must_match_the_reviewed_template(self):
         result = self.create()
@@ -555,7 +479,6 @@ class FeedbackAdminTests(unittest.TestCase):
         })
         self.assertFalse(os.path.exists(os.path.join(self.directory, "key-" + request["nonce"] + ".der")))
         state = self._state()
-        self.assertFalse(state["bootstrap_lock_consumed"])
         self.assertEqual(state["requests"][0]["status"], "abandoned")
         self.assertEqual(state["requests"][0]["key_state"], "retired")
 
@@ -638,7 +561,6 @@ class FeedbackAdminTests(unittest.TestCase):
         self.assertEqual(calls[0][1]["run_id"], str(RUN_ID))
         self.assertEqual(calls[0][1]["run_attempt"], 1)
         self.assertEqual(returned["kind"], "linux_quick")
-        self.assertFalse(returned["bootstrap_lock_consumed"])
         self.assertTrue(returned["private_output_path"].endswith("-linux-quick.payload"))
         with open(returned["private_output_path"], "rb") as output:
             self.assertEqual(output.read(), PLAINTEXT)
@@ -813,7 +735,7 @@ class FeedbackAdminTests(unittest.TestCase):
             returned = self.admin.consume_return(
                 request["request_id"], object(), manual_summary_review=gate,
             )
-        self.assertEqual(returned["kind"], "lock")
+        self.assertEqual(returned["kind"], "rust_patch")
         diagnostics = self.create("build_diagnostics")["request"]
         with self.assertRaises(subject.FeedbackAdminRefusal):
             self.admin.consume_return(
@@ -1014,13 +936,13 @@ class FeedbackAdminTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.directory, "key-" + request["nonce"] + ".der")))
         self.assertEqual(self._state()["requests"][0]["status"], "expired")
         self.assertFalse(os.path.exists(os.path.join(self.directory,
-                         "return-" + request["request_id"] + "-lock.payload")))
+                         "return-" + request["request_id"] + "-patch.payload")))
 
     def test_lock_wait_crossing_exception_end_retires_under_held_lock(self):
         with mock.patch.object(subject.time, "time", return_value=feedback_request.EXCEPTION_END - 60):
             result = self.admin.create_request(
                 _fields(expiry=feedback_request.EXCEPTION_END),
-                expected_manifest=_expectation(), confirm_reviewed=True,
+                reviewed_rust_paths=["src/lib.rs"], confirm_reviewed=True,
             )
         request = result["request"]
         clock = [feedback_request.EXCEPTION_END - 1]
@@ -1056,7 +978,6 @@ class FeedbackAdminTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.directory, "key-" + request["nonce"] + ".der")))
         state = self._state()
         self.assertEqual(state["requests"][0]["status"], "expired")
-        self.assertFalse(state["bootstrap_lock_consumed"])
 
     def test_collector_delay_past_expiry_retires_key_without_decrypt(self):
         result = self.create(expiry=NOW + 60)
@@ -1090,7 +1011,7 @@ class FeedbackAdminTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.directory, "key-" + request["nonce"] + ".der")))
         self.assertEqual(self._state()["requests"][0]["status"], "expired")
         self.assertFalse(os.path.exists(os.path.join(self.directory,
-                         "return-" + request["request_id"] + "-lock.payload")))
+                         "return-" + request["request_id"] + "-patch.payload")))
 
     def test_helper_delay_past_expiry_discards_plaintext_and_retires_key(self):
         result = self.create(expiry=NOW + 60)
@@ -1116,9 +1037,8 @@ class FeedbackAdminTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.directory, "key-" + request["nonce"] + ".der")))
         state = self._state()
         self.assertEqual(state["requests"][0]["status"], "expired")
-        self.assertFalse(state["bootstrap_lock_consumed"])
         self.assertFalse(os.path.exists(os.path.join(self.directory,
-                         "return-" + request["request_id"] + "-lock.payload")))
+                         "return-" + request["request_id"] + "-patch.payload")))
 
     def test_output_write_crossing_expiry_removes_private_file(self):
         result = self.create(expiry=NOW + 60)
@@ -1146,7 +1066,7 @@ class FeedbackAdminTests(unittest.TestCase):
         self.assertEqual(state["requests"][0]["status"], "consumed")
         self.assertEqual(state["requests"][0]["key_state"], "retired")
         self.assertFalse(os.path.exists(os.path.join(self.directory,
-                         "return-" + request["request_id"] + "-lock.payload")))
+                         "return-" + request["request_id"] + "-patch.payload")))
 
     def test_failure_after_tombstone_never_releases_or_replays_plaintext(self):
         result = self.create()
@@ -1163,7 +1083,7 @@ class FeedbackAdminTests(unittest.TestCase):
         self.assertEqual(state["requests"][0]["status"], "consumed")
         self.assertEqual(state["requests"][0]["key_state"], "retired")
         self.assertFalse(os.path.exists(os.path.join(self.directory,
-                         "return-" + request["request_id"] + "-lock.payload")))
+                         "return-" + request["request_id"] + "-patch.payload")))
 
     def _state(self):
         with self.admin._locked_directory(create=False) as dir_fd:
@@ -1191,37 +1111,11 @@ class ProfilePayloadLimitTests(unittest.TestCase):
             )
         create.assert_called_once()
         self.assertTrue(path.endswith("-patch.payload"))
-        cargo = feedback_request.PROFILE_BY_KIND["cargo_lock"]
-        with mock.patch.object(subject, "_create_named") as create:
-            path = subject.FeedbackAdmin._release_private_output(
-                stub, -1, {"request_id": "a" * 64}, cargo, b"x" * cargo["max_payload_bytes"],
-            )
-        create.assert_called_once()
-        self.assertTrue(path.endswith("-cargo-lock.payload"))
         with self.assertRaises(subject.FeedbackAdminRefusal):
             subject.FeedbackAdmin._release_private_output(
-                stub, -1, {"request_id": "a" * 64}, dict(cargo, max_payload_bytes="1"), b"x",
+                stub, -1, {"request_id": "a" * 64}, dict(patch_profile, max_payload_bytes="1"), b"x",
             )
 
-    def test_the_diagnostic_file_name_is_reserved_for_the_npm_admission_kind_and_its_prefix(self):
-        stub = types.SimpleNamespace(state_directory="/unused")
-        diagnostic = b"KD-NPM-DIAGNOSTICS schema=1 step=npm_lock reason=npm_lock_refused\nstderr:\nreport:\n"
-        for kind, profile in feedback_request.PROFILE_BY_KIND.items():
-            for plaintext in (diagnostic, bytearray(diagnostic)):
-                with self.subTest(kind=kind, plaintext=type(plaintext).__name__):
-                    with mock.patch.object(subject, "_create_named"):
-                        path = subject.FeedbackAdmin._release_private_output(
-                            stub, -1, {"request_id": "a" * 64}, profile, plaintext,
-                        )
-                    self.assertEqual(
-                        path.endswith("-npm-diagnostics.payload"),
-                        kind == feedback_request.NPM_ADMISSION_KIND,
-                    )
-        npm = feedback_request.PROFILE_BY_KIND[feedback_request.NPM_ADMISSION_KIND]
-        for plaintext in (b"", b"KD-NPM-DIAGNOSTICS", b"kd-npm-diagnostics ", b'{"schema_version":1}'):
-            with self.subTest(plaintext=plaintext):
-                self.assertFalse(subject._is_npm_diagnostic(npm, plaintext))
-        self.assertTrue(subject._is_npm_diagnostic(npm, diagnostic))
 
 
 class UnsupportedPlatformTests(unittest.TestCase):

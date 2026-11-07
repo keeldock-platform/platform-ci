@@ -10,18 +10,19 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import sys
 import tempfile
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import macos_core_contract as subject
 import macos_private_validation as private_validation
+import macos_feedback_producer as feedback_producer
 import feedback_failure
-import macos_node_contract as real_node_contract
+import gate_table
 import macos_rust_toolchain as real_rust
-import test_foundation_node_feedback as foundation_tests
 
 
 SOURCE_SHA = "a" * 40
@@ -65,37 +66,6 @@ def _success_record(include_runtime=False):
     return record, versions, gates
 
 
-NPM_RESOLVE_KEYS = (
-    "eresolve", "ebadengine", "etarget", "enotfound", "etimedout", "econnreset", "e404",
-    "eintegrity", "enoversions", "other",
-)
-NPM_RUNNER_KEYS = ("timeout", "spawn", "runner", "capture_invalid")
-NPM_BOOTSTRAP_KEYS = (
-    "npm_input_invalid", "npm_environment_refused", "npm_manifest_refused", "npm_request_refused",
-    "npm_request_mismatch", "npm_lock_refused", "npm_network_refused", "npm_integrity_mismatch",
-    "npm_package_too_young", "npm_package_deprecated", "npm_licence_refused", "npm_peer_refused",
-    "npm_archive_refused", "npm_advisory_blocked", "npm_advisory_invalid", "npm_evidence_invalid",
-    "npm_stale", "npm_payload_too_large", "npm_policy_refused",
-)
-NPM_KEYS_BY_STEP = {
-    "npm_inputs": (
-        "npm_input_invalid", "npm_manifest_refused", "npm_request_refused", "npm_request_mismatch",
-        "npm_policy_refused", "npm_stale", "manifest_invalid",
-    ),
-    "npm_config": (
-        "npm_environment_refused", "npm_input_invalid", "manifest_invalid", "output_unavailable",
-        "tool_unavailable",
-    ),
-    "npm_version": ("nonzero_exit", "mismatch") + NPM_RUNNER_KEYS,
-    "npm_resolve": NPM_RESOLVE_KEYS + NPM_RUNNER_KEYS,
-    "npm_lock": ("npm_lock_refused", "npm_payload_too_large", "capture_invalid"),
-    "npm_bundle": NPM_BOOTSTRAP_KEYS,
-}
-NPM_STEP_DIAGNOSTICS = frozenset(
-    "source_gates_" + step + "_" + key for step, keys in NPM_KEYS_BY_STEP.items() for key in keys
-)
-
-
 class CoreContractTests(unittest.TestCase):
     def test_cli_accepts_only_fixed_run_shape(self):
         args = [
@@ -111,6 +81,117 @@ class CoreContractTests(unittest.TestCase):
         ):
             with self.subTest(arguments=invalid), self.assertRaises(subject.Refusal):
                 subject._parse_arguments(invalid)
+
+    def test_typescript_diagnostic_checks_use_the_committed_lock_and_ignore_install_scripts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            lock_bytes = b'{"lockfileVersion":3}\n'
+            (source / "package-lock.json").write_bytes(lock_bytes)
+            tool_cache = root / "tool-cache"
+            node_root = tool_cache / "node" / "24.22.1" / "arm64"
+            node_path = node_root / "bin" / "node"
+            npm_path = node_root / "lib" / "node_modules" / "npm" / "bin" / "npm-cli.js"
+            node_path.parent.mkdir(parents=True)
+            npm_path.parent.mkdir(parents=True)
+            node_path.write_bytes(b"synthetic node executable")
+            npm_path.write_bytes(b"synthetic npm cli")
+            node_path.chmod(0o555)
+            npm_path.chmod(0o444)
+            worker_storage = root / "worker"
+            worker_storage.mkdir()
+
+            def make_worker_directory(path, uid, gid):
+                Path(path).mkdir(mode=0o700)
+
+            def copy_reviewed_files(unused_source, destination, unused_files, uid, gid):
+                Path(destination).mkdir(mode=0o700)
+
+            def write_worker_file(path, payload, uid, gid):
+                Path(path).write_bytes(payload)
+
+            producer = SimpleNamespace(
+                NODE_VERSION="24.22.1",
+                _read_file=lambda path, maximum: Path(path).read_bytes(),
+                _make_worker_directory=make_worker_directory,
+                _copy_reviewed_files=copy_reviewed_files,
+                _write_worker_file=write_worker_file,
+                _read_worker_file=lambda path, uid, maximum: Path(path).read_bytes(),
+                _trim_incomplete_utf8=feedback_producer._trim_incomplete_utf8,
+            )
+            runtime = SimpleNamespace(
+                CORE_CONTRACT_PACKAGE_LOCK_PATH="package-lock.json",
+                MAX_CORE_CONTRACT_PACKAGE_LOCK_BYTES=4096,
+            )
+            responses = (
+                SimpleNamespace(returncode=0, stdout=b"v24.22.1\n", stderr=b""),
+                SimpleNamespace(returncode=0, stdout=b"11.19.1\n", stderr=b""),
+                SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+                SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+                SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+            )
+            rust = SimpleNamespace(_run_worker_command=Mock(side_effect=responses))
+            reviewed = SimpleNamespace(_worker_census=Mock())
+            capability = SimpleNamespace(PROBE_PRIMARY_GID=os.getgid())
+            with patch.object(subject, "_typescript_workspace_files", return_value=()), \
+                    patch.object(subject, "_load_control_sibling", return_value=reviewed):
+                outcome = subject._typescript_workspace_gates(
+                    source, worker_storage, os.getuid(), {}, {"python": sys.executable},
+                    capability, rust, time.monotonic() + 60, node_path, tool_cache,
+                    runtime, producer,
+                )
+
+            commands = [call.args[0] for call in rust._run_worker_command.call_args_list]
+            stages = tuple(call.kwargs["stage"] for call in rust._run_worker_command.call_args_list)
+            self.assertEqual(stages, (
+                "node_dependency_prepare", "node_dependency_prepare", "node_dependency_prepare",
+                "typescript_typecheck", "typescript_tests",
+            ))
+            self.assertTrue(all(
+                call.kwargs["allow_nonzero_capture"] for call in rust._run_worker_command.call_args_list
+            ))
+            expected_node = str(node_path.resolve())
+            expected_npm = str(npm_path.resolve())
+            self.assertEqual(len(commands), 5)
+            self.assertIn((expected_node, expected_npm, "ci", "--workspaces=true",
+                           "--include-workspace-root", "--ignore-scripts"), commands)
+            self.assertIn((expected_node, expected_npm, "run", "typecheck", "--workspaces",
+                           "--ignore-scripts"), commands)
+            self.assertIn((expected_node, expected_npm, "run", "test", "--workspaces",
+                           "--ignore-scripts"), commands)
+            self.assertEqual(outcome["selected_gates"], subject.NODE_GATE_NAMES)
+            self.assertEqual(outcome["completed"], subject.NODE_GATE_NAMES)
+            self.assertIsNone(outcome["failed_stage"])
+            self.assertEqual(reviewed._worker_census.call_count, 5)
+
+    def test_build_diagnostic_outcome_keeps_typescript_checks_in_the_gate_prefix(self):
+        rust_gates = ("format", "clippy")
+        node_success = {
+            "selected_gates": subject.NODE_GATE_NAMES,
+            "completed": subject.NODE_GATE_NAMES,
+            "failed_stage": None, "returncode": 0,
+            "stdout": b"", "stderr": b"",
+            "stdout_truncated": False, "stderr_truncated": False,
+        }
+        rust_success = {**node_success, "selected_gates": rust_gates, "completed": rust_gates}
+        combined = subject._extend_build_diagnostic_outcome(rust_success, node_success)
+        self.assertEqual(combined["selected_gates"], rust_gates + subject.NODE_GATE_NAMES)
+        self.assertEqual(combined["completed"], combined["selected_gates"])
+        self.assertIsNone(combined["failed_stage"])
+
+        node_failure = {
+            **node_success, "completed": ("node_dependency_prepare",),
+            "failed_stage": "typescript_typecheck", "returncode": 1,
+        }
+        combined_failure = subject._extend_build_diagnostic_outcome(rust_success, node_failure)
+        self.assertEqual(combined_failure["failed_stage"], "typescript_typecheck")
+        self.assertEqual(combined_failure["completed"], rust_gates + ("node_dependency_prepare",))
+
+        rust_failure = {**rust_success, "completed": ("format",), "failed_stage": "clippy", "returncode": 1}
+        failed_before_node = subject._extend_build_diagnostic_outcome(rust_failure, None)
+        self.assertEqual(failed_before_node["failed_stage"], "clippy")
+        self.assertEqual(failed_before_node["selected_gates"], rust_gates + subject.NODE_GATE_NAMES)
 
     def test_privilege_identity_accepts_the_native_primary_group_20(self):
         worker_uid = 504
@@ -452,7 +533,7 @@ class CoreContractTests(unittest.TestCase):
 
         self.assertEqual(subject.SOURCE_GATES_SURVIVOR_CLASSES, tuple(macos_capability.SURVIVOR_CLASS_ORDER))
 
-    def test_node_cleanup_refusal_carries_only_a_listed_source_gates_diagnostic(self):
+    def test_source_gate_cleanup_refusal_carries_only_a_listed_source_gates_diagnostic(self):
         for diagnostic in sorted(subject.SOURCE_GATES_CLEANUP_DIAGNOSTICS):
             error = SimpleNamespace(reason="cleanup_incomplete", cleanup_diagnostic=diagnostic)
             with self.subTest(diagnostic=diagnostic):
@@ -661,74 +742,6 @@ class CoreContractTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn('"diagnostic":"summary_guard_input"', output.getvalue())
 
-    def test_oversize_accepted_node_provenance_reports_the_precise_limit_diagnostic(self):
-        runtime = SimpleNamespace(SOURCE_CANDIDATE_REF_ENV="SOURCE_CANDIDATE_REF")
-        controls = (SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), runtime,
-                    SimpleNamespace(), SimpleNamespace())
-
-        class FeedbackRefusal(Exception):
-            pass
-
-        def strict_json(raw, maximum):
-            if type(raw) is not bytes or not 0 < len(raw) <= maximum:
-                raise FeedbackRefusal()
-            return json.loads(raw.decode("utf-8"))
-
-        def producer(kind):
-            return SimpleNamespace(
-                FeedbackRefusal=FeedbackRefusal,
-                validate_dispatch=lambda unused_kind, unused_environ: {
-                    "request": {"source_sha": SOURCE_SHA, "base_sha": BASE_SHA, "base_branch": "develop"},
-                    "profile": {"concern": subject.CONCERN, "kind": kind},
-                },
-                resolve_node=lambda unused_environ, require_npm: ("node", "npm"),
-                _strict_json=strict_json,
-            )
-
-        def fail_source(*unused_args, **unused_kwargs):
-            raise subject.Refusal("summary_guard_failed", "summary_guard")
-
-        arguments = (
-            "run", "--token-stdin", "--source-sha", SOURCE_SHA,
-            "--base-sha", BASE_SHA, "--base-branch", "develop",
-        )
-        limit = subject.ACCEPTED_NODE_PROVENANCE_MAX_BYTES
-        self.assertEqual(limit, 16384)
-        fitting = '{"a":"' + "x" * (limit - 8) + '"}'
-        oversize = '{"a":"' + "x" * (limit - 7) + '"}'
-        self.assertEqual((len(fitting), len(oversize)), (limit, limit + 1))
-        self.assertIn(subject.ACCEPTED_NODE_PROVENANCE_OVERSIZE, subject.SOURCE_GATES_NODE_DIAGNOSTICS)
-        self.assertEqual(
-            subject.SOURCE_GATES_NODE_DIAGNOSTIC_REASONS[subject.ACCEPTED_NODE_PROVENANCE_OVERSIZE],
-            "runner_unavailable",
-        )
-        self.assertNotIn(subject.ACCEPTED_NODE_PROVENANCE_OVERSIZE, subject.SOURCE_GATES_NODE_DIAGNOSTIC_STAGES)
-        cases = (
-            ("build_diagnostics", oversize,
-             ("runner_unavailable", "worker_setup", "source_gates_node_none_limit_exceeded")),
-            ("build_diagnostics", fitting, ("summary_guard_failed", "summary_guard")),
-            ("build_diagnostics", "[]", ("runner_unavailable", "worker_setup", "unavailable")),
-            ("lock", oversize, ("runner_unavailable", "worker_setup", "unavailable")),
-        )
-        for kind, value, expected in cases:
-            with self.subTest(kind=kind, size=len(value)):
-                environ = {"CORE_CONTRACT_ACCEPTED_NODE_LOCK_JSON": value}
-                with patch.object(subject, "_load_controls", return_value=controls), \
-                     patch.object(subject, "_load_control_sibling", return_value=producer(kind)), \
-                     patch.object(subject, "_validate_context", return_value=({}, Path.cwd(), Path.cwd())), \
-                     patch.object(subject, "_validate_review_gate", return_value=(DIFF_SHA256, CANDIDATE_REF)), \
-                     patch.object(subject, "_check_temp_root"), \
-                     patch.object(subject, "_validate_smoke_receipt", return_value={"rustc": "fixture"}), \
-                     patch.object(subject, "_run_source", side_effect=fail_source), \
-                     patch.object(subject.os, "geteuid", return_value=0, create=True), \
-                     patch.object(subject.sys, "platform", "darwin"), \
-                     patch.object(subject.platform, "machine", return_value="arm64"):
-                    with self.assertRaises(subject.Refusal) as raised:
-                        subject._execute(arguments, environ, "x", {}, feedback_kind=kind)
-                refusal = raised.exception
-                actual = (refusal.reason, refusal.stage, refusal.diagnostic)
-                self.assertEqual(actual[:len(expected)], expected)
-
     def test_producer_revocation_marker_follows_successful_cleanup_on_late_refusal(self):
         arguments = [
             "run", "--token-stdin", "--source-sha", SOURCE_SHA,
@@ -875,546 +888,6 @@ class CoreContractTests(unittest.TestCase):
         self.assertEqual(preserved.reason, "cleanup_incomplete")
         self.assertEqual(preserved.diagnostic, "worker_privilege_probe")
 
-    def _real_node_refusal(self, **options):
-        harness = foundation_tests.FoundationNodeFeedbackTests()
-        with self.assertRaises(real_node_contract.NodeContractRefusal) as caught:
-            harness._run(
-                "bootstrap", "lock", validated_tree="core_node_lock_return",
-                real_node_contract=real_node_contract, **options,
-            )
-        return caught.exception
-
-    def _follow_refusal_to_the_published_line(self, body_error, expected):
-        diagnostics = subject._FailureDiagnostics()
-        cleanup_state = {"first": None}
-
-        @contextmanager
-        def lease():
-            yield object()
-
-        with self.assertRaises(real_node_contract.NodeContractRefusal) as raised:
-            with subject._lease_with_diagnostic_capture(
-                lease(), diagnostics, lambda: "source_gates", cleanup_state,
-            ):
-                raise body_error
-        attached = diagnostics.attach(
-            subject._toolchain_refusal(raised.exception, "worker_setup"), "source_gates",
-            cleanup_state["first"],
-        )
-        self.assertEqual((attached.reason, attached.stage), ("cleanup_incomplete", "cleanup"))
-        self.assertEqual(attached.diagnostic, expected)
-        later = diagnostics.attach(
-            subject.Refusal("cleanup_incomplete", "cleanup"), "worker_cleanup", None,
-        )
-        self.assertEqual(later.diagnostic, expected)
-        reattached = subject._FailureDiagnostics().attach(attached, "source_gates")
-        self.assertEqual((reattached.reason, reattached.stage), ("cleanup_incomplete", "cleanup"))
-        self.assertEqual(reattached.diagnostic, expected)
-        payload = subject._format_refusal(reattached)
-        self.assertEqual(json.loads(payload)["diagnostic"], expected)
-        line = feedback_failure.REFUSAL_PREFIX + payload + b"\n"
-        self.assertEqual(feedback_failure.normalize_refusal(line), line)
-
-    @unittest.skipUnless(os.name == "posix", "Node worker cleanup harness requires POSIX paths")
-    def test_real_worker_survivor_class_survives_lease_capture_and_reattach(self):
-        command_error = real_rust.Refusal(
-            "cleanup_incomplete", command_check="helper_failure",
-            probe_check="probe_process_survivor", survivor_classes=("ps",),
-        )
-        node_refusal = self._real_node_refusal(command_error=command_error)
-        self.assertEqual(node_refusal.reason, "cleanup_incomplete")
-        self.assertEqual(node_refusal.cleanup_diagnostic, "source_gates_survivor_ps")
-        self._follow_refusal_to_the_published_line(node_refusal, "source_gates_survivor_ps")
-
-    @unittest.skipUnless(os.name == "posix", "Node worker cleanup harness requires POSIX paths")
-    def test_real_audit_request_cleanup_failure_survives_to_the_published_line(self):
-        contract_error = real_node_contract.NodeContractRefusal(
-            "cleanup_incomplete", stage="node_dependency_audit", substage="bulk_audit",
-        )
-        node_refusal = self._real_node_refusal(contract_error=contract_error)
-        self.assertEqual(node_refusal.cleanup_diagnostic, "source_gates_audit_request")
-        self._follow_refusal_to_the_published_line(node_refusal, "source_gates_audit_request")
-
-    @unittest.skipUnless(os.name == "posix", "Node worker cleanup harness requires POSIX paths")
-    def test_other_unrecorded_node_cleanup_failure_uses_the_unclassified_fallback(self):
-        contract_error = real_node_contract.NodeContractRefusal(
-            "cleanup_incomplete", stage="node_dependency_prepare", substage="runtime_version",
-        )
-        node_refusal = self._real_node_refusal(contract_error=contract_error)
-        self.assertEqual(node_refusal.cleanup_diagnostic, "source_gates_cleanup_unclassified")
-        self._follow_refusal_to_the_published_line(node_refusal, "source_gates_cleanup_unclassified")
-
-    def test_unlisted_cleanup_diagnostic_on_a_real_node_refusal_keeps_the_generic_value(self):
-        for unlisted in ("source_gates_survivor_private", "worker_cleanup", 7, None):
-            error = real_node_contract.NodeContractRefusal(
-                "cleanup_incomplete", stage="node_dependency_audit", substage="bulk_audit",
-            )
-            error.cleanup_diagnostic = unlisted
-            with self.subTest(unlisted=unlisted):
-                self._follow_refusal_to_the_published_line(error, "source_gates")
-
-    def test_node_diagnostic_vocabulary_is_a_closed_generated_set(self):
-        generated = set()
-        for substage, reasons in subject.SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE:
-            self.assertEqual(len(reasons), len(set(reasons)))
-            self.assertNotIn("cleanup_incomplete", reasons)
-            for reason in reasons:
-                generated.add("source_gates_node_" + substage + "_" + reason)
-        for substage in subject.SOURCE_GATES_NODE_COMMAND_SUBSTAGES:
-            for check in subject.SOURCE_GATES_NODE_COMMAND_CHECKS:
-                generated.add("source_gates_node_" + substage + "_command_" + check)
-        self.assertEqual(subject.SOURCE_GATES_NODE_DIAGNOSTICS, frozenset(generated))
-        self.assertEqual(len(subject.SOURCE_GATES_NODE_DIAGNOSTICS), 90)
-        self.assertEqual(set(subject.SOURCE_GATES_NODE_DIAGNOSTIC_REASONS), generated)
-        self.assertTrue(subject.SOURCE_GATES_NODE_DIAGNOSTICS <= subject.DIAGNOSTICS)
-        self.assertTrue(subject.SOURCE_GATES_NODE_DIAGNOSTICS <= subject.DETAILED_DIAGNOSTICS)
-        self.assertTrue(subject.SOURCE_GATES_NODE_DIAGNOSTICS <= subject.PRESERVED_SOURCE_DIAGNOSTICS)
-        self.assertFalse(subject.SOURCE_GATES_NODE_DIAGNOSTICS & subject.CLEANUP_DIAGNOSTICS)
-        self.assertEqual(
-            set(subject.SOURCE_GATES_NODE_DIAGNOSTIC_REASONS.values()),
-            {"capture_invalid", "runner_unavailable"},
-        )
-        for value in subject.SOURCE_GATES_NODE_DIAGNOSTICS:
-            self.assertRegex(value, r"\Asource_gates_node_[a-z_]+\Z")
-        self.assertEqual(
-            subject.SOURCE_GATES_NODE_COMMAND_CHECKS,
-            ("spawn_failure", "nonzero_exit", "timeout", "capture_invalid", "capture_overflow",
-             "helper_failure"),
-        )
-        self.assertEqual(frozenset(subject.SOURCE_GATES_NODE_COMMAND_CHECKS), real_node_contract.COMMAND_CHECKS)
-        self.assertEqual(frozenset(subject.SOURCE_GATES_NODE_COMMAND_CHECKS), real_rust.COMMAND_CHECKS)
-        node_substages = {"none"} | set(foundation_tests.subject.NODE_SUBSTAGES)
-        self.assertEqual(
-            {name for name, unused in subject.SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE}, node_substages,
-        )
-        node_reasons = set(foundation_tests.subject.NODE_REASONS) - {"cleanup_incomplete"}
-        for substage, reasons in subject.SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE:
-            self.assertTrue(set(reasons) <= node_reasons)
-        self.assertTrue(
-            set(subject.SOURCE_GATES_NODE_COMMAND_SUBSTAGES) <= set(foundation_tests.subject.NODE_SUBSTAGES)
-        )
-        self.assertNotIn("lock_validation", subject.SOURCE_GATES_NODE_COMMAND_SUBSTAGES)
-
-    def _published_node_refusal(self, error, stage="worker_setup"):
-        diagnostics = subject._FailureDiagnostics()
-        cleanup_state = {"first": None}
-
-        @contextmanager
-        def lease():
-            yield object()
-
-        with self.assertRaises(type(error)) as raised:
-            with subject._lease_with_diagnostic_capture(
-                lease(), diagnostics, lambda: "source_gates", cleanup_state,
-            ):
-                raise error
-        self.assertIsNone(cleanup_state["first"])
-        attached = diagnostics.attach(
-            subject._toolchain_refusal(raised.exception, stage), "source_gates",
-            cleanup_state["first"],
-        )
-        reattached = subject._FailureDiagnostics().attach(attached, "source_gates")
-        self.assertEqual((reattached.reason, reattached.stage, reattached.diagnostic),
-                         (attached.reason, attached.stage, attached.diagnostic))
-        final = subject._FailureDiagnostics().attach(
-            reattached, getattr(reattached, "diagnostic", "unavailable"),
-        )
-        self.assertEqual((final.reason, final.stage, final.diagnostic),
-                         (attached.reason, attached.stage, attached.diagnostic))
-        payload = subject._format_refusal(final)
-        record = json.loads(payload)
-        self.assertEqual(record["diagnostic"], attached.diagnostic)
-        line = feedback_failure.REFUSAL_PREFIX + payload + b"\n"
-        return attached, record, feedback_failure.normalize_refusal(line) == line
-
-    NODE_STAGE_BY_SUBSTAGE = (
-        ("runtime_version", "node_dependency_prepare"), ("npm_version", "node_dependency_prepare"),
-        ("lock_generation", "node_dependency_prepare"), ("lock_validation", "node_dependency_prepare"),
-        ("bulk_audit", "node_dependency_audit"), ("npm_ci", "node_dependency_audit"),
-        ("typecheck", "typescript_typecheck"), ("tests", "typescript_tests"),
-    )
-
-    def _expected_node_stage(self, expected):
-        for substage, stage in self.NODE_STAGE_BY_SUBSTAGE:
-            if expected.startswith("source_gates_node_" + substage + "_"):
-                return stage
-        return "worker_setup"
-
-    def _expect_node_diagnostic(self, error, expected, public_reason="runner_unavailable"):
-        attached, record, normalized = self._published_node_refusal(error)
-        expected_stage = self._expected_node_stage(expected)
-        self.assertEqual(attached.diagnostic, expected)
-        self.assertEqual((attached.reason, attached.stage), (public_reason, expected_stage))
-        self.assertEqual(
-            (record["reason"], record["stage"], record["diagnostic"]),
-            (public_reason, expected_stage, expected),
-        )
-        self.assertTrue(normalized)
-
-    def _real_tool_version_refusal(self, npm_stdout):
-        def run_worker(argv, *, stage, substage, cwd, env, deadline, timeout, allow_nonzero_capture):
-            stdout = (("v" + real_node_contract.NODE_VERSION + "\n").encode("ascii")
-                      if substage == "runtime_version" else npm_stdout)
-            return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"",
-                                   stdout_truncated=False, stderr_truncated=False)
-
-        with self.assertRaises(real_node_contract.NodeContractRefusal) as caught:
-            real_node_contract._tool_versions(
-                run_worker, Path("node"), Path("npm-cli"), Path("project"), {}, time.monotonic() + 60,
-            )
-        return caught.exception
-
-    def _real_worker_refusal(self, substage, command_error):
-        def run_worker(*arguments, **options):
-            raise command_error
-
-        with self.assertRaises(real_node_contract.NodeContractRefusal) as caught:
-            real_node_contract._worker_result(
-                run_worker, ("fixed",), stage="node_dependency_prepare", substage=substage,
-                project=Path("project"), environment={}, deadline=time.monotonic() + 60, timeout=10,
-            )
-        return caught.exception
-
-    @unittest.skipUnless(os.name == "posix", "Node worker harness requires POSIX paths")
-    def test_real_npm_version_mismatch_publishes_its_substage_through_run_node_profile(self):
-        refusal = self._real_tool_version_refusal(b"0.0.0\n")
-        self.assertEqual((refusal.reason, refusal.substage), ("toolchain_mismatch", "npm_version"))
-        raised = self._real_node_refusal(contract_error=refusal)
-        self.assertIs(raised, refusal)
-        self._expect_node_diagnostic(raised, "source_gates_node_npm_version_toolchain_mismatch")
-
-    @unittest.skipUnless(os.name == "posix", "Node worker harness requires POSIX paths")
-    def test_real_runtime_command_check_survives_run_node_profile_to_the_published_line(self):
-        for check in sorted(real_rust.COMMAND_CHECKS):
-            command_error = real_rust.Refusal("version_mismatch", command_check=check)
-            with self.subTest(check=check):
-                refusal = self._real_node_refusal(command_error=command_error)
-                self.assertEqual(
-                    (refusal.reason, refusal.substage, refusal.command_check),
-                    ("command_failed", "runtime_version", check),
-                )
-                self._expect_node_diagnostic(
-                    refusal, "source_gates_node_runtime_version_command_" + check,
-                )
-
-    @unittest.skipUnless(os.name == "posix", "Node worker harness requires POSIX paths")
-    def test_real_lock_generation_failures_publish_command_check_or_plain_command_failed(self):
-        command_error = real_rust.Refusal("version_mismatch", command_check="helper_failure")
-        refusal = self._real_worker_refusal("lock_generation", command_error)
-        self.assertEqual(refusal.command_check, "helper_failure")
-        raised = self._real_node_refusal(contract_error=refusal)
-        self._expect_node_diagnostic(raised, "source_gates_node_lock_generation_command_helper_failure")
-        no_check = self._real_worker_refusal("lock_generation", RuntimeError("private"))
-        self.assertIsNone(no_check.command_check)
-        self._expect_node_diagnostic(
-            self._real_node_refusal(contract_error=no_check),
-            "source_gates_node_lock_generation_command_failed",
-        )
-        with self.assertRaises(real_node_contract.NodeContractRefusal) as caught:
-            real_node_contract._validate_stage_result(
-                SimpleNamespace(returncode=1, stdout=b"", stderr=b"", stdout_truncated=False,
-                                stderr_truncated=False),
-                "node_dependency_prepare", "lock_generation",
-            )
-        self._expect_node_diagnostic(
-            self._real_node_refusal(contract_error=caught.exception),
-            "source_gates_node_lock_generation_command_failed",
-        )
-
-    @unittest.skipUnless(os.name == "posix", "Node worker harness requires POSIX paths")
-    def test_real_capture_invalid_keeps_its_public_reason_and_gains_the_substage(self):
-        refusal = real_node_contract.NodeContractRefusal(
-            "capture_invalid", stage="node_dependency_audit", substage="bulk_audit",
-        )
-        self._expect_node_diagnostic(
-            self._real_node_refusal(contract_error=refusal),
-            "source_gates_node_bulk_audit_capture_invalid", public_reason="capture_invalid",
-        )
-
-    def test_every_listed_node_combination_publishes_its_bound_value(self):
-        stage_for = dict(self.NODE_STAGE_BY_SUBSTAGE)
-        for substage, reasons in subject.SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE:
-            for reason in reasons:
-                error = real_node_contract.NodeContractRefusal(
-                    reason, substage=None if substage == "none" else substage,
-                    stage=stage_for.get(substage, "node_dependency_prepare"),
-                )
-                expected = "source_gates_node_" + substage + "_" + reason
-                with self.subTest(diagnostic=expected):
-                    self._expect_node_diagnostic(
-                        error, expected,
-                        public_reason="capture_invalid" if reason == "capture_invalid"
-                        else "runner_unavailable",
-                    )
-        for substage in subject.SOURCE_GATES_NODE_COMMAND_SUBSTAGES:
-            for check in subject.SOURCE_GATES_NODE_COMMAND_CHECKS:
-                error = real_node_contract.NodeContractRefusal(
-                    "command_failed", substage=substage, command_check=check,
-                    stage=stage_for[substage],
-                )
-                expected = "source_gates_node_" + substage + "_command_" + check
-                with self.subTest(diagnostic=expected):
-                    self._expect_node_diagnostic(error, expected)
-
-    def test_node_substage_values_bind_to_exactly_one_node_stage(self):
-        stage_for = dict(self.NODE_STAGE_BY_SUBSTAGE)
-        self.assertEqual(subject.SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE, stage_for)
-        self.assertEqual(
-            set(stage_for.values()),
-            {"node_dependency_prepare", "node_dependency_audit", "typescript_typecheck",
-             "typescript_tests"},
-        )
-        self.assertEqual(set(stage_for.values()), set(foundation_tests.subject.NODE_GATE_NAMES))
-        generated = {}
-        for substage, reasons in subject.SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE:
-            if substage in stage_for:
-                for reason in reasons:
-                    generated["source_gates_node_" + substage + "_" + reason] = stage_for[substage]
-        for substage in subject.SOURCE_GATES_NODE_COMMAND_SUBSTAGES:
-            for check in subject.SOURCE_GATES_NODE_COMMAND_CHECKS:
-                generated["source_gates_node_" + substage + "_command_" + check] = stage_for[substage]
-        self.assertEqual(subject.SOURCE_GATES_NODE_DIAGNOSTIC_STAGES, generated)
-        self.assertEqual(len(generated), 90 - 10)
-        self.assertTrue(set(generated) <= subject.SOURCE_GATES_NODE_DIAGNOSTICS)
-        for diagnostic in subject.SOURCE_GATES_NODE_DIAGNOSTICS - set(generated):
-            self.assertTrue(diagnostic.startswith("source_gates_node_none_"), msg=diagnostic)
-
-    def test_node_substage_refusals_keep_worker_setup_without_a_known_substage(self):
-        refusal = real_node_contract.NodeContractRefusal
-        for stage in sorted(real_node_contract.STAGES):
-            for reason in ("invalid_input", "tool_unavailable", "capture_invalid"):
-                with self.subTest(stage=stage, reason=reason):
-                    self._expect_node_diagnostic(
-                        refusal(reason, stage=stage), "source_gates_node_none_" + reason,
-                        public_reason="capture_invalid" if reason == "capture_invalid"
-                        else "runner_unavailable",
-                    )
-
-    def test_node_substage_refusal_at_a_disagreeing_stage_keeps_the_generic_value(self):
-        refusal = real_node_contract.NodeContractRefusal
-        stage_for = dict(self.NODE_STAGE_BY_SUBSTAGE)
-        for substage, bound in sorted(stage_for.items()):
-            for stage in sorted(real_node_contract.STAGES - {bound}):
-                with self.subTest(substage=substage, stage=stage):
-                    self._expect_node_diagnostic(
-                        refusal("command_failed", stage=stage, substage=substage, command_check="timeout"),
-                        "source_gates",
-                    )
-        refused = subject._toolchain_refusal(
-            refusal("command_failed", stage="typescript_tests", substage="tests", command_check="timeout"),
-            "worker_setup",
-        )
-        self.assertEqual(
-            (refused.reason, refused.stage, refused.diagnostic),
-            ("runner_unavailable", "typescript_tests", "source_gates_node_tests_command_timeout"),
-        )
-        other = subject._toolchain_refusal(
-            refusal("command_failed", stage="typescript_tests", substage="tests", command_check="timeout"),
-            "toolchain_install",
-        )
-        self.assertEqual((other.reason, other.stage), ("toolchain_install_failed", "toolchain_install"))
-        self.assertEqual(other.diagnostic, "unavailable")
-
-    def test_unlisted_node_combinations_keep_the_generic_source_gates_value(self):
-        refusal = real_node_contract.NodeContractRefusal
-        tampered_substage = refusal("command_failed", substage="lock_generation")
-        tampered_substage.substage = "private_substage"
-        tampered_check = refusal("command_failed", substage="lock_generation", command_check="timeout")
-        tampered_check.command_check = "private_check"
-        tampered_reason = refusal("command_failed", substage="lock_generation")
-        tampered_reason.reason = 7
-        for error in (
-            refusal("contract_refused", substage="lock_validation"),
-            refusal("toolchain_mismatch", substage="bulk_audit"),
-            refusal("vulnerable_dependency", substage="npm_ci"),
-            refusal("command_failed", substage="lock_validation", command_check="timeout"),
-            tampered_substage, tampered_check, tampered_reason,
-        ):
-            with self.subTest(reason=error.reason, substage=error.substage):
-                self._expect_node_diagnostic(error, "source_gates")
-        generic = SimpleNamespace(reason="command_failed", substage="lock_generation",
-                                  command_check="spawn_failure")
-        refused = subject._toolchain_refusal(generic, "worker_setup")
-        self.assertEqual((refused.reason, refused.stage, refused.diagnostic),
-                         ("runner_unavailable", "worker_setup", "unavailable"))
-        self.assertEqual(
-            subject._FailureDiagnostics().attach(refused, "source_gates").diagnostic, "source_gates",
-        )
-        other_stage = subject._toolchain_refusal(
-            refusal("command_failed", substage="lock_generation", command_check="timeout"),
-            "toolchain_install",
-        )
-        self.assertEqual((other_stage.reason, other_stage.stage), ("toolchain_install_failed", "toolchain_install"))
-        self.assertEqual(other_stage.diagnostic, "unavailable")
-        for unlisted in ("source_gates_node_private_command_timeout", "source_gates_node_", "source_gates_node"):
-            forced = subject.Refusal("runner_unavailable", "worker_setup", diagnostic=unlisted)
-            self.assertEqual(forced.diagnostic, "unavailable")
-            self.assertEqual(
-                subject._FailureDiagnostics().attach(forced, "source_gates").diagnostic, "source_gates",
-            )
-
-    def test_node_cleanup_refusal_still_wins_over_the_node_substage_value(self):
-        error = real_node_contract.NodeContractRefusal(
-            "cleanup_incomplete", stage="node_dependency_audit", substage="bulk_audit",
-        )
-        refusal = subject._toolchain_refusal(error, "worker_setup")
-        self.assertEqual((refusal.reason, refusal.stage), ("cleanup_incomplete", "cleanup"))
-        self.assertNotIn(refusal.diagnostic, subject.SOURCE_GATES_NODE_DIAGNOSTICS)
-
-    def test_step_diagnostic_vocabulary_is_closed_bound_and_separate_from_the_substage_set(self):
-        generated = {"source_gates_payload_invalid", "source_gates_payload_capture_invalid"}
-        generated |= {
-            "source_gates_node_profile_" + reason
-            for reason in ("manifest_invalid", "command_failed", "capture_invalid", "output_unavailable")
-        }
-        generated |= {
-            "source_gates_node_outcome_" + check
-            for check in ("rust", "stage", "capture", "substage", "verification", "reviewed_files")
-        }
-        generated |= NPM_STEP_DIAGNOSTICS
-        self.assertEqual(subject.SOURCE_GATES_STEP_DIAGNOSTICS, frozenset(generated))
-        self.assertEqual(len(subject.SOURCE_GATES_STEP_DIAGNOSTICS), 66)
-        self.assertEqual(set(subject.SOURCE_GATES_STEP_DIAGNOSTIC_REASONS), generated)
-        self.assertEqual(
-            set(subject.SOURCE_GATES_STEP_DIAGNOSTIC_REASONS.values()), {"capture_invalid", "runner_unavailable"},
-        )
-        self.assertEqual(
-            {name for name, reason in subject.SOURCE_GATES_STEP_DIAGNOSTIC_REASONS.items()
-             if reason == "capture_invalid"},
-            {"source_gates_payload_capture_invalid", "source_gates_node_profile_capture_invalid",
-             "source_gates_npm_version_capture_invalid", "source_gates_npm_resolve_capture_invalid",
-             "source_gates_npm_lock_capture_invalid"},
-        )
-        self.assertFalse(subject.SOURCE_GATES_STEP_DIAGNOSTICS & subject.SOURCE_GATES_NODE_DIAGNOSTICS)
-        self.assertFalse(subject.SOURCE_GATES_STEP_DIAGNOSTICS & subject.CLEANUP_DIAGNOSTICS)
-        self.assertTrue(subject.SOURCE_GATES_STEP_DIAGNOSTICS <= subject.DIAGNOSTICS)
-        self.assertTrue(subject.SOURCE_GATES_STEP_DIAGNOSTICS <= subject.DETAILED_DIAGNOSTICS)
-        self.assertTrue(subject.SOURCE_GATES_STEP_DIAGNOSTICS <= subject.PRESERVED_SOURCE_DIAGNOSTICS)
-        self.assertEqual(
-            {key[0] for key in subject.SOURCE_GATES_STEP_DIAGNOSTICS_BY_KEY},
-            {"payload", "node_profile", "node_outcome", "npm_inputs", "npm_config", "npm_version",
-             "npm_resolve", "npm_lock", "npm_bundle"},
-        )
-        for key, diagnostic in subject.SOURCE_GATES_STEP_DIAGNOSTICS_BY_KEY.items():
-            self.assertRegex(diagnostic, r"\Asource_gates_[a-z0-9_]+\Z")
-            self.assertIn(diagnostic, subject.DIAGNOSTICS)
-
-    def test_node_gate_names_are_refusal_stages(self):
-        self.assertTrue(real_node_contract.STAGES <= subject.STAGES)
-        self.assertTrue(set(foundation_tests.subject.NODE_GATE_NAMES) <= subject.STAGES)
-        for stage in sorted(real_node_contract.STAGES):
-            with self.subTest(stage=stage):
-                refusal = subject.Refusal("runner_unavailable", stage)
-                self.assertEqual(refusal.stage, stage)
-        self.assertEqual(subject.Refusal("runner_unavailable", "typescript_private").stage, "internal")
-
-    def _tagged_error(self, reason, step, key):
-        error = Exception("synthetic")
-        error.reason = reason
-        error.source_gates_step = step
-        error.source_gates_key = key
-        return error
-
-    def test_payload_failures_publish_their_fixed_step_diagnostic(self):
-        self._expect_node_diagnostic(
-            self._tagged_error("payload_invalid", "payload", "payload_invalid"),
-            "source_gates_payload_invalid",
-        )
-        self._expect_node_diagnostic(
-            self._tagged_error("capture_invalid", "payload", "capture_invalid"),
-            "source_gates_payload_capture_invalid", public_reason="capture_invalid",
-        )
-
-    def test_npm_steps_publish_their_fixed_step_diagnostic_at_worker_setup(self):
-        self.assertEqual(len(NPM_STEP_DIAGNOSTICS), 54)
-        for step, keys in sorted(NPM_KEYS_BY_STEP.items()):
-            for key in keys:
-                diagnostic = "source_gates_" + step + "_" + key
-                public_reason = "capture_invalid" if key == "capture_invalid" else "runner_unavailable"
-                for reason in ("command_failed", "tool_unavailable", "payload_invalid", "manifest_invalid"):
-                    if public_reason == "capture_invalid":
-                        reason = "capture_invalid"
-                    with self.subTest(step=step, key=key, reason=reason):
-                        self._expect_node_diagnostic(
-                            self._tagged_error(reason, step, key), diagnostic, public_reason=public_reason,
-                        )
-
-    def test_npm_tags_with_a_mismatched_reason_or_unknown_key_keep_the_generic_value(self):
-        for error in (
-            self._tagged_error("command_failed", "npm_resolve", "capture_invalid"),
-            self._tagged_error("capture_invalid", "npm_resolve", "eresolve"),
-            self._tagged_error("command_failed", "npm_resolve", "ERESOLVE"),
-            self._tagged_error("command_failed", "npm_resolve", "other_code"),
-            self._tagged_error("command_failed", "npm_version", "eresolve"),
-            self._tagged_error("payload_invalid", "npm_bundle", "manifest_invalid"),
-            self._tagged_error("payload_invalid", "npm_lock", "npm_peer_refused"),
-            self._tagged_error("manifest_invalid", "npm_inputs", "npm_lock_refused"),
-            self._tagged_error("payload_invalid", "npm", "npm_lock_refused"),
-            self._tagged_error("payload_invalid", "npm_bundle", None),
-        ):
-            with self.subTest(reason=error.reason, step=error.source_gates_step, key=error.source_gates_key):
-                self._expect_node_diagnostic(
-                    error, "source_gates",
-                    public_reason="capture_invalid" if error.reason == "capture_invalid" else "runner_unavailable",
-                )
-
-    def test_node_profile_failures_publish_their_fixed_step_diagnostic(self):
-        for reason in ("manifest_invalid", "command_failed", "capture_invalid", "output_unavailable"):
-            with self.subTest(reason=reason):
-                self._expect_node_diagnostic(
-                    self._tagged_error(reason, "node_profile", reason),
-                    "source_gates_node_profile_" + reason,
-                    public_reason="capture_invalid" if reason == "capture_invalid" else "runner_unavailable",
-                )
-
-    def test_node_outcome_failures_publish_their_fixed_step_diagnostic(self):
-        for check in subject.SOURCE_GATES_NODE_OUTCOME_CHECKS:
-            with self.subTest(check=check):
-                self._expect_node_diagnostic(
-                    foundation_tests.subject.NodeOutcomeInvalid("synthetic", check),
-                    "source_gates_node_outcome_" + check,
-                )
-        with self.assertRaises(foundation_tests.subject.NodeOutcomeInvalid) as caught:
-            foundation_tests.subject.extend_diagnostic_outcome({}, lambda: None, SimpleNamespace())
-        self._expect_node_diagnostic(caught.exception, "source_gates_node_outcome_rust")
-
-    def test_unlisted_or_mismatched_step_tags_keep_the_generic_source_gates_value(self):
-        for error in (
-            self._tagged_error("payload_invalid", "payload", "private"),
-            self._tagged_error("payload_invalid", "private", "payload_invalid"),
-            self._tagged_error("payload_invalid", "payload", 7),
-            self._tagged_error("payload_invalid", 7, "payload_invalid"),
-            self._tagged_error("command_failed", "payload", "capture_invalid"),
-            self._tagged_error("command_failed", "node_profile", "capture_invalid"),
-            self._tagged_error(None, "node_outcome", "private"),
-            self._tagged_error(None, None, None),
-        ):
-            with self.subTest(reason=error.reason, step=error.source_gates_step, key=error.source_gates_key):
-                self._expect_node_diagnostic(error, "source_gates")
-
-    def test_step_tags_never_override_cleanup_or_other_stages(self):
-        tagged = self._tagged_error("cleanup_incomplete", "node_profile", "command_failed")
-        refusal = subject._toolchain_refusal(tagged, "worker_setup")
-        self.assertEqual((refusal.reason, refusal.stage), ("cleanup_incomplete", "cleanup"))
-        self.assertNotIn(refusal.diagnostic, subject.SOURCE_GATES_STEP_DIAGNOSTICS)
-        other_stage = subject._toolchain_refusal(
-            self._tagged_error("payload_invalid", "payload", "payload_invalid"), "toolchain_install",
-        )
-        self.assertEqual((other_stage.reason, other_stage.stage), ("toolchain_install_failed", "toolchain_install"))
-        self.assertEqual(other_stage.diagnostic, "unavailable")
-        for unlisted in ("source_gates_payload_private", "source_gates_node_outcome_", "source_gates_node_profile"):
-            forced = subject.Refusal("runner_unavailable", "worker_setup", diagnostic=unlisted)
-            self.assertEqual(forced.diagnostic, "unavailable")
-
-    def test_step_tag_helper_keeps_the_first_tag_and_never_raises(self):
-        error = Exception("synthetic")
-        subject._tag_source_gates_step(error, "payload", "payload_invalid")
-        subject._tag_source_gates_step(error, "node_profile", "command_failed")
-        self.assertEqual((error.source_gates_step, error.source_gates_key), ("payload", "payload_invalid"))
-        subject._tag_source_gates_step(object(), "payload", "payload_invalid")
-        self.assertIsNone(subject._source_gates_step_diagnostic(object()))
-        self.assertEqual(subject._source_gates_step_diagnostic(error), "source_gates_payload_invalid")
-
     def test_review_binding_requires_every_protected_value(self):
         request = _request()
         binding = _binding()
@@ -1491,11 +964,17 @@ class CoreContractTests(unittest.TestCase):
             self.assertIn(stage, subject.SOURCE_GATE_STAGES)
             self.assertIn(stage, subject.STAGES)
             self.assertIn(stage, real_rust.SOURCE_COMMAND_STAGES)
+        for stage in subject.NODE_GATE_NAMES:
+            self.assertIn(stage, subject.SOURCE_GATE_STAGES)
+            self.assertIn(stage, subject.STAGES)
+            self.assertIn(stage, real_rust.SOURCE_COMMAND_STAGES)
+        self.assertIn("typescript_tests", subject.TEST_GATE_STAGES)
+        self.assertNotIn("typescript_typecheck", subject.TEST_GATE_STAGES)
         self.assertIn("api_feature_tests", subject.TEST_GATE_STAGES)
         self.assertNotIn("api_feature_clippy", subject.TEST_GATE_STAGES)
         self.assertEqual(subject._gate_command_seconds("api_feature_tests"), 300)
         self.assertEqual(subject._gate_command_seconds("api_feature_clippy"), 120)
-        self.assertEqual(foundation_tests.subject.RUST_GATE_NAMES, subject.GATE_NAMES)
+        self.assertEqual(gate_table.RUST_GATE_NAMES, subject.GATE_NAMES)
         self.assertEqual(producer_module.DIAGNOSTIC_BASE_GATES, subject.GATE_NAMES)
 
     def test_runtime_commands_are_fixed_locked_offline_and_cover_all_targets(self):
@@ -1527,19 +1006,14 @@ class CoreContractTests(unittest.TestCase):
         with self.assertRaises(subject.Refusal):
             subject._source_commands(source, tools, include_runtime=1)
 
-    def test_authenticated_runtime_selector_is_threaded_to_source_snapshot(self):
+    def test_retired_dependency_lock_routes_are_absent_from_source_snapshot(self):
         source = Path(subject.__file__).read_text(encoding="ascii")
-        validation_source = Path(private_validation.__file__).read_text(encoding="ascii")
-        self.assertIn(
-            'workspace_selector = feedback_producer.feedback_request.request_workspace(\n'
-            '                        dispatch["request"],\n'
-            '                    )',
-            source,
-        )
-        self.assertIn("feedback=feedback, workspace_selector=workspace_selector,", source)
-        self.assertIn("workspace_selector=workspace_selector,", source)
-        self.assertIn('workspace_selector == "runtime" and concern != "core-rust-lock-return"', validation_source)
-        self.assertIn('workspace_selector == "contract"', validation_source)
+        producer_source = Path(subject.__file__).with_name("macos_feedback_producer.py").read_text(encoding="ascii")
+        self.assertNotIn("request_workspace(", source)
+        self.assertIn('feedback=feedback,', source)
+        for retired in ("core-node-lock-return", "core-rust-lock-return", "core-npm-admission-return"):
+            with self.subTest(concern=retired):
+                self.assertNotIn(retired, producer_source)
 
     def test_runtime_root_selection_requires_both_validated_root_files(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1579,19 +1053,21 @@ class CoreContractTests(unittest.TestCase):
             rust = SimpleNamespace(_run_worker_command=run_command)
             with patch.object(subject, "_load_control_sibling", return_value=SimpleNamespace(
                     _worker_census=lambda *args: None)):
-                gates = subject._run_gates(
-                    source, {}, 502, {"python": "/usr/bin/python3"}, object(), rust, tools,
-                    subject.time.monotonic() + 30, include_runtime=True,
-                )
+                with patch.object(subject, "_prepare_cargo_registry"):
+                    gates = subject._run_gates(
+                        source, {}, 502, {"python": "/usr/bin/python3"}, object(), rust, tools,
+                        subject.time.monotonic() + 30, include_runtime=True,
+                    )
                 self.assertEqual(tuple(gates), subject.GATE_NAMES + subject.RUNTIME_GATE_NAMES)
                 self.assertEqual(calls, list(subject.GATE_NAMES + subject.RUNTIME_GATE_NAMES))
                 calls.clear()
                 fail_runtime_clippy[0] = True
                 with self.assertRaises(subject.Refusal) as raised:
-                    subject._run_gates(
-                        source, {}, 502, {"python": "/usr/bin/python3"}, object(), rust, tools,
-                        subject.time.monotonic() + 30, include_runtime=True,
-                    )
+                    with patch.object(subject, "_prepare_cargo_registry"):
+                        subject._run_gates(
+                            source, {}, 502, {"python": "/usr/bin/python3"}, object(), rust, tools,
+                            subject.time.monotonic() + 30, include_runtime=True,
+                        )
             self.assertEqual(raised.exception.reason, "gate_failed")
             self.assertEqual(raised.exception.stage, "runtime_clippy")
             self.assertEqual(raised.exception.diagnostic, "source_gate_nonzero_exit")
@@ -1623,12 +1099,13 @@ class CoreContractTests(unittest.TestCase):
         with self.assertRaises(subject.Refusal):
             subject._source_commands(source, tools, include_parser=1)
 
-    def test_locked_foundation_lease_marker_is_limited_to_diagnostics(self):
+    def test_package_lock_uses_the_normal_build_diagnostic_lease(self):
         request = {**_request(), "concern": "core-build-diagnostic-return"}
         binding = _binding()
         record = {
             **binding, **request, "repository_id": "67890", "candidate_class": "signed-descendant",
-            "signature": "verified", "rules_lock": "present", "tree": subject.LOCKED_FOUNDATION_TREE,
+            "signature": "verified",
+            "tree": subject.FEEDBACK_TREE_LABELS["core-build-diagnostic-return"],
             "source_execution": "not_run_at_yield", "app_build": "not_run", "cleanup": "lease_open",
             "repository_scope": "verified", "metadata": "verified",
             "token_revocation": "confirmed_before_yield", "signer_authority": "bound_base",
@@ -1637,8 +1114,8 @@ class CoreContractTests(unittest.TestCase):
         }
         self.assertEqual(subject._validate_source_lease(
             record, request, binding, 504, private_validation,
-        )["tree"], subject.LOCKED_FOUNDATION_TREE)
-        for concern in ("core-contract", "core-node-lock-return", "core-rust-format-return"):
+        )["tree"], subject.FEEDBACK_TREE_LABELS["core-build-diagnostic-return"])
+        for concern in ("core-node-lock-return",):
             with self.subTest(concern=concern), self.assertRaises(subject.Refusal):
                 subject._validate_source_lease(
                     {**record, "concern": concern}, {**request, "concern": concern},
@@ -1647,56 +1124,26 @@ class CoreContractTests(unittest.TestCase):
         for tree in ("core_build_diagnostic_return_v3", "core_node_lock_return"):
             with self.subTest(tree=tree), self.assertRaises(subject.Refusal):
                 subject._validate_source_lease({**record, "tree": tree}, request, binding, 504, private_validation)
-        with self.assertRaises(subject.Refusal):
-            subject._validate_source_lease(record, request, binding, 504, SimpleNamespace())
         legacy = {**record, "tree": "core_build_diagnostic_return"}
         self.assertEqual(subject._validate_source_lease(
             legacy, request, binding, 504, private_validation,
         )["tree"], "core_build_diagnostic_return")
 
-    def test_fixture_lease_marker_is_limited_to_npm_admission_and_carries_no_rules_lock(self):
+    def test_npm_admission_fixture_lease_is_no_longer_accepted(self):
         request = {**_request(), "concern": "core-npm-admission-return"}
         binding = _binding()
         record = {
             **binding, **request, "repository_id": "67890", "candidate_class": "signed-descendant",
-            "signature": "verified", "rules_lock": "not-applicable", "tree": subject.NPM_FIXTURE_TREE,
+            "signature": "verified",
+            "tree": "npm_fixture_admission_return",
             "source_execution": "not_run_at_yield", "app_build": "not_run", "cleanup": "lease_open",
             "repository_scope": "verified", "metadata": "verified",
             "token_revocation": "confirmed_before_yield", "signer_authority": "bound_base",
             "signatures": "all_new_commits_verified", "ancestry": "base_ancestor",
             "revocation_policy": "current_control_fingerprints", "worker_access": "uid_read_only",
         }
-        self.assertEqual(subject._validate_source_lease(
-            record, request, binding, 504, private_validation,
-        )["tree"], subject.NPM_FIXTURE_TREE)
-        for concern in (
-            "core-contract", "core-node-lock-return", "core-rust-format-return",
-            "core-build-diagnostic-return", "core-rust-lock-return",
-        ):
-            with self.subTest(concern=concern), self.assertRaises(subject.Refusal):
-                subject._validate_source_lease(
-                    {**record, "concern": concern}, {**request, "concern": concern},
-                    binding, 504, private_validation,
-                )
-        for changes in (
-            {"rules_lock": "present"},
-            {"tree": "core_npm_admission_return"},
-            {"tree": "npm_fixture_admission_return_v2"},
-        ):
-            with self.subTest(changes=changes), self.assertRaises(subject.Refusal):
-                subject._validate_source_lease(
-                    {**record, **changes}, request, binding, 504, private_validation,
-                )
         with self.assertRaises(subject.Refusal):
-            subject._validate_source_lease(record, request, binding, 504, SimpleNamespace())
-        core = {**record, "rules_lock": "present", "tree": "core_npm_admission_return"}
-        self.assertEqual(subject._validate_source_lease(
-            core, request, binding, 504, private_validation,
-        )["tree"], "core_npm_admission_return")
-        with self.assertRaises(subject.Refusal):
-            subject._validate_source_lease(
-                {**core, "rules_lock": "not-applicable"}, request, binding, 504, private_validation,
-            )
+            subject._validate_source_lease(record, request, binding, 504, private_validation)
 
     def test_fixture_source_path_check_needs_only_the_fixture_cargo_files(self):
         self.assertEqual(subject.FIXTURE_SOURCE_FILES, (
@@ -2136,43 +1583,13 @@ class CoreContractTests(unittest.TestCase):
                 )
                 self.assertIs(subject._clean_gate_timeout(unclean), False)
 
-    def test_gate_diagnostic_helpers_match_the_node_feedback_helpers(self):
-        node = foundation_tests.subject
-        cleanup_shapes = (
-            {"probe_check": "probe_process_timeout", "command_check": "timeout"},
-            {"probe_check": "probe_process_timeout", "command_check": "helper_failure"},
-            {"probe_check": "probe_process_timeout"},
-            {"probe_check": "probe_process_group_cleanup"},
-            {"probe_check": "probe_process_capture_cleanup"},
-            {"probe_check": "probe_process_census"},
-            {"probe_check": "probe_process_survivor", "survivor_classes": ("python",)},
-            {"probe_check": "probe_process_survivor", "survivor_classes": ("python", "ps")},
-            {"probe_check": "probe_process_survivor", "survivor_classes": ()},
-            {"probe_check": "probe_process_survivor", "survivor_classes": ("private",)},
-            {"command_check": "timeout"},
-            {"command_check": "nonzero_exit"},
-            {},
-        )
-        for attributes in cleanup_shapes:
-            with self.subTest(attributes=attributes):
-                error = self._gate_cleanup_error(**attributes)
-                self.assertEqual(
-                    subject._gate_cleanup_diagnostic(error), node._command_cleanup_diagnostic(error),
-                )
-        for classes in (("helper_trust",), ("python", "ps"), (), "unclassified", "unavailable", None):
-            with self.subTest(classes=classes):
-                error = SimpleNamespace(survivor_classes=classes)
-                self.assertEqual(
-                    subject._gate_census_diagnostic(error), node._census_diagnostic(error),
-                )
-
     def test_test_gates_use_the_larger_command_limit_inside_the_job_deadline(self):
         self.assertEqual(subject.MAX_COMMAND_SECONDS, 120)
         self.assertEqual(subject.MAX_TEST_COMMAND_SECONDS, 300)
         self.assertEqual(
             subject.TEST_GATE_STAGES,
             frozenset(("workspace_tests", "api_tests", "api_feature_tests", "mock_tests",
-                       "conformance_tests", "parser_replay", "runtime_tests")),
+                       "conformance_tests", "parser_replay", "runtime_tests", "typescript_tests")),
         )
         self.assertLessEqual(subject.TEST_GATE_STAGES, frozenset(subject.SOURCE_GATE_STAGES))
         self.assertLess(subject.MAX_TEST_COMMAND_SECONDS, subject.MAX_TOTAL_SECONDS)
@@ -2463,41 +1880,6 @@ class CoreContractTests(unittest.TestCase):
             subject._source_runtime_diagnostic(runtime, wrong_reason),
             "source_runtime_bootstrap_bootstrap_not_approved",
         )
-
-    def test_an_npm_refusal_becomes_a_diagnostic_only_for_a_pair_in_the_closed_table(self):
-        converted = []
-
-        class FakeProducer:
-            @staticmethod
-            def npm_diagnostic_result(error):
-                converted.append(error)
-                return {"source_result": "npm_diagnostic"}
-
-        def refusal(step, key):
-            error = RuntimeError("npm")
-            error.source_gates_step = step
-            error.source_gates_key = key
-            return error
-
-        for step, key in (("npm_resolve", "eresolve"), ("npm_lock", "npm_lock_refused"),
-                          ("npm_bundle", "capture_invalid")):
-            if (step, key) not in subject.SOURCE_GATES_STEP_DIAGNOSTICS_BY_KEY:
-                continue
-            with self.subTest(step=step, key=key):
-                error = refusal(step, key)
-                self.assertEqual(subject._npm_feedback_result(FakeProducer, error),
-                                 {"source_result": "npm_diagnostic"})
-                self.assertIs(converted[-1], error)
-        converted.clear()
-        for step, key in (("npm_resolve", "not_in_the_table"), ("npm_lock", "eresolve"),
-                          ("npm_version", "mismatch"), ("payload", "payload_invalid"),
-                          ("npm_bundle", ["x"]), (None, None), (["npm_lock"], "npm_lock_refused")):
-            error = refusal(step, key)
-            with self.subTest(step=step, key=key):
-                with self.assertRaises(RuntimeError) as raised:
-                    subject._npm_feedback_result(FakeProducer, error)
-                self.assertIs(raised.exception, error)
-        self.assertEqual(converted, [])
 
     def test_source_lease_open_unknown_exception_class_uses_only_fixed_type_labels(self):
         class CustomTypeError(TypeError):

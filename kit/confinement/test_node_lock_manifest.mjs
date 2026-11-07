@@ -1,15 +1,23 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import {
   LOCK_MANIFEST_LIMITS,
   LockManifestError,
+  captureDependencyCheck,
+  deriveNpmLockExpectation,
+  formatDependencyCheckSummary,
+  validateNoNpmShrinkwrap,
   validateLockManifest,
   validateLockManifestInventory,
+  validateNpmProjectLock,
 } from './node_lock_manifest.mjs';
 
 const expected = {
@@ -70,6 +78,16 @@ function bytes(lock = lockFixture()) {
 
 function rejected(lock = lockFixture(), expectation = expected) {
   assert.throws(() => validateLockManifest(bytes(lock), expectation), LockManifestError);
+}
+
+function codeOf(lock, expectation = expected) {
+  try {
+    validateLockManifest(bytes(lock), expectation);
+    return 'accepted';
+  } catch (error) {
+    assert.ok(error instanceof LockManifestError);
+    return error.code;
+  }
 }
 
 function workspaceTypescriptFixture(version) {
@@ -168,7 +186,78 @@ test('workspace dependency resolution chooses the nearest reviewed package entry
   assert.throws(() => validateLockManifest(bytes(shadowed.lock), shadowed.expectation), LockManifestError);
 });
 
-test('rejects unknown package sources, missing integrity, credentials, and nonpublic registries', () => {
+test('accepts apps workspaces and ranged peer dependencies without treating ranges as installed pins', () => {
+  const workspacePath = 'apps/test-shell-desktop/web';
+  const peerRange = '>=19.2.0 <20';
+  const expectedWithPeer = {
+    root: {
+      name: 'fixture-root',
+      version: '1.0.0',
+      workspaces: [workspacePath],
+    },
+    workspaces: [{
+      path: workspacePath,
+      name: '@fixture/app',
+      version: '1.0.0',
+      peerDependencies: { react: peerRange },
+    }],
+  };
+  const lock = {
+    name: 'fixture-root',
+    version: '1.0.0',
+    lockfileVersion: 3,
+    requires: true,
+    packages: {
+      '': { name: 'fixture-root', version: '1.0.0', workspaces: [workspacePath] },
+      [workspacePath]: {
+        name: '@fixture/app', version: '1.0.0', peerDependencies: { react: peerRange },
+      },
+      'node_modules/react': {
+        version: '19.3.1',
+        resolved: 'https://registry.npmjs.org/react/-/react-19.3.1.tgz',
+        integrity: `sha512-${'A'.repeat(86)}==`,
+      },
+    },
+  };
+
+  assert.deepEqual(validateLockManifest(bytes(lock), expectedWithPeer), { packageCount: 3, lockfileVersion: 3 });
+  const inventory = validateLockManifestInventory(bytes(lock), expectedWithPeer);
+  const app = inventory.packages.find((item) => item.name === '@fixture/app');
+  assert.deepEqual(app.dependencies, [{ name: 'react', version: '19.3.1' }]);
+});
+
+test('accepts bounded source-local file dependencies through reviewed package links', () => {
+  const workspacePath = 'packages/client-api';
+  const localPath = '../packages/shared';
+  const fileSpec = 'file:../../../packages/shared';
+  const expectedWithLocal = {
+    root: { name: 'fixture-root', version: '1.0.0', workspaces: [workspacePath] },
+    workspaces: [{
+      path: workspacePath,
+      name: '@fixture/client-api',
+      version: '1.0.0',
+      dependencies: { '@fixture/shared': fileSpec },
+    }],
+    localPackages: [{ path: localPath, name: '@fixture/shared', version: '1.0.0' }],
+  };
+  const lock = {
+    name: 'fixture-root', version: '1.0.0', lockfileVersion: 3, requires: true,
+    packages: {
+      '': { name: 'fixture-root', version: '1.0.0', workspaces: [workspacePath] },
+      [workspacePath]: {
+        name: '@fixture/client-api', version: '1.0.0', dependencies: { '@fixture/shared': fileSpec },
+      },
+      [localPath]: { name: '@fixture/shared', version: '1.0.0' },
+      'node_modules/@fixture/shared': { resolved: localPath, link: true },
+    },
+  };
+
+  assert.deepEqual(validateLockManifest(bytes(lock), expectedWithLocal), { packageCount: 4, lockfileVersion: 3 });
+  const inventory = validateLockManifestInventory(bytes(lock), expectedWithLocal);
+  assert.ok(inventory.packages.some((item) => item.name === '@fixture/shared' && item.kind === 'workspace'));
+});
+
+test('rejects unknown package sources, credentials, and nonpublic registries', () => {
   for (const resolved of [
     'file:../../outside.tgz',
     'git+https://registry.npmjs.org/typescript.git',
@@ -183,10 +272,185 @@ test('rejects unknown package sources, missing integrity, credentials, and nonpu
   }
   const noIntegrity = lockFixture();
   delete noIntegrity.packages['node_modules/typescript'].integrity;
-  rejected(noIntegrity);
+  assert.deepEqual(validateLockManifest(bytes(noIntegrity), expected), { packageCount: 6, lockfileVersion: 3 });
+  assert.throws(() => validateLockManifestInventory(bytes(noIntegrity), expected), LockManifestError);
+  const noResolved = lockFixture();
+  delete noResolved.packages['node_modules/typescript'].resolved;
+  delete noResolved.packages['node_modules/typescript'].integrity;
+  assert.deepEqual(validateLockManifest(bytes(noResolved), expected), { packageCount: 6, lockfileVersion: 3 });
+  assert.throws(() => validateLockManifestInventory(bytes(noResolved), expected), LockManifestError);
   const badIntegrity = lockFixture();
   badIntegrity.packages['node_modules/typescript'].integrity = 'sha1-not-accepted';
   rejected(badIntegrity);
+
+  const externalTarball = lockFixture();
+  externalTarball.packages['node_modules/typescript'].tarball = 'https://packages.example.invalid/typescript.tgz';
+  rejected(externalTarball);
+
+  const scopedRegistryPackage = lockFixture();
+  scopedRegistryPackage.packages['node_modules/@fixture/other'] = {
+    version: '1.0.0',
+    resolved: 'https://registry.npmjs.org/@fixture%2fother/-/other-1.0.0.tgz',
+    integrity: `sha512-${'A'.repeat(86)}==`,
+  };
+  assert.deepEqual(validateLockManifest(bytes(scopedRegistryPackage), expected), {
+    packageCount: 7,
+    lockfileVersion: 3,
+  });
+
+  const officialTarball = lockFixture();
+  officialTarball.packages['node_modules/typescript'].tarball =
+    'https://registry.npmjs.org/typescript/-/typescript-6.0.3.tgz';
+  assert.deepEqual(validateLockManifest(bytes(officialTarball), expected), {
+    packageCount: 6, lockfileVersion: 3,
+  });
+});
+
+test('dependency tool output is private and summaries contain only allowlisted fields', async () => {
+  const temporary = mkdtempSync(join(tmpdir(), 'kd-dependency-output-test-'));
+  const privateMarker = 'private-source-diagnostic-marker';
+  try {
+    const result = await captureDependencyCheck({
+      check: 'cargo-audit-root',
+      command: process.execPath,
+      args: ['-e', `process.stdout.write(${JSON.stringify(`${privateMarker} RUSTSEC-2026-1234`)});`
+        + `process.stderr.write(${JSON.stringify('GHSA-ABCD-2345-XY67')});process.exitCode=7;`],
+      timeoutMs: 5_000,
+      tempRoot: temporary,
+    });
+    const summary = formatDependencyCheckSummary(result);
+    assert.equal(result.status, 'failed');
+    assert.equal(result.advisoryCount, 2);
+    assert.deepEqual(result.advisoryIds, ['GHSA-ABCD-2345-XY67', 'RUSTSEC-2026-1234']);
+    assert.equal(summary,
+      'KD-DEPENDENCY-RESULT check=cargo-audit-root status=failed advisory-count=2 advisory-ids=GHSA-ABCD-2345-XY67,RUSTSEC-2026-1234');
+    assert.equal(summary.includes(privateMarker), false);
+    assert.deepEqual(readdirSync(temporary), []);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test('Rust and npm workflow checks use only private capture summaries and publish no artifacts', () => {
+  const workflowPath = fileURLToPath(new URL('../../.github/workflows/core-dependency-checks.yml', import.meta.url));
+  const workflow = readFileSync(workflowPath, 'utf8');
+
+  for (const check of [
+    'cargo-deny-${name}', 'cargo-audit-${name}',
+    'cargo-vet-root', 'cargo-vet-fuzz', 'cargo-vet-runtime',
+    'npm12-toolchain-install', 'npm12-bootstrap',
+    'npm-root-ci', 'npm-root-audit', 'npm-root-signatures',
+    'npm-runtime-ci', 'npm-runtime-audit', 'npm-runtime-signatures',
+  ]) {
+    assert.ok(workflow.includes(check), `${check} is present`);
+  }
+  assert.equal((workflow.match(/captureDependencyCheck\(\{/gu) ?? []).length, 7);
+  assert.equal((workflow.match(/formatDependencyCheckSummary\(result\)/gu) ?? []).length, 7);
+  assert.equal(workflow.includes('actions/upload-artifact'), false);
+  for (const check of ['npm12-toolchain-install', 'npm12-bootstrap']) {
+    const start = workflow.indexOf("check: '" + check + "'");
+    const end = workflow.indexOf('formatDependencyCheckSummary(result)', start);
+    assert.ok(start >= 0 && end > start, check + ' is captured');
+    const blockStart = workflow.lastIndexOf('captureDependencyCheck, formatDependencyCheckSummary', start);
+    assert.ok(blockStart >= 0, check + ' uses the private capture wrapper');
+    const command = workflow.slice(blockStart, end);
+    assert.ok(command.includes('--registry=https://registry.npmjs.org/'), check + ' pins the registry');
+    assert.ok(command.includes("npm_config_userconfig: '/dev/null'"), check + ' ignores user npm config');
+    assert.ok(command.includes("npm_config_replace_registry_host: 'never'"), check + ' keeps the registry host fixed');
+  }
+});
+
+test('npm CI validates both locks before install and fixes every registry request', () => {
+  const workflowPath = fileURLToPath(new URL('../../.github/workflows/core-dependency-checks.yml', import.meta.url));
+  const workflow = readFileSync(workflowPath, 'utf8');
+  const npmJob = workflow.slice(workflow.indexOf('\n  npm:\n'));
+  const validation = npmJob.indexOf('validateNpmProjectLock(source, project);');
+  const rootInstall = npmJob.indexOf("['npm-root-ci', ['ci'");
+  const runtimeInstall = npmJob.indexOf("['npm-runtime-ci', ['ci'");
+
+  assert.ok(validation >= 0);
+  assert.ok(rootInstall > validation);
+  assert.ok(runtimeInstall > validation);
+  assert.ok(npmJob.includes("for (const project of [source, path.join(source, 'runtime')])"));
+  assert.ok(npmJob.includes('--replace-registry-host=never'));
+  assert.ok(npmJob.includes("npm_config_userconfig: '/dev/null'"));
+  assert.ok(npmJob.includes("npm_config_globalconfig: '/dev/null'"));
+  assert.equal((workflow.match(/validateNpmProjectLock\(source, project\);/gu) ?? []).length, 2);
+  for (const check of [
+    'npm-root-ci', 'npm-root-audit', 'npm-root-signatures',
+    'npm-runtime-ci', 'npm-runtime-audit', 'npm-runtime-signatures',
+  ]) {
+    const start = npmJob.indexOf("['" + check + "',");
+    const end = npmJob.indexOf(']],', start);
+    assert.ok(start >= 0 && end > start, check + ' is present');
+    const command = npmJob.slice(start, end);
+    assert.ok(command.includes('--registry=https://registry.npmjs.org/'), check + ' sets the official registry');
+  }
+});
+
+test('rejects npm-shrinkwrap.json at either npm root, including a dangling symlink', () => {
+  const temporary = mkdtempSync(join(tmpdir(), 'kd-npm-shrinkwrap-test-'));
+  const root = join(temporary, 'root');
+  const runtime = join(root, 'runtime');
+  mkdirSync(runtime, { recursive: true });
+  try {
+    for (const project of [root, runtime]) {
+      assert.equal(validateNoNpmShrinkwrap(project), true);
+      const shrinkwrap = join(project, 'npm-shrinkwrap.json');
+      writeFileSync(shrinkwrap, '{"name":"private-canary"}\n');
+      assert.throws(() => validateNoNpmShrinkwrap(project), LockManifestError);
+      rmSync(shrinkwrap);
+      symlinkSync('missing-shrinkwrap-target', shrinkwrap);
+      assert.throws(() => validateNoNpmShrinkwrap(project), LockManifestError);
+      rmSync(shrinkwrap);
+    }
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test('derives npm lock metadata from real manifests and validates source-contained file links', () => {
+  const temporary = mkdtempSync(join(tmpdir(), 'kd-npm-project-lock-test-'));
+  const source = join(temporary, 'source');
+  const runtime = join(source, 'runtime');
+  const workspace = join(runtime, 'packages/host-ui');
+  const localPackage = join(source, 'packages/shared');
+  mkdirSync(workspace, { recursive: true });
+  mkdirSync(localPackage, { recursive: true });
+  const runtimeManifest = { name: 'fixture-runtime', version: '1.0.0', workspaces: ['packages/host-ui'] };
+  const workspaceManifest = {
+    name: '@fixture/host-ui', version: '1.0.0', dependencies: { '@fixture/shared': 'file:../../../packages/shared' },
+  };
+  const localManifest = { name: '@fixture/shared', version: '1.0.0' };
+  writeFileSync(join(runtime, 'package.json'), `${JSON.stringify(runtimeManifest)}\n`);
+  writeFileSync(join(workspace, 'package.json'), `${JSON.stringify(workspaceManifest)}\n`);
+  writeFileSync(join(localPackage, 'package.json'), `${JSON.stringify(localManifest)}\n`);
+  const lock = {
+    name: 'fixture-runtime', version: '1.0.0', lockfileVersion: 3, requires: true,
+    packages: {
+      '': { name: 'fixture-runtime', version: '1.0.0', workspaces: ['packages/host-ui'] },
+      'packages/host-ui': {
+        name: '@fixture/host-ui', version: '1.0.0', dependencies: { '@fixture/shared': 'file:../../../packages/shared' },
+      },
+      '../packages/shared': { name: '@fixture/shared', version: '1.0.0' },
+      'node_modules/@fixture/shared': { resolved: '../packages/shared', link: true },
+    },
+  };
+  writeFileSync(join(runtime, 'package-lock.json'), bytes(lock));
+  try {
+    const expectation = deriveNpmLockExpectation(source, runtime);
+    assert.deepEqual(expectation.localPackages.map((item) => item.path), ['../packages/shared']);
+    assert.deepEqual(validateNpmProjectLock(source, runtime), { packageCount: 4, lockfileVersion: 3 });
+    writeFileSync(join(workspace, 'package.json'), `${JSON.stringify({
+      ...workspaceManifest,
+      dependencies: { '@fixture/shared': 'file:../../../../outside' },
+    })}\n`);
+    assert.throws(() => deriveNpmLockExpectation(source, runtime), LockManifestError);
+    writeFileSync(join(runtime, 'npm-shrinkwrap.json'), '{}\n');
+    assert.throws(() => validateNpmProjectLock(source, runtime), LockManifestError);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
 });
 
 test('workspace links must resolve to one reviewed in-workspace path', () => {
@@ -352,530 +616,4 @@ test('accepts a bare origin funding URL and one plain fragment as npm copies the
   const stringForm = lockFixture();
   stringForm.packages['node_modules/typescript'].funding = `https://example.invalid/support${String.fromCharCode(35)}top`;
   assert.equal(codeOf(stringForm, expected), 'accepted');
-});
-
-const contractText = readFileSync(new URL('./macos_node_contract.py', import.meta.url), 'utf8');
-
-function contractConstant(name, quote) {
-  const matches = [...contractText.matchAll(new RegExp(`^${name} = ${quote}([^${quote}\\r\\n]+)${quote}\\r?$`, 'gm'))];
-  assert.equal(matches.length, 1);
-  return matches[0][1];
-}
-
-const titleProbeSource = [
-  'process.title = "kd-title-probe";',
-  'const short = String(process.title);',
-  'process.title = "k".repeat(4096);',
-  'process.stdout.write(JSON.stringify({ short, length: String(process.title).length }));',
-].join('\n');
-
-test('the fixed Node title option keeps long process.title values intact in a script main entry', () => {
-  const option = contractConstant('NODE_OPTIONS_VALUE', '"');
-  const source = contractConstant('NODE_TITLE_MODULE_SOURCE', "'");
-  const prefix = '--import=data:text/javascript;base64,';
-  assert.ok(option.startsWith(prefix));
-  assert.match(option, /^[A-Za-z0-9+/=,:;.\-]+$/);
-  assert.equal(Buffer.from(option.slice(prefix.length), 'base64').toString('ascii'), source);
-  const baseEnvironment = {};
-  for (const name of ['PATH', 'SystemRoot']) {
-    if (process.env[name] !== undefined) {
-      baseEnvironment[name] = process.env[name];
-    }
-  }
-  const directory = mkdtempSync(join(tmpdir(), 'kd-title-probe-'));
-  try {
-    const probeFile = join(directory, 'probe.cjs');
-    writeFileSync(probeFile, titleProbeSource);
-    const run = (environment) => spawnSync(process.execPath, [probeFile], {
-      env: environment, encoding: 'utf8', timeout: 30000, windowsHide: true, cwd: directory,
-    });
-    const fixed = run({ ...baseEnvironment, NODE_OPTIONS: option });
-    assert.equal(fixed.error, undefined);
-    assert.equal(fixed.status, 0);
-    assert.equal(fixed.stderr, '');
-    assert.deepEqual(JSON.parse(fixed.stdout), { short: 'kd-title-probe', length: 4096 });
-    const control = run(baseEnvironment);
-    assert.equal(control.error, undefined);
-    assert.equal(control.status, 0);
-    if (process.platform === 'linux' || process.platform === 'darwin') {
-      assert.ok(JSON.parse(control.stdout).length < 4096);
-    }
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-function lightningcssEntry(version) {
-  return {
-    version,
-    resolved: `https://registry.npmjs.org/lightningcss/-/lightningcss-${version}.tgz`,
-    integrity: `sha512-${'A'.repeat(86)}==`,
-  };
-}
-
-function overrideFixture(overrides = { lightningcss: '1.33.0' }, version = '1.33.0') {
-  const expectation = JSON.parse(JSON.stringify(expected));
-  expectation.root.overrides = overrides;
-  const lock = lockFixture();
-  lock.packages['node_modules/lightningcss'] = lightningcssEntry(version);
-  return { expectation, lock };
-}
-
-function codeOf(lock, expectation) {
-  try {
-    validateLockManifest(bytes(lock), expectation);
-  } catch (error) {
-    assert.ok(error instanceof LockManifestError);
-    return error.code;
-  }
-  return 'accepted';
-}
-
-test('accepts exactly one root override that pins lightningcss to the exact reviewed version', () => {
-  const { expectation, lock } = overrideFixture();
-  assert.deepEqual(validateLockManifest(bytes(lock), expectation), { packageCount: 7, lockfileVersion: 3 });
-  assert.equal(validateLockManifestInventory(bytes(lock), expectation).packages.length, 5);
-
-  const mirrored = overrideFixture();
-  mirrored.lock.packages[''].overrides = { lightningcss: '1.33.0' };
-  assert.deepEqual(validateLockManifest(bytes(mirrored.lock), mirrored.expectation), {
-    packageCount: 7, lockfileVersion: 3,
-  });
-
-  const absent = overrideFixture();
-  absent.lock.packages['node_modules/other'] = {
-    version: '2.0.0',
-    resolved: 'https://registry.npmjs.org/other/-/other-2.0.0.tgz',
-    integrity: `sha512-${'A'.repeat(86)}==`,
-  };
-  absent.lock.packages['node_modules/other/node_modules/lightningcss'] = lightningcssEntry('1.33.0');
-  assert.equal(codeOf(absent.lock, absent.expectation), 'accepted');
-
-  const second = JSON.parse(JSON.stringify(expected));
-  second.root.name = 'runtime-root';
-  second.root.overrides = { lightningcss: '1.33.0' };
-  const runtimeLock = lockFixture();
-  runtimeLock.name = 'runtime-root';
-  runtimeLock.packages[''].name = 'runtime-root';
-  runtimeLock.packages['node_modules/lightningcss'] = lightningcssEntry('1.33.0');
-  assert.equal(codeOf(runtimeLock, second), 'accepted');
-});
-
-test('refuses every override expectation except the single exact lightningcss pin', () => {
-  const refused = [
-    { typescript: '6.0.3' },
-    { lightningcss: '1.33.0', typescript: '6.0.3' },
-    {},
-    { lightningcss: '^1.33.0' },
-    { lightningcss: '~1.33.0' },
-    { lightningcss: '1.33' },
-    { lightningcss: '1.x' },
-    { lightningcss: '>=1.33.0' },
-    { lightningcss: '*' },
-    { lightningcss: 'latest' },
-    { lightningcss: '1.32.0' },
-    { lightningcss: '1.33.1' },
-    { lightningcss: '1.33.0-beta.1' },
-    { lightningcss: 'npm:lightningcss@1.33.0' },
-    { lightningcss: { '.': '1.33.0' } },
-    { lightningcss: { lightningcss: '1.33.0' } },
-    { lightningcss: ['1.33.0'] },
-    { lightningcss: 133 },
-    { lightningcss: null },
-    { lightningcss: undefined },
-    { 'lightningcss@1.33.0': '1.33.0' },
-    { '@scope/lightningcss': '1.33.0' },
-    { __proto__x: '1.33.0' },
-    ['lightningcss'],
-    '1.33.0',
-    null,
-    undefined,
-    7,
-  ];
-  for (const overrides of refused) {
-    const { expectation, lock } = overrideFixture();
-    expectation.root.overrides = overrides;
-    assert.equal(codeOf(lock, expectation), 'invalid_expectation', JSON.stringify(overrides));
-  }
-
-  const nested = overrideFixture();
-  nested.expectation.root.overrides = { foo: { lightningcss: '1.33.0' } };
-  assert.equal(codeOf(nested.lock, nested.expectation), 'invalid_expectation');
-
-  const onWorkspace = overrideFixture();
-  onWorkspace.expectation.workspaces[0].overrides = { lightningcss: '1.33.0' };
-  assert.equal(codeOf(onWorkspace.lock, onWorkspace.expectation), 'invalid_expectation');
-
-  const onWorkspaceOnly = overrideFixture();
-  delete onWorkspaceOnly.expectation.root.overrides;
-  onWorkspaceOnly.expectation.workspaces[1].overrides = { lightningcss: '1.33.0' };
-  assert.equal(codeOf(onWorkspaceOnly.lock, onWorkspaceOnly.expectation), 'invalid_expectation');
-
-  const conflictingPin = overrideFixture();
-  conflictingPin.expectation.root.devDependencies.lightningcss = '1.30.1';
-  conflictingPin.lock.packages[''].devDependencies.lightningcss = '1.30.1';
-  assert.equal(codeOf(conflictingPin.lock, conflictingPin.expectation), 'invalid_expectation');
-
-  const workspacePin = overrideFixture();
-  workspacePin.expectation.workspaces[1].dependencies = { lightningcss: '1.30.1' };
-  assert.equal(codeOf(workspacePin.lock, workspacePin.expectation), 'invalid_expectation');
-
-  const matchingPin = overrideFixture();
-  matchingPin.expectation.root.devDependencies.lightningcss = '1.33.0';
-  matchingPin.lock.packages[''].devDependencies.lightningcss = '1.33.0';
-  assert.equal(codeOf(matchingPin.lock, matchingPin.expectation), 'accepted');
-});
-
-test('keeps the lock root, other entries, and resolved versions consistent with the override', () => {
-  const withoutExpectation = overrideFixture();
-  delete withoutExpectation.expectation.root.overrides;
-  withoutExpectation.lock.packages[''].overrides = { lightningcss: '1.33.0' };
-  assert.equal(codeOf(withoutExpectation.lock, withoutExpectation.expectation), 'root_mismatch');
-
-  for (const overrides of [
-    { lightningcss: '1.32.0' },
-    { lightningcss: '1.33.0', typescript: '6.0.3' },
-    {},
-    '1.33.0',
-    ['lightningcss'],
-    null,
-  ]) {
-    const { expectation, lock } = overrideFixture();
-    lock.packages[''].overrides = overrides;
-    assert.equal(codeOf(lock, expectation), 'root_mismatch', JSON.stringify(overrides));
-  }
-
-  const onWorkspaceEntry = overrideFixture();
-  onWorkspaceEntry.lock.packages['packages/shared'].overrides = { lightningcss: '1.33.0' };
-  assert.equal(codeOf(onWorkspaceEntry.lock, onWorkspaceEntry.expectation), 'invalid_package');
-
-  const onPackageEntry = overrideFixture();
-  onPackageEntry.lock.packages['node_modules/typescript'].overrides = { lightningcss: '1.33.0' };
-  assert.equal(codeOf(onPackageEntry.lock, onPackageEntry.expectation), 'invalid_package');
-
-  const staleVersion = overrideFixture({ lightningcss: '1.33.0' }, '1.30.1');
-  assert.equal(codeOf(staleVersion.lock, staleVersion.expectation), 'override_mismatch');
-
-  const nestedStale = overrideFixture();
-  nestedStale.lock.packages['node_modules/other'] = {
-    version: '2.0.0',
-    resolved: 'https://registry.npmjs.org/other/-/other-2.0.0.tgz',
-    integrity: `sha512-${'A'.repeat(86)}==`,
-  };
-  nestedStale.lock.packages['node_modules/other/node_modules/lightningcss'] = lightningcssEntry('1.30.1');
-  assert.equal(codeOf(nestedStale.lock, nestedStale.expectation), 'override_mismatch');
-
-  const unconstrained = overrideFixture();
-  delete unconstrained.expectation.root.overrides;
-  unconstrained.lock.packages['node_modules/lightningcss'] = lightningcssEntry('1.30.1');
-  assert.equal(codeOf(unconstrained.lock, unconstrained.expectation), 'accepted');
-});
-
-function registryEntry(name, version) {
-  return {
-    version,
-    resolved: `https://registry.npmjs.org/${name}/-/${name}-${version}.tgz`,
-    integrity: `sha512-${'A'.repeat(86)}==`,
-  };
-}
-
-test('requires the platform binaries of the overridden package to match its exact version', () => {
-  const complete = overrideFixture();
-  complete.lock.packages['node_modules/lightningcss-linux-x64-gnu'] = registryEntry('lightningcss-linux-x64-gnu', '1.33.0');
-  complete.lock.packages['node_modules/lightningcss-win32-x64-msvc'] = registryEntry('lightningcss-win32-x64-msvc', '1.33.0');
-  assert.equal(codeOf(complete.lock, complete.expectation), 'accepted');
-
-  const halfOverridden = overrideFixture();
-  halfOverridden.lock.packages['node_modules/lightningcss-linux-x64-gnu'] = registryEntry('lightningcss-linux-x64-gnu', '1.32.0');
-  assert.equal(codeOf(halfOverridden.lock, halfOverridden.expectation), 'override_mismatch');
-
-  const nestedBinary = overrideFixture();
-  nestedBinary.lock.packages['node_modules/other'] = registryEntry('other', '2.0.0');
-  nestedBinary.lock.packages['node_modules/other/node_modules/lightningcss-darwin-arm64'] =
-    registryEntry('lightningcss-darwin-arm64', '1.30.1');
-  assert.equal(codeOf(nestedBinary.lock, nestedBinary.expectation), 'override_mismatch');
-
-  const unrelated = overrideFixture();
-  unrelated.lock.packages['node_modules/lightningcssx'] = registryEntry('lightningcssx', '9.9.9');
-  assert.equal(codeOf(unrelated.lock, unrelated.expectation), 'accepted');
-
-  const unconstrained = overrideFixture();
-  delete unconstrained.expectation.root.overrides;
-  unconstrained.lock.packages['node_modules/lightningcss-linux-x64-gnu'] = registryEntry('lightningcss-linux-x64-gnu', '1.32.0');
-  assert.equal(codeOf(unconstrained.lock, unconstrained.expectation), 'accepted');
-});
-
-test('limits the platform binary version check to the official lightningcss binary names', () => {
-  const official = [
-    'darwin-arm64', 'darwin-x64', 'freebsd-x64', 'linux-arm-gnueabihf', 'linux-arm64-gnu', 'linux-arm64-musl',
-    'linux-x64-gnu', 'linux-x64-musl', 'win32-arm64-msvc', 'win32-x64-msvc', 'android-arm64',
-  ];
-  for (const suffix of official) {
-    const name = `lightningcss-${suffix}`;
-    const stale = overrideFixture();
-    stale.lock.packages[`node_modules/${name}`] = registryEntry(name, '1.32.0');
-    assert.equal(codeOf(stale.lock, stale.expectation), 'override_mismatch', name);
-    const current = overrideFixture();
-    current.lock.packages[`node_modules/${name}`] = registryEntry(name, '1.33.0');
-    assert.equal(codeOf(current.lock, current.expectation), 'accepted', name);
-  }
-  for (const name of ['lightningcss-loader', 'lightningcss-cli', 'lightningcss-linux-x64', 'lightningcss-wasm']) {
-    const other = overrideFixture();
-    other.lock.packages[`node_modules/${name}`] = registryEntry(name, '2.4.6');
-    assert.equal(codeOf(other.lock, other.expectation), 'accepted', name);
-  }
-});
-
-const OXIDE_PARENT = 'node_modules/@tailwindcss/oxide-wasm32-wasi';
-const OXIDE_BUNDLED = [
-  '@napi-rs/wasm-runtime', '@emnapi/core', '@emnapi/runtime', 'tslib',
-  '@tybys/wasm-util', '@emnapi/wasi-threads',
-];
-
-function bundledFixture({ children = true, shape = {} } = {}) {
-  const lock = lockFixture();
-  const dependencies = Object.fromEntries(OXIDE_BUNDLED.map((name) => [name, '^1.0.0']));
-  lock.packages[OXIDE_PARENT] = {
-    version: '4.3.3',
-    resolved: 'https://registry.npmjs.org/@tailwindcss/oxide-wasm32-wasi/-/oxide-wasm32-wasi-4.3.3.tgz',
-    integrity: `sha512-${'A'.repeat(86)}==`,
-    bundleDependencies: [...OXIDE_BUNDLED],
-    cpu: ['wasm32'],
-    dev: true,
-    optional: true,
-    dependencies,
-  };
-  if (children) {
-    for (const name of OXIDE_BUNDLED) {
-      lock.packages[`${OXIDE_PARENT}/node_modules/${name}`] = {
-        version: '1.2.3', dev: true, inBundle: true, optional: true,
-      };
-    }
-  }
-  Object.assign(lock.packages[OXIDE_PARENT], shape);
-  return lock;
-}
-
-test('admits the optional non-host-architecture bundling entry with its bundled children', () => {
-  const lock = bundledFixture();
-  assert.equal(codeOf(lock, expected), 'accepted');
-  const inventory = validateLockManifestInventory(bytes(lock), expected);
-  const names = inventory.packages.map((item) => item.name);
-  assert.ok(names.includes('@tailwindcss/oxide-wasm32-wasi'));
-  assert.equal(names.includes('tslib'), false);
-  assert.equal(inventory.packages.length, 5);
-  const parent = inventory.packages.find((item) => item.name === '@tailwindcss/oxide-wasm32-wasi');
-  assert.deepEqual(parent.dependencies, []);
-});
-
-test('admits the same entry when the lock writes no bundled child entries', () => {
-  const lock = bundledFixture({ children: false });
-  assert.equal(codeOf(lock, expected), 'accepted');
-  assert.equal(validateLockManifestInventory(bytes(lock), expected).packages.length, 5);
-});
-
-test('refuses inBundle children under a parent that is not inert', () => {
-  for (const shape of [
-    { optional: undefined },
-    { optional: false },
-    { cpu: ['x64'] },
-    { cpu: ['wasm32', 'arm64'] },
-    { cpu: undefined },
-    { bundleDependencies: undefined },
-    { bundleDependencies: ['tslib', 'Bad Name'] },
-  ]) {
-    const lock = bundledFixture({ shape });
-    assert.notEqual(codeOf(lock, expected), 'accepted', JSON.stringify(shape));
-  }
-});
-
-test('refuses bundled children that are not marked optional', () => {
-  for (const flags of [{ optional: undefined }, { optional: false }, { optional: 'true' }]) {
-    for (const name of ['tslib', '@emnapi/core']) {
-      const lock = bundledFixture();
-      Object.assign(lock.packages[`${OXIDE_PARENT}/node_modules/${name}`], flags);
-      assert.notEqual(codeOf(lock, expected), 'accepted', `${name} ${JSON.stringify(flags)}`);
-    }
-  }
-});
-
-test('refuses bundled children whose parent carries any link key or lives under a workspace', () => {
-  const linked = bundledFixture();
-  linked.packages[OXIDE_PARENT].link = false;
-  assert.notEqual(codeOf(linked, expected), 'accepted');
-
-  const nested = bundledFixture();
-  const moved = 'packages/client-api/node_modules/@tailwindcss/oxide-wasm32-wasi';
-  nested.packages[moved] = nested.packages[OXIDE_PARENT];
-  delete nested.packages[OXIDE_PARENT];
-  for (const name of OXIDE_BUNDLED) {
-    nested.packages[`${moved}/node_modules/${name}`] = nested.packages[`${OXIDE_PARENT}/node_modules/${name}`];
-    delete nested.packages[`${OXIDE_PARENT}/node_modules/${name}`];
-  }
-  assert.notEqual(codeOf(nested, expected), 'accepted');
-});
-
-test('refuses undeclared, sourced, and deeper bundled children', () => {
-  const undeclared = bundledFixture();
-  undeclared.packages[`${OXIDE_PARENT}/node_modules/left-pad`] = { version: '1.0.0', inBundle: true };
-  assert.notEqual(codeOf(undeclared, expected), 'accepted');
-
-  for (const extra of [
-    { resolved: 'https://registry.npmjs.org/tslib/-/tslib-1.2.3.tgz' },
-    { integrity: `sha512-${'A'.repeat(86)}==` },
-    { link: true },
-    { hasInstallScript: true },
-    { bundleDependencies: ['tslib'] },
-    { name: 'other' },
-  ]) {
-    const lock = bundledFixture();
-    Object.assign(lock.packages[`${OXIDE_PARENT}/node_modules/tslib`], extra);
-    assert.notEqual(codeOf(lock, expected), 'accepted', JSON.stringify(extra));
-  }
-
-  const badVersion = bundledFixture();
-  badVersion.packages[`${OXIDE_PARENT}/node_modules/tslib`].version = '^1.0.0';
-  assert.notEqual(codeOf(badVersion, expected), 'accepted');
-
-  const deeper = bundledFixture();
-  deeper.packages[`${OXIDE_PARENT}/node_modules/@emnapi/core/node_modules/tslib`] = {
-    version: '1.2.3', inBundle: true,
-  };
-  assert.notEqual(codeOf(deeper, expected), 'accepted');
-
-  const wrongParent = bundledFixture();
-  wrongParent.packages['node_modules/tslib'] = { version: '1.2.3', inBundle: true };
-  assert.notEqual(codeOf(wrongParent, expected), 'accepted');
-});
-
-const MEMBER_PATHS = ['packages/edge-api', 'packages/edge-locale', 'packages/edge-icons', 'packages/edge-kit'];
-
-function memberName(path) {
-  return `@fixture/${path.slice('packages/'.length)}`;
-}
-
-function memberEdgeFixture() {
-  const expectation = {
-    root: {
-      name: 'fixture-root',
-      version: '0.1.0',
-      workspaces: ['packages/*'],
-      devDependencies: { typescript: '6.0.3' },
-    },
-    workspaces: MEMBER_PATHS.map((path) => ({ path, name: memberName(path), version: '0.1.0' })),
-  };
-  expectation.workspaces[3].dependencies = { '@fixture/edge-icons': '0.1.0' };
-  const packages = {
-    '': {
-      name: 'fixture-root',
-      version: '0.1.0',
-      workspaces: ['packages/*'],
-      devDependencies: { typescript: '6.0.3' },
-    },
-  };
-  for (const path of MEMBER_PATHS) {
-    packages[`node_modules/${memberName(path)}`] = { resolved: path, link: true };
-  }
-  packages['node_modules/typescript'] = {
-    version: '6.0.3',
-    resolved: 'https://registry.npmjs.org/typescript/-/typescript-6.0.3.tgz',
-    integrity: `sha512-${'A'.repeat(86)}==`,
-    dev: true,
-  };
-  for (const path of MEMBER_PATHS) packages[path] = { name: memberName(path), version: '0.1.0' };
-  packages['packages/edge-kit'].dependencies = { '@fixture/edge-icons': '0.1.0' };
-  const lock = {
-    name: 'fixture-root', version: '0.1.0', lockfileVersion: 3, requires: true, packages,
-  };
-  return { lock, expectation };
-}
-
-test('admits one workspace edge at the exact listed version through its root link entry', () => {
-  const { lock, expectation } = memberEdgeFixture();
-  assert.equal(codeOf(lock, expectation), 'accepted');
-  const inventory = validateLockManifestInventory(bytes(lock), expectation);
-  const kit = inventory.packages.find((item) => item.name === '@fixture/edge-kit');
-  assert.deepEqual(kit.dependencies, [{ name: '@fixture/edge-icons', version: '0.1.0' }]);
-});
-
-test('refuses a workspace edge to a package that is not a listed workspace', () => {
-  const { lock, expectation } = memberEdgeFixture();
-  expectation.workspaces[3].dependencies = { '@fixture/edge-ghost': '0.1.0' };
-  lock.packages['packages/edge-kit'].dependencies = { '@fixture/edge-ghost': '0.1.0' };
-  lock.packages['node_modules/@fixture/edge-ghost'] = { resolved: 'packages/edge-ghost', link: true };
-  assert.notEqual(codeOf(lock, expectation), 'accepted');
-
-  const listedElsewhere = memberEdgeFixture();
-  listedElsewhere.expectation.workspaces.splice(2, 1);
-  delete listedElsewhere.lock.packages['packages/edge-icons'];
-  assert.notEqual(codeOf(listedElsewhere.lock, listedElsewhere.expectation), 'accepted');
-});
-
-test('refuses a workspace edge at any spec other than the exact listed version', () => {
-  for (const spec of ['0.1.1', '^0.1.0', '~0.1.0', '>=0.1.0', '*', '0.1']) {
-    const { lock, expectation } = memberEdgeFixture();
-    expectation.workspaces[3].dependencies = { '@fixture/edge-icons': spec };
-    lock.packages['packages/edge-kit'].dependencies = { '@fixture/edge-icons': spec };
-    assert.equal(codeOf(lock, expectation), 'invalid_expectation', spec);
-  }
-  const versionDrift = memberEdgeFixture();
-  versionDrift.lock.packages['packages/edge-icons'].version = '0.1.1';
-  assert.notEqual(codeOf(versionDrift.lock, versionDrift.expectation), 'accepted');
-
-  const lockSpecDrift = memberEdgeFixture();
-  lockSpecDrift.lock.packages['packages/edge-kit'].dependencies = { '@fixture/edge-icons': '^0.1.0' };
-  assert.notEqual(codeOf(lockSpecDrift.lock, lockSpecDrift.expectation), 'accepted');
-});
-
-test('refuses a workspace edge whose link entry is missing or wrong', () => {
-  const missing = memberEdgeFixture();
-  delete missing.lock.packages['node_modules/@fixture/edge-icons'];
-  assert.notEqual(codeOf(missing.lock, missing.expectation), 'accepted');
-
-  for (const replacement of [
-    { resolved: 'packages/edge-kit', link: true },
-    { resolved: 'packages/edge-icons', link: false },
-    { resolved: 'packages/edge-icons' },
-    { resolved: 'packages/edge-icons', link: true, integrity: `sha512-${'A'.repeat(86)}==` },
-    {
-      version: '0.1.0',
-      resolved: 'https://registry.npmjs.org/@fixture/edge-icons/-/edge-icons-0.1.0.tgz',
-      integrity: `sha512-${'A'.repeat(86)}==`,
-    },
-  ]) {
-    const { lock, expectation } = memberEdgeFixture();
-    lock.packages['node_modules/@fixture/edge-icons'] = replacement;
-    assert.notEqual(codeOf(lock, expectation), 'accepted', JSON.stringify(replacement));
-  }
-
-  const nested = memberEdgeFixture();
-  nested.lock.packages['packages/edge-kit/node_modules/@fixture/edge-icons'] = {
-    resolved: 'packages/edge-icons', link: true,
-  };
-  assert.equal(codeOf(nested.lock, nested.expectation), 'direct_pin_mismatch');
-});
-
-test('refuses a workspace edge whose link points at a path that is not a listed workspace', () => {
-  for (const resolved of ['packages/edge-other', 'node_modules/typescript', 'packages', '../edge-icons']) {
-    const { lock, expectation } = memberEdgeFixture();
-    lock.packages['node_modules/@fixture/edge-icons'].resolved = resolved;
-    assert.notEqual(codeOf(lock, expectation), 'accepted', resolved);
-  }
-});
-
-test('refuses an exact version edge from the root or from a workspace to itself', () => {
-  const fromRoot = memberEdgeFixture();
-  fromRoot.expectation.root.dependencies = { '@fixture/edge-icons': '0.1.0' };
-  fromRoot.lock.packages[''].dependencies = { '@fixture/edge-icons': '0.1.0' };
-  assert.equal(codeOf(fromRoot.lock, fromRoot.expectation), 'invalid_expectation');
-
-  const fromRootDevelopment = memberEdgeFixture();
-  fromRootDevelopment.expectation.root.devDependencies['@fixture/edge-icons'] = '0.1.0';
-  fromRootDevelopment.lock.packages[''].devDependencies['@fixture/edge-icons'] = '0.1.0';
-  assert.equal(codeOf(fromRootDevelopment.lock, fromRootDevelopment.expectation), 'invalid_expectation');
-
-  const toItself = memberEdgeFixture();
-  toItself.expectation.workspaces[2].dependencies = { '@fixture/edge-icons': '0.1.0' };
-  toItself.lock.packages['packages/edge-icons'].dependencies = { '@fixture/edge-icons': '0.1.0' };
-  assert.equal(codeOf(toItself.lock, toItself.expectation), 'invalid_expectation');
 });

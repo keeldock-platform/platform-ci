@@ -1,4 +1,3 @@
-import hashlib
 import io
 import inspect
 import os
@@ -9,31 +8,6 @@ import unittest
 from unittest.mock import patch
 
 import macos_core_bootstrap as subject
-
-
-HOOK_PATH = subject.RULES_DIRECTORY + "/hooks/shared/check.sh"
-LOCK_PATH = subject.RULES_DIRECTORY + "/shared.lock"
-
-
-def _lock(file_digest="a" * 64, hook_path=HOOK_PATH, signature="verified"):
-    lines = (
-        "format 3",
-        "source rules-control",
-        "profile full",
-        "tag v1.2.3",
-        "tag-object " + "b" * 40,
-        "commit " + "c" * 40,
-        "signature " + signature,
-        "signer signer@example.invalid",
-        "anchor v1.0.0 " + "d" * 40 + " SHA256:" + "A" * 43,
-        "signers-sha256 " + "e" * 64,
-        "fragment " + "f" * 64,
-        "file AGENTS.md " + file_digest,
-        "file " + hook_path + " " + "1" * 64,
-        "hook PreToolUse Bash " + hook_path,
-        "setting includeCoAuthoredBy false",
-    )
-    return ((chr(35) + " generated fixture\n") + "\n".join(lines) + "\n").encode("ascii")
 
 
 def _run_runtime_refusal(reason, stage, proof_confirmed, source_diagnostic=None):
@@ -443,50 +417,6 @@ class InputTests(unittest.TestCase):
         self.assertEqual(environment["SOURCE_READER_TOKEN"], token)
 
 
-class LockSchemaTests(unittest.TestCase):
-    def test_format_three_lock_schema_accepts_fixed_field_shapes(self):
-        parsed = subject._parse_lock(_lock())
-        self.assertEqual(parsed["fields"]["format"], "3")
-        self.assertEqual(set(parsed["files"]), {"AGENTS.md", HOOK_PATH})
-
-    def test_unknown_duplicate_traversal_and_unverified_fields_refuse(self):
-        valid = _lock().decode("ascii")
-        invalid = (
-            valid + "format 3\n",
-            valid + "unexpected value\n",
-            valid.replace("file AGENTS.md", "file ../AGENTS.md", 1),
-            _lock(signature="unverified").decode("ascii"),
-            valid.replace("profile full", "profile partial"),
-            valid.replace("hook PreToolUse Bash " + HOOK_PATH, "hook PreToolUse Bash missing.sh"),
-        )
-        for payload in invalid:
-            with self.subTest(payload=payload[:24]), self.assertRaises(subject.Refusal):
-                subject._parse_lock(payload.encode("ascii"))
-
-    def test_manifest_checks_every_local_file_hash(self):
-        first = b"administrative fixture\n"
-        second = b"hook fixture\n"
-        first_digest = hashlib.sha256(first).hexdigest()
-        second_digest = hashlib.sha256(second).hexdigest()
-        lock = _lock(file_digest=first_digest).decode("ascii")
-        lock = lock.replace("1" * 64, second_digest)
-        values = {
-            LOCK_PATH: lock.encode("ascii"),
-            "AGENTS.md": first,
-            HOOK_PATH: second,
-        }
-        with patch.object(subject, "_read_source_file", side_effect=lambda root, path, maximum: values[path]):
-            result = subject._verify_lock_manifest(Path("synthetic-source"))
-        self.assertEqual(result["format"], "3")
-        self.assertEqual(result["manifest"], "matched")
-        self.assertEqual(result["signers_hash"], "well-formed")
-        values["AGENTS.md"] = b"changed\n"
-        with patch.object(subject, "_read_source_file", side_effect=lambda root, path, maximum: values[path]):
-            with self.assertRaises(subject.Refusal) as mismatch:
-                subject._verify_lock_manifest(Path("synthetic-source"))
-        self.assertEqual((mismatch.exception.reason, mismatch.exception.stage), ("manifest_mismatch", "manifest"))
-
-
 class SummaryEvidenceTests(unittest.TestCase):
     def test_summary_probe_uses_fixed_child_args_and_no_environment_file_leak(self):
         self.assertEqual(subject.STANDIN_GUARD_MARKER, b"summary-standin=write-denied\n")
@@ -496,7 +426,7 @@ class SummaryEvidenceTests(unittest.TestCase):
         self.assertIn("reviewed_build._prepare_runner_summary(uid)", inspect.getsource(subject._run_summary_probe))
         self.assertIn("reviewed_build._run_real_summary_probe(", inspect.getsource(subject._run_summary_probe))
 
-    def test_success_line_distinguishes_source_signature_from_lock_declaration(self):
+    def test_success_line_keeps_source_signature_without_rules_lock_claim(self):
         record = {
             "repository_id": "123",
             "source_sha": "a" * 40,
@@ -509,15 +439,10 @@ class SummaryEvidenceTests(unittest.TestCase):
             "image_os": "macos-test",
             "image_version": "1",
         }
-        line = subject._success_line(record, binding, {
-            "format": "3",
-            "manifest": "matched",
-            "signers_hash": "well-formed",
-            "fragment_hash": "well-formed",
-        })
+        line = subject._success_line(record, binding)
         self.assertIn("source-signature=verified", line.split())
         self.assertIn("token-revocation=confirmed-before-execution", line.split())
-        self.assertIn("rules-lock-signature=declared-verified", line.split())
+        self.assertFalse(any(field.startswith("rules-lock") for field in line.split()))
         self.assertNotIn("signature=verified", line.split())
         self.assertIn("summary-control=append-denied", line.split())
         self.assertIn("summary-sibling=create-denied", line.split())
@@ -539,7 +464,6 @@ class SummaryEvidenceTests(unittest.TestCase):
             "concern": "core-bootstrap",
             "candidate_class": "permanent-tip",
             "signature": "verified",
-            "rules_lock": "present",
             "tree": "core_administrative",
             "source_execution": "not_run_at_yield",
             "app_build": "not_run",

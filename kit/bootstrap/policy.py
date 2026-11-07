@@ -7,8 +7,6 @@ from types import MappingProxyType
 import policy_baselines
 import policy_handoff
 import policy_linux
-import policy_npm
-import policy_rust
 import policy_windows
 from policy_linux import LINUX_CONFINEMENT_WORKFLOW_TEMPLATE
 from policy_windows import WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE
@@ -24,10 +22,10 @@ MAX_DURATION_MS = 86400000
 MACOS_SOURCE_READER_ACTION_SHA = "64ab729a6294000f5aa4a4bc0b73d1f32bc45510"
 MACOS_SOURCE_READER_WORKFLOW_SHA256 = "6c7e82c8a9d91436ae98f1357fd0fe4f09847f5fd17abc4843eadb130405b626"
 MACOS_RULES_SOURCE_READER_WORKFLOW_SHA256 = "cb9b70226175069e9c148c06f18d4d89cf8b6d5b33b39e02579a4aa2de5ee8a6"
-MACOS_RULES_BOOTSTRAP_WORKFLOW_SHA256 = "a91387440f8caceadf8f19f7c87feb3d82377eb3c9e1813de48b518992d48807"
-MACOS_CORE_BOOTSTRAP_WORKFLOW_SHA256 = "08cf50d62e18e52661befe3153294c2d188b8a980f914437dab7cbd899744b81"
+MACOS_RULES_BOOTSTRAP_WORKFLOW_SHA256 = "f56e0c0eb86493c320a72048201d4bfae6bedbec46ee85a8b027674d5cd62d3a"
+MACOS_CORE_BOOTSTRAP_WORKFLOW_SHA256 = "b140312f22310633089594255fb17d25aeece02869355e608408098c4e91a4eb"
 MACOS_CORE_CONTRACT_WORKFLOW_SHA256 = "38c33a1b30bc18378359910af0da73e493026e8105511062f96f6f80fafbe096"
-DEVELOPMENT_FEEDBACK_SMOKE_WORKFLOW_SHA256 = "09e058574372baa40016327e8a0da12d130a262a8bd70baba3a38ed10acc3d7a"
+DEVELOPMENT_FEEDBACK_SMOKE_WORKFLOW_SHA256 = "8f55731d8c013ba9741595e6fd7a4d0ce1c0cae0bff75c5ea40fa750ec4fca09"
 
 
 class PolicyError(ValueError):
@@ -121,14 +119,38 @@ def load_policy_document(path, expected_pool=None):
 PLATFORM_WORKFLOW_TEMPLATE = """name: public-policy
 on:
   push:
-    branches:
-      - "**"
   pull_request:
   workflow_dispatch:
 permissions: {}
 jobs:
+  promotion-check-reuse:
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/main') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      checks: read
+      contents: read
+      statuses: read
+    outputs:
+      skip_checks: ${{ steps.decide.outputs.skip_checks }}
+    steps:
+      - name: Fetch the exact candidate SHA
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check prior workflow results for this exact SHA
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROMOTION_TARGET: ${{ github.ref_name }}
+          PROMOTION_SHA: ${{ github.sha }}
+          PROMOTION_WORKFLOW: public-policy
+        run: timeout 1m python -B kit/promotion/branch_promotion.py --reuse-checks-if-green --target "$PROMOTION_TARGET" --sha "$PROMOTION_SHA" --workflow "$PROMOTION_WORKFLOW"
   policy:
     name: policy-${{ matrix.runner }}
+    needs: promotion-check-reuse
+    if: ${{ always() && (needs.promotion-check-reuse.result == 'skipped' || needs.promotion-check-reuse.outputs.skip_checks != 'true') }}
     strategy:
       fail-fast: true
       matrix:
@@ -1199,14 +1221,38 @@ jobs:
 NODE_LOCK_SMOKE_WORKFLOW_TEMPLATE = r"""name: node-lock-smoke
 on:
   push:
-    branches:
-      - "**"
   pull_request:
   workflow_dispatch:
 permissions: {}
 jobs:
+  promotion-check-reuse:
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/main') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      checks: read
+      contents: read
+      statuses: read
+    outputs:
+      skip_checks: ${{ steps.decide.outputs.skip_checks }}
+    steps:
+      - name: Fetch the exact candidate SHA
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check prior workflow results for this exact SHA
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROMOTION_TARGET: ${{ github.ref_name }}
+          PROMOTION_SHA: ${{ github.sha }}
+          PROMOTION_WORKFLOW: node-lock-smoke
+        run: timeout 1m python -B kit/promotion/branch_promotion.py --reuse-checks-if-green --target "$PROMOTION_TARGET" --sha "$PROMOTION_SHA" --workflow "$PROMOTION_WORKFLOW"
   node-lock-smoke:
     name: node-lock-smoke-${{ matrix.runner }}
+    needs: promotion-check-reuse
+    if: ${{ always() && (needs.promotion-check-reuse.result == 'skipped' || needs.promotion-check-reuse.outputs.skip_checks != 'true') }}
     strategy:
       fail-fast: true
       matrix:
@@ -1296,13 +1342,49 @@ def consumer_workflow_template(pool, pin):
         "name: public-policy\n"
         "on:\n"
         "  push:\n"
-        "    branches:\n"
-        "      - \"**\"\n"
         "  pull_request:\n"
         "  workflow_dispatch:\n"
         "permissions: {}\n"
         "jobs:\n"
+        "  promotion-check-reuse:\n"
+        "    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/main') }}\n"
+        "    runs-on: ubuntu-24.04\n"
+        "    timeout-minutes: 5\n"
+        "    permissions:\n"
+        "      checks: read\n"
+        "      contents: read\n"
+        "      statuses: read\n"
+        "    outputs:\n"
+        "      skip_checks: ${{ steps.decide.outputs.skip_checks }}\n"
+        "    steps:\n"
+        "      - name: Fetch the exact candidate SHA\n"
+        "        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n"
+        "        with:\n"
+        "          ref: ${{ github.sha }}\n"
+        "          persist-credentials: false\n"
+        "      - name: Fetch the pinned promotion policy\n"
+        "        env:\n"
+        "          CONTROL_SHA: " + pin + "\n"
+        "        run: |\n"
+        "          set -euo pipefail\n"
+        "          timeout 1m git init -q control\n"
+        "          timeout 1m git -C control config core.autocrlf false\n"
+        "          timeout 1m git -C control remote add origin \"${GITHUB_SERVER_URL%/}/${GITHUB_REPOSITORY}.git\"\n"
+        "          timeout 1m git -C control fetch --quiet --no-tags --depth=1 origin \"$CONTROL_SHA\"\n"
+        "          timeout 1m git -C control checkout --quiet --detach FETCH_HEAD\n"
+        "          actual_sha=\"$(timeout 1m git -C control rev-parse HEAD)\"\n"
+        "          [[ \"$actual_sha\" == \"$CONTROL_SHA\" ]]\n"
+        "      - name: Check prior workflow results for this exact SHA\n"
+        "        id: decide\n"
+        "        env:\n"
+        "          GH_TOKEN: ${{ github.token }}\n"
+        "          PROMOTION_TARGET: ${{ github.ref_name }}\n"
+        "          PROMOTION_SHA: ${{ github.sha }}\n"
+        "          PROMOTION_WORKFLOW: public-policy\n"
+        "        run: timeout 1m python -B control/kit/promotion/branch_promotion.py --reuse-checks-if-green --target \"$PROMOTION_TARGET\" --sha \"$PROMOTION_SHA\" --workflow \"$PROMOTION_WORKFLOW\"\n"
         "  policy:\n"
+        "    needs: promotion-check-reuse\n"
+        "    if: ${{ always() && (needs.promotion-check-reuse.result == 'skipped' || needs.promotion-check-reuse.outputs.skip_checks != 'true') }}\n"
         "    name: policy-${{ matrix.runner }}\n"
         "    strategy:\n"
         "      fail-fast: true\n"
@@ -1324,9 +1406,8 @@ def consumer_workflow_template(pool, pin):
 
 
 FEEDBACK_RETURN_WORKFLOW_SHA256 = {
-    'node-lock-return': 'd8ff50dbe107182819694d22238e4b7d7146d226c8e4e5f756b11ece228bd5e5',
-    'core-rust-format-return': '2fc271cfb7e87e3175e3033eceeda9bedbc4bafca21eae4bd10f69d9f81d413c',
-    'core-build-diagnostic-return': '22d44fd5c3e67319c3a1e99b83a4094e02534a5a2c8b683135e24123a95655c7',
+    'core-rust-format-return': 'c56fc9e8199681d2dab689f7f09a9fbb57825549c0f6132c27a7016ce72c79ab',
+    'core-build-diagnostic-return': 'd75840b7a8b8541a1f1a083a35c5b54255d3ce8e5242c6e7e8bd1eb06bbd13ad',
 }
 ATTESTATION_PROBE_WORKFLOW_SHA256 = '804d5bf224067808374c42886e615723ab1b1d77716463a3990391c812976e3e'
 
@@ -1348,9 +1429,7 @@ SHARED_WORKFLOW_KINDS = frozenset(
         "macos-rules-source-reader",
     )
 ) | frozenset(FEEDBACK_RETURN_WORKFLOW_SHA256)
-LANE_MODULES = (
-    policy_linux, policy_windows, policy_handoff, policy_rust, policy_baselines, policy_npm,
-)
+LANE_MODULES = (policy_linux, policy_windows, policy_handoff, policy_baselines)
 LANE_DIGEST_PATTERN = re.compile(r"[a-f0-9]{64}\Z")
 
 

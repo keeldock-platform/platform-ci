@@ -2,6 +2,8 @@ import hashlib
 import io
 import json
 import tarfile
+import tempfile
+from contextlib import ExitStack
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 import unittest
@@ -9,12 +11,13 @@ from unittest.mock import patch
 import urllib.parse
 import urllib.request
 
+import macos_private_validation as private_validation
 import macos_rules_bootstrap as bootstrap
 
 
 CONTROL = "a" * 40
 SOURCE = "b" * 40
-BASE = "c" * 40
+BASE = SOURCE
 
 
 def request_value(**changes):
@@ -75,18 +78,10 @@ def definitions_environment(raw=b"| D99999999 |\n| CI99999999 |\n"):
 
 def review_environment(request=None):
     request = request or request_value()
-    environment = definitions_environment()
-    environment.update({
-        "RULES_BOOTSTRAP_ALLOWED_SHA": request["source_sha"],
-        "RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA": CONTROL,
+    return {
         "CI_SHA": CONTROL,
-        "SOURCE_REVIEWED_SHA": request["source_sha"],
-        "SOURCE_REVIEWED_BASE": request["base_sha"],
-        "SOURCE_REVIEWED_BASE_BRANCH": request["base_branch"],
-        "SOURCE_REVIEWED_DIFF_SHA256": "d" * 64,
-        "SOURCE_CANDIDATE_REF": "refs/heads/chore/test-123",
-    })
-    return environment
+        "SOURCE_CANDIDATE_REF": "refs/heads/main",
+    }
 
 
 def extract_verified_fixture(bottle, formula_sha256=None):
@@ -115,6 +110,16 @@ def bottle_fixture(entries):
 
 
 class RequestAndGateTests(unittest.TestCase):
+    def test_required_sources_cover_hooks_without_retired_rule_gate_files(self):
+        self.assertEqual(
+            bootstrap.REQUIRED_SOURCE_FILES,
+            (
+                "hooks/pre-push-guard.sh",
+                "hooks/guard-bash.sh",
+                "tests/run-hook-tests.sh",
+            ),
+        )
+
     def test_request_is_exact_fixed_schema(self):
         parsed = bootstrap._parse_request((
             "--source-sha", SOURCE,
@@ -172,47 +177,39 @@ class RequestAndGateTests(unittest.TestCase):
         with patch("sys.stdin", SimpleNamespace(buffer=io.BytesIO(b"x" * 4096))):
             self.assertEqual(bootstrap._read_token_stdin(lifecycle), "x" * 4096)
 
-    def test_sha_allowlist_mismatch_refuses_before_snapshot_or_source_reader(self):
+    def test_non_main_candidate_ref_refuses_before_snapshot_or_source_reader(self):
         request = request_value()
         binding = binding_value()
         environment = {
-            "RULES_BOOTSTRAP_ALLOWED_SHA": "d" * 40,
-            "RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA": CONTROL,
             "CI_SHA": CONTROL,
+            "SOURCE_CANDIDATE_REF": "refs/heads/chore/test-123",
         }
-        with patch.object(bootstrap, "_validate_plan_definitions") as plan:
-            with self.assertRaisesRegex(bootstrap.Refusal, "bootstrap_gate_refused"):
-                bootstrap._validate_bootstrap_gate(request, binding, environment)
-        plan.assert_not_called()
+        with self.assertRaisesRegex(bootstrap.Refusal, "bootstrap_gate_refused"):
+            bootstrap._validate_bootstrap_gate(request, binding, environment)
 
-    def test_control_sha_allowlist_mismatch_fails_closed(self):
+    def test_control_sha_mismatch_fails_closed(self):
         environment = {
-            "RULES_BOOTSTRAP_ALLOWED_SHA": SOURCE,
-            "RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA": "d" * 40,
-            "CI_SHA": CONTROL,
+            "CI_SHA": "d" * 40,
+            "SOURCE_CANDIDATE_REF": "refs/heads/main",
         }
         with self.assertRaisesRegex(bootstrap.Refusal, "bootstrap_gate_refused"):
             bootstrap._validate_bootstrap_gate(request_value(), binding_value(), environment)
 
-    def test_review_binding_requires_exact_shas_branch_diff_and_safe_ref(self):
+    def test_rules_gate_requires_the_unsigned_main_tip(self):
         request = request_value()
         definitions, digest, diff = bootstrap._validate_bootstrap_gate(
             request, binding_value(), review_environment(request)
         )
         self.assertEqual(digest, hashlib.sha256(definitions).hexdigest())
-        self.assertEqual(diff, "d" * 64)
-        for key, value in (
-            ("SOURCE_REVIEWED_SHA", "f" * 40),
-            ("SOURCE_REVIEWED_BASE", "f" * 40),
-            ("SOURCE_REVIEWED_BASE_BRANCH", "develop"),
-            ("SOURCE_REVIEWED_DIFF_SHA256", "not-a-digest"),
-            ("SOURCE_CANDIDATE_REF", "refs/heads/chore/../bad"),
+        self.assertEqual(diff, hashlib.sha256(b"").hexdigest())
+        for changed_request, changed_environment in (
+            (dict(request, base_branch="develop"), review_environment(request)),
+            (dict(request, source_sha="d" * 40), review_environment(request)),
+            (request, dict(review_environment(request), SOURCE_CANDIDATE_REF="refs/heads/feat/candidate")),
         ):
-            with self.subTest(key=key):
-                environment = review_environment(request)
-                environment[key] = value
+            with self.subTest(request=changed_request, environment=changed_environment):
                 with self.assertRaisesRegex(bootstrap.Refusal, "bootstrap_gate_refused"):
-                    bootstrap._validate_bootstrap_gate(request, binding_value(), environment)
+                    bootstrap._validate_bootstrap_gate(changed_request, binding_value(), changed_environment)
 
     def test_permanent_tip_requires_its_base_ref(self):
         request = request_value(source_sha=BASE)
@@ -263,9 +260,8 @@ class RequestAndGateTests(unittest.TestCase):
         capability = object()
         boundary = object()
         environment = {
-            "RULES_BOOTSTRAP_ALLOWED_SHA": "d" * 40,
-            "RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA": CONTROL,
             "CI_SHA": CONTROL,
+            "SOURCE_CANDIDATE_REF": "refs/heads/feat/candidate",
         }
         with patch.object(bootstrap, "_load_control", return_value=(reviewed, capability, boundary)):
             with patch.object(bootstrap, "_public_context", return_value=(binding_value(), "/control")):
@@ -530,9 +526,8 @@ class LeaseRecordTests(unittest.TestCase):
             "base_sha": request["base_sha"],
             "base_branch": request["base_branch"],
             "concern": request["concern"],
-            "candidate_class": "signed-descendant",
-            "signature": "verified",
-            "rules_lock": "not-applicable",
+            "candidate_class": "permanent-tip",
+            "signature": "not_required",
             "tree": "rules_regular_files",
             "source_execution": "not_run_at_yield",
             "app_build": "not_run",
@@ -545,10 +540,10 @@ class LeaseRecordTests(unittest.TestCase):
             "repository_scope": "verified",
             "metadata": "verified",
             "token_revocation": "confirmed_before_yield",
-            "signer_authority": "bound_base",
-            "signatures": "all_new_commits_verified",
+            "signer_authority": "not_required",
+            "signatures": "unsigned_main_tip",
             "ancestry": "base_ancestor",
-            "revocation_policy": "current_control_fingerprints",
+            "revocation_policy": "not_applicable",
             "worker_access": "uid_read_only",
         })
 
@@ -556,6 +551,52 @@ class LeaseRecordTests(unittest.TestCase):
         bootstrap._validate_lease_record(
             self.valid_record(), request_value(), binding_value(), 502, current_uid=501
         )
+
+    def test_source_validation_emits_a_lease_record_accepted_by_the_consumer(self):
+        request = request_value()
+        binding = binding_value()
+        record = {
+            "repository_id": "987654321",
+            "source_sha": request["source_sha"],
+            "base_sha": request["base_sha"],
+            "base_branch": request["base_branch"],
+            "concern": request["concern"],
+            "candidate_class": "permanent-tip",
+            "signature": "not_required",
+            "tree": "rules_regular_files",
+            "source_execution": "not_run",
+            "app_build": "not_run",
+            "cleanup": "lease_open",
+        }
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent).resolve()
+            storage = root / "storage"
+            temporary = root / "snapshot"
+            source = temporary / "source"
+            patches = (
+                patch.object(private_validation, "_check_rules_bootstrap_gate"),
+                patch.object(private_validation, "_check_core_contract_gate"),
+                patch.object(private_validation, "_check_source_ref_binding", return_value="refs/heads/main"),
+                patch.object(private_validation, "_safe_context", return_value=(binding, root)),
+                patch.object(private_validation, "_check_worker_identity"),
+                patch.object(private_validation, "_validate_storage_root", return_value=storage),
+                patch.object(private_validation, "_add_storage_search_acl"),
+                patch.object(private_validation, "_source_snapshot", return_value=(record, temporary, source)),
+                patch.object(private_validation, "_grant_worker_readonly", return_value="/usr/bin/python3"),
+                patch.object(private_validation, "_assert_worker_absent"),
+                patch.object(private_validation, "_remove_tree"),
+                patch.object(private_validation, "_remove_storage_search_acl"),
+            )
+            with ExitStack() as stack:
+                for context in patches:
+                    stack.enter_context(context)
+                with private_validation.validated_source(
+                    request, binding, root, {}, worker_uid=502, storage_root=storage,
+                ) as lease:
+                    self.assertNotIn("rules_lock", lease.record)
+                    bootstrap._validate_lease_record(
+                        lease.record, request, binding, 502, current_uid=501,
+                    )
 
     def test_record_with_unconfirmed_revocation_or_wrong_control_is_refused(self):
         for key, value in (("token_revocation", "attempted"), ("control_sha", "d" * 40)):
@@ -688,7 +729,7 @@ class CleanupFailureTests(unittest.TestCase):
 
     def test_gate_failure_remains_when_every_cleanup_step_succeeds(self):
         calls = []
-        original = bootstrap.Refusal("suite_failed", "rules.sync")
+        original = bootstrap.Refusal("suite_failed", "rules.hooks")
         failure = bootstrap._attempt_cleanup_steps(
             original,
             (("cleanup_worker", lambda: calls.append("worker")),
@@ -1782,7 +1823,7 @@ class OutputTests(unittest.TestCase):
             "source_sha": SOURCE,
             "base_sha": BASE,
             "base_branch": "main",
-            "candidate_class": "signed-descendant",
+            "candidate_class": "permanent-tip",
             "suites": bootstrap.GATES,
             "token_revocation": "confirmed_before_execution",
             "lease_cleanup": "complete",
@@ -1800,7 +1841,7 @@ class OutputTests(unittest.TestCase):
         }
         line = bootstrap._format_success(record)
         self.assertIn("same-job-memory=not-verified", line)
-        self.assertIn("suites=rules.hooks,rules.sync,rules.static,rules.public,plan-ids", line)
+        self.assertIn("suites=rules.hooks", line)
         self.assertIn("summary-guard=append-sibling-create-readback-restore", line)
         self.assertIn("reviewed-diff-sha256=" + "a" * 64, line)
         self.assertNotIn("definitions-sha256", line)

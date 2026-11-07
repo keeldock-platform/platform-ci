@@ -314,7 +314,6 @@ class SuiteSelectorTests(unittest.TestCase):
     def test_ci_control_changes_are_always_full_set_inputs(self):
         for path in (
             "kit/confinement/feedback_request.py",
-            "kit/confinement/npm_admission_bootstrap.py",
             "kit/cache/policy.py",
             "ci/policy.json",
             "core-runtime/test_separation.py",

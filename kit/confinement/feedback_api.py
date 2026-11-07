@@ -637,7 +637,7 @@ def _quick_audit_line(run):
     return (
         "KD-CONFINEMENT-AUDIT schema=1 status=accepted os=linux mode=quick tier=quick"
         + " admission=never control-sha=" + run["head_sha"] + " run-id=" + str(run["id"])
-        + " run-attempt=1 verdict=none log-canary=absent artifacts=expected caches=unchanged"
+        + " run-attempt=1 verdict=none log-canary=absent artifacts=expected caches=verified"
     ).encode("ascii")
 
 

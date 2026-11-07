@@ -16,7 +16,9 @@ annotation, artifact and cache records it checks that:
     refused because their nested headers and markers cannot be mapped to job steps
     the run artifact inventory is empty: artifact contents are not scanned, so no artifact is
     admitted until a content scan exists
-    the repository cache inventory equals the digest taken before the producer jobs ran
+    the full repository cache inventory is fingerprinted, cache-service evictions are tolerated,
+    row mutations and unknown additions are refused, and only validated main-ref managed keys may
+    be added; untrusted workflows cannot add cache entries
 
 The Windows source profile is a separate closed shape selected by the windows argument. It has six
 audited jobs, four of them called workflows whose step lists are matched as required steps in order
@@ -39,13 +41,14 @@ API client interface, injected so tests use fakes:
 Accepted line:
 
     KD-CONFINEMENT-AUDIT schema=1 status=accepted os=<os> mode=<mode> control-sha=<sha>
-    run-id=<n> run-attempt=<n> verdict=accepted log-canary=absent artifacts=expected caches=unchanged
+    run-id=<n> run-attempt=<n> verdict=accepted log-canary=absent artifacts=expected caches=verified
 
 Refusal line:
 
     KD-CONFINEMENT-AUDIT schema=1 status=refused phase=<phase> reason=confinement_audit_invalid
 """
 
+import base64
 import datetime
 import hashlib
 import json
@@ -67,13 +70,15 @@ SCHEMA_VERSION = 1
 AUDIT_PREFIX = "KD-CONFINEMENT-AUDIT"
 REFUSAL_REASON = "confinement_audit_invalid"
 EXPECTED_ENV = "CONFINEMENT_AUDIT_EXPECTED"
-MAX_EXPECTED_BYTES = 65536
+AUDIT_CACHE_KEYS_ENV = "CONFINEMENT_AUDIT_CACHE_KEYS"
+MAX_EXPECTED_BYTES = 600000
 MAX_LINE_BYTES = 512
 PAGE_SIZE = 100
 MAX_PAGES = 100
 MAX_JOBS = 20
 MAX_ARTIFACTS = 1000
 MAX_CACHES = 10000
+MAX_CACHE_BASELINE_BYTES = 32 + MAX_CACHES * 40
 MAX_ANNOTATIONS = 1000
 MAX_LOG_BYTES = 32 * 1024 * 1024
 MAX_CHECK_TEXT = 262144
@@ -88,7 +93,7 @@ PHASES = frozenset((
 EXPECTED_FIELDS = frozenset((
     "repository", "os", "mode", "control_sha", "run_id", "run_attempt", "workflow_path",
     "ci_ref", "display_title", "jobs", "verdict_job", "verdict_step", "auditor_job",
-    "artifact_names", "cache_digest",
+    "artifact_names", "cache_digest", "cache_baseline",
 ))
 UNSECTIONED_STEPS = ("Set up job", "Complete job")
 GROUP_MARK = bytes((35, 35)) + b"[group]"
@@ -110,7 +115,7 @@ ACCEPTED_RE = re.compile(
     re.escape(AUDIT_PREFIX) + r" schema=1 status=accepted os=(linux|windows)"
     r" mode=(candidate|synthetic) control-sha=([a-f0-9]{40}) run-id=([1-9][0-9]{0,15})"
     r" run-attempt=([1-9][0-9]?) verdict=accepted log-canary=absent artifacts=expected"
-    r" caches=unchanged"
+    r" caches=(verified|unchanged)"
 )
 REFUSED_RE = re.compile(
     re.escape(AUDIT_PREFIX) + r" schema=1 status=refused phase=([a-z_]{1,24})"
@@ -120,6 +125,8 @@ REFUSED_RE = re.compile(
 
 QUICK_MODE = "quick"
 QUICK_WORKFLOW_PATH = ".github/workflows/core-linux-quick-return.yml"
+LINUX_SOURCE_WORKFLOW_PATH = ".github/workflows/linux-source-admission.yml"
+LINUX_SOURCE_TITLE_PREFIX = "Linux admission source "
 QUICK_GATES_STEP = "Run all offline project gates"
 QUICK_LINE_STEP = "Record quick return counts"
 QUICK_ARTIFACT_PREFIX = "linux-quick-"
@@ -206,7 +213,10 @@ def validate_expected(expected):
             or expected["auditor_job"] in jobs
             or type(expected["artifact_names"]) is not tuple or expected["artifact_names"] != ()
             or type(expected["cache_digest"]) is not str
-            or DIGEST_RE.fullmatch(expected["cache_digest"]) is None):
+            or DIGEST_RE.fullmatch(expected["cache_digest"]) is None
+            or not _cache_baseline_ok(expected["cache_baseline"])
+            or (expected["cache_baseline"] != ""
+                and _cache_baseline_digest(expected["cache_baseline"]) != expected["cache_digest"])):
         _fail("request")
     for name, spec in jobs.items():
         if (type(name) is not str or LABEL_RE.fullmatch(name) is None or type(spec) is not dict
@@ -619,11 +629,92 @@ def cache_inventory_digest(entries):
     return hashlib.sha256(encoded.encode("ascii")).hexdigest()
 
 
+SOURCE_CACHE_NAMESPACE = "-linux-source-"
+
+
+def _cache_entry_digest(item):
+    row = [
+        item["id"], item["key"], item["ref"], item["version"],
+        item["size_in_bytes"], item["created_at"],
+    ]
+    encoded = json.dumps(row, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("ascii")).digest()
+
+
+def _decode_cache_baseline(cache_baseline):
+    maximum = ((MAX_CACHE_BASELINE_BYTES + 2) // 3) * 4
+    if cache_baseline == "":
+        return {}
+    if type(cache_baseline) is not str or len(cache_baseline) > maximum:
+        raise ValueError("cache baseline")
+    try:
+        encoded = base64.b64decode(cache_baseline, validate=True)
+    except (ValueError, TypeError):
+        raise ValueError("cache baseline") from None
+    if (base64.b64encode(encoded).decode("ascii") != cache_baseline
+            or len(encoded) < 32 or (len(encoded) - 32) % 40 != 0
+            or (len(encoded) - 32) // 40 > MAX_CACHES
+            or hashlib.sha256(encoded[32:]).digest() != encoded[:32]):
+        raise ValueError("cache baseline")
+    result = {}
+    previous = 0
+    for offset in range(32, len(encoded), 40):
+        identifier = int.from_bytes(encoded[offset:offset + 8], "big")
+        if identifier <= previous:
+            raise ValueError("cache baseline")
+        result[identifier] = encoded[offset + 8:offset + 40]
+        previous = identifier
+    return result
+
+
+def _cache_baseline_ok(cache_baseline):
+    try:
+        _decode_cache_baseline(cache_baseline)
+    except (ValueError, TypeError, OverflowError):
+        return False
+    return True
+
+
+def _cache_baseline_digest(cache_baseline):
+    if cache_baseline == "":
+        return None
+    try:
+        encoded = base64.b64decode(cache_baseline, validate=True)
+    except (ValueError, TypeError):
+        raise ValueError("cache baseline") from None
+    return encoded[:32].hex()
+
+
+def cache_inventory_baseline(entries):
+    """Encode per-cache fingerprints compactly so evictions can be distinguished from mutations."""
+    cache_inventory_digest(entries)
+    fingerprints = bytearray()
+    for item in sorted(entries, key=lambda entry: entry["id"]):
+        try:
+            fingerprints.extend(item["id"].to_bytes(8, "big"))
+        except OverflowError:
+            _fail("cache_inventory")
+        fingerprints.extend(_cache_entry_digest(item))
+    encoded = hashlib.sha256(fingerprints).digest() + fingerprints
+    return base64.b64encode(encoded).decode("ascii")
+
+
+def snapshot_cache_inventory(api, repository):
+    """Capture the baseline digest and per-entry fingerprints for the later audit."""
+    if type(repository) is not str or REPOSITORY_RE.fullmatch(repository) is None:
+        _fail("request")
+    entries = _collect_caches(api, repository)
+    baseline = cache_inventory_baseline(entries)
+    return _cache_baseline_digest(baseline), baseline
+
+
 def snapshot_cache_digest(api, repository):
     """Take the cache digest before producer jobs run, for later comparison by the auditor."""
     if type(repository) is not str or REPOSITORY_RE.fullmatch(repository) is None:
         _fail("request")
-    return cache_inventory_digest(_collect_caches(api, repository))
+    entries = _collect_caches(api, repository)
+    baseline = cache_inventory_baseline(entries)
+    return _cache_baseline_digest(baseline), baseline
 
 
 def _collect_caches(api, repository):
@@ -637,7 +728,7 @@ def accepted_line(expected):
         AUDIT_PREFIX + " schema=" + str(SCHEMA_VERSION) + " status=accepted os=" + expected["os"]
         + " mode=" + expected["mode"] + " control-sha=" + expected["control_sha"]
         + " run-id=" + str(expected["run_id"]) + " run-attempt=" + str(expected["run_attempt"])
-        + " verdict=accepted log-canary=absent artifacts=expected caches=unchanged"
+        + " verdict=accepted log-canary=absent artifacts=expected caches=verified"
     )
 
 
@@ -675,9 +766,109 @@ def decode_audit_line(raw):
     _fail("unavailable")
 
 
-def audit(api, expected, config=None):
+RUST_CACHE_KEY_RE = re.compile(
+    r"kd-rust-v5-(?:Linux|macOS|Windows)-(?:x64|arm64)-"
+    r"(?:rust|runtime-workspace|linux-source-admission|linux-source-verifier)-"
+    r"(?:primary|independent-verifier)-[a-f0-9]{40}-[a-f0-9]{40}-"
+    r"[a-f0-9]{64}-[a-f0-9]{64}-[a-f0-9]{64}\Z"
+)
+SOURCE_CACHE_KEY_RE = re.compile(
+    r"kd-rust-v5-Linux-x64-linux-source-(?:admission-primary|verifier-independent-verifier)-"
+    r"([a-f0-9]{40})-([a-f0-9]{40})-[a-f0-9]{64}-[a-f0-9]{64}-[a-f0-9]{64}\Z"
+)
+
+
+def _cache_inventory_matches(api, expected, allowed_cache_keys=()):
+    items = _collect_caches(api, expected["repository"])
+    cache_inventory_digest(items)
+    baseline = _decode_cache_baseline(expected["cache_baseline"])
+    baseline_rows = [item for item in items if item["id"] in baseline]
+    additions = [item for item in items if item["id"] not in baseline]
+    baseline_by_id = {item["id"]: item for item in baseline_rows}
+    if (_cache_baseline_digest(expected["cache_baseline"]) != expected["cache_digest"]
+            or any(_cache_entry_digest(item) != baseline[item["id"]] for item in baseline_rows)
+            or (len(baseline_by_id) == len(baseline)
+                and cache_inventory_baseline(baseline_rows) != expected["cache_baseline"])
+            or any(not _authorized_cache_addition(item, expected, allowed_cache_keys)
+                   for item in additions)
+            or len({item["key"] for item in additions}) != len(additions)):
+        _fail("cache_inventory")
+
+
+def _authorized_cache_addition(item, expected, allowed_cache_keys=()):
+    """Accept current-run keys or schema-valid managed writes from protected main."""
+    if item["ref"] != "refs/heads/main" or item["size_in_bytes"] <= 0:
+        return False
+    if item["key"] in allowed_cache_keys:
+        return expected["ci_ref"] == "main"
+    if SOURCE_CACHE_NAMESPACE in item["key"]:
+        matched = SOURCE_CACHE_KEY_RE.fullmatch(item["key"])
+        if matched is None:
+            return False
+        title_prefix = LINUX_SOURCE_TITLE_PREFIX
+        if (expected["workflow_path"] == LINUX_SOURCE_WORKFLOW_PATH
+                and expected["mode"] == "candidate" and expected["ci_ref"] == "main"
+                and expected["display_title"].startswith(title_prefix)
+                and SHA_RE.fullmatch(expected["display_title"][len(title_prefix):]) is not None
+                and matched.group(1) == expected["display_title"][len(title_prefix):]
+                and matched.group(2) == expected["control_sha"]):
+            return False
+        return True
+    if RUST_CACHE_KEY_RE.fullmatch(item["key"]) is not None:
+        return True
+    return re.fullmatch(
+        r"macos-public-cache-seed-v1-[1-9][0-9]{0,18}-[1-9][0-9]{0,18}", item["key"]
+    ) is not None
+
+
+def parse_allowed_cache_keys(raw, expected):
+    """Accept only the exact cache-key forms emitted by the main-ref source-read job."""
+    if type(raw) is not str or len(raw) > 2048:
+        _fail("request")
+    if raw == "":
+        return ()
+    keys = tuple(raw.split(","))
+    if any(not item for item in keys):
+        _fail("request")
+    if not keys:
+        return ()
+    if (expected["mode"] != "candidate" or expected["ci_ref"] != "main"
+            or len(keys) > 2 or len(set(keys)) != len(keys)):
+        _fail("request")
+    title_prefix = LINUX_SOURCE_TITLE_PREFIX
+    source_sha = expected["display_title"][len(title_prefix):]
+    if (not expected["display_title"].startswith(title_prefix)
+            or SHA_RE.fullmatch(source_sha) is None):
+        _fail("request")
+    allowed_prefixes = (
+        ("kd-rust-v5-Linux-x64-linux-source-admission-primary-", "primary"),
+        ("kd-rust-v5-Linux-x64-linux-source-verifier-independent-verifier-", "independent-verifier"),
+    )
+    seen_scopes = set()
+    for key in keys:
+        matched_prefix = next(((prefix, scope) for prefix, scope in allowed_prefixes
+                               if key.startswith(prefix)), None)
+        if RUST_CACHE_KEY_RE.fullmatch(key) is None or matched_prefix is None:
+            _fail("request")
+        suffix = key[len(matched_prefix[0]):].split("-")
+        if (len(suffix) != 5 or suffix[0] != source_sha or suffix[1] != expected["control_sha"]
+                or any(SHA_RE.fullmatch(value) is None for value in suffix[:2])
+                or any(DIGEST_RE.fullmatch(value) is None for value in suffix[2:])):
+            _fail("request")
+        scope = matched_prefix[1]
+        if scope in seen_scopes:
+            _fail("request")
+        seen_scopes.add(scope)
+    return keys
+
+
+def audit(api, expected, config=None, allowed_cache_keys=()):
     """Return the accepted public line, or raise AuditRefusal naming only a closed phase."""
     _guard("request", validate_expected, expected)
+    if type(allowed_cache_keys) is not tuple or len(allowed_cache_keys) > 2:
+        _fail("request")
+    if allowed_cache_keys:
+        _guard("request", parse_allowed_cache_keys, ",".join(allowed_cache_keys), expected)
     resolved = _guard("log_canary", _resolve_config, config)
     _guard("run", _check_run, api, expected)
     jobs = _guard("jobs", _list_jobs, api, expected)
@@ -693,16 +884,14 @@ def audit(api, expected, config=None):
     if any(VERDICT_PREFIX in text.encode("utf-8", "replace") for text in texts):
         _fail("annotations")
     _guard("artifact_inventory", _check_artifacts, api, expected)
-    items = _guard("cache_inventory", _collect_caches, api, expected["repository"])
-    if _guard("cache_inventory", cache_inventory_digest, items) != expected["cache_digest"]:
-        _fail("cache_inventory")
+    _guard("cache_inventory", _cache_inventory_matches, api, expected, allowed_cache_keys)
     return accepted_line(expected)
 
 
-def audit_line(api, expected, config=None):
+def audit_line(api, expected, config=None, allowed_cache_keys=()):
     """Return a pair of the accepted flag and the one public line; never raises on a refusal."""
     try:
-        return True, audit(api, expected, config)
+        return True, audit(api, expected, config, allowed_cache_keys)
     except AuditRefusal as error:
         return False, refusal_line(error.phase)
     except Exception:
@@ -734,7 +923,10 @@ def validate_expected_quick(expected):
             or type(expected["artifact_names"]) is not tuple
             or expected["artifact_names"] != (QUICK_ARTIFACT_PREFIX + request_id,)
             or type(expected["cache_digest"]) is not str
-            or DIGEST_RE.fullmatch(expected["cache_digest"]) is None):
+            or DIGEST_RE.fullmatch(expected["cache_digest"]) is None
+            or not _cache_baseline_ok(expected["cache_baseline"])
+            or (expected["cache_baseline"] != ""
+                and _cache_baseline_digest(expected["cache_baseline"]) != expected["cache_digest"])):
         _fail("request")
     for name, spec in jobs.items():
         if (type(name) is not str or LABEL_RE.fullmatch(name) is None or type(spec) is not dict
@@ -866,7 +1058,7 @@ def quick_accepted_line(expected):
         AUDIT_PREFIX + " schema=" + str(SCHEMA_VERSION) + " status=accepted os=linux mode=quick"
         + " tier=quick admission=never control-sha=" + expected["control_sha"]
         + " run-id=" + str(expected["run_id"]) + " run-attempt=" + str(expected["run_attempt"])
-        + " verdict=none log-canary=absent artifacts=expected caches=unchanged"
+        + " verdict=none log-canary=absent artifacts=expected caches=verified"
     )
 
 
@@ -887,9 +1079,7 @@ def audit_quick(api, expected, config=None):
     if any(VERDICT_PREFIX in text.encode("utf-8", "replace") for text in texts):
         _fail("annotations")
     _guard("artifact_inventory", _check_quick_artifacts, api, expected)
-    items = _guard("cache_inventory", _collect_caches, api, expected["repository"])
-    if _guard("cache_inventory", cache_inventory_digest, items) != expected["cache_digest"]:
-        _fail("cache_inventory")
+    _guard("cache_inventory", _cache_inventory_matches, api, expected)
     return quick_accepted_line(expected)
 
 
@@ -919,7 +1109,6 @@ WINDOWS_OPEN_JOBS = (
     WINDOWS_PRODUCER_JOB, WINDOWS_VERIFIER_JOB, WINDOWS_LINUX_JOB, WINDOWS_ATTESTER_JOB,
 )
 WINDOWS_VERDICT_STEP = "Publish confinement verdict"
-WINDOWS_SOURCE_ONLY_RECEIVER_STEP = "Install pinned cargo-deny and prepare the RustSec database"
 WINDOWS_SETTINGS_STEPS = (
     "Set up job",
     "Fetch exact public control",
@@ -952,9 +1141,7 @@ WINDOWS_LINUX_SYNTHETIC_SKIPS = (
     "Record image and fetch pinned toolchains",
     "Mint scoped source-reader token",
     "Verify selected installation identity",
-    "Fetch exact source and verify binding, tree, signatures and lock provenance",
-    "Require trusted Rust licence admission",
-    "Run trusted dependency audit",
+    "Fetch exact source and verify binding, tree, signatures and committed locks",
     "Post Mint scoped source-reader token",
 )
 WINDOWS_ATTESTER_STEPS = (
@@ -1033,6 +1220,9 @@ def validate_expected_windows(expected):
             or not _is(expected["open_jobs"], WINDOWS_OPEN_JOBS)
             or type(expected["cache_digest"]) is not str
             or DIGEST_RE.fullmatch(expected["cache_digest"]) is None
+            or not _cache_baseline_ok(expected["cache_baseline"])
+            or (expected["cache_baseline"] != ""
+                and _cache_baseline_digest(expected["cache_baseline"]) != expected["cache_digest"])
             or type(jobs) is not dict
             or set(jobs) != set(WINDOWS_OPEN_JOBS) | {WINDOWS_SETTINGS_JOB, WINDOWS_EVIDENCE_JOB}):
         _fail("request")
@@ -1173,9 +1363,7 @@ def audit_windows(api, expected, config=None):
     if any(VERDICT_PREFIX in text.encode("utf-8", "replace") for text in texts):
         _fail("annotations")
     _guard("artifact_inventory", _check_windows_artifacts, api, expected)
-    items = _guard("cache_inventory", _collect_caches, api, expected["repository"])
-    if _guard("cache_inventory", cache_inventory_digest, items) != expected["cache_digest"]:
-        _fail("cache_inventory")
+    _guard("cache_inventory", _cache_inventory_matches, api, expected)
     return accepted_line(expected)
 
 
@@ -1189,7 +1377,7 @@ def windows_audit_line(api, expected, config=None):
         return False, refusal_line("unavailable")
 
 
-def windows_expected(environ, cache_digest):
+def windows_expected(environ, cache_digest, cache_baseline=""):
     """Build the expected Windows run description from the dispatch environment."""
     mode = environ.get("CI_MODE", "")
     run_id = environ.get("GITHUB_RUN_ID", "")
@@ -1208,7 +1396,6 @@ def windows_expected(environ, cache_digest):
     else:
         title = WINDOWS_SYNTHETIC_TITLE
         optional = WINDOWS_LINUX_SYNTHETIC_SKIPS
-    receiver_optional = (WINDOWS_SOURCE_ONLY_RECEIVER_STEP,) if mode == "synthetic" else ()
     expected = {
         "repository": environ.get("CI_REPOSITORY", ""),
         "os": "windows",
@@ -1223,9 +1410,9 @@ def windows_expected(environ, cache_digest):
             WINDOWS_SETTINGS_JOB: {"steps": WINDOWS_SETTINGS_STEPS, "optional_steps": ()},
             WINDOWS_PRODUCER_JOB: {
                 "steps": WINDOWS_PRODUCER_STEPS,
-                "optional_steps": (WINDOWS_VERDICT_STEP,) + receiver_optional,
+                "optional_steps": (WINDOWS_VERDICT_STEP,),
             },
-            WINDOWS_VERIFIER_JOB: {"steps": WINDOWS_VERIFIER_STEPS, "optional_steps": receiver_optional},
+            WINDOWS_VERIFIER_JOB: {"steps": WINDOWS_VERIFIER_STEPS, "optional_steps": ()},
             WINDOWS_LINUX_JOB: {"steps": WINDOWS_LINUX_STEPS, "optional_steps": optional},
             WINDOWS_ATTESTER_JOB: {"steps": WINDOWS_ATTESTER_STEPS, "optional_steps": ()},
             WINDOWS_EVIDENCE_JOB: {"steps": WINDOWS_EVIDENCE_STEPS, "optional_steps": ()},
@@ -1236,6 +1423,7 @@ def windows_expected(environ, cache_digest):
         "artifact_names": windows_capsule_names(run_number, 1),
         "open_jobs": WINDOWS_OPEN_JOBS,
         "cache_digest": cache_digest if DIGEST_RE.fullmatch(cache_digest or "") else "0" * 64,
+        "cache_baseline": cache_baseline,
     }
     validate_expected_windows(expected)
     return expected
@@ -1246,8 +1434,8 @@ def _write_windows_expected(env, sink, factory):
     token = env.get("GITHUB_TOKEN", "")
     repository = env.get("CI_REPOSITORY", "")
     api = factory(token, repository)
-    digest = snapshot_cache_digest(api, repository)
-    expected = windows_expected(env, digest)
+    digest, baseline = snapshot_cache_digest(api, repository)
+    expected = windows_expected(env, digest, baseline)
     encoded = json.dumps(expected, sort_keys=True, separators=(",", ":"))
     path = env.get("GITHUB_OUTPUT", "")
     if not path:
@@ -1398,10 +1586,16 @@ def main(arguments=None, environ=None, api_factory=None, stdout=None):
                 _windows_config(env),
             )
         else:
-            runner = quick_audit_line if quick else audit_line
-            accepted, line = runner(
-                factory(env.get("GITHUB_TOKEN", ""), expected["repository"]), expected,
-            )
+            api = factory(env.get("GITHUB_TOKEN", ""), expected["repository"])
+            if quick:
+                accepted, line = quick_audit_line(api, expected)
+            else:
+                allowed_cache_keys = parse_allowed_cache_keys(
+                    env.get(AUDIT_CACHE_KEYS_ENV, ""), expected,
+                )
+                accepted, line = audit_line(
+                    api, expected, allowed_cache_keys=allowed_cache_keys,
+                )
     except AuditRefusal as error:
         accepted, line = False, refusal_line(error.phase)
     except Exception:

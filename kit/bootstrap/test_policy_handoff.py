@@ -48,9 +48,14 @@ def declared_permission_lines(text):
 class HandoffWorkflowPolicyTests(unittest.TestCase):
     def test_workflow_declares_exactly_one_empty_permissions_key(self):
         workflow = HANDOFF_WORKFLOW.read_text(encoding="utf-8")
-        self.assertEqual(declared_permission_lines(workflow), ["permissions: {}"])
-        self.assertEqual(workflow.count("permissions"), 1)
+        self.assertEqual(
+            declared_permission_lines(workflow),
+            ["permissions: {}", "    permissions:"],
+        )
+        self.assertEqual(workflow.count("permissions"), 2)
         self.assertIn("\npermissions: {}\njobs:\n", workflow)
+        reuse = workflow.split("  promotion-check-reuse:\n", 1)[1].split("  handoff-unit:\n", 1)[0]
+        self.assertIn("      checks: read\n      contents: read\n      statuses: read\n", reuse)
         for widened in (
             workflow.replace("    timeout-minutes: 10\n", "    timeout-minutes: 10\n    permissions: {}\n"),
             workflow.replace("permissions: {}\n", "permissions:\n  contents: read\n"),
@@ -67,6 +72,11 @@ class HandoffWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("kit/handoff/source_free.py", workflow)
         self.assertIn("- ubuntu-24.04", workflow)
         self.assertIn("- windows-2025", workflow)
+        self.assertIn("promotion-check-reuse", workflow)
+        self.assertIn("PROMOTION_WORKFLOW: windows-handoff-synthetic", workflow)
+        self.assertIn("PROMOTION_SHA: ${{ github.sha }}", workflow)
+        unit = workflow.split("  handoff-unit:\n", 1)[1]
+        self.assertIn("needs: promotion-check-reuse", unit)
         for forbidden in (
             "inputs:",
             "secrets.",
@@ -81,13 +91,12 @@ class HandoffWorkflowPolicyTests(unittest.TestCase):
             "outputs:",
             "pull_request_target",
             "continue-on-error",
-            "needs:",
             "workflow_run",
             "environment:",
             "-latest",
         ):
             with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, workflow)
+                self.assertNotIn(forbidden, unit)
         with self.assertRaises(PolicyError):
             validate_workflow_text(workflow, "connect", HANDOFF_KIND)
         with self.assertRaises(PolicyError):
@@ -327,8 +336,6 @@ class WindowsSourceWorkflowTests(unittest.TestCase):
                 "WINDOWS_SOURCE_ENVIRONMENT_NAME", "WINDOWS_SOURCE_ALLOWED_SHA",
                 "WINDOWS_SOURCE_ALLOWED_BASE_SHA", "WINDOWS_SOURCE_ALLOWED_BASE_BRANCH",
                 "WINDOWS_SOURCE_ALLOWED_FINGERPRINT", "WINDOWS_SOURCE_ALLOWED_CONTROL_SHA",
-                "WINDOWS_SOURCE_ACCEPTED_NODE_LOCK_SHA256", "WINDOWS_SOURCE_ACCEPTED_MANIFEST_SHA256",
-                "WINDOWS_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON",
                 "LINUX_SOURCE_ENVIRONMENT_ID", "LINUX_SOURCE_MAIN_BRANCH_POLICY_ID",
                 "LINUX_SOURCE_UNTRUSTED_BRANCH_POLICY_ID",
             },
