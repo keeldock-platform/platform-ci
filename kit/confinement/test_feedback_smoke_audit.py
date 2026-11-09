@@ -26,10 +26,10 @@ def _ciphertext(runner):
     return b"KDLE" + runner.encode("ascii").ljust(124, b"-")
 
 
-def _archive(member):
+def _archive(member, member_name=None):
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_STORED) as archive:
-        info = zipfile.ZipInfo(subject.ZIP_MEMBER)
+        info = zipfile.ZipInfo(subject.SMOKE_MEMBER if member_name is None else member_name)
         info.create_system = 3
         info.external_attr = (stat.S_IFREG | 0o600) << 16
         archive.writestr(info, member)
@@ -39,9 +39,12 @@ def _archive(member):
 def _cipher_marker(runner, digest, size=128):
     return (
         "KD-FEEDBACK-CIPHERTEXT schema=1 control-sha={sha} run-id={run_id} "
-        "run-attempt=1 member=build-diagnostic-return-v1.enc ciphertext-sha256={digest} "
+        "run-attempt=1 member={member} ciphertext-sha256={digest} "
         "ciphertext-size={size} roundtrip=passed source=synthetic"
-    ).format(sha=CONTROL_SHA, run_id=RUN_ID, digest=digest, size=size).encode("ascii")
+    ).format(
+        sha=CONTROL_SHA, run_id=RUN_ID, member=subject.SMOKE_MEMBER,
+        digest=digest, size=size,
+    ).encode("ascii")
 
 
 def _upload_marker(digest, archive_digest, size=128):
@@ -299,11 +302,18 @@ class MarkerTests(unittest.TestCase):
             hashlib.sha256(_archive(_ciphertext("macos-15"))).hexdigest(),
         )
         self.assertEqual(subject.parse_ciphertext_marker(cipher)["run_id"], RUN_ID)
+        self.assertEqual(
+            subject.parse_ciphertext_marker(cipher)["member"], subject.SMOKE_MEMBER,
+        )
         self.assertEqual(subject.parse_upload_marker(upload)["artifact_id"], ARTIFACT_ID)
         for raw in (
             cipher + b"\n" + cipher,
             cipher + b"\n" + subject.CANARY,
             cipher.replace(b"roundtrip=passed", b"roundtrip=skipped"),
+            cipher.replace(
+                ("member=" + subject.SMOKE_MEMBER).encode("ascii"),
+                b"member=rust-format-return-v1.enc",
+            ),
         ):
             with self.subTest(prefix=raw[:40]), self.assertRaises(subject.SmokeAuditRefusal):
                 subject.parse_ciphertext_marker(raw)
@@ -326,6 +336,28 @@ class ProviderShapeTests(unittest.TestCase):
         self.assertIn("/actions/artifacts/97531/zip", api.requests[0].full_url)
         self.assertEqual(api.requests[0].get_header("Authorization"), "Bearer " + api._token)
         self.assertIsNone(api.requests[1].get_header("Authorization"))
+
+    def test_archive_member_is_strictly_bound_to_the_feedback_profile(self):
+        self.assertEqual(
+            subject.SMOKE_MEMBER,
+            subject.FEEDBACK_PROFILES["core-build-diagnostic-return"]["member_name"],
+        )
+        state, env = _fixture()
+        member = _ciphertext("macos-15")
+        archive = _archive(member, member_name="rust-format-return-v1.enc")
+        archive_digest = hashlib.sha256(archive).hexdigest()
+        ciphertext_digest = hashlib.sha256(member).hexdigest()
+        state["archive"] = archive
+        state["artifacts"][0]["size_in_bytes"] = len(archive)
+        state["artifacts"][0]["digest"] = "sha256:" + archive_digest
+        state["logs"][JOB_IDS["macos-15"]] = (
+            _cipher_marker("macos-15", ciphertext_digest) + b"\n"
+            + _upload_marker(ciphertext_digest, archive_digest) + b"\n"
+        )
+        with self.assertRaises(subject.SmokeAuditRefusal) as caught:
+            _audit(state, env)
+        self.assertEqual(caught.exception.reason, "artifact_invalid")
+        self.assertEqual(caught.exception.detail, "artifact")
 
     def test_artifact_expiry_accepts_live_short_lifetimes_and_rejects_out_of_bounds(self):
         now = datetime(2026, 10, 28, 4, 0, 0, tzinfo=timezone.utc)

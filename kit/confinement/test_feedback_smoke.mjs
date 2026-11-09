@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { after, test } from 'node:test';
 
 import { createSmokeCiphertext } from './feedback_smoke.mjs';
+import { RETURN_PROFILES } from './node_lock_envelope.mjs';
 
 const directories = [];
 const CONTROL_SHA = 'f'.repeat(40);
@@ -45,7 +46,7 @@ test('creates one bounded encrypted fixture and reports only ciphertext metadata
   assert.deepEqual(Object.keys(result).sort(), [
     'ciphertextPath', 'ciphertextSha256', 'ciphertextSize', 'memberName', 'roundTrip',
   ]);
-  assert.equal(result.memberName, 'build-diagnostic-return-v1.enc');
+  assert.equal(result.memberName, RETURN_PROFILES['core-build-diagnostic-return'].artifactMember);
   assert.equal(result.roundTrip, true);
   assert.equal(bytes.subarray(0, 4).toString('ascii'), 'KDLE');
   assert.equal(bytes[5], 3);

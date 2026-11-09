@@ -4,8 +4,10 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { decryptDevelopmentFeedback, encryptDevelopmentFeedback } from './development_feedback.mjs';
+import { RETURN_PROFILES } from './node_lock_envelope.mjs';
 
-const MEMBER_NAME = 'build-diagnostic-return-v1.enc';
+const SMOKE_PROFILE = RETURN_PROFILES['core-build-diagnostic-return'];
+const MEMBER_NAME = SMOKE_PROFILE.artifactMember;
 const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 const MAX_EXPIRY = 1_800_835_200;
 const CANARY = 'feedback-smoke-canary-7c49b2';
@@ -31,8 +33,8 @@ function buildContext(publicKey, env, now) {
     request_id: randomBytes(32).toString('hex'),
     nonce: randomBytes(32).toString('hex'),
     recipient_fingerprint: fingerprint,
-    concern: 'core-build-diagnostic-return',
-    kind: 'build_diagnostics',
+    concern: SMOKE_PROFILE.concern,
+    kind: SMOKE_PROFILE.kind,
     repository_id: env.GITHUB_REPOSITORY_ID,
     source_sha: 'a'.repeat(40),
     base_sha: 'b'.repeat(40),
@@ -41,7 +43,7 @@ function buildContext(publicKey, env, now) {
     reviewed_diff_sha256: 'c'.repeat(64),
     workflow_ref: 'refs/heads/main',
     run_id: env.GITHUB_RUN_ID,
-    producer_job: 'core-build-diagnostic-return',
+    producer_job: SMOKE_PROFILE.producerJob,
     run_attempt: 1,
     expiry: now + 3600,
   };

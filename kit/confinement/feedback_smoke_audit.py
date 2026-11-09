@@ -16,7 +16,11 @@ from macos_public_audit import (
     _read_annotations,
     _validate_log_location,
 )
-from node_lock_receipt import MAX_ARCHIVE_BYTES, ZIP_MEMBER, validate_ciphertext_archive
+from node_lock_receipt import (
+    FEEDBACK_PROFILES,
+    MAX_ARCHIVE_BYTES,
+    validate_ciphertext_archive,
+)
 
 
 REPOSITORY = "keeldock-platform/platform-ci"
@@ -26,6 +30,8 @@ RUNNERS = ("ubuntu-24.04", "macos-15", "windows-2025")
 AUDITOR_JOB = "feedback-smoke-audit"
 PROMOTION_JOB = "promotion-check-reuse"
 ARTIFACT_PREFIX = "development-feedback-smoke-"
+SMOKE_PROFILE = FEEDBACK_PROFILES["core-build-diagnostic-return"]
+SMOKE_MEMBER = SMOKE_PROFILE["member_name"]
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 MAX_SUMMARY_BYTES = 16 * 1024
 MAX_LOG_BYTES = 32 * 1024 * 1024
@@ -38,7 +44,8 @@ TIMESTAMP = rb"(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9
 CIPHERTEXT_MARKER = re.compile(
     rb"(?m)^" + TIMESTAMP
     + rb"KD-FEEDBACK-CIPHERTEXT schema=1 control-sha=([a-f0-9]{40}) "
-    rb"run-id=([1-9][0-9]{0,18}) run-attempt=1 member=build-diagnostic-return-v1\.enc "
+    + rb"run-id=([1-9][0-9]{0,18}) run-attempt=1 member="
+    + re.escape(SMOKE_MEMBER.encode("ascii")) + rb" "
     rb"ciphertext-sha256=([a-f0-9]{64}) ciphertext-size=([1-9][0-9]{0,6}) "
     rb"roundtrip=passed source=synthetic(?=\r?(?:\n|$))"
 )
@@ -127,7 +134,7 @@ def parse_ciphertext_marker(raw):
         "run_id": run_id.decode("ascii"),
         "ciphertext_sha256": digest.decode("ascii"),
         "ciphertext_size": int(size),
-        "member": ZIP_MEMBER,
+        "member": SMOKE_MEMBER,
     }
 
 
@@ -541,7 +548,7 @@ def _validate_artifact(api, identity, upload):
             or (expected_archive_size is not None and len(archive) != expected_archive_size)):
         valid = False
     try:
-        member = validate_ciphertext_archive(archive, member_name=ZIP_MEMBER)
+        member = validate_ciphertext_archive(archive, member_name=SMOKE_MEMBER)
     except Exception:
         return False
     archive_digest = hashlib.sha256(archive).hexdigest()
