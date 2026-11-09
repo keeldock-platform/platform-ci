@@ -155,10 +155,7 @@ def green_required_checks(required, check_runs, statuses, expected_sha):
             row for row in statuses
             if type(row) is dict and row.get("context") == context and row.get("sha") == expected_sha
         ]
-        attempts = [
-            row for row in matches
-            if not (row.get("status") == "completed" and row.get("conclusion") == "skipped")
-        ]
+        attempts = matches
         if required_app is not None and not attempts:
             raise PromotionRefusal("check")
         if attempts:
@@ -193,7 +190,7 @@ def promotion_checks_reusable(workflow, target, expected_sha, repository, curren
         return False
     try:
         check_payload = _api_json(
-            repository, "commits/" + expected_sha + "/check-runs?per_page=100", paginate=True,
+            repository, "commits/" + expected_sha + "/check-runs?filter=all&per_page=100", paginate=True,
         )
         status_payload = _api_json(
             repository, "commits/" + expected_sha + "/statuses?per_page=100", paginate=True,
@@ -257,7 +254,7 @@ def promote(root, target, sha, owner_approved):
     source_protection = _api_json(repository, "branches/" + source + "/protection/required_status_checks")
     target_protection = _api_json(repository, "branches/" + target + "/protection/required_status_checks")
     required = matching_required_checks(source_protection, target_protection)
-    check_payload = _api_json(repository, "commits/" + sha + "/check-runs?per_page=100", paginate=True)
+    check_payload = _api_json(repository, "commits/" + sha + "/check-runs?filter=all&per_page=100", paginate=True)
     status_payload = _api_json(repository, "commits/" + sha + "/statuses?per_page=100", paginate=True)
     green_required_checks(required, _pages(check_payload, "check_runs"), _pages(status_payload), sha)
     if _remote_sha(root, source) != sha:

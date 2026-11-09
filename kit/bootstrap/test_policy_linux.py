@@ -19,15 +19,17 @@ __all__ = [
 
 ROOT = Path(__file__).resolve().parents[2]
 LINUX_WORKFLOW = ROOT / ".github/workflows/linux-confinement.yml"
+LINUX_DIAGNOSTIC_WORKFLOW = ROOT / ".github/workflows/linux-confinement-diagnostic.yml"
 ADMISSION_WORKFLOW = ROOT / ".github/workflows/linux-source-admission.yml"
 QUICK_WORKFLOW = ROOT / ".github/workflows/core-linux-quick-return.yml"
 QUICK_MODULE = ROOT / "core-ci/linux_quick_return.py"
 STANDIN = "kd-synthetic-standin-NOT-A-SECRET-0123456789abcdef0123456789abcd"
 ENVIRONMENT_LINE = "    environment: ${{ inputs.mode == 'source' && 'linux-source-read' || '' }}\n"
 MAIN_ENVIRONMENT_LINE = "    environment: ${{ inputs.mode == 'source' && github.ref == 'refs/heads/main' && 'linux-source-read-main' || inputs.mode == 'source' && 'linux-source-read' || '' }}\n"
-LINUX_WORKFLOW_SHA256_BEFORE_SPLIT = "d185cbe6abd3a0caf5235c7521378bc0247f8f08de4adc5a43c2abff2158c5c3"
+LINUX_CONFINEMENT_WORKFLOW_SHA256 = "621b8f4340184efc8c834b8eba8897590bb10e7b680ed85cb43d444bfa3705f6"
 LINUX_LANE_FILES = (
     ".github/workflows/linux-confinement.yml",
+    ".github/workflows/linux-confinement-diagnostic.yml",
     "kit/bootstrap/policy_linux.py",
     "kit/bootstrap/test_policy_linux.py",
     "kit/confinement/linux_harness.py",
@@ -60,17 +62,20 @@ class LinuxWorkflowPolicyTests(unittest.TestCase):
     def test_actual_linux_workflow_matches_closed_supported_shape(self):
         workflow = LINUX_WORKFLOW.read_text(encoding="utf-8")
         self.assertTrue(validate_workflow_text(workflow, "platform", "linux-confinement"))
-        static_lane, privileged_lane = workflow.split("  linux-confinement:\n", 1)
-        self.assertNotIn("sudo ", static_lane)
-        self.assertIn("needs: linux-policy", privileged_lane)
-        self.assertIn("github.event_name == 'workflow_dispatch'", privileged_lane)
-        self.assertIn("github.ref == 'refs/heads/main'", privileged_lane)
+        self.assertNotIn("workflow_dispatch", workflow)
+        self.assertNotIn("promotion-check-reuse", workflow)
+        self.assertNotIn("sudo ", workflow)
         self.assertNotIn("inputs:", workflow)
-        self.assertIn('"$CI_REF" != "refs/heads/main"', privileged_lane)
-        self.assertIn('"$CI_REPOSITORY" != "keeldock-platform/platform-ci"', privileged_lane)
-        self.assertIn("CI_SHA: ${{ github.sha }}", privileged_lane)
-        self.assertIn('if [[ "$actual_sha" != "$CI_SHA" ]]', privileged_lane)
-        self.assertIn('git fetch --quiet --no-tags --depth=1 origin "$CI_REF"', privileged_lane)
+        diagnostic = LINUX_DIAGNOSTIC_WORKFLOW.read_text(encoding="utf-8")
+        self.assertTrue(validate_workflow_text(diagnostic, "platform", "linux-confinement-diagnostic"))
+        self.assertIn("github.event_name == 'workflow_dispatch'", diagnostic)
+        self.assertIn("github.ref == 'refs/heads/main'", diagnostic)
+        self.assertIn('"$CI_REF" != "refs/heads/main"', diagnostic)
+        self.assertIn('"$CI_REPOSITORY" != "keeldock-platform/platform-ci"', diagnostic)
+        self.assertIn("CI_SHA: ${{ github.sha }}", diagnostic)
+        self.assertIn('if [[ "$actual_sha" != "$CI_SHA" ]]', diagnostic)
+        self.assertIn('git fetch --quiet --no-tags --depth=1 origin "$CI_REF"', diagnostic)
+        self.assertNotIn("linux-policy", diagnostic)
         with self.assertRaises(PolicyError):
             validate_workflow_text(workflow, "connect", "linux-confinement")
         with self.assertRaises(PolicyError):
@@ -79,37 +84,43 @@ class LinuxWorkflowPolicyTests(unittest.TestCase):
     def test_linux_workflow_rejects_skips_masking_extra_execution_and_weak_permissions(self):
         base = LINUX_WORKFLOW.read_text(encoding="utf-8")
         mutations = (
-            base.replace("      - name: Run Linux synthetic confinement proof\n", "      - name: Extra execution\n        run: echo extra\n      - name: Run Linux synthetic confinement proof\n"),
-            base.replace("      - name: Run Linux synthetic confinement proof\n        run: |", "      - name: Run Linux synthetic confinement proof\n        if: ${{ false }}\n        run: |"),
-            base.replace("      - name: Run Linux synthetic confinement proof\n", "      - name: Run Linux synthetic confinement proof\n        continue-on-error: true\n"),
+            base.replace("      - name: Run unprivileged source-free checks\n", "      - name: Extra execution\n        run: echo extra\n      - name: Run unprivileged source-free checks\n"),
+            base.replace("      - name: Run unprivileged source-free checks\n        run: |", "      - name: Run unprivileged source-free checks\n        if: ${{ false }}\n        run: |"),
+            base.replace("      - name: Run unprivileged source-free checks\n", "      - name: Run unprivileged source-free checks\n        continue-on-error: true\n"),
             base.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-latest\n"),
             base.replace("permissions: {}\n", "permissions:\n  contents: read\n"),
-            base.replace("    timeout-minutes: 15\n", "    timeout-minutes: 0\n"),
+            base.replace("    timeout-minutes: 10\n", "    timeout-minutes: 0\n"),
             base.replace("  pull_request:\n", "  pull_request:\n    branches: []\n"),
             base + "  extra:\n    runs-on: ubuntu-24.04\n    steps: []\n",
-            base.replace("    needs: linux-policy\n", ""),
-            base.replace("github.ref == 'refs/heads/main'", "always()"),
-            base.replace('"$CI_REF" != "refs/heads/main"', '"$CI_REF" != "refs/heads/feature"'),
-            base.replace('"$CI_REPOSITORY" != "keeldock-platform/platform-ci"', '"$CI_REPOSITORY" != "fork/platform-ci"'),
-            base.replace("      - name: Run unprivileged source-free checks\n", "      - name: Run unprivileged source-free checks\n        run: sudo true\n"),
+            base.replace("  push:\n", "  workflow_dispatch:\n"),
+            base.replace("      - uat\n", "      - develop\n"),
         )
         for index, changed in enumerate(mutations):
             with self.subTest(mutation_index=index):
                 with self.assertRaises(PolicyError):
                     validate_workflow_text(changed, "platform", "linux-confinement")
 
+    def test_linux_diagnostic_is_a_separate_manual_check(self):
+        workflow = LINUX_DIAGNOSTIC_WORKFLOW.read_text(encoding="utf-8")
+        self.assertTrue(validate_workflow_text(workflow, "platform", "linux-confinement-diagnostic"))
+        self.assertEqual(
+            workflow.encode("utf-8"),
+            policy_linux.LINUX_CONFINEMENT_DIAGNOSTIC_WORKFLOW_TEMPLATE.encode("utf-8"),
+        )
+        self.assertNotIn("linux-policy", workflow)
+
 
 class LinuxLaneRegistryTests(unittest.TestCase):
-    def test_moved_template_is_byte_for_byte_the_pre_split_template(self):
+    def test_moved_template_matches_the_exact_workflow_digest(self):
         template = policy_linux.LINUX_CONFINEMENT_WORKFLOW_TEMPLATE
         self.assertEqual(
             hashlib.sha256(template.encode("utf-8")).hexdigest(),
-            LINUX_WORKFLOW_SHA256_BEFORE_SPLIT,
+            LINUX_CONFINEMENT_WORKFLOW_SHA256,
         )
         self.assertEqual(template.encode("utf-8"), LINUX_WORKFLOW.read_bytes())
         self.assertEqual(
             hashlib.sha256(LINUX_WORKFLOW.read_bytes()).hexdigest(),
-            LINUX_WORKFLOW_SHA256_BEFORE_SPLIT,
+            LINUX_CONFINEMENT_WORKFLOW_SHA256,
         )
 
     def test_shared_policy_reexports_the_moved_template_unchanged(self):
@@ -123,6 +134,7 @@ class LinuxLaneRegistryTests(unittest.TestCase):
             dict(policy_linux.WORKFLOW_TEMPLATES),
             {
                 "linux-confinement": policy_linux.LINUX_CONFINEMENT_WORKFLOW_TEMPLATE,
+                "linux-confinement-diagnostic": policy_linux.LINUX_CONFINEMENT_DIAGNOSTIC_WORKFLOW_TEMPLATE,
                 "linux-source-admission": policy_linux.LINUX_SOURCE_ADMISSION_WORKFLOW_TEMPLATE,
                 "core-linux-quick-return": policy_linux.LINUX_QUICK_RETURN_WORKFLOW_TEMPLATE,
             },
@@ -132,6 +144,11 @@ class LinuxLaneRegistryTests(unittest.TestCase):
             policy_linux.CANDIDATE_WORKFLOWS,
             (
                 (".github/workflows/linux-confinement.yml", "linux-confinement", "linux-workflow-too-large"),
+                (
+                    ".github/workflows/linux-confinement-diagnostic.yml",
+                    "linux-confinement-diagnostic",
+                    "linux-confinement-diagnostic-workflow-too-large",
+                ),
                 (
                     ".github/workflows/linux-source-admission.yml",
                     "linux-source-admission",

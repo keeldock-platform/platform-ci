@@ -19,6 +19,7 @@ WRAPPER = ROOT / "kit/confinement/windows_confinement.ps1"
 RUNNER = ROOT / "kit/confinement/windows_source_run.ps1"
 PROBE = ROOT / "kit/confinement/windows_probe.rs"
 WORKFLOW = ROOT / ".github/workflows/windows-confinement.yml"
+DIAGNOSTIC_WORKFLOW = ROOT / ".github/workflows/windows-confinement-diagnostic.yml"
 CONFINED_STAGES = (
     "cmd_exec",
     "acl_ro_read",
@@ -532,7 +533,7 @@ foreach ($case in $cases) {
 
     def test_only_the_confinement_workflow_loads_the_spike_native_and_wrapper_files(self):
         names = ("windows_confinement.cs", "windows_confinement.ps1", "windows_probe.rs")
-        allowed = {WORKFLOW.resolve()}
+        allowed = {WORKFLOW.resolve(), DIAGNOSTIC_WORKFLOW.resolve()}
         candidates = list((ROOT / ".github").rglob("*.yml")) + list((ROOT / "kit").rglob("action.yml"))
         self.assertGreater(len(candidates), 1)
         for path in candidates:
@@ -543,15 +544,22 @@ foreach ($case in $cases) {
                 with self.subTest(path=path.name, name=name):
                     self.assertNotIn(name, text)
         template = (ROOT / "kit/bootstrap/policy_windows.py").read_text(encoding="utf-8")
-        start = template.index('WINDOWS_CONFINEMENT_WORKFLOW_TEMPLATE = """')
-        end = template.index('"""', start + 60)
+        start = template.index('WINDOWS_CONFINEMENT_WORKFLOW_TEMPLATE = r"""')
+        start = template.index('"""', start) + 3
+        end = template.index('"""', start)
+        diagnostic_start = template.index('WINDOWS_CONFINEMENT_DIAGNOSTIC_WORKFLOW_TEMPLATE = r"""')
+        diagnostic_start = template.index('"""', diagnostic_start) + 3
+        diagnostic_end = template.index('"""', diagnostic_start)
         for path in sorted((ROOT / "kit/bootstrap").glob("policy_*.py")):
             text = path.read_text(encoding="utf-8")
             for name in names:
                 if path.name == "policy_windows.py":
                     for match in re.finditer(re.escape(name), text):
                         with self.subTest(path=path.name, name=name, offset=match.start()):
-                            self.assertTrue(start <= match.start() < end)
+                            self.assertTrue(
+                                start <= match.start() < end
+                                or diagnostic_start <= match.start() < diagnostic_end
+                            )
                 else:
                     with self.subTest(path=path.name, name=name):
                         self.assertNotIn(name, text)
@@ -701,8 +709,9 @@ foreach ($case in $cases) {
         worst = ladders + downloads * attempts * per_attempt + staging_allowance + dns_after + self.channel_budget() + self.fixture_budget()
         workflow = WORKFLOW.read_text(encoding="utf-8")
         minutes = [int(value) for value in re.findall(r"timeout-minutes: ([0-9]+)", workflow)]
-        self.assertEqual(minutes, [5, 15, 240])
-        spike = re.search(r"(?ms)^  windows-confinement-spike:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", workflow)
+        self.assertEqual(minutes, [15])
+        diagnostic = DIAGNOSTIC_WORKFLOW.read_text(encoding="utf-8")
+        spike = re.search(r"(?ms)^  windows-confinement-spike:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", diagnostic)
         self.assertIsNotNone(spike)
         spike_timeout = re.search(r"(?m)^    timeout-minutes: ([0-9]+)$", spike.group(1))
         self.assertIsNotNone(spike_timeout)
@@ -794,14 +803,21 @@ foreach ($case in $cases) {
 
     def test_workflow_runs_only_source_free_checks(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
+        diagnostic = DIAGNOSTIC_WORKFLOW.read_text(encoding="utf-8")
         jobs = {}
-        for name in ("promotion-check-reuse", "windows-policy", "windows-confinement-spike"):
+        for name in ("windows-policy",):
             match = re.search(
                 r"(?ms)^  " + re.escape(name) + r":\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
                 workflow,
             )
             self.assertIsNotNone(match, name)
             jobs[name] = match.group(1)
+        spike = re.search(
+            r"(?ms)^  windows-confinement-spike:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            diagnostic,
+        )
+        self.assertIsNotNone(spike)
+        jobs["windows-confinement-spike"] = spike.group(1)
 
         for required in (
             "windows_confinement.ps1 -Mode compile",
@@ -815,29 +831,11 @@ foreach ($case in $cases) {
                 with self.subTest(job=job_name, forbidden=forbidden):
                     self.assertNotIn(forbidden, jobs[job_name])
 
-        reuse = jobs["promotion-check-reuse"]
-        self.assertIn(
-            "if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/main') }}",
-            reuse,
-        )
-        self.assertIn("runs-on: ubuntu-24.04", reuse)
-        self.assertIn("timeout-minutes: 5", reuse)
-        self.assertIn("checks: read", reuse)
-        self.assertIn("contents: read", reuse)
-        self.assertIn("statuses: read", reuse)
-        self.assertRegex(reuse, r"(?m)^\s+uses: actions/checkout@[a-f0-9]{40}$")
-        self.assertIn("ref: ${{ github.sha }}", reuse)
-        self.assertIn("persist-credentials: false", reuse)
-        self.assertIn("PROMOTION_TARGET: ${{ github.ref_name }}", reuse)
-        self.assertIn("PROMOTION_SHA: ${{ github.sha }}", reuse)
-        self.assertIn("PROMOTION_WORKFLOW: windows-confinement", reuse)
-        self.assertIn("--reuse-checks-if-green", reuse)
-        self.assertIn("--target \"$PROMOTION_TARGET\" --sha \"$PROMOTION_SHA\"", reuse)
-        self.assertIn("--workflow \"$PROMOTION_WORKFLOW\"", reuse)
-        self.assertIn("skip_checks: ${{ steps.decide.outputs.skip_checks }}", reuse)
-        self.assertIn("needs: promotion-check-reuse", jobs["windows-policy"])
-        self.assertIn("needs.promotion-check-reuse.result == 'skipped'", jobs["windows-policy"])
-        self.assertIn("needs.promotion-check-reuse.outputs.skip_checks != 'true'", jobs["windows-policy"])
+        self.assertNotIn("workflow_dispatch", workflow)
+        self.assertNotIn("promotion-check-reuse", workflow)
+        self.assertIn("workflow_dispatch", diagnostic)
+        self.assertIn("github.ref == 'refs/heads/main'", diagnostic)
+        self.assertNotIn("windows-policy", diagnostic)
 
     def test_windows_has_no_source_mode_so_the_rust_licence_gate_is_linux_only(self):
         """Windows has no source mode, so the Rust licence gate is Linux source admission only."""
@@ -1070,7 +1068,7 @@ foreach ($case in $cases) {
         for name in ("windows_confinement_recovery.ps1", "test_windows_confinement_recovery.ps1"):
             with self.subTest(removed=name):
                 self.assertFalse((ROOT / "kit/confinement" / name).exists())
-        for path in (NATIVE, WRAPPER, PROBE, WORKFLOW):
+        for path in (NATIVE, WRAPPER, PROBE, WORKFLOW, DIAGNOSTIC_WORKFLOW):
             text = path.read_text(encoding="utf-8")
             for forbidden in (
                 "schtasks",
@@ -1152,7 +1150,7 @@ foreach ($case in $cases) {
         self.assertIn("$layout.NodeChild = Join-Path $layout.TestDir 'kd_child.js'", self.wrapper)
 
     def test_no_rust_lld_reference(self):
-        for path in (NATIVE, WRAPPER, PROBE, WORKFLOW):
+        for path in (NATIVE, WRAPPER, PROBE, WORKFLOW, DIAGNOSTIC_WORKFLOW):
             text = path.read_text(encoding="utf-8")
             with self.subTest(path=path.name):
                 self.assertIsNone(re.search(r"(?i)rust-lld|rust_lld|lld-link|linker-flavor|\blld\b", text))
@@ -3268,10 +3266,12 @@ foreach ($case in $cases) {
         budget = self.fixture_budget()
         self.assertEqual(budget, 2 * 3 * 243 + 2 * 63 + 2 * 33)
         workflow = WORKFLOW.read_text(encoding="utf-8")
+        diagnostic = DIAGNOSTIC_WORKFLOW.read_text(encoding="utf-8")
         template = (ROOT / "kit/bootstrap/policy_windows.py").read_text(encoding="utf-8")
-        self.assertIn("    timeout-minutes: 240\n", workflow)
+        self.assertIn("    timeout-minutes: 15\n", workflow)
+        self.assertIn("    timeout-minutes: 240\n", diagnostic)
         self.assertEqual(template.count("    timeout-minutes: 240\n"), 1)
-        self.assertNotIn("    timeout-minutes: 200\n", workflow + template)
+        self.assertNotIn("    timeout-minutes: 200\n", workflow + diagnostic + template)
 
     def test_leak_guards_run_and_judge_the_confined_attempt_whatever_the_control_and_exit_code(self):
         attempt = self.function_body("Invoke-ChannelAttempt")

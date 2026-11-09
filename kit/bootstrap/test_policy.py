@@ -265,9 +265,8 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_node_lock_smoke_workflow_rejects_source_cache_and_runtime_changes(self):
         base = NODE_LOCK_SMOKE_WORKFLOW.read_text(encoding="utf-8")
         mutations = (
-            base.replace("  workflow_dispatch:\n", "  pull_request:\n", 1),
+            base.replace("  pull_request:\n", "  pull_request:\n    branches: []\n", 1),
             base.replace("  pull_request:\n", "", 1),
-            base.replace("        PROMOTION_WORKFLOW: node-lock-smoke\n", "        PROMOTION_WORKFLOW: other\n", 1),
             base.replace("permissions: {}\n", "permissions:\n  contents: read\n", 1),
             base.replace("          - macos-15\n", "          - macos-latest\n", 1),
             base.replace("      fail-fast: true\n", "      fail-fast: false\n", 1),
@@ -282,7 +281,7 @@ class WorkflowPolicyTests(unittest.TestCase):
             base.replace('          "$python_command" -B -m unittest discover -s kit/confinement -p "test_sbom_normalizer.py"\n', "", 1),
             base.replace('            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_sbom_normalizer.py"\n', "", 1),
             base.replace("      - name: Run source-free helper tests\n", "      - name: Extra step\n        run: echo extra\n      - name: Run source-free helper tests\n", 1),
-            base.replace("  workflow_dispatch:\n", "  workflow_dispatch:\n    inputs: {}\n", 1),
+            base.replace("      - main\n", "      - develop\n", 1),
         )
         for index, changed in enumerate(mutations):
             with self.subTest(mutation_index=index):
@@ -1437,8 +1436,10 @@ class LaneRegistryTests(unittest.TestCase):
             set(policy.WORKFLOW_KIND_LANES),
             {
                 "linux-confinement",
+                "linux-confinement-diagnostic",
                 "windows-native-preflight",
                 "windows-confinement",
+                "windows-confinement-diagnostic",
                 "capsule-vectors",
                 "windows-handoff-synthetic",
                 "windows-source-admission",
@@ -1492,6 +1493,11 @@ class LaneRegistryTests(unittest.TestCase):
             (
                 (".github/workflows/linux-confinement.yml", "linux-confinement", "linux-workflow-too-large"),
                 (
+                    ".github/workflows/linux-confinement-diagnostic.yml",
+                    "linux-confinement-diagnostic",
+                    "linux-confinement-diagnostic-workflow-too-large",
+                ),
+                (
                     ".github/workflows/linux-source-admission.yml",
                     "linux-source-admission",
                     "linux-source-admission-workflow-too-large",
@@ -1510,6 +1516,11 @@ class LaneRegistryTests(unittest.TestCase):
                     ".github/workflows/windows-confinement.yml",
                     "windows-confinement",
                     "windows-confinement-workflow-too-large",
+                ),
+                (
+                    ".github/workflows/windows-confinement-diagnostic.yml",
+                    "windows-confinement-diagnostic",
+                    "windows-confinement-diagnostic-workflow-too-large",
                 ),
                 (
                     ".github/workflows/capsule-vectors.yml",
@@ -1638,10 +1649,10 @@ class LaneRegistryTests(unittest.TestCase):
                 with self.assertRaisesRegex(PolicyError, "workflow-kind"):
                     validate_workflow_text("name: x\n", "platform", kind)
 
-    def test_moved_templates_keep_their_pre_split_digests_through_the_shared_module(self):
+    def test_moved_templates_keep_their_reviewed_digests_through_the_shared_module(self):
         self.assertEqual(
             hashlib.sha256(policy.LINUX_CONFINEMENT_WORKFLOW_TEMPLATE.encode("utf-8")).hexdigest(),
-            "d185cbe6abd3a0caf5235c7521378bc0247f8f08de4adc5a43c2abff2158c5c3",
+            "621b8f4340184efc8c834b8eba8897590bb10e7b680ed85cb43d444bfa3705f6",
         )
         self.assertEqual(
             hashlib.sha256(policy.WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE.encode("utf-8")).hexdigest(),

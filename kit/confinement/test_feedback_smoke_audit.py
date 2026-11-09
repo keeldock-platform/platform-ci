@@ -110,15 +110,6 @@ def _fixture(*, retention_seconds=24 * 60 * 60 - 2, created_offset_seconds=-300,
         logs[job_id] = log + b"\n"
     jobs.append({
         "id": 104,
-        "name": subject.PROMOTION_JOB,
-        "run_id": int(RUN_ID),
-        "run_attempt": 1,
-        "head_sha": CONTROL_SHA,
-        "status": "completed",
-        "conclusion": "success" if event == "push" and branch in ("uat", "main") else "skipped",
-    })
-    jobs.append({
-        "id": 105,
         "name": subject.AUDITOR_JOB,
         "run_id": int(RUN_ID),
         "run_attempt": 1,
@@ -424,7 +415,7 @@ class ProviderShapeTests(unittest.TestCase):
             lambda state: state["jobs"][3].update(run_id=24681),
             lambda state: state["jobs"][3].update(run_attempt=2),
             lambda state: state["jobs"][3].update(head_sha="b" * 40),
-            lambda state: state["jobs"][3].update(status="in_progress"),
+            lambda state: state["jobs"][3].update(status="completed"),
             lambda state: state["jobs"][3].update(conclusion="skipped"),
             lambda state: state["jobs"][-1].update(run_id=24681),
             lambda state: state["jobs"][-1].update(run_attempt=2),
@@ -437,12 +428,10 @@ class ProviderShapeTests(unittest.TestCase):
             with self.subTest(change=mutate), self.assertRaises(subject.SmokeAuditRefusal):
                 _audit(state, env)
 
-    def test_promotion_job_is_skipped_only_when_its_workflow_gate_is_false(self):
-        for branch, event in (("feature", "push"), ("main", "workflow_dispatch"), ("uat", "push")):
-            state, env = _fixture(branch=branch, event=event)
-            with self.subTest(branch=branch, event=event):
-                marker, _ = _audit(state, env)
-                self.assertIn("status=passed", marker)
+    def test_manual_dispatch_is_not_an_accepted_feedback_smoke_run(self):
+        state, env = _fixture(branch="main", event="workflow_dispatch")
+        with self.assertRaises(subject.SmokeAuditRefusal):
+            _audit(state, env)
 
     def test_failed_terminal_producer_still_scans_all_known_surfaces_before_refusing(self):
         state, env = _fixture()

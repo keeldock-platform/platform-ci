@@ -70,40 +70,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
 """
 
-WINDOWS_CONFINEMENT_WORKFLOW_TEMPLATE = """name: windows-confinement
+WINDOWS_CONFINEMENT_WORKFLOW_TEMPLATE = r"""name: windows-confinement
 on:
   push:
+    branches-ignore:
+      - uat
+      - main
   pull_request:
-  workflow_dispatch:
 permissions: {}
 jobs:
-  promotion-check-reuse:
-    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/main') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      checks: read
-      contents: read
-      statuses: read
-    outputs:
-      skip_checks: ${{ steps.decide.outputs.skip_checks }}
-    steps:
-      - name: Fetch the exact candidate SHA
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Check prior workflow results for this exact SHA
-        id: decide
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PROMOTION_TARGET: ${{ github.ref_name }}
-          PROMOTION_SHA: ${{ github.sha }}
-          PROMOTION_WORKFLOW: windows-confinement
-        run: timeout 1m python -B kit/promotion/branch_promotion.py --reuse-checks-if-green --target "$PROMOTION_TARGET" --sha "$PROMOTION_SHA" --workflow "$PROMOTION_WORKFLOW"
   windows-policy:
-    needs: promotion-check-reuse
-    if: ${{ always() && (needs.promotion-check-reuse.result == 'skipped' || needs.promotion-check-reuse.outputs.skip_checks != 'true') }}
     runs-on: windows-2025
     timeout-minutes: 15
     defaults:
@@ -173,8 +149,14 @@ jobs:
           $ErrorActionPreference = 'Stop'
           & kit/confinement/windows_confinement.ps1 -Mode compile
           if ($LASTEXITCODE -ne 0) { exit 1 }
+"""
+
+WINDOWS_CONFINEMENT_DIAGNOSTIC_WORKFLOW_TEMPLATE = r"""name: windows-confinement-diagnostic
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
   windows-confinement-spike:
-    needs: windows-policy
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: windows-2025
     timeout-minutes: 240
@@ -418,6 +400,7 @@ jobs:
 WORKFLOW_TEMPLATES = {
     "windows-native-preflight": WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE,
     "windows-confinement": WINDOWS_CONFINEMENT_WORKFLOW_TEMPLATE,
+    "windows-confinement-diagnostic": WINDOWS_CONFINEMENT_DIAGNOSTIC_WORKFLOW_TEMPLATE,
     "capsule-vectors": CAPSULE_VECTORS_WORKFLOW_TEMPLATE,
 }
 WORKFLOW_SHA256 = {}
@@ -431,6 +414,11 @@ CANDIDATE_WORKFLOWS = (
         ".github/workflows/windows-confinement.yml",
         "windows-confinement",
         "windows-confinement-workflow-too-large",
+    ),
+    (
+        ".github/workflows/windows-confinement-diagnostic.yml",
+        "windows-confinement-diagnostic",
+        "windows-confinement-diagnostic-workflow-too-large",
     ),
     (
         ".github/workflows/capsule-vectors.yml",

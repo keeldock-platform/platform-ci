@@ -50,12 +50,10 @@ class HandoffWorkflowPolicyTests(unittest.TestCase):
         workflow = HANDOFF_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(
             declared_permission_lines(workflow),
-            ["permissions: {}", "    permissions:"],
+            ["permissions: {}"],
         )
-        self.assertEqual(workflow.count("permissions"), 2)
+        self.assertEqual(workflow.count("permissions"), 1)
         self.assertIn("\npermissions: {}\njobs:\n", workflow)
-        reuse = workflow.split("  promotion-check-reuse:\n", 1)[1].split("  handoff-unit:\n", 1)[0]
-        self.assertIn("      checks: read\n      contents: read\n      statuses: read\n", reuse)
         for widened in (
             workflow.replace("    timeout-minutes: 10\n", "    timeout-minutes: 10\n    permissions: {}\n"),
             workflow.replace("permissions: {}\n", "permissions:\n  contents: read\n"),
@@ -72,11 +70,9 @@ class HandoffWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("kit/handoff/source_free.py", workflow)
         self.assertIn("- ubuntu-24.04", workflow)
         self.assertIn("- windows-2025", workflow)
-        self.assertIn("promotion-check-reuse", workflow)
-        self.assertIn("PROMOTION_WORKFLOW: windows-handoff-synthetic", workflow)
-        self.assertIn("PROMOTION_SHA: ${{ github.sha }}", workflow)
+        self.assertNotIn("workflow_dispatch", workflow)
+        self.assertNotIn("promotion-check-reuse", workflow)
         unit = workflow.split("  handoff-unit:\n", 1)[1]
-        self.assertIn("needs: promotion-check-reuse", unit)
         for forbidden in (
             "inputs:",
             "secrets.",

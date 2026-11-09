@@ -3,15 +3,17 @@
 `kit/promotion/branch_promotion.py` promotes one SHA from `develop` to `uat`, then from `uat` to `main`. Run it from an authenticated clone of `keeldock-platform/platform-ci` after the candidate SHA has passed the required checks on `develop`:
 
 ```sh
-timeout 15m python3 -B kit/promotion/branch_promotion.py --target uat --sha "$GREEN_SHA" --owner-approved
-timeout 15m python3 -B kit/promotion/branch_promotion.py --target main --sha "$GREEN_SHA" --owner-approved
+python3 -B kit/promotion/branch_promotion.py --target uat --sha "$GREEN_SHA" --owner-approved
+python3 -B kit/promotion/branch_promotion.py --target main --sha "$GREEN_SHA" --owner-approved
 ```
 
 Set `GREEN_SHA` to the full commit SHA that is green on `develop`.
 
-The tool checks that the source branch still points to the supplied SHA, the destination is its ancestor, the source and destination have identical required status-check contexts and app IDs, and every required check is green on that exact SHA. It pushes the SHA itself and reads the remote destination back; promotion fails unless the destination is exactly that SHA. Run the second command only after the first succeeds.
+The tool checks that the source branch still points to the supplied SHA, the destination is its ancestor, the source and destination have identical required status-check contexts and app IDs, and every required check is green on that exact SHA. Only the latest attempt may count, and it must be completed with a `success` conclusion; any newer non-success attempt invalidates the older success. It pushes the SHA itself and reads the remote destination back; promotion fails unless the destination is exactly that SHA. Run the second command only after the first succeeds.
 
-On pushes to `uat` and `main`, each CI workflow checks for completed green evidence on the same SHA and skips its build jobs when the evidence is still current. A newer queued, in-progress, cancelled, or failed attempt makes the evidence unusable, even when an older attempt passed. A later job skipped by this reuse coordinator does not supersede the earlier successful run because that job did not execute the check. `promotion-check-reuse` is an internal coordination job and must not be a required status check.
+The six workflows that produce the required contexts ignore pushes to `uat` and `main`, and do not support manual dispatch. Promotion therefore leaves the successful check runs on the exact candidate SHA intact. The promotion tool requires every configured context from the same SHA, and GitHub branch rules enforce those contexts independently; an unchecked SHA remains blocked. It requests all check-run attempts, follows every API page, and selects the greatest run ID for each context. A newer queued, in-progress, skipped, cancelled, or failed attempt is not green and cannot be replaced by an older success.
+
+The Linux and Windows manual confinement diagnostics remain available through `linux-confinement-diagnostic.yml` and `windows-confinement-diagnostic.yml`. They dispatch only their separate `linux-confinement` and `windows-confinement-spike` job checks on `main`; neither check is part of the 14 promotion contexts. The commands above use Python directly and do not require GNU `timeout`, so they also run on macOS.
 
 **GitHub branch rules to configure**
 
@@ -36,7 +38,7 @@ Apply these settings in `keeldock-platform/platform-ci` for each of `develop`, `
 
    Use the job check names GitHub reports: explicit job `name` values include their rendered matrix values, unnamed jobs use the job ID, and reusable-workflow jobs use GitHub's `caller / callee` form.
 
-   Pin each context to GitHub Actions app ID `15368`. Do not add `promotion-check-reuse` as a required context. If another required context is added, add it to the promotion checker and this list before enabling it in branch rules.
+   Pin each context to GitHub Actions app ID `15368`. If another required context is added, add it to the promotion checker and this list before enabling it in branch rules.
 
 2. Require linear history, block force pushes, and block branch deletion. Keep ordinary pull-request review rules on `develop`.
 

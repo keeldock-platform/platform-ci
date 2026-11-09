@@ -13,40 +13,16 @@ CANDIDATE_WORKFLOWS lists, in order, the path, workflow kind and size-failure
 code that the candidate checker validates when the pool is platform.
 """
 
-LINUX_CONFINEMENT_WORKFLOW_TEMPLATE = """name: linux-confinement
+LINUX_CONFINEMENT_WORKFLOW_TEMPLATE = r"""name: linux-confinement
 on:
   push:
+    branches-ignore:
+      - uat
+      - main
   pull_request:
-  workflow_dispatch:
 permissions: {}
 jobs:
-  promotion-check-reuse:
-    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/main') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      checks: read
-      contents: read
-      statuses: read
-    outputs:
-      skip_checks: ${{ steps.decide.outputs.skip_checks }}
-    steps:
-      - name: Fetch the exact candidate SHA
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Check prior workflow results for this exact SHA
-        id: decide
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PROMOTION_TARGET: ${{ github.ref_name }}
-          PROMOTION_SHA: ${{ github.sha }}
-          PROMOTION_WORKFLOW: linux-confinement
-        run: timeout 1m python -B kit/promotion/branch_promotion.py --reuse-checks-if-green --target "$PROMOTION_TARGET" --sha "$PROMOTION_SHA" --workflow "$PROMOTION_WORKFLOW"
   linux-policy:
-    needs: promotion-check-reuse
-    if: ${{ always() && (needs.promotion-check-reuse.result == 'skipped' || needs.promotion-check-reuse.outputs.skip_checks != 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     defaults:
@@ -99,8 +75,14 @@ jobs:
           python3 -B kit/bootstrap/test_public_tree.py
           python3 -B kit/confinement/test_linux_harness.py
           python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
+"""
+
+LINUX_CONFINEMENT_DIAGNOSTIC_WORKFLOW_TEMPLATE = r"""name: linux-confinement-diagnostic
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
   linux-confinement:
-    needs: linux-policy
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -1381,12 +1363,18 @@ jobs:
 
 WORKFLOW_TEMPLATES = {
     "linux-confinement": LINUX_CONFINEMENT_WORKFLOW_TEMPLATE,
+    "linux-confinement-diagnostic": LINUX_CONFINEMENT_DIAGNOSTIC_WORKFLOW_TEMPLATE,
     "linux-source-admission": LINUX_SOURCE_ADMISSION_WORKFLOW_TEMPLATE,
     "core-linux-quick-return": LINUX_QUICK_RETURN_WORKFLOW_TEMPLATE,
 }
 WORKFLOW_SHA256 = {}
 CANDIDATE_WORKFLOWS = (
     (".github/workflows/linux-confinement.yml", "linux-confinement", "linux-workflow-too-large"),
+    (
+        ".github/workflows/linux-confinement-diagnostic.yml",
+        "linux-confinement-diagnostic",
+        "linux-confinement-diagnostic-workflow-too-large",
+    ),
     (
         ".github/workflows/linux-source-admission.yml",
         "linux-source-admission",

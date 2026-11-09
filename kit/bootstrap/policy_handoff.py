@@ -14,7 +14,7 @@ code that the candidate checker validates when the pool is platform.
 
 WORKFLOW_TEMPLATES = {}
 WORKFLOW_SHA256 = {
-    "windows-handoff-synthetic": "b0e648372ab0092b3341f1a53f3f6f03a470b40758b9af38505f71d4559ba06f",
+    "windows-handoff-synthetic": "0ee9b206768bba48d1957923ea921a9978b489c48203f5a6936a581364beb717",
     "windows-source-admission": "ef10b21b69f841f6c2b69bc22497400e89e959fdfd6e24740a24e4b00139b5a8",
     "lane-h-windows-receiver": "a6033b3c5dd1748bd4e55fa0dc4da82e40cd3ccfeee6b0fcc3ba3f88e165bde3",
     "lane-h-linux-fetch-encrypt": "c173b2298dca7757b37a67669ad6ae4abf6eaf32cf1dea94b8b0a17a1c50d423",

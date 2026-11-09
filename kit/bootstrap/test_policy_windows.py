@@ -23,6 +23,7 @@ __all__ = [
 ROOT = Path(__file__).resolve().parents[2]
 WINDOWS_NATIVE_PREFLIGHT_WORKFLOW = ROOT / ".github/workflows/windows-native-preflight.yml"
 WINDOWS_CONFINEMENT_WORKFLOW = ROOT / ".github/workflows/windows-confinement.yml"
+WINDOWS_CONFINEMENT_DIAGNOSTIC_WORKFLOW = ROOT / ".github/workflows/windows-confinement-diagnostic.yml"
 CAPSULE_VECTORS_WORKFLOW = ROOT / ".github/workflows/capsule-vectors.yml"
 CAPSULE_FRAME_WRAPPER = ROOT / "kit/confinement/capsule_frame.ps1"
 WINDOWS_WORKFLOW_SHA256_BEFORE_SPLIT = "da294aadfc0e99cbe109aba90f9fb86df65867cd32d3325d26a9e9a5b035e5bb"
@@ -34,6 +35,7 @@ WINDOWS_LANE_FILES = (
     "kit/confinement/windows_native_preflight.ps1",
     "kit/confinement/test_windows_native_preflight.py",
     ".github/workflows/windows-confinement.yml",
+    ".github/workflows/windows-confinement-diagnostic.yml",
     "kit/confinement/windows_confinement.cs",
     "kit/confinement/windows_confinement.ps1",
     "kit/confinement/windows_probe.rs",
@@ -103,17 +105,12 @@ class WindowsConfinementWorkflowTests(unittest.TestCase):
             workflow.encode("utf-8"),
             policy_windows.WINDOWS_CONFINEMENT_WORKFLOW_TEMPLATE.encode("utf-8"),
         )
-        self.assertEqual(workflow.count("runs-on: windows-2025\n"), 2)
+        self.assertEqual(workflow.count("runs-on: windows-2025\n"), 1)
         self.assertIn("permissions: {}\n", workflow)
-        self.assertIn("  workflow_dispatch:\n", workflow)
+        self.assertNotIn("  workflow_dispatch:\n", workflow)
         self.assertIn("  push:\n", workflow)
         self.assertIn("  pull_request:\n", workflow)
-        self.assertIn(
-            "if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}",
-            workflow,
-        )
         self.assertIn("windows_confinement.ps1 -Mode compile", workflow)
-        self.assertIn("windows_confinement.ps1 -Mode spike", workflow)
         parser_step = workflow.split("      - name: Parse every PowerShell file under kit\n", 1)[1].split("      - name:", 1)[0]
         self.assertIn("Get-ChildItem -LiteralPath (Join-Path $root 'kit') -Recurse -File -Force", parser_step)
         self.assertIn("$_.Extension -in @('.ps1', '.psm1')", parser_step)
@@ -121,9 +118,13 @@ class WindowsConfinementWorkflowTests(unittest.TestCase):
         self.assertIn("if ($bad -ne 0) { exit 1 }", parser_step)
         self.assertNotIn("foreach ($name in @('windows_confinement.ps1'))", parser_step)
         self.assertIn("test_windows_confinement.py", workflow)
-        self.assertIn("promotion-check-reuse", workflow)
-        self.assertIn("PROMOTION_WORKFLOW: windows-confinement", workflow)
-        policy_job = workflow.split("  windows-policy:\n", 1)[1].split("  windows-confinement-spike:\n", 1)[0]
+        self.assertNotIn("promotion-check-reuse", workflow)
+        diagnostic = WINDOWS_CONFINEMENT_DIAGNOSTIC_WORKFLOW.read_text(encoding="utf-8")
+        self.assertTrue(validate_workflow_text(diagnostic, "platform", "windows-confinement-diagnostic"))
+        self.assertIn("  windows-confinement-spike:\n", diagnostic)
+        self.assertIn("windows_confinement.ps1 -Mode spike", diagnostic)
+        self.assertNotIn("windows-policy", diagnostic)
+        policy_job = workflow.split("  windows-policy:\n", 1)[1]
         for forbidden in (
             "inputs:",
             "secrets.",
@@ -151,15 +152,13 @@ class WindowsConfinementWorkflowTests(unittest.TestCase):
         base = WINDOWS_CONFINEMENT_WORKFLOW.read_text(encoding="utf-8")
         mutations = (
             base.replace("  pull_request:\n", "  pull_request_target:\n"),
-            base.replace("  workflow_dispatch:\n", ""),
-            base.replace("github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'", "true"),
-            base.replace("github.ref == 'refs/heads/main'", "github.ref == 'refs/heads/feature'"),
+            base.replace("  push:\n", "  workflow_dispatch:\n"),
+            base.replace("      - uat\n", "      - develop\n"),
             base.replace("runs-on: windows-2025", "runs-on: windows-latest", 1),
             base.replace("permissions: {}\n", "permissions:\n  contents: read\n"),
-            base.replace("-Mode spike", "-Mode compile"),
             base.replace("      - name: Compile native confinement module\n", ""),
             base.replace("python -B kit/confinement/test_windows_confinement.py\n", ""),
-            base.replace("    needs: windows-policy\n", ""),
+            base.replace("    timeout-minutes: 15\n", "    timeout-minutes: 0\n"),
             base.replace("        run: |\n", "        continue-on-error: true\n        run: |\n", 1),
             base.replace("    steps:\n", "    environment: source-read\n    steps:\n", 1),
             base + "  extra:\n    runs-on: windows-2025\n    steps: []\n",
@@ -169,6 +168,16 @@ class WindowsConfinementWorkflowTests(unittest.TestCase):
                 self.assertNotEqual(changed, base)
                 with self.assertRaises(PolicyError):
                     validate_workflow_text(changed, "platform", "windows-confinement")
+
+    def test_confinement_diagnostic_is_separate_and_exact(self):
+        workflow = WINDOWS_CONFINEMENT_DIAGNOSTIC_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(
+            workflow.encode("utf-8"),
+            policy_windows.WINDOWS_CONFINEMENT_DIAGNOSTIC_WORKFLOW_TEMPLATE.encode("utf-8"),
+        )
+        self.assertTrue(validate_workflow_text(workflow, "platform", "windows-confinement-diagnostic"))
+        self.assertIn("workflow_dispatch", workflow)
+        self.assertNotIn("promotion-check-reuse", workflow)
 
 
 class WindowsLaneRegistryTests(unittest.TestCase):
@@ -365,6 +374,7 @@ class WindowsLaneRegistryTests(unittest.TestCase):
             {
                 "windows-native-preflight": policy_windows.WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE,
                 "windows-confinement": policy_windows.WINDOWS_CONFINEMENT_WORKFLOW_TEMPLATE,
+                "windows-confinement-diagnostic": policy_windows.WINDOWS_CONFINEMENT_DIAGNOSTIC_WORKFLOW_TEMPLATE,
                 "capsule-vectors": policy_windows.CAPSULE_VECTORS_WORKFLOW_TEMPLATE,
             },
         )
@@ -381,6 +391,11 @@ class WindowsLaneRegistryTests(unittest.TestCase):
                     ".github/workflows/windows-confinement.yml",
                     "windows-confinement",
                     "windows-confinement-workflow-too-large",
+                ),
+                (
+                    ".github/workflows/windows-confinement-diagnostic.yml",
+                    "windows-confinement-diagnostic",
+                    "windows-confinement-diagnostic-workflow-too-large",
                 ),
                 (
                     ".github/workflows/capsule-vectors.yml",

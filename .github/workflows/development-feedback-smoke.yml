@@ -1,37 +1,13 @@
 name: development-feedback-smoke
 on:
   push:
-  workflow_dispatch:
+    branches-ignore:
+      - uat
+      - main
 permissions: {}
 jobs:
-  promotion-check-reuse:
-    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/main') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      checks: read
-      contents: read
-      statuses: read
-    outputs:
-      skip_checks: ${{ steps.decide.outputs.skip_checks }}
-    steps:
-      - name: Fetch the exact candidate SHA
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Check prior workflow results for this exact SHA
-        id: decide
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PROMOTION_TARGET: ${{ github.ref_name }}
-          PROMOTION_SHA: ${{ github.sha }}
-          PROMOTION_WORKFLOW: development-feedback-smoke
-        run: timeout 1m python -B kit/promotion/branch_promotion.py --reuse-checks-if-green --target "$PROMOTION_TARGET" --sha "$PROMOTION_SHA" --workflow "$PROMOTION_WORKFLOW"
   feedback-smoke-producer:
     name: feedback-smoke-producer ${{ matrix.runner }}
-    needs: promotion-check-reuse
-    if: ${{ always() && (needs.promotion-check-reuse.result == 'skipped' || needs.promotion-check-reuse.outputs.skip_checks != 'true') }}
     strategy:
       fail-fast: true
       matrix:
@@ -54,7 +30,7 @@ jobs:
       - name: Fetch public control
         run: |
           set -euo pipefail
-          if [[ "$CI_EVENT_NAME" != "push" && "$CI_EVENT_NAME" != "workflow_dispatch" ]]; then
+          if [[ "$CI_EVENT_NAME" != "push" ]]; then
             exit 1
           fi
           if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
@@ -156,8 +132,8 @@ jobs:
             exit 1
           fi
   feedback-smoke-audit:
-    if: ${{ always() && needs.promotion-check-reuse.outputs.skip_checks != 'true' }}
-    needs: [feedback-smoke-producer, promotion-check-reuse]
+    if: ${{ always() }}
+    needs: feedback-smoke-producer
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     defaults:
@@ -178,7 +154,7 @@ jobs:
       - name: Fetch public control
         run: |
           set -euo pipefail
-          if [[ "$CI_EVENT_NAME" != "push" && "$CI_EVENT_NAME" != "workflow_dispatch" ]]; then
+          if [[ "$CI_EVENT_NAME" != "push" ]]; then
             exit 1
           fi
           if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then

@@ -17,6 +17,22 @@ WORKFLOW_CHECK_JOBS = {
         "feedback-smoke-producer", "feedback-smoke-audit",
     ),
 }
+EXPECTED_REQUIRED_CONTEXTS = frozenset((
+    "policy-ubuntu-24.04",
+    "policy-macos-15",
+    "policy-windows-2025",
+    "handoff-unit-ubuntu-24.04",
+    "handoff-unit-windows-2025",
+    "linux-policy",
+    "node-lock-smoke-ubuntu-24.04",
+    "node-lock-smoke-macos-15",
+    "node-lock-smoke-windows-2025",
+    "windows-policy",
+    "feedback-smoke-producer ubuntu-24.04",
+    "feedback-smoke-producer macos-15",
+    "feedback-smoke-producer windows-2025",
+    "feedback-smoke-audit",
+))
 
 
 def _job_blocks(source):
@@ -35,8 +51,7 @@ def _job_blocks(source):
 def _workflow_job_names(workflow_path, selected_jobs=None):
     source = workflow_path.read_text(encoding="utf-8")
     blocks = _job_blocks(source)
-    selected_jobs = tuple(job for job in blocks if job != "promotion-check-reuse") \
-        if selected_jobs is None else selected_jobs
+    selected_jobs = tuple(blocks) if selected_jobs is None else selected_jobs
     names = []
     for job_id in selected_jobs:
         if job_id not in blocks:
@@ -118,7 +133,7 @@ class BranchPromotionTests(unittest.TestCase):
         runs[1]["conclusion"] = "success"
         self.assertTrue(branch_promotion.green_required_checks(required, runs, [], sha))
 
-    def test_newer_queued_or_failing_attempt_overrides_an_older_slow_success(self):
+    def test_newer_queued_failing_or_skipped_attempt_overrides_an_older_success(self):
         required = {"dependency-checks / dependencies": 15368}
         sha = "a" * 40
         old_slow_success = {
@@ -146,7 +161,8 @@ class BranchPromotionTests(unittest.TestCase):
             newer_queued, status="completed", conclusion="skipped",
             completed_at="2026-11-08T11:00:00Z",
         )
-        self.assertTrue(branch_promotion.green_required_checks(required, [old_slow_success, skipped], [], sha))
+        with self.assertRaisesRegex(branch_promotion.PromotionRefusal, "check"):
+            branch_promotion.green_required_checks(required, [old_slow_success, skipped], [], sha)
         with self.assertRaisesRegex(branch_promotion.PromotionRefusal, "check"):
             branch_promotion.green_required_checks(required, [skipped], [], sha)
 
@@ -196,15 +212,35 @@ class BranchPromotionTests(unittest.TestCase):
             [{"check_runs": runs}],
             [[]],
         ]
-        with patch.object(branch_promotion, "_api_json", side_effect=payloads):
+        with patch.object(branch_promotion, "_api_json", side_effect=payloads) as api:
+            self.assertFalse(branch_promotion.promotion_checks_reusable(
+                "public-policy", "uat", sha, "keeldock-platform/platform-ci", "200",
+            ))
+        self.assertEqual(
+            api.call_args_list[0].args,
+            ("keeldock-platform/platform-ci", f"commits/{sha}/check-runs?filter=all&per_page=100"),
+        )
+        self.assertEqual(api.call_args_list[0].kwargs, {"paginate": True})
+
+        successful_retry = runs + [{
+            "name": contexts[0], "status": "completed", "conclusion": "success",
+            "head_sha": sha, "created_at": "2026-11-08T11:15:00Z",
+            "completed_at": "2026-11-08T11:15:00Z", "id": 250,
+            "app": {"id": 15368},
+            "details_url": "https://github.com/" + "keeldock" + "-platform/platform-ci/actions/runs/100",
+        }]
+        with patch.object(
+            branch_promotion, "_api_json",
+            side_effect=[[{"check_runs": successful_retry}], [[]]],
+        ):
             self.assertTrue(branch_promotion.promotion_checks_reusable(
                 "public-policy", "uat", sha, "keeldock-platform/platform-ci", "200",
             ))
 
-        failed_then_skipped = runs + [{
+        failed_then_skipped = successful_retry + [{
             "name": contexts[0], "status": "completed", "conclusion": "failure",
-            "head_sha": sha, "created_at": "2026-11-08T10:45:00Z",
-            "completed_at": "2026-11-08T10:45:00Z", "id": 175,
+            "head_sha": sha, "created_at": "2026-11-08T11:20:00Z",
+            "completed_at": "2026-11-08T11:20:00Z", "id": 275,
             "app": {"id": 15368},
             "details_url": "https://github.com/" + "keeldock" + "-platform/platform-ci/actions/runs/175",
         }]
@@ -222,6 +258,88 @@ class BranchPromotionTests(unittest.TestCase):
                 "public-policy", "main", "b" * 40,
                 "keeldock-platform/platform-ci", "200",
             ))
+
+    def test_promotion_workflows_do_not_run_on_protected_branch_pushes(self):
+        contexts = tuple(
+            context
+            for workflow_contexts in branch_promotion.WORKFLOW_CHECKS.values()
+            for context in workflow_contexts
+        )
+        self.assertEqual(len(contexts), 14)
+        self.assertEqual(set(contexts), EXPECTED_REQUIRED_CONTEXTS)
+        push_filter = "on:\n  push:\n    branches-ignore:\n      - uat\n      - main\n"
+        for relative in WORKFLOW_CHECK_JOBS:
+            workflow = (ROOT / relative).read_text(encoding="utf-8")
+            with self.subTest(workflow=relative):
+                self.assertEqual(workflow.count(push_filter), 1)
+                self.assertNotIn("  workflow_dispatch:\n", workflow)
+
+        diagnostics = {
+            ".github/workflows/linux-confinement-diagnostic.yml": "linux-confinement",
+            ".github/workflows/windows-confinement-diagnostic.yml": "windows-confinement-spike",
+        }
+        for relative, check_name in diagnostics.items():
+            workflow = (ROOT / relative).read_text(encoding="utf-8")
+            with self.subTest(diagnostic=relative):
+                self.assertIn("  workflow_dispatch:\n", workflow)
+                self.assertIn(f"  {check_name}:\n", workflow)
+                self.assertNotIn(check_name, EXPECTED_REQUIRED_CONTEXTS)
+
+    def test_promotion_refuses_an_unchecked_sha_before_attempting_a_push(self):
+        sha = "a" * 40
+        previous = "b" * 40
+        contexts = sorted(EXPECTED_REQUIRED_CONTEXTS)
+        protections = {
+            "contexts": [],
+            "checks": [
+                {"context": context, "app_id": branch_promotion.GITHUB_ACTIONS_APP_ID}
+                for context in contexts
+            ],
+        }
+        check_runs = [
+            {
+                "name": context,
+                "status": "completed",
+                "conclusion": "success",
+                "head_sha": sha,
+                "id": index,
+                "app": {"id": branch_promotion.GITHUB_ACTIONS_APP_ID},
+            }
+            for index, context in enumerate(contexts[:-1], start=1)
+        ]
+
+        def fake_run(argv, cwd=None, timeout=30):
+            argv = tuple(argv)
+            if argv == ("git", "remote", "get-url", "origin"):
+                return "https://github.com/" + "keeldock" + "-platform/platform-ci.git"
+            if argv[:2] == ("git", "fetch"):
+                return ""
+            if argv[:3] == ("git", "rev-parse", "refs/remotes/origin/develop"):
+                return sha
+            if argv[:3] == ("git", "rev-parse", "refs/remotes/origin/uat"):
+                return previous
+            return ""
+
+        with patch.object(branch_promotion, "_run", side_effect=fake_run) as run:
+            with patch.object(
+                branch_promotion,
+                "_api_json",
+                side_effect=(protections, protections, [{"check_runs": check_runs}], [[]]),
+            ) as api:
+                with patch.object(
+                    branch_promotion.subprocess,
+                    "run",
+                    return_value=type("Result", (), {"returncode": 0})(),
+                ):
+                    with self.assertRaisesRegex(branch_promotion.PromotionRefusal, "check"):
+                        branch_promotion.promote(str(ROOT), "uat", sha, True)
+
+        self.assertFalse(any(call.args[0][:2] == ("git", "push") for call in run.call_args_list))
+        self.assertEqual(
+            api.call_args_list[2].args,
+            ("keeldock-platform/platform-ci", f"commits/{sha}/check-runs?filter=all&per_page=100"),
+        )
+        self.assertEqual(api.call_args_list[2].kwargs, {"paginate": True})
 
     def test_promotion_reuse_contexts_match_the_workflow_job_names(self):
         self.assertEqual(

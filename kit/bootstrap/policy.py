@@ -25,7 +25,7 @@ MACOS_RULES_SOURCE_READER_WORKFLOW_SHA256 = "cb9b70226175069e9c148c06f18d4d89cf8
 MACOS_RULES_BOOTSTRAP_WORKFLOW_SHA256 = "f56e0c0eb86493c320a72048201d4bfae6bedbec46ee85a8b027674d5cd62d3a"
 MACOS_CORE_BOOTSTRAP_WORKFLOW_SHA256 = "b140312f22310633089594255fb17d25aeece02869355e608408098c4e91a4eb"
 MACOS_CORE_CONTRACT_WORKFLOW_SHA256 = "38c33a1b30bc18378359910af0da73e493026e8105511062f96f6f80fafbe096"
-DEVELOPMENT_FEEDBACK_SMOKE_WORKFLOW_SHA256 = "8f55731d8c013ba9741595e6fd7a4d0ce1c0cae0bff75c5ea40fa750ec4fca09"
+DEVELOPMENT_FEEDBACK_SMOKE_WORKFLOW_SHA256 = "edaaa6379f7cef3f76134948b937628a3b1c8084ee85769c73046eb50c02bf2c"
 
 
 class PolicyError(ValueError):
@@ -116,41 +116,17 @@ def load_policy_document(path, expected_pool=None):
     return validate_policy_document(value, expected_pool)
 
 
-PLATFORM_WORKFLOW_TEMPLATE = """name: public-policy
+PLATFORM_WORKFLOW_TEMPLATE = r"""name: public-policy
 on:
   push:
+    branches-ignore:
+      - uat
+      - main
   pull_request:
-  workflow_dispatch:
 permissions: {}
 jobs:
-  promotion-check-reuse:
-    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/main') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      checks: read
-      contents: read
-      statuses: read
-    outputs:
-      skip_checks: ${{ steps.decide.outputs.skip_checks }}
-    steps:
-      - name: Fetch the exact candidate SHA
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Check prior workflow results for this exact SHA
-        id: decide
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PROMOTION_TARGET: ${{ github.ref_name }}
-          PROMOTION_SHA: ${{ github.sha }}
-          PROMOTION_WORKFLOW: public-policy
-        run: timeout 1m python -B kit/promotion/branch_promotion.py --reuse-checks-if-green --target "$PROMOTION_TARGET" --sha "$PROMOTION_SHA" --workflow "$PROMOTION_WORKFLOW"
   policy:
     name: policy-${{ matrix.runner }}
-    needs: promotion-check-reuse
-    if: ${{ always() && (needs.promotion-check-reuse.result == 'skipped' || needs.promotion-check-reuse.outputs.skip_checks != 'true') }}
     strategy:
       fail-fast: true
       matrix:
@@ -207,7 +183,6 @@ jobs:
         with:
           pool: platform
 """
-
 
 MACOS_CAPABILITY_WORKFLOW_TEMPLATE = """name: macos-capability
 on:
@@ -1221,38 +1196,14 @@ jobs:
 NODE_LOCK_SMOKE_WORKFLOW_TEMPLATE = r"""name: node-lock-smoke
 on:
   push:
+    branches-ignore:
+      - uat
+      - main
   pull_request:
-  workflow_dispatch:
 permissions: {}
 jobs:
-  promotion-check-reuse:
-    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/main') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      checks: read
-      contents: read
-      statuses: read
-    outputs:
-      skip_checks: ${{ steps.decide.outputs.skip_checks }}
-    steps:
-      - name: Fetch the exact candidate SHA
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Check prior workflow results for this exact SHA
-        id: decide
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PROMOTION_TARGET: ${{ github.ref_name }}
-          PROMOTION_SHA: ${{ github.sha }}
-          PROMOTION_WORKFLOW: node-lock-smoke
-        run: timeout 1m python -B kit/promotion/branch_promotion.py --reuse-checks-if-green --target "$PROMOTION_TARGET" --sha "$PROMOTION_SHA" --workflow "$PROMOTION_WORKFLOW"
   node-lock-smoke:
     name: node-lock-smoke-${{ matrix.runner }}
-    needs: promotion-check-reuse
-    if: ${{ always() && (needs.promotion-check-reuse.result == 'skipped' || needs.promotion-check-reuse.outputs.skip_checks != 'true') }}
     strategy:
       fail-fast: true
       matrix:
@@ -1275,7 +1226,7 @@ jobs:
       - name: Fetch public candidate
         run: |
           set -euo pipefail
-          if [[ "$CI_EVENT_NAME" != "push" && "$CI_EVENT_NAME" != "workflow_dispatch" && "$CI_EVENT_NAME" != "pull_request" ]]; then
+          if [[ "$CI_EVENT_NAME" != "push" && "$CI_EVENT_NAME" != "pull_request" ]]; then
             exit 1
           fi
           if [[ ! "$CI_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
@@ -1329,7 +1280,6 @@ jobs:
             /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_sbom_normalizer.py"
           fi
 """
-
 
 CONSUMER_ACTION_PREFIX = "keeldock-platform/platform-ci/kit/bootstrap@"
 
