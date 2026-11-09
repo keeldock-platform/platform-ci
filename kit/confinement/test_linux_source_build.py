@@ -1055,7 +1055,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             harden = names.index("Harden runner paths before confined project checks") if "Harden runner paths before confined project checks" in names else names.index("Harden runner paths before confined runtime checks")
             selftest = names.index("Prepare kernel restrictions and run the independent boundary self-test")
             recheck = names.index("Re-run positive controls immediately before confined Rust checks") if "Re-run positive controls immediately before confined Rust checks" in names else names.index("Re-run positive controls immediately before runtime checks")
-            build = names.index("Build and test root and fuzz Rust workspaces with locks enforced") if "Build and test root and fuzz Rust workspaces with locks enforced" in names else names.index("Build and test the registered runtime workspace suite in confinement")
+            build = names.index("Build and test root and fuzz Rust workspaces with locks enforced") if "Build and test root and fuzz Rust workspaces with locks enforced" in names else names.index("Run npm --prefix runtime run check:workspace in confinement")
             self.assertLess(harden, selftest)
             self.assertLess(selftest, recheck)
             self.assertLess(recheck, build)
@@ -1666,7 +1666,10 @@ class LinuxSourceBuildTests(unittest.TestCase):
             self.assertEqual(run_host.call_count, 1)
             launch = run_host.call_args.args[2]
             project_env = run_host.call_args.args[3]
-            self.assertEqual(launch[-2:], ("/node/bin/node", "runtime/scripts/check-workspace.mjs"))
+            self.assertEqual(
+                launch[-5:],
+                ("/npm/bin/npm", "--prefix", "runtime", "run", "check:workspace"),
+            )
             self.assertEqual(project_env["CARGO_NET_OFFLINE"], "true")
             self.assertEqual(project_env["NPM_CONFIG_OFFLINE"], "true")
             self.assertNotIn("sudo", project_env.get("PATH", ""))

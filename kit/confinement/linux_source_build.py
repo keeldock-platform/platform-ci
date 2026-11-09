@@ -3689,8 +3689,8 @@ def run_runtime_workspace(environ=None):
         "npm_config_globalconfig": str(worker / ".home" / NPM_GLOBAL_CONFIG_NAME),
         "npm_config_update_notifier": "false", "PYTHONDONTWRITEBYTECODE": "1", "CI": "true",
     }
-    node = Path(node_bin) / "node"
-    argv = (str(node), "runtime/scripts/check-workspace.mjs")
+    npm = Path(npm_bin) / "npm"
+    argv = (str(npm), "--prefix", "runtime", "run", "check:workspace")
     nonce = os.urandom(12).hex()
     try:
         result = linux_session.run_host(

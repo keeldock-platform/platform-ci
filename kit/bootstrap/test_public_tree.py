@@ -470,9 +470,9 @@ class PublicTreeTests(unittest.TestCase):
         job = workflow[start:end]
         self.assertIn("KD_INCLUDE_RUNTIME_NPM_LOCK: \"true\"", job)
         self.assertIn("linux_source_build.py runtime-workspace", job)
-        self.assertIn("Build and test the registered runtime workspace suite in confinement", job)
-        self.assertNotIn("npm --prefix runtime run check:workspace", job)
+        self.assertIn("Run npm --prefix runtime run check:workspace in confinement", job)
         source_build = (ROOT / "kit/confinement/linux_source_build.py").read_text(encoding="utf-8")
+        self.assertIn('"--prefix", "runtime", "run", "check:workspace"', source_build)
         self.assertIn('"CARGO_NET_OFFLINE": "true"', source_build)
         self.assertIn('"NPM_CONFIG_OFFLINE": "true"', source_build)
         self.assertIn("timeout=RUNTIME_WORKSPACE_TIMEOUT_SECONDS", source_build)
@@ -605,7 +605,7 @@ class PublicTreeTests(unittest.TestCase):
                 elif "core-dependency-checks" in relative:
                     for start, end, build in (
                         ("  rust:\n", "  runtime-workspace:\n", "Build and test root and fuzz Rust workspaces with locks enforced"),
-                        ("  runtime-workspace:\n", "  npm:\n", "Build and test the registered runtime workspace suite in confinement"),
+                        ("  runtime-workspace:\n", "  npm:\n", "Run npm --prefix runtime run check:workspace in confinement"),
                     ):
                         job = workflow.split(start, 1)[1].split(end, 1)[0]
                         self.assertLess(job.index("uses: actions/cache/restore@"), job.index(build))

@@ -1025,7 +1025,7 @@ jobs:
           set -euo pipefail
           arguments=(--control-sha "$CONTROL_SHA" --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP" --rust-sysroot "$KD_RUST_SYSROOT" --node-bin "$KD_NODE_BIN" --synthetic-standin)
           sudo -n --preserve-env=KD_CANARY_SECRET python3 -B kit/confinement/linux_boundary.py recheck "${arguments[@]}" --record "$RUNNER_TEMP/kd-records/recheck.json"
-      - name: Build and test the registered runtime workspace suite in confinement
+      - name: Run npm --prefix runtime run check:workspace in confinement
         id: confined-runtime
         timeout-minutes: 95
         working-directory: control
