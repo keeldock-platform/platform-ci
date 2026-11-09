@@ -24,6 +24,7 @@ WORKFLOW_PATH = ".github/workflows/development-feedback-smoke.yml"
 PRODUCER_PREFIX = "feedback-smoke-producer "
 RUNNERS = ("ubuntu-24.04", "macos-15", "windows-2025")
 AUDITOR_JOB = "feedback-smoke-audit"
+PROMOTION_JOB = "promotion-check-reuse"
 ARTIFACT_PREFIX = "development-feedback-smoke-"
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 MAX_SUMMARY_BYTES = 16 * 1024
@@ -216,9 +217,10 @@ def _validate_jobs(api, identity):
         return {runner: [] for runner in RUNNERS}, False
     if type(value) is not dict or type(value.get("jobs")) is not list:
         return {runner: [] for runner in RUNNERS}, False
-    valid = (value.get("total_count") == 4 and len(value["jobs"]) == 4
+    valid = (value.get("total_count") == 5 and len(value["jobs"]) == 5
              and not headers.get("Link") and len(value["jobs"]) <= 100)
     by_name = {runner: [] for runner in RUNNERS}
+    promotion_jobs = []
     audit_jobs = []
     seen_ids = set()
     for job in value["jobs"][:100]:
@@ -237,6 +239,27 @@ def _validate_jobs(api, identity):
                     or type(job.get("run_attempt")) is not int or job.get("run_attempt") != 1
                     or job.get("head_sha") != identity["sha"]
                     or type(job.get("status")) is not str):
+                valid = False
+            continue
+        if job["name"] == PROMOTION_JOB:
+            promotion_jobs.append(job)
+            promotion_id = job.get("id")
+            if not _exact_int(promotion_id, 1) or promotion_id in seen_ids:
+                valid = False
+            else:
+                seen_ids.add(promotion_id)
+            if (type(job.get("run_id")) is not int
+                    or job.get("run_id") != int(identity["run_id"])
+                    or type(job.get("run_attempt")) is not int or job.get("run_attempt") != 1
+                    or job.get("head_sha") != identity["sha"]
+                    or type(job.get("status")) is not str):
+                valid = False
+            expected_conclusion = (
+                "success"
+                if identity["event"] == "push" and identity["ref"] in ("refs/heads/uat", "refs/heads/main")
+                else "skipped"
+            )
+            if job.get("status") != "completed" or job.get("conclusion") != expected_conclusion:
                 valid = False
             continue
         if not job["name"].startswith(PRODUCER_PREFIX):
@@ -261,6 +284,8 @@ def _validate_jobs(api, identity):
     for runner in RUNNERS:
         if len(by_name[runner]) != 1:
             valid = False
+    if len(promotion_jobs) != 1:
+        valid = False
     if (len(audit_jobs) != 1 or audit_jobs[0].get("status") != "in_progress"
             or audit_jobs[0].get("conclusion") is not None):
         valid = False

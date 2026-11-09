@@ -133,11 +133,13 @@ class CoreContractTests(unittest.TestCase):
             )
             rust = SimpleNamespace(_run_worker_command=Mock(side_effect=responses))
             reviewed = SimpleNamespace(_worker_census=Mock())
-            capability = SimpleNamespace(PROBE_PRIMARY_GID=os.getgid())
+            primary_uid = 1000
+            primary_gid = 1000
+            capability = SimpleNamespace(PROBE_PRIMARY_GID=primary_gid)
             with patch.object(subject, "_typescript_workspace_files", return_value=()), \
                     patch.object(subject, "_load_control_sibling", return_value=reviewed):
                 outcome = subject._typescript_workspace_gates(
-                    source, worker_storage, os.getuid(), {}, {"python": sys.executable},
+                    source, worker_storage, primary_uid, {}, {"python": sys.executable},
                     capability, rust, time.monotonic() + 60, node_path, tool_cache,
                     runtime, producer,
                 )

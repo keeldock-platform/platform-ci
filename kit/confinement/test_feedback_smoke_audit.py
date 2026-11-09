@@ -56,7 +56,8 @@ def _upload_marker(digest, archive_digest, size=128):
     ).encode("ascii")
 
 
-def _fixture(*, retention_seconds=24 * 60 * 60 - 2, created_offset_seconds=-300, now=None):
+def _fixture(*, retention_seconds=24 * 60 * 60 - 2, created_offset_seconds=-300, now=None,
+             branch="main", event="push"):
     member = _ciphertext("macos-15")
     archive = _archive(member)
     cipher_digests = {
@@ -106,6 +107,15 @@ def _fixture(*, retention_seconds=24 * 60 * 60 - 2, created_offset_seconds=-300,
         logs[job_id] = log + b"\n"
     jobs.append({
         "id": 104,
+        "name": subject.PROMOTION_JOB,
+        "run_id": int(RUN_ID),
+        "run_attempt": 1,
+        "head_sha": CONTROL_SHA,
+        "status": "completed",
+        "conclusion": "success" if event == "push" and branch in ("uat", "main") else "skipped",
+    })
+    jobs.append({
+        "id": 105,
         "name": subject.AUDITOR_JOB,
         "run_id": int(RUN_ID),
         "run_attempt": 1,
@@ -131,9 +141,9 @@ def _fixture(*, retention_seconds=24 * 60 * 60 - 2, created_offset_seconds=-300,
         "run": {
             "id": int(RUN_ID),
             "path": subject.WORKFLOW_PATH,
-            "head_branch": "main",
+            "head_branch": branch,
             "head_sha": CONTROL_SHA,
-            "event": "push",
+            "event": event,
             "run_attempt": 1,
             "status": "in_progress",
             "conclusion": None,
@@ -149,10 +159,10 @@ def _fixture(*, retention_seconds=24 * 60 * 60 - 2, created_offset_seconds=-300,
     }
     env = {
         "CI_REPOSITORY": subject.REPOSITORY,
-        "CI_REF": "refs/heads/main",
+        "CI_REF": "refs/heads/" + branch,
         "CI_SHA": CONTROL_SHA,
         "CI_SERVER_URL": "https://github.com",
-        "CI_EVENT_NAME": "push",
+        "CI_EVENT_NAME": event,
         "GITHUB_RUN_ID": RUN_ID,
         "GITHUB_RUN_ATTEMPT": "1",
         "GITHUB_REPOSITORY_ID": str(REPOSITORY_ID),
@@ -377,6 +387,13 @@ class ProviderShapeTests(unittest.TestCase):
             lambda state: state["jobs"][0].update(run_id=24681),
             lambda state: state["jobs"][0].update(conclusion="failure"),
             lambda state: state["jobs"][1].update(status="in_progress", conclusion=None),
+            lambda state: state["jobs"].pop(3),
+            lambda state: state["jobs"][3].update(name="unexpected-job"),
+            lambda state: state["jobs"][3].update(run_id=24681),
+            lambda state: state["jobs"][3].update(run_attempt=2),
+            lambda state: state["jobs"][3].update(head_sha="b" * 40),
+            lambda state: state["jobs"][3].update(status="in_progress"),
+            lambda state: state["jobs"][3].update(conclusion="skipped"),
             lambda state: state["jobs"][-1].update(run_id=24681),
             lambda state: state["jobs"][-1].update(run_attempt=2),
             lambda state: state["jobs"][-1].update(head_sha="b" * 40),
@@ -387,6 +404,13 @@ class ProviderShapeTests(unittest.TestCase):
             mutate(state)
             with self.subTest(change=mutate), self.assertRaises(subject.SmokeAuditRefusal):
                 _audit(state, env)
+
+    def test_promotion_job_is_skipped_only_when_its_workflow_gate_is_false(self):
+        for branch, event in (("feature", "push"), ("main", "workflow_dispatch"), ("uat", "push")):
+            state, env = _fixture(branch=branch, event=event)
+            with self.subTest(branch=branch, event=event):
+                marker, _ = _audit(state, env)
+                self.assertIn("status=passed", marker)
 
     def test_failed_terminal_producer_still_scans_all_known_surfaces_before_refusing(self):
         state, env = _fixture()
@@ -682,7 +706,7 @@ class ReadinessAndDetailTests(unittest.TestCase):
         self.assertIn("status=passed", marker)
         self.assertEqual(clock.sleeps, [10])
 
-    def test_readiness_waits_for_the_jobs_total_to_reach_four(self):
+    def test_readiness_waits_for_the_jobs_total_to_reach_five(self):
         state, env = _fixture()
         jobs_suffix = "/actions/runs/24680/jobs?filter=all&per_page=100&page=1"
         api = FaultAPI(state, jobs_suffix, "short", 2)
