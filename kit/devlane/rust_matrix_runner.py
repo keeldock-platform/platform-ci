@@ -109,6 +109,7 @@ def _run(label, argv, deadline, *, timeout=1800, cwd=SOURCE_ROOT, json_stdout=Fa
     stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     env = {
         "PATH": "/tools/rust/bin:/usr/bin:/bin",
+        "CARGO": "/tools/rust/bin/cargo",
         "HOME": "/devlane-home",
         "TMPDIR": "/scratch/tmp",
         "CARGO_HOME": "/scratch/cargo-home",

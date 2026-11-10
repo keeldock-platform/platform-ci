@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -17,6 +18,7 @@ import bundle
 import coordinator
 import project
 import rehearsal
+import test_e2e
 
 
 CONTROL_SHA = "a" * 40
@@ -269,6 +271,124 @@ class ProcedureDocumentTests(unittest.TestCase):
 
 def bundle_request_digest(owner):
     return json.loads((owner / "bundle-request.json").read_text(encoding="utf-8"))["fetch_sha256"]
+
+
+class ProductionFailureDiagnosticsTests(unittest.TestCase):
+    def test_every_production_phase_has_a_bounded_allowlisted_failure_line(self):
+        private_path = chr(47) + "private/runner"
+        secret_marker = "SYNTHETIC_SOURCE_CANARY KEYCANARY-73A10X " + private_path + "/candidate"
+        for phase in sorted(test_e2e.DIAGNOSTIC_PHASES):
+            with self.subTest(phase=phase):
+                state = test_e2e._DiagnosticState()
+                try:
+                    with state.phase(phase):
+                        raise RuntimeError(secret_marker)
+                except RuntimeError as error:
+                    line = state.refusal_line(error)
+                self.assertRegex(
+                    line,
+                    r"devlane_production_e2e=refused stage=[a-z0-9-]{1,48} exception=[a-z0-9-]{1,32}",
+                )
+                self.assertLessEqual(len(line), 160)
+                for forbidden in ("SYNTHETIC_SOURCE_CANARY", "KEYCANARY-73A10X", private_path, "candidate"):
+                    self.assertNotIn(forbidden, line)
+
+    def test_exception_classes_use_exact_allowlist_categories(self):
+        private_path = chr(47) + "private/runner"
+        cases = (
+            (RuntimeError, "runtime-error"),
+            (PermissionError, "permission-denied"),
+            (test_e2e.rust_tooling.ToolingRefusal, "tooling-refusal"),
+            (test_e2e.deadline_budget.DeadlineRefusal, "deadline-refusal"),
+            (test_e2e.urllib_error.URLError, "url-error"),
+            (json.JSONDecodeError, "json-decode-error"),
+        )
+        for error_type, category in cases:
+            with self.subTest(exception=error_type.__name__):
+                state = test_e2e._DiagnosticState()
+                error = (error_type("SYNTHETIC_SOURCE_CANARY " + private_path + " KEYCANARY-73A10X", "", 0)
+                         if error_type is json.JSONDecodeError else
+                         error_type("SYNTHETIC_SOURCE_CANARY " + private_path + " KEYCANARY-73A10X"))
+                try:
+                    with state.phase("tool-fetch-setup"):
+                        raise error
+                except Exception as caught:
+                    line = state.refusal_line(caught)
+                self.assertTrue(line.endswith("exception=" + category))
+                self.assertNotIn("SYNTHETIC_SOURCE_CANARY", line)
+                self.assertNotIn(private_path, line)
+                self.assertNotIn("KEYCANARY-73A10X", line)
+
+        class DerivedRuntimeError(RuntimeError):
+            pass
+
+        state = test_e2e._DiagnosticState()
+        error = DerivedRuntimeError("private detail")
+        try:
+            with state.phase("variant-execute"):
+                raise error
+        except DerivedRuntimeError as caught:
+            line = state.refusal_line(caught)
+        self.assertTrue(line.endswith("exception=unclassified"))
+        self.assertNotIn("private detail", line)
+
+    def test_later_cleanup_error_does_not_replace_the_first_execution_failure(self):
+        state = test_e2e._DiagnosticState()
+        try:
+            with state.phase("variant-execute"):
+                raise RuntimeError("first failure with SYNTHETIC_SOURCE_CANARY and a private path")
+        except RuntimeError:
+            pass
+        try:
+            with state.phase("variant-host-cleanup-finally"):
+                raise PermissionError("later KEYCANARY cleanup failure")
+        except PermissionError:
+            pass
+        self.assertEqual(state.first_failure, ("variant-execute", "runtime-error"))
+        line = state.refusal_line(RuntimeError("unused"))
+        self.assertIn("stage=variant-execute exception=runtime-error", line)
+        self.assertNotIn("KEYCANARY", line)
+        self.assertNotIn("private path", line)
+
+    def test_tool_staging_cleanup_error_preserves_the_original_failure(self):
+        class TemporaryDirectory:
+            name = "/trusted/staging-fixture"
+
+            @staticmethod
+            def cleanup():
+                raise PermissionError("KEYCANARY cleanup detail")
+
+        state = test_e2e._DiagnosticState()
+        with mock.patch.object(test_e2e.rust_tooling.tempfile, "TemporaryDirectory",
+                               return_value=TemporaryDirectory()):
+            with self.assertRaisesRegex(RuntimeError, "original-stage-failure"):
+                with state.phase("variant-execute"):
+                    with test_e2e.rust_tooling._staging_directory(state.phase):
+                        with state.phase("tool-cargo-deny-version"):
+                            raise RuntimeError("original-stage-failure")
+        self.assertEqual(state.first_failure, ("tool-cargo-deny-version", "runtime-error"))
+        line = state.refusal_line(RuntimeError("unused"))
+        self.assertIn("stage=tool-cargo-deny-version exception=runtime-error", line)
+        self.assertNotIn("KEYCANARY", line)
+
+    def test_trusted_isolated_rust_runner_import_smoke_is_part_of_source_free_acceptance(self):
+        root = Path(__file__).resolve().parents[2]
+        runner = root / "kit/devlane/rust_matrix_runner.py"
+        supervisor_source = (root / "kit/devlane/supervisor.py").read_text(encoding="utf-8")
+        runner_source = runner.read_text(encoding="utf-8")
+        self.assertIn('"/usr/bin/python3", "-B", "-I", "-S", "/control/devlane/rust_matrix_runner.py"',
+                      supervisor_source)
+        self.assertIn('control_root / "kit/devlane", root / "control/devlane", readonly=True', supervisor_source)
+        self.assertIn("sys.path.insert(0, str(Path(__file__).resolve().parent))", runner_source)
+        self.assertNotIn("/workspace/source/rust_matrix_runner.py", supervisor_source)
+        result = subprocess.run(
+            [sys.executable, "-B", "-I", "-S", str(runner)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=10, check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"the following arguments are required", result.stderr)
+        self.assertNotIn(b"ModuleNotFoundError", result.stderr)
 
 
 if __name__ == "__main__":

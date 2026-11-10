@@ -233,6 +233,23 @@ class RustMatrixRunnerTests(unittest.TestCase):
         self.assertEqual(vet[1:3], ["vet", "check"])
         self.assertEqual(vet[-2:], ["--locked", "--frozen"])
 
+    def test_standalone_cargo_vet_child_receives_the_trusted_cargo_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            process = Mock(pid=321, wait=Mock(return_value=0))
+            with patch.object(rust_matrix_runner, "RAW", temporary), \
+                    patch.object(rust_matrix_runner, "_remaining", return_value=30), \
+                    patch.object(rust_matrix_runner.subprocess, "Popen", return_value=process) as spawn:
+                code, _ = rust_matrix_runner._run(
+                    "fixed-vet-environment",
+                    ["/prepared/devlane-tools/cargo-vet", "vet", "check", "--locked", "--frozen"],
+                    time.monotonic() + 30,
+                )
+            self.assertEqual(code, 0)
+            child_env = spawn.call_args.kwargs["env"]
+            self.assertEqual(child_env["CARGO"], "/tools/rust/bin/cargo")
+            self.assertEqual(child_env["CARGO_HOME"], "/scratch/cargo-home")
+            self.assertEqual(child_env["CARGO_NET_OFFLINE"], "true")
+
     def test_advisory_database_copy_matches_cargo_deny_default_root(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -436,10 +453,11 @@ class RustMatrixRunnerTests(unittest.TestCase):
         self.assertIn("bundle.inspect_archive", contract)
         install = inspect.getsource(test_e2e._run_scenario)
         self.assertIn("rust_tooling.install", install)
-        self.assertIn("_verify_prepared_rust_tools(prepared, rust_tool_cache)", install)
-        self.assertLess(install.index("rust_tooling.install"), install.index("_run_variant("))
+        self.assertIn('_phase_call("scenario-tool-verify", _verify_prepared_rust_tools, prepared, rust_tool_cache)',
+                      install)
+        self.assertLess(install.index("rust_tooling.install"), install.index('_phase_call("scenario-variant-run"'))
         main = inspect.getsource(test_e2e.main)
-        self.assertLess(main.index("rust_tooling.fetch_tools"), main.index("_run_scenario(rust_scenario"))
+        self.assertLess(main.index("rust_tooling.fetch_tools"), main.index('_phase_call("scenario-run", _run_scenario'))
         prepared_tools = inspect.getsource(test_e2e._verify_prepared_rust_tools)
         self.assertIn("hashlib.sha256(path.read_bytes())", prepared_tools)
         self.assertIn('"advisory-db"', prepared_tools)

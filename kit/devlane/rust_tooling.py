@@ -8,6 +8,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from contextlib import contextmanager
+from contextlib import nullcontext
 from pathlib import Path, PurePosixPath
 from urllib.request import Request, urlopen
 
@@ -99,43 +101,78 @@ def _binary(root, name, version):
     return candidate
 
 
-def fetch_tools(output, deadline_file):
+def _phase_context(phase_context, name):
+    return phase_context(name) if phase_context is not None else nullcontext()
+
+
+@contextmanager
+def _staging_directory(phase_context):
+    with _phase_context(phase_context, "tool-staging-create"):
+        temporary = tempfile.TemporaryDirectory(prefix="devlane-rust-tools-")
+    try:
+        yield temporary.name
+    except BaseException:
+        try:
+            temporary.cleanup()
+        except BaseException:
+            pass
+        raise
+    else:
+        with _phase_context(phase_context, "tool-staging-cleanup"):
+            temporary.cleanup()
+
+
+def fetch_tools(output, deadline_file, *, phase_context=None):
     global _DEADLINE_FILE
     _DEADLINE_FILE = deadline_file
-    if not _DEADLINE_FILE:
-        raise ToolingRefusal("deadline-file-required")
-    _remaining(60)
-    output = Path(output)
-    if output.exists() or output.is_symlink():
-        raise ToolingRefusal("tool-output-exists")
-    output.mkdir(mode=0o700, parents=True)
-    with tempfile.TemporaryDirectory(prefix="devlane-rust-tools-") as temporary:
+    with _phase_context(phase_context, "tool-fetch-setup"):
+        if not _DEADLINE_FILE:
+            raise ToolingRefusal("deadline-file-required")
+        _remaining(60)
+        output = Path(output)
+        if output.exists() or output.is_symlink():
+            raise ToolingRefusal("tool-output-exists")
+        output.mkdir(mode=0o700, parents=True)
+    with _staging_directory(phase_context) as temporary:
         temporary = Path(temporary)
+        phase_names = {
+            "cargo-deny": "tool-cargo-deny",
+            "cargo-audit": "tool-cargo-audit",
+            "cargo-vet": "tool-cargo-vet",
+        }
         for name, (url, checksum, archive_name, version, mode) in TOOLS.items():
+            prefix = phase_names[name]
             archive_path = temporary / archive_name
-            _download(url, archive_path, checksum)
+            with _phase_context(phase_context, prefix + "-download"):
+                _download(url, archive_path, checksum)
             extract = temporary / (name + "-extract")
-            extract.mkdir(mode=0o700)
-            _safe_extract(archive_path, extract, mode)
-            binary = _binary(extract, name, version)
-            shutil.copyfile(binary, output / name)
-            (output / name).chmod(0o500)
+            with _phase_context(phase_context, prefix + "-extract"):
+                extract.mkdir(mode=0o700)
+                _safe_extract(archive_path, extract, mode)
+            with _phase_context(phase_context, prefix + "-version"):
+                binary = _binary(extract, name, version)
+            with _phase_context(phase_context, prefix + "-copy"):
+                shutil.copyfile(binary, output / name)
+                (output / name).chmod(0o500)
         advisory = output / "advisory-db"
-        result = subprocess.run(
-            ["git", "clone", "--quiet", "--depth=1", "--filter=blob:none", "--", ADVISORY_REPO, str(advisory)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=_remaining(180), env={"PATH": "/usr/bin:/bin", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"}, check=False,
-        )
-        if result.returncode != 0:
-            raise ToolingRefusal("advisory-database-fetch-failed")
-        commit = subprocess.run(["git", "-C", str(advisory), "rev-parse", "--verify", "HEAD"],
-                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, timeout=_remaining(10), check=False)
-        value = commit.stdout.decode("ascii", "strict").strip()
-        if commit.returncode != 0 or len(value) != 40 or any(char not in "0123456789abcdef" for char in value):
-            raise ToolingRefusal("advisory-database-revision")
-        (output / "advisory-db-revision").write_text(value + "\n", encoding="ascii")
-    print("rust_offline_tools=prepared")
+        with _phase_context(phase_context, "tool-advisory-clone"):
+            result = subprocess.run(
+                ["git", "clone", "--quiet", "--depth=1", "--filter=blob:none", "--", ADVISORY_REPO, str(advisory)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=_remaining(180), env={"PATH": "/usr/bin:/bin", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"}, check=False,
+            )
+            if result.returncode != 0:
+                raise ToolingRefusal("advisory-database-fetch-failed")
+        with _phase_context(phase_context, "tool-advisory-revision"):
+            commit = subprocess.run(["git", "-C", str(advisory), "rev-parse", "--verify", "HEAD"],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, timeout=_remaining(10), check=False)
+            value = commit.stdout.decode("ascii", "strict").strip()
+            if commit.returncode != 0 or len(value) != 40 or any(char not in "0123456789abcdef" for char in value):
+                raise ToolingRefusal("advisory-database-revision")
+            (output / "advisory-db-revision").write_text(value + "\n", encoding="ascii")
+    with _phase_context(phase_context, "tool-fetch-finish"):
+        print("rust_offline_tools=prepared")
 
 
 def install(source, prepared, deadline_file):

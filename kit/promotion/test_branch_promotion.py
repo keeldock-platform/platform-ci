@@ -1,4 +1,10 @@
+import ast
+import copy
+import os
 import re
+import shutil
+import subprocess
+import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -33,6 +39,214 @@ EXPECTED_REQUIRED_CONTEXTS = frozenset((
     "devlane-synthetic / devlane-synthetic",
     "control-audit",
 ))
+BASH_REF_GATE = re.compile(
+    r"^[ \t]*\[\[\s*(?P<negate>!\s*)?\"\$CI_REF\"\s*=~\s*(?P<pattern>[^\s]+)\s*\]\][ \t]*$"
+)
+POWERSHELL_REF_GATE = re.compile(
+    r"^[ \t]*if \(\$env:CI_REF -notmatch '([^']+)'\) \{ exit 1 \}[ \t]*$"
+)
+SAFE_BRANCH_PATTERN = re.compile(r"[A-Za-z0-9_./,*?^$()\[\]{}+|\\-]+\Z")
+SOURCE_FREE_REFS = (
+    "refs/heads/main", "refs/heads/develop", "refs/heads/fix/pr1-contract",
+)
+REFUSED_CONTROL_REFS = (
+    "refs/pull/8/merge", "refs/tags/v1", "refs/heads/a b", "main",
+)
+EXPECTED_SHELL_GATE_COUNTS = {
+    "public-policy.yml": 2,
+    "node-lock-smoke.yml": 1,
+    "linux-confinement.yml": 2,
+    "windows-confinement.yml": 2,
+    "windows-handoff-synthetic.yml": 1,
+    "development-feedback-smoke.yml": 2,
+}
+
+
+def _workflow_python_dispatch_expression(workflow, job_name):
+    source = workflow.read_text(encoding="utf-8")
+    block = _job_blocks(source).get(job_name)
+    if block is None:
+        raise AssertionError("workflow job is missing")
+    heredocs = re.findall(
+        r"(?ms)^[ \t]*python3 -B - <<'PY'[ \t]*\n(.*?)^[ \t]*PY[ \t]*$", block,
+    )
+    matches = []
+    for heredoc in heredocs:
+        module = ast.parse(textwrap.dedent(heredoc))
+        for node in ast.walk(module):
+            if not isinstance(node, ast.If):
+                continue
+            refuses_dispatch = any(
+                isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "refuse"
+                and call.args and isinstance(call.args[0], ast.Constant)
+                and call.args[0].value == "dispatch-identity"
+                for statement in node.body for call in ast.walk(statement)
+            )
+            if refuses_dispatch:
+                matches.append(copy.deepcopy(node.test))
+    if len(matches) != 1:
+        raise AssertionError("workflow must have one dispatch identity predicate")
+    return matches[0]
+
+
+def _python_condition_value(node, ref):
+    environment = {
+        "CI_REPOSITORY": "keeldock-platform/platform-ci",
+        "CI_REPOSITORY_ID": "1430960557",
+        "CI_SERVER_URL": "https://github.com",
+        "CI_EVENT_NAME": "workflow_dispatch",
+        "CI_REF": ref,
+        "CI_SHA": "a" * 40,
+        "CI_RUN_ID": "1",
+        "CI_CONTROL_RUN_ID": "1",
+        "GITHUB_RUN_ATTEMPT": "1",
+    }
+    locals_map = {"run_id": "1", "attempt": "1"}
+
+    def attribute_path(value):
+        if isinstance(value, ast.Name):
+            return value.id
+        if isinstance(value, ast.Attribute):
+            parent = attribute_path(value.value)
+            return parent + "." + value.attr if parent else ""
+        return ""
+
+    def safe_value(value):
+        if isinstance(value, ast.Constant) and type(value.value) in (str, int, bool, type(None)):
+            return value.value
+        if isinstance(value, ast.Name) and value.id in locals_map:
+            return locals_map[value.id]
+        if isinstance(value, ast.BoolOp) and type(value.op) in (ast.And, ast.Or):
+            values = [safe_value(item) for item in value.values]
+            return all(values) if isinstance(value.op, ast.And) else any(values)
+        if isinstance(value, ast.UnaryOp) and isinstance(value.op, ast.Not):
+            return not safe_value(value.operand)
+        if isinstance(value, ast.Call):
+            call_name = attribute_path(value.func)
+            if call_name == "os.environ.get" and 1 <= len(value.args) <= 2 and not value.keywords:
+                key = safe_value(value.args[0])
+                default = safe_value(value.args[1]) if len(value.args) == 2 else None
+                if type(key) is not str or (len(value.args) == 2 and type(default) is not str):
+                    raise AssertionError("unsupported environment lookup")
+                return environment.get(key, default)
+            if call_name == "re.fullmatch" and 2 <= len(value.args) <= 3 and not value.keywords:
+                pattern = safe_value(value.args[0])
+                candidate = safe_value(value.args[1])
+                flags = safe_value(value.args[2]) if len(value.args) == 3 else 0
+                if type(pattern) is not str or type(candidate) is not str or type(flags) is not int:
+                    raise AssertionError("unsupported regular expression predicate")
+                return re.fullmatch(pattern, candidate, flags)
+            raise AssertionError("unsupported workflow predicate call")
+        if isinstance(value, ast.Compare) and len(value.ops) == len(value.comparators):
+            left = safe_value(value.left)
+            for operation, comparator in zip(value.ops, value.comparators):
+                right = safe_value(comparator)
+                if isinstance(operation, ast.Eq):
+                    matched = left == right
+                elif isinstance(operation, ast.NotEq):
+                    matched = left != right
+                else:
+                    raise AssertionError("unsupported workflow predicate comparison")
+                if not matched:
+                    return False
+                left = right
+            return True
+        raise AssertionError("unsupported workflow dispatch predicate")
+
+    return safe_value(node)
+
+
+def _python_gate_allows(refusal_expression, ref):
+    return not bool(_python_condition_value(refusal_expression, ref))
+
+
+def _mutate_python_ref_pattern(expression, replacement):
+    class Mutation(ast.NodeTransformer):
+        changed = False
+
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            path = ""
+            cursor = node.func
+            while isinstance(cursor, ast.Attribute):
+                path = "." + cursor.attr + path
+                cursor = cursor.value
+            if isinstance(cursor, ast.Name):
+                path = cursor.id + path
+            if (path == "re.fullmatch" and node.args and isinstance(node.args[0], ast.Constant)
+                    and type(node.args[0].value) is str and node.args[0].value.startswith("refs/heads/")):
+                node.args[0] = ast.Constant(value=replacement)
+                self.changed = True
+            return node
+
+    transformer = Mutation()
+    mutated = transformer.visit(copy.deepcopy(expression))
+    if not transformer.changed:
+        raise AssertionError("source-free Python branch pattern was not found")
+    return mutated
+
+
+def _mutate_python_main_refusal(expression, replacement):
+    class Mutation(ast.NodeTransformer):
+        changed = False
+
+        def visit_Compare(self, node):
+            self.generic_visit(node)
+            left = node.left
+            if (len(node.ops) == 1 and isinstance(node.ops[0], ast.NotEq)
+                    and len(node.comparators) == 1 and isinstance(node.comparators[0], ast.Constant)
+                    and node.comparators[0].value == "refs/heads/main"
+                    and isinstance(left, ast.Call) and isinstance(left.func, ast.Attribute)
+                    and left.func.attr == "get" and left.args and isinstance(left.args[0], ast.Constant)
+                    and left.args[0].value == "CI_REF"):
+                node.comparators[0] = ast.Constant(value=replacement)
+                self.changed = True
+            return node
+
+    transformer = Mutation()
+    mutated = transformer.visit(copy.deepcopy(expression))
+    if not transformer.changed:
+        raise AssertionError("main-only Python branch condition was not found")
+    return mutated
+
+
+def _shell_ref_gates(workflow):
+    bash, powershell = [], []
+    for line in workflow.read_text(encoding="utf-8").splitlines():
+        bash_match = BASH_REF_GATE.fullmatch(line)
+        if bash_match:
+            pattern = bash_match.group("pattern")
+            if SAFE_BRANCH_PATTERN.fullmatch(pattern) is None:
+                raise AssertionError("unsupported Bash branch predicate")
+            bash.append((pattern, bool(bash_match.group("negate"))))
+        powershell_match = POWERSHELL_REF_GATE.fullmatch(line)
+        if powershell_match:
+            pattern = powershell_match.group(1)
+            if SAFE_BRANCH_PATTERN.fullmatch(pattern) is None:
+                raise AssertionError("unsupported PowerShell branch predicate")
+            powershell.append(pattern)
+    return bash, powershell
+
+
+def _bash_gate_allows(pattern, negate, ref):
+    bash = shutil.which("bash")
+    if bash is None:
+        raise AssertionError("Bash is required to validate shell branch predicates")
+    expression = "[[ \"$CI_REF\" =~ " + pattern + " ]]"
+    if negate:
+        expression = "[[ ! \"$CI_REF\" =~ " + pattern + " ]]"
+    result = subprocess.run(
+        [bash, "--noprofile", "--norc", "-c", "set -euo pipefail; " + expression],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env={**os.environ, "CI_REF": ref}, timeout=5, check=False,
+    )
+    return result.returncode == 0
+
+
+def _powershell_gate_allows(pattern, ref):
+    if SAFE_BRANCH_PATTERN.fullmatch(pattern) is None:
+        raise AssertionError("unsupported PowerShell branch predicate")
+    return re.search(pattern, ref) is not None
 
 
 def _job_blocks(source):
@@ -288,24 +502,91 @@ class BranchPromotionTests(unittest.TestCase):
         """develop requires the same 18 contexts as uat and main; a pull request head into develop can only
         satisfy them if the secret-free control may be dispatched from any branch, while the encrypted
         lane and the durable evidence stay on main."""
-        branch_gate = "^refs/heads/[A-Za-z0-9._/-]{1,200}$"
-        old_gate = "(develop|uat|main)"
-        for relative in (
+        source_free = (
             "public-policy.yml", "node-lock-smoke.yml", "linux-confinement.yml", "windows-confinement.yml",
             "windows-handoff-synthetic.yml", "development-feedback-smoke.yml", "devlane-synthetic.yml",
+        )
+        seen_shell_kinds = set()
+        for relative in (
+            *source_free,
         ):
-            workflow = (ROOT / ".github/workflows" / relative).read_text(encoding="utf-8")
+            path = ROOT / ".github/workflows" / relative
+            workflow = path.read_text(encoding="utf-8")
             with self.subTest(workflow=relative):
-                self.assertIn(branch_gate, workflow)
-                self.assertNotIn(old_gate, workflow)
                 self.assertNotIn("secrets.", workflow)
                 self.assertNotIn("environment:", workflow)
+                bash_gates, powershell_gates = _shell_ref_gates(path)
+                if relative == "devlane-synthetic.yml":
+                    self.assertEqual((len(bash_gates), len(powershell_gates)), (0, 0))
+                else:
+                    self.assertEqual(
+                        len(bash_gates) + len(powershell_gates),
+                        EXPECTED_SHELL_GATE_COUNTS[relative],
+                    )
+                if bash_gates:
+                    seen_shell_kinds.add("bash")
+                if powershell_gates:
+                    seen_shell_kinds.add("powershell")
+                for pattern, negate in bash_gates:
+                    for ref in SOURCE_FREE_REFS + REFUSED_CONTROL_REFS:
+                        with self.subTest(workflow=relative, shell="bash", ref=ref):
+                            self.assertEqual(
+                                _bash_gate_allows(pattern, negate, ref),
+                                branch_promotion.control_dispatch_allowed(ref),
+                            )
+                for pattern in powershell_gates:
+                    for ref in SOURCE_FREE_REFS + REFUSED_CONTROL_REFS:
+                        with self.subTest(workflow=relative, shell="powershell", ref=ref):
+                            self.assertEqual(
+                                _powershell_gate_allows(pattern, ref),
+                                branch_promotion.control_dispatch_allowed(ref),
+                            )
+                if relative == "devlane-synthetic.yml":
+                    expression = _workflow_python_dispatch_expression(path, "devlane-synthetic")
+                    for ref in SOURCE_FREE_REFS + REFUSED_CONTROL_REFS:
+                        with self.subTest(workflow=relative, shell="python", ref=ref):
+                            self.assertEqual(
+                                _python_gate_allows(expression, ref),
+                                branch_promotion.control_dispatch_allowed(ref),
+                            )
+        self.assertEqual(seen_shell_kinds, {"bash", "powershell"})
+
+        bash_pattern, bash_negate = _shell_ref_gates(ROOT / ".github/workflows/public-policy.yml")[0][0]
+        restricted_shell = r"^refs/heads/(develop|uat|main)$"
+        broad_shell = r"^refs/.*$"
+        self.assertTrue(_bash_gate_allows(bash_pattern, bash_negate, "refs/heads/fix/pr1-contract"))
+        self.assertFalse(_bash_gate_allows(restricted_shell, False, "refs/heads/fix/pr1-contract"))
+        self.assertTrue(_bash_gate_allows(broad_shell, False, "refs/pull/8/merge"))
+
+        powershell_pattern = _shell_ref_gates(ROOT / ".github/workflows/windows-confinement.yml")[1][0]
+        self.assertTrue(_powershell_gate_allows(powershell_pattern, "refs/heads/fix/pr1-contract"))
+        self.assertFalse(_powershell_gate_allows(restricted_shell, "refs/heads/fix/pr1-contract"))
+        self.assertTrue(_powershell_gate_allows(broad_shell, "refs/pull/8/merge"))
+
+        synthetic_path = ROOT / ".github/workflows/devlane-synthetic.yml"
+        synthetic_gate = _workflow_python_dispatch_expression(synthetic_path, "devlane-synthetic")
+        restricted_python = _mutate_python_ref_pattern(synthetic_gate, r"refs/heads/(develop|uat|main)")
+        broad_python = _mutate_python_ref_pattern(synthetic_gate, r".*")
+        self.assertFalse(_python_gate_allows(restricted_python, "refs/heads/fix/pr1-contract"))
+        self.assertTrue(_python_gate_allows(broad_python, "refs/pull/8/merge"))
+
         control = (ROOT / ".github/workflows/public-policy.yml").read_text(encoding="utf-8")
         self.assertIn("if: ${{ github.ref == 'refs/heads/main' }}\n        uses: actions/cache/save@", control)
         self.assertEqual(control.count("actions/cache/save@"), 1)
-        encrypted = (ROOT / ".github/workflows/devlane-encrypted.yml").read_text(encoding="utf-8")
-        self.assertEqual(encrypted.count('[[ "$CI_REF" == "refs/heads/main" ]]'), 2)
-        self.assertNotIn(branch_gate, encrypted)
+        encrypted_path = ROOT / ".github/workflows/devlane-encrypted.yml"
+        encrypted_gates = [
+            _workflow_python_dispatch_expression(encrypted_path, "devlane-encrypted-run"),
+            _workflow_python_dispatch_expression(encrypted_path, "devlane-encrypted-audit"),
+        ]
+        for index, expression in enumerate(encrypted_gates):
+            for ref in ("refs/heads/main", "refs/heads/develop", "refs/heads/fix/pr1-contract",
+                        "refs/pull/8/merge", "refs/tags/v1"):
+                with self.subTest(encrypted_gate=index, ref=ref):
+                    self.assertEqual(_python_gate_allows(expression, ref), ref == "refs/heads/main")
+            moved_main_gate = _mutate_python_main_refusal(expression, "refs/heads/develop")
+            self.assertTrue(_python_gate_allows(moved_main_gate, "refs/heads/develop"))
+            self.assertFalse(_python_gate_allows(moved_main_gate, "refs/heads/main"))
+
         self.assertTrue(branch_promotion.control_dispatch_allowed("refs/heads/devlane/d1"))
         self.assertTrue(branch_promotion.control_dispatch_allowed("refs/heads/main"))
         for refused in ("refs/tags/v1", "refs/pull/1/merge", "refs/heads/", "refs/heads/a b", "main", None, ""):

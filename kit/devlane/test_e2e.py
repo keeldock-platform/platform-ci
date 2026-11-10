@@ -36,7 +36,9 @@ import sys
 import tarfile
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from urllib import error as urllib_error
 
 import bundle
 import fetch
@@ -65,6 +67,100 @@ RUST_VERSION = "1.99.1"
 RUST_LOCKFILES = ("Cargo.lock", "fuzz/Cargo.lock", "runtime/Cargo.lock")
 PLAYWRIGHT_VERSION = "1.54.2"
 SYNTHETIC_LOCK = ROOT / "kit/confinement/synthetic_project/package-lock.json"
+
+DIAGNOSTIC_PHASES = frozenset((
+    "harness-startup", "argument-parse", "deadline-validate", "fixture-toolchain-discovery",
+    "fixture-toolchain-verify", "fixture-generation", "runner-preflight", "fixture-load",
+    "tooling-root-create", "tooling-root-fetch", "tooling-root-cleanup", "scenario-construction",
+    "scenario-run", "late-scenario-construction", "late-scenario-run", "tool-path-discovery",
+    "rust-tool-path-resolution", "tool-fetch-setup", "tool-staging-create", "tool-staging-cleanup",
+    "tool-advisory-clone",
+    "tool-advisory-revision", "tool-fetch-finish",
+    "tool-cargo-deny-download", "tool-cargo-deny-extract", "tool-cargo-deny-version", "tool-cargo-deny-copy",
+    "tool-cargo-audit-download", "tool-cargo-audit-extract", "tool-cargo-audit-version", "tool-cargo-audit-copy",
+    "tool-cargo-vet-download", "tool-cargo-vet-extract", "tool-cargo-vet-version", "tool-cargo-vet-copy",
+    "scenario-projection-write", "scenario-dependency-prepare", "scenario-tool-install",
+    "scenario-tool-verify", "scenario-after-prepare-hook", "scenario-variant-run",
+    "scenario-prepared-tree-cleanup", "scenario-projection-cleanup", "variant-root-setup",
+    "variant-projection-write", "variant-source-build", "variant-archive-build", "variant-rust-archive-verify",
+    "variant-envelope-build", "variant-context-build", "variant-context-validate", "variant-context-write",
+    "variant-positive-control",
+    "variant-supervisor-start", "variant-startup-refusal-check", "variant-supervisor-probe",
+    "variant-key-create", "variant-decrypt", "variant-key-cleanup", "variant-execute",
+    "variant-summary-validate", "variant-host-cleanup", "variant-teardown-confirm",
+    "variant-host-cleanup-finally", "variant-teardown-confirm-finally",
+))
+
+_EXCEPTION_CATEGORIES = {
+    AssertionError: "assertion-error",
+    AttributeError: "attribute-error",
+    FileExistsError: "file-exists",
+    FileNotFoundError: "file-not-found",
+    IsADirectoryError: "is-directory",
+    KeyError: "key-error",
+    NotADirectoryError: "not-directory",
+    OSError: "os-error",
+    PermissionError: "permission-denied",
+    RuntimeError: "runtime-error",
+    TimeoutError: "timeout-error",
+    TypeError: "type-error",
+    ValueError: "value-error",
+    UnicodeError: "unicode-error",
+    UnicodeDecodeError: "unicode-decode-error",
+    json.JSONDecodeError: "json-decode-error",
+    subprocess.CalledProcessError: "process-exit-error",
+    subprocess.SubprocessError: "process-error",
+    subprocess.TimeoutExpired: "process-timeout",
+    tarfile.TarError: "archive-error",
+    urllib_error.HTTPError: "http-error",
+    urllib_error.URLError: "url-error",
+    bundle.Refusal: "bundle-refusal",
+    deadline_budget.DeadlineRefusal: "deadline-refusal",
+    fetch.Refusal: "fetch-refusal",
+    network_probe.ProbeRefusal: "network-probe-refusal",
+    output_filter.FilterRefusal: "filter-refusal",
+    rust_matrix_runner.MatrixRefusal: "matrix-refusal",
+    rust_tooling.ToolingRefusal: "tooling-refusal",
+}
+
+
+class _DiagnosticState:
+    """Keep one bounded trusted phase and exception category for the first failure."""
+
+    def __init__(self):
+        self.first_failure = None
+
+    def reset(self):
+        self.first_failure = None
+
+    def capture(self, phase, error):
+        if self.first_failure is None:
+            category = _EXCEPTION_CATEGORIES.get(type(error), "unclassified")
+            self.first_failure = (phase, category)
+
+    @contextmanager
+    def phase(self, name):
+        if name not in DIAGNOSTIC_PHASES:
+            raise RuntimeError("diagnostic-phase-invalid")
+        try:
+            yield
+        except Exception as error:
+            self.capture(name, error)
+            raise
+
+    def refusal_line(self, error):
+        if self.first_failure is None:
+            self.capture("harness-startup", error)
+        phase, category = self.first_failure
+        return "devlane_production_e2e=refused stage=" + phase + " exception=" + category
+
+
+DIAGNOSTICS = _DiagnosticState()
+
+
+def _phase_call(name, callback, *args, **kwargs):
+    with DIAGNOSTICS.phase(name):
+        return callback(*args, **kwargs)
 
 
 def _require(condition, code):
@@ -810,12 +906,15 @@ def late_scenarios():
 """---------------------------------------------------------------- production path"""
 
 def _tool_paths(profile):
-    paths = {name: shutil.which(name) or "" for name in ("node", "npm", "cargo", "rustc")}
+    paths = _phase_call("tool-path-discovery", lambda: {
+        name: shutil.which(name) or "" for name in ("node", "npm", "cargo", "rustc")
+    })
     if profile == "core-rust":
-        rustup = shutil.which("rustup")
+        rustup = _phase_call("rust-tool-path-resolution", shutil.which, "rustup")
         _require(bool(rustup), "rustup-unavailable")
         for name in ("cargo", "rustc"):
-            result = _run([rustup, "which", "--toolchain", RUST_VERSION, name], timeout=15)
+            result = _phase_call("rust-tool-path-resolution", _run,
+                                 [rustup, "which", "--toolchain", RUST_VERSION, name], timeout=15)
             paths[name] = result.stdout.decode("ascii", "strict").strip()
     return paths
 
@@ -935,151 +1034,170 @@ class _SupervisorLifecycle:
 
 
 def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_bytes, variant, lifecycle):
-    profile = scenario["profile"]
-    root = RUNNER_TEMP / ("devlane-" + RUN_ID)
-    lifecycle.begin_variant(root)
-    _require(not root.exists() and not root.is_symlink(), "runner-root-already-exists")
-    root.mkdir(mode=0o700)
+    with DIAGNOSTICS.phase("variant-root-setup"):
+        profile = scenario["profile"]
+        root = RUNNER_TEMP / ("devlane-" + RUN_ID)
+        lifecycle.begin_variant(root)
+        _require(not root.exists() and not root.is_symlink(), "runner-root-already-exists")
+        root.mkdir(mode=0o700)
     try:
         projection_path = root / "projection.json"
-        projection_path.write_bytes(projection_bytes)
+        _phase_call("variant-projection-write", projection_path.write_bytes, projection_bytes)
         expires = int(time.time()) + 3600
         label = scenario["name"].replace("-", "")
         wave_id = "e2e-wave-" + label
         bundle_id = "e2e-bundle-" + label + variant.replace("-", "")
         projection_sha = hashlib.sha256(projection_bytes).hexdigest()
-        files = scenario["files"](**({"failing_test": True} if variant == "failing-test" else
-                                     {"hang": True} if variant == "cancel" else {}))
-        archive = _archive(files, profile, projection_sha, scenario["allowed_files"],
-                           scenario["allowed_tests"], scenario["frames"],
-                           original_lockfiles=scenario.get("original_lockfiles"))
+        files = _phase_call("variant-source-build", scenario["files"], **(
+            {"failing_test": True} if variant == "failing-test" else
+            {"hang": True} if variant == "cancel" else {}
+        ))
+        archive = _phase_call(
+            "variant-archive-build", _archive, files, profile, projection_sha, scenario["allowed_files"],
+            scenario["allowed_tests"], scenario["frames"],
+            original_lockfiles=scenario.get("original_lockfiles"),
+        )
         if profile == "core-rust":
-            rust_manifest, rust_files, _ = bundle.inspect_archive(archive, {
-                "profile": "core-rust", "fetch_sha256": projection_sha,
-            })
-            _require(set(rust_manifest["original_lockfiles"]) == set(RUST_LOCKFILES),
-                     "rust-matrix-envelope-lock-set")
-            _require(all(rust_files[path] == files[path] for path in RUST_LOCKFILES),
-                     "rust-matrix-envelope-lock-binding")
-        bindings = {
-            "format": "kd-public-devlane-aesgcm-v1", "repository_id": fetch.REPOSITORY_ID,
-            "control_sha": CONTROL_SHA, "workflow_path": fetch.WORKFLOW_PATH, "profile": profile,
-            "wave_id": wave_id, "bundle_id": bundle_id, "fetch_sha256": projection_sha, "expires": expires,
-        }
-        envelope = bundle.build_envelope(archive, key_bytes, bindings)
+            with DIAGNOSTICS.phase("variant-rust-archive-verify"):
+                rust_manifest, rust_files, _ = bundle.inspect_archive(archive, {
+                    "profile": "core-rust", "fetch_sha256": projection_sha,
+                })
+                _require(set(rust_manifest["original_lockfiles"]) == set(RUST_LOCKFILES),
+                         "rust-matrix-envelope-lock-set")
+                _require(all(rust_files[path] == files[path] for path in RUST_LOCKFILES),
+                         "rust-matrix-envelope-lock-binding")
+        with DIAGNOSTICS.phase("variant-envelope-build"):
+            bindings = {
+                "format": "kd-public-devlane-aesgcm-v1", "repository_id": fetch.REPOSITORY_ID,
+                "control_sha": CONTROL_SHA, "workflow_path": fetch.WORKFLOW_PATH, "profile": profile,
+                "wave_id": wave_id, "bundle_id": bundle_id, "fetch_sha256": projection_sha, "expires": expires,
+            }
+            envelope = bundle.build_envelope(archive, key_bytes, bindings)
         bundle_path = root / "bundle.enc"
-        bundle_path.write_bytes(envelope)
-        context = {
-            "repository": fetch.REPOSITORY, "repository_id": fetch.REPOSITORY_ID,
-            "server_url": "https://github.com", "event": "workflow_dispatch", "ref": "refs/heads/main",
-            "control_sha": CONTROL_SHA, "control_run_id": CONTROL_RUN_ID,
-            "workflow_path": fetch.WORKFLOW_PATH, "run_attempt": 1, "profile": profile,
-            "wave_id": wave_id, "bundle_id": bundle_id, "bundle_asset_id": "123456",
-            "bundle_sha256": hashlib.sha256(envelope).hexdigest(), "bundle_size": len(envelope),
-            "projection_asset_id": "123457", "projection_sha256": projection_sha,
-            "projection_size": len(projection_bytes), "expires": expires,
-        }
-        fetch.validate_dispatch(context)
+        _phase_call("variant-envelope-build", bundle_path.write_bytes, envelope)
+        with DIAGNOSTICS.phase("variant-context-build"):
+            context = {
+                "repository": fetch.REPOSITORY, "repository_id": fetch.REPOSITORY_ID,
+                "server_url": "https://github.com", "event": "workflow_dispatch", "ref": "refs/heads/main",
+                "control_sha": CONTROL_SHA, "control_run_id": CONTROL_RUN_ID,
+                "workflow_path": fetch.WORKFLOW_PATH, "run_attempt": 1, "profile": profile,
+                "wave_id": wave_id, "bundle_id": bundle_id, "bundle_asset_id": "123456",
+                "bundle_sha256": hashlib.sha256(envelope).hexdigest(), "bundle_size": len(envelope),
+                "projection_asset_id": "123457", "projection_sha256": projection_sha,
+                "projection_size": len(projection_bytes), "expires": expires,
+            }
+        _phase_call("variant-context-validate", fetch.validate_dispatch, context)
         context_path = root / "context.json"
-        context_path.write_bytes(bundle.canonical_json(context) + b"\n")
+        _phase_call("variant-context-write", context_path.write_bytes,
+                    bundle.canonical_json(context) + b"\n")
         positive_path = root / "positive-control.json"
-        _positive_control(positive_path)
+        _phase_call("variant-positive-control", _positive_control, positive_path)
         state_path = root / "state"
         if variant == "startup-refusal":
             """Startup fails after the supervisor process exists: cleanup must still confirm and leave nothing."""
-            projection_path.write_bytes(projection_bytes + b" ")
-        start = _supervisor("start", "--state-dir", str(state_path), "--context", str(context_path),
-                            "--workspace", str(ROOT), "--prepared", str(prepared_path),
-                            "--bundle", str(bundle_path), "--projection", str(projection_path),
-                            "--positive-control", str(positive_path), "--deadline-file", DEADLINE_FILE)
-        for name in ("node", "npm", "cargo", "rustc"):
-            start.extend(("--" + name + "-path", tool_paths[name]))
-        lifecycle.note_start_attempt()
+            _phase_call("variant-startup-refusal-check", projection_path.write_bytes, projection_bytes + b" ")
+        with DIAGNOSTICS.phase("variant-supervisor-start"):
+            start = _supervisor("start", "--state-dir", str(state_path), "--context", str(context_path),
+                                "--workspace", str(ROOT), "--prepared", str(prepared_path),
+                                "--bundle", str(bundle_path), "--projection", str(projection_path),
+                                "--positive-control", str(positive_path), "--deadline-file", DEADLINE_FILE)
+            for name in ("node", "npm", "cargo", "rustc"):
+                start.extend(("--" + name + "-path", tool_paths[name]))
+            lifecycle.note_start_attempt()
         if variant == "startup-refusal":
-            refused = _run(start, timeout=90, expected=2)
-            _assert_startup_projection_refusal(refused)
-            host_cleanup.clean(str(root), str(RUNNER_TEMP), deadline_file=DEADLINE_FILE)
-            lifecycle.confirm_teardown()
+            refused = _phase_call("variant-startup-refusal-check", _run, start, timeout=90, expected=2)
+            _phase_call("variant-startup-refusal-check", _assert_startup_projection_refusal, refused)
+            _phase_call("variant-host-cleanup", host_cleanup.clean, str(root), str(RUNNER_TEMP),
+                        deadline_file=DEADLINE_FILE)
+            _phase_call("variant-teardown-confirm", lifecycle.confirm_teardown)
             return
-        _run(start, timeout=90)
-        _run(_supervisor("probe", "--state-dir", str(state_path)), timeout=90)
+        _phase_call("variant-supervisor-start", _run, start, timeout=90)
+        _phase_call("variant-supervisor-probe", _run,
+                    _supervisor("probe", "--state-dir", str(state_path)), timeout=90)
 
         key_path = root / "synthetic-key.hex"
-        bundle.write_private_key(key_path, key_bytes)
-        supplied_key = bundle.read_key_file(key_path).hex()
+        _phase_call("variant-key-create", bundle.write_private_key, key_path, key_bytes)
+        supplied_key = _phase_call("variant-key-create", bundle.read_key_file, key_path).hex()
         if variant == "wrong-key":
             supplied_key = bytes(reversed(key_bytes)).hex()
         decrypt_env = os.environ.copy()
         decrypt_env["DEVLANE_DECRYPT_KEY"] = supplied_key
         try:
-            _run(_supervisor("decrypt", "--state-dir", str(state_path)), env=decrypt_env, timeout=180,
-                 expected=2 if variant == "wrong-key" else 0)
+            _phase_call("variant-decrypt", _run, _supervisor("decrypt", "--state-dir", str(state_path)),
+                        env=decrypt_env, timeout=180, expected=2 if variant == "wrong-key" else 0)
         finally:
             decrypt_error = sys.exc_info()[1]
             decrypt_env.pop("DEVLANE_DECRYPT_KEY", None)
             supplied_key = ""
             try:
-                key_path.unlink(missing_ok=True)
+                _phase_call("variant-key-cleanup", key_path.unlink, missing_ok=True)
             except OSError:
                 if decrypt_error is None:
                     raise
                 print("key_cleanup=unconfirmed", file=sys.stderr)
-        execute = _supervisor("execute", "--state-dir", str(state_path), "--context", str(context_path))
-        if variant == "wrong-key":
-            """A refused decryption must leave execution refused: exit 2 and no summary at all."""
-            refused = _run(execute, expected=2)
-            _require(refused.stdout == b"", "summary-after-decrypt-refusal")
-        elif variant == "cancel":
-            wait_budget = _bounded_timeout(180)
-            process = subprocess.Popen(execute, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE, close_fds=True, start_new_session=True)
-            wait_until = time.monotonic() + wait_budget
-            while time.monotonic() < wait_until and process.poll() is None and not _processes_matching(BACKGROUND_MARKER):
-                time.sleep(min(1, wait_until - time.monotonic()))
-            _require(process.poll() is None and bool(_processes_matching(BACKGROUND_MARKER)),
-                     "cancel-target-did-not-start")
-            host_cleanup.clean(str(root), str(RUNNER_TEMP), deadline_file=DEADLINE_FILE)
-            try:
-                output, errors = process.communicate(timeout=_bounded_timeout(180))
-            except subprocess.TimeoutExpired:
-                process.kill()
-                raise RuntimeError("cancelled-execute-did-not-end") from None
-            _require(process.returncode != 0, "cancelled-execute-reported-success")
-            _scan_output(output + errors, "canary-after-cancel")
-        else:
-            expected = 1 if variant in ("failing-test", "accept-with-failure") else 0
-            result = _run(execute, timeout=60 * 40, expected=expected)
-            _require(result.stdout.endswith(b"\n"), "summary-schema-invalid")
-            records = _summary_records(result.stdout, scenario)
-            summary = result.stdout.splitlines()
-            _require(len(summary) <= 100 and len(result.stdout) <= 16 * 1024, "summary-limits")
-            if variant in ("failing-test", "accept-with-failure"):
-                wanted = "case_0001" if variant == "failing-test" else "case_0002"
-                _require(any(record.get("kind") == "test" and record.get("test") == wanted
-                             for record in records), "test-failure-not-mapped")
-            if scenario["frames"]:
-                _require(any(b'"frame":"frame_0001"' in line and b'"status":"pass"' in line for line in summary),
-                         "browser-frame-not-reported")
-            if variant == "accept" and scenario["name"] == "synthetic-node":
-                _require(not any(b'"kind":"control"' in line for line in summary), "unexpected-control-failure")
+        execute = _phase_call("variant-execute", _supervisor, "execute", "--state-dir", str(state_path),
+                              "--context", str(context_path))
+        with DIAGNOSTICS.phase("variant-execute"):
+            if variant == "wrong-key":
+                """A refused decryption must leave execution refused: exit 2 and no summary at all."""
+                refused = _run(execute, expected=2)
+                _require(refused.stdout == b"", "summary-after-decrypt-refusal")
+            elif variant == "cancel":
+                wait_budget = _bounded_timeout(180)
+                process = subprocess.Popen(execute, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, close_fds=True, start_new_session=True)
+                wait_until = time.monotonic() + wait_budget
+                while (time.monotonic() < wait_until and process.poll() is None
+                       and not _processes_matching(BACKGROUND_MARKER)):
+                    time.sleep(min(1, wait_until - time.monotonic()))
+                _require(process.poll() is None and bool(_processes_matching(BACKGROUND_MARKER)),
+                         "cancel-target-did-not-start")
+                _phase_call("variant-host-cleanup", host_cleanup.clean, str(root), str(RUNNER_TEMP),
+                            deadline_file=DEADLINE_FILE)
+                try:
+                    output, errors = process.communicate(timeout=_bounded_timeout(180))
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    raise RuntimeError("cancelled-execute-did-not-end") from None
+                _require(process.returncode != 0, "cancelled-execute-reported-success")
+                _scan_output(output + errors, "canary-after-cancel")
+            else:
+                expected = 1 if variant in ("failing-test", "accept-with-failure") else 0
+                result = _run(execute, timeout=60 * 40, expected=expected)
+                with DIAGNOSTICS.phase("variant-summary-validate"):
+                    _require(result.stdout.endswith(b"\n"), "summary-schema-invalid")
+                    records = _summary_records(result.stdout, scenario)
+                    summary = result.stdout.splitlines()
+                    _require(len(summary) <= 100 and len(result.stdout) <= 16 * 1024, "summary-limits")
+                    if variant in ("failing-test", "accept-with-failure"):
+                        wanted = "case_0001" if variant == "failing-test" else "case_0002"
+                        _require(any(record.get("kind") == "test" and record.get("test") == wanted
+                                     for record in records), "test-failure-not-mapped")
+                    if scenario["frames"]:
+                        _require(any(b'"frame":"frame_0001"' in line and b'"status":"pass"' in line
+                                     for line in summary), "browser-frame-not-reported")
+                    if variant == "accept" and scenario["name"] == "synthetic-node":
+                        _require(not any(b'"kind":"control"' in line for line in summary),
+                                 "unexpected-control-failure")
         os.environ.setdefault("GITHUB_RUN_ID", RUN_ID)
-        host_cleanup.clean(str(root), str(RUNNER_TEMP), deadline_file=DEADLINE_FILE)
+        _phase_call("variant-host-cleanup", host_cleanup.clean, str(root), str(RUNNER_TEMP),
+                    deadline_file=DEADLINE_FILE)
         """Descendants that outlived their parent must not outlive cleanup."""
-        _require(not _processes_matching(BACKGROUND_MARKER), "background-process-survived-cleanup")
-        lifecycle.confirm_teardown()
+        _phase_call("variant-teardown-confirm", lifecycle.confirm_teardown)
     finally:
         previous_error = sys.exc_info()[1]
         cleanup_error = None
         try:
-            (root / "synthetic-key.hex").unlink(missing_ok=True)
+            _phase_call("variant-key-cleanup", (root / "synthetic-key.hex").unlink, missing_ok=True)
         except OSError as error:
             cleanup_error = error
         try:
-            if root.exists() or root.is_symlink():
-                if not root.is_symlink():
-                    os.environ.setdefault("GITHUB_RUN_ID", RUN_ID)
-                    host_cleanup.clean(str(root), str(RUNNER_TEMP), deadline_file=DEADLINE_FILE)
-            lifecycle.confirm_teardown()
+            with DIAGNOSTICS.phase("variant-host-cleanup-finally"):
+                if root.exists() or root.is_symlink():
+                    if not root.is_symlink():
+                        os.environ.setdefault("GITHUB_RUN_ID", RUN_ID)
+                        host_cleanup.clean(str(root), str(RUNNER_TEMP), deadline_file=DEADLINE_FILE)
+            _phase_call("variant-teardown-confirm-finally", lifecycle.confirm_teardown)
         except Exception as error:
             cleanup_error = cleanup_error or error
         if cleanup_error is not None:
@@ -1094,25 +1212,29 @@ def _run_scenario(scenario, rust_tool_cache=None):
     projection_path = RUNNER_TEMP / ("devlane-e2e-projection-" + RUN_ID + "-" + scenario["name"])
     lifecycle = _SupervisorLifecycle(RUNNER_TEMP / ("devlane-" + RUN_ID))
     try:
-        projection_path.write_bytes(scenario["payload"])
-        tool_paths = _prepare(scenario["profile"], projection_path, prepared)
+        _phase_call("scenario-projection-write", projection_path.write_bytes, scenario["payload"])
+        tool_paths = _phase_call("scenario-dependency-prepare", _prepare,
+                                 scenario["profile"], projection_path, prepared)
         if scenario["profile"] == "core-rust":
             _require(rust_tool_cache is not None, "rust-matrix-tool-preparation-missing")
-            rust_tooling.install(str(rust_tool_cache), str(prepared), deadline_file=DEADLINE_FILE)
-            _verify_prepared_rust_tools(prepared, rust_tool_cache)
+            _phase_call("scenario-tool-install", rust_tooling.install,
+                        str(rust_tool_cache), str(prepared), deadline_file=DEADLINE_FILE)
+            _phase_call("scenario-tool-verify", _verify_prepared_rust_tools, prepared, rust_tool_cache)
         if "after_prepare" in scenario:
-            scenario["after_prepare"](prepared)
+            _phase_call("scenario-after-prepare-hook", scenario["after_prepare"], prepared)
         key_bytes = KEY_CANARY + bytes(range(16))
         for variant in scenario["variants"]:
-            _run_variant(scenario, scenario["payload"], prepared, tool_paths, key_bytes, variant, lifecycle)
+            _phase_call("scenario-variant-run", _run_variant, scenario, scenario["payload"],
+                        prepared, tool_paths, key_bytes, variant, lifecycle)
     finally:
         previous_error = sys.exc_info()[1]
         try:
             try:
-                if prepared.exists() or prepared.is_symlink():
-                    _require(lifecycle.permits_prepared_cleanup(), "prepared-cleanup-supervisor-unconfirmed")
-                    _remove_owned_prepared_tree(prepared)
-                _require(not prepared.exists() and not prepared.is_symlink(), "prepared-cleanup-tree-remains")
+                with DIAGNOSTICS.phase("scenario-prepared-tree-cleanup"):
+                    if prepared.exists() or prepared.is_symlink():
+                        _require(lifecycle.permits_prepared_cleanup(), "prepared-cleanup-supervisor-unconfirmed")
+                        _remove_owned_prepared_tree(prepared)
+                    _require(not prepared.exists() and not prepared.is_symlink(), "prepared-cleanup-tree-remains")
             except Exception:
                 if previous_error is None:
                     raise
@@ -1122,9 +1244,10 @@ def _run_scenario(scenario, rust_tool_cache=None):
                 print("prepared_cleanup=unconfirmed", file=sys.stderr)
         finally:
             try:
-                projection_path.unlink(missing_ok=True)
-                if projection_path.exists() or projection_path.is_symlink():
-                    raise RuntimeError("projection-cleanup-remains")
+                with DIAGNOSTICS.phase("scenario-projection-cleanup"):
+                    projection_path.unlink(missing_ok=True)
+                    if projection_path.exists() or projection_path.is_symlink():
+                        raise RuntimeError("projection-cleanup-remains")
             except Exception:
                 if previous_error is None:
                     raise
@@ -1136,53 +1259,66 @@ def _deadline_termination(signum, _frame):
 
 
 def main(argv=None):
-    parser = __import__("argparse").ArgumentParser()
-    parser.add_argument("--generate-rust-fixture", default="")
-    parser.add_argument("--rust-fixture", default="")
-    parser.add_argument("--deadline-file", required=True)
-    args = parser.parse_args(argv)
+    DIAGNOSTICS.reset()
+    with DIAGNOSTICS.phase("argument-parse"):
+        parser = __import__("argparse").ArgumentParser()
+        parser.add_argument("--generate-rust-fixture", default="")
+        parser.add_argument("--rust-fixture", default="")
+        parser.add_argument("--deadline-file", required=True)
+        args = parser.parse_args(argv)
     global DEADLINE_FILE
     DEADLINE_FILE = args.deadline_file
-    deadline_budget.remaining(DEADLINE_FILE)
+    _phase_call("deadline-validate", deadline_budget.remaining, DEADLINE_FILE)
     if args.generate_rust_fixture:
-        _require(bool(DEADLINE_FILE), "deadline-file-required")
-        paths = _tool_paths("core-rust")
-        _verify_rust_toolchain(paths)
-        _write_rust_fixture(args.generate_rust_fixture, paths["cargo"])
+        with DIAGNOSTICS.phase("fixture-toolchain-discovery"):
+            _require(bool(DEADLINE_FILE), "deadline-file-required")
+            paths = _tool_paths("core-rust")
+        _phase_call("fixture-toolchain-verify", _verify_rust_toolchain, paths)
+        _phase_call("fixture-generation", _write_rust_fixture, args.generate_rust_fixture, paths["cargo"])
         return 0
-    _require(sys.platform.startswith("linux") and os.geteuid() != 0, "linux-runner-user-required")
-    _require(bool(DEADLINE_FILE), "deadline-file-required")
-    signal.signal(signal.SIGTERM, _deadline_termination)
-    _require(bool(RUN_ID and RUN_ID.isdecimal() and CONTROL_SHA and len(CONTROL_SHA) == 40), "workflow-identity-required")
-    _require(shutil.which("sudo") and shutil.which("unshare") and shutil.which("pgrep"), "linux-tools-required")
-    fixture_root = args.rust_fixture or os.environ.get("DEVLANE_RUST_FIXTURE", "")
-    _require(bool(fixture_root), "rust-fixture-path-required")
-    projection, projection_bytes, snapshot, rust_files = _load_rust_fixture(fixture_root)
-    tooling_root = RUNNER_TEMP / ("devlane-rust-tools-" + RUN_ID)
-    rust_scenario = {
-        "name": "synthetic-rust", "profile": "core-rust", "projection": projection,
-        "payload": projection_bytes, "files": lambda **kw: rust_files,
-        "allowed_files": {}, "allowed_tests": RUST_FIXTURE_TESTS, "frames": {},
-        "original_lockfiles": {path: value["sha256"] for path, value in snapshot["lockfiles"].items()},
-        "variants": ("accept", "wrong-key"),
-    }
+    with DIAGNOSTICS.phase("runner-preflight"):
+        _require(sys.platform.startswith("linux") and os.geteuid() != 0, "linux-runner-user-required")
+        _require(bool(DEADLINE_FILE), "deadline-file-required")
+        signal.signal(signal.SIGTERM, _deadline_termination)
+        _require(bool(RUN_ID and RUN_ID.isdecimal() and CONTROL_SHA and len(CONTROL_SHA) == 40),
+                 "workflow-identity-required")
+        _require(shutil.which("sudo") and shutil.which("unshare") and shutil.which("pgrep"),
+                 "linux-tools-required")
+        fixture_root = args.rust_fixture or os.environ.get("DEVLANE_RUST_FIXTURE", "")
+        _require(bool(fixture_root), "rust-fixture-path-required")
+    projection, projection_bytes, snapshot, rust_files = _phase_call(
+        "fixture-load", _load_rust_fixture, fixture_root,
+    )
+    with DIAGNOSTICS.phase("tooling-root-create"):
+        tooling_root = RUNNER_TEMP / ("devlane-rust-tools-" + RUN_ID)
+        rust_scenario = {
+            "name": "synthetic-rust", "profile": "core-rust", "projection": projection,
+            "payload": projection_bytes, "files": lambda **kw: rust_files,
+            "allowed_files": {}, "allowed_tests": RUST_FIXTURE_TESTS, "frames": {},
+            "original_lockfiles": {path: value["sha256"] for path, value in snapshot["lockfiles"].items()},
+            "variants": ("accept", "wrong-key"),
+        }
     done = []
     try:
-        rust_tooling.fetch_tools(str(tooling_root), deadline_file=DEADLINE_FILE)
-        for scenario in scenarios():
-            _run_scenario(scenario)
+        _phase_call("tooling-root-fetch", rust_tooling.fetch_tools, str(tooling_root),
+                    deadline_file=DEADLINE_FILE, phase_context=DIAGNOSTICS.phase)
+        scenario_list = _phase_call("scenario-construction", scenarios)
+        for scenario in scenario_list:
+            _phase_call("scenario-run", _run_scenario, scenario)
             done.append(scenario["name"])
-        _run_scenario(rust_scenario, tooling_root)
+        _phase_call("scenario-run", _run_scenario, rust_scenario, tooling_root)
         done.append(rust_scenario["name"])
-        for scenario in late_scenarios():
-            _run_scenario(scenario)
+        late_scenario_list = _phase_call("late-scenario-construction", late_scenarios)
+        for scenario in late_scenario_list:
+            _phase_call("late-scenario-run", _run_scenario, scenario)
             done.append(scenario["name"])
     finally:
         previous_error = sys.exc_info()[1]
         try:
-            if tooling_root.exists() and not tooling_root.is_symlink():
-                shutil.rmtree(tooling_root)
-            _require(not tooling_root.exists() and not tooling_root.is_symlink(), "rust-tool-cleanup-remains")
+            with DIAGNOSTICS.phase("tooling-root-cleanup"):
+                if tooling_root.exists() and not tooling_root.is_symlink():
+                    shutil.rmtree(tooling_root)
+                _require(not tooling_root.exists() and not tooling_root.is_symlink(), "rust-tool-cleanup-remains")
         except Exception:
             if previous_error is None:
                 raise
@@ -1194,6 +1330,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as error:
-        code = str(error) if type(error) is RuntimeError and len(str(error)) < 80 else "unexpected-failure"
-        print("devlane_production_e2e=refused code=" + code, file=sys.stderr)
+        print(DIAGNOSTICS.refusal_line(error), file=sys.stderr)
         raise SystemExit(1)
