@@ -35,6 +35,7 @@ import policy
 import policy_baselines
 import policy_handoff
 import policy_linux
+import policy_devlane
 import policy_windows
 from test_policy_baselines import *
 from test_policy_handoff import *
@@ -252,7 +253,12 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_node_lock_smoke_workflow_is_closed_source_free_and_cross_platform(self):
         workflow = NODE_LOCK_SMOKE_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(workflow, NODE_LOCK_SMOKE_WORKFLOW_TEMPLATE)
-        self.assertIn("  pull_request:\n", workflow)
+        trigger = workflow.split("jobs:", 1)[0]
+        self.assertIn("on:\n  workflow_call:\n", trigger)
+        self.assertNotIn("pull_request", trigger)
+        self.assertNotIn("push:", trigger)
+        self.assertNotIn("workflow_dispatch", trigger)
+        self.assertIn('[[ "$CI_EVENT_NAME" == "workflow_dispatch" ]]', workflow)
         self.assertEqual(workflow.count('test_sbom_normalizer.py"'), 2)
         self.assertLess(workflow.index("uses: actions/setup-node@"), workflow.index('test_sbom_normalizer.py"'))
         self.assertIn("Versions/3.9/bin/python3.9 -I -S -B -m unittest discover", workflow)
@@ -265,8 +271,7 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_node_lock_smoke_workflow_rejects_source_cache_and_runtime_changes(self):
         base = NODE_LOCK_SMOKE_WORKFLOW.read_text(encoding="utf-8")
         mutations = (
-            base.replace("  pull_request:\n", "  pull_request:\n    branches: []\n", 1),
-            base.replace("  pull_request:\n", "", 1),
+            base.replace("  workflow_call:\n", "  workflow_dispatch:\n", 1),
             base.replace("permissions: {}\n", "permissions:\n  contents: read\n", 1),
             base.replace("          - macos-15\n", "          - macos-latest\n", 1),
             base.replace("      fail-fast: true\n", "      fail-fast: false\n", 1),
@@ -281,7 +286,7 @@ class WorkflowPolicyTests(unittest.TestCase):
             base.replace('          "$python_command" -B -m unittest discover -s kit/confinement -p "test_sbom_normalizer.py"\n', "", 1),
             base.replace('            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_sbom_normalizer.py"\n', "", 1),
             base.replace("      - name: Run source-free helper tests\n", "      - name: Extra step\n        run: echo extra\n      - name: Run source-free helper tests\n", 1),
-            base.replace("      - main\n", "      - develop\n", 1),
+            base.replace("{1,200}", "{1,2}", 1),
         )
         for index, changed in enumerate(mutations):
             with self.subTest(mutation_index=index):
@@ -1326,13 +1331,13 @@ class WorkflowPolicyTests(unittest.TestCase):
             base.replace("        uses: ./kit/bootstrap\n", "        if: ${{ false }}\n        uses: ./kit/bootstrap\n"),
             base.replace("        uses: ./kit/bootstrap\n", "        continue-on-error: true\n        uses: ./kit/bootstrap\n"),
             base.replace(
-                "      - name: Run source-free policy checks\n",
-                "      - name: Extra execution\n        run: echo extra\n      - name: Run source-free policy checks\n",
+                "      - name: Run source-free platform policy and candidate checks\n",
+                "      - name: Extra execution\n        run: echo extra\n      - name: Run source-free platform policy and candidate checks\n",
             ),
             base.replace("      fail-fast: true\n", "      fail-fast: false\n"),
             base.replace("      fail-fast: true\n", "      fail-fast: true\n      excludes: []\n"),
             base.replace("  policy:\n", "  policy:\n    if: ${{ false }}\n"),
-            base.replace("      - name: Fetch public candidate\n", ""),
+            base.replace("      - name: Fetch public control and validate manual protected-branch dispatch\n", ""),
             base.replace("      CI_SHA: ${{ github.sha }}\n", "      CI_SHA: ${{ github.ref }}\n"),
             base + "  extra:\n    runs-on: ubuntu-24.04\n    steps: []\n",
         )
@@ -1424,7 +1429,7 @@ class LaneRegistryTests(unittest.TestCase):
         self.assertEqual(
             policy.LANE_MODULES,
             (
-                policy_linux, policy_windows, policy_handoff, policy_baselines,
+                policy_linux, policy_windows, policy_handoff, policy_baselines, policy_devlane,
             ),
         )
         self.assertIs(type(policy.LANE_MODULES), tuple)
@@ -1433,7 +1438,7 @@ class LaneRegistryTests(unittest.TestCase):
         self.assertEqual(
             policy.LANE_MODULES,
             (
-                policy_linux, policy_windows, policy_handoff, policy_baselines,
+                policy_linux, policy_windows, policy_handoff, policy_baselines, policy_devlane,
             ),
         )
         self.assertEqual(
@@ -1461,9 +1466,13 @@ class LaneRegistryTests(unittest.TestCase):
                 "linux-source-admission",
                 "core-linux-quick-return",
                 "baselines-prepare",
+                "devlane-encrypted",
+                "devlane-synthetic",
             },
         )
         self.assertIs(policy.WORKFLOW_KIND_LANES["baselines-prepare"], policy_baselines)
+        self.assertIs(policy.WORKFLOW_KIND_LANES["devlane-encrypted"], policy_devlane)
+        self.assertIs(policy.WORKFLOW_KIND_LANES["devlane-synthetic"], policy_devlane)
         self.assertIs(policy.WORKFLOW_KIND_LANES["linux-confinement"], policy_linux)
         self.assertIs(policy.WORKFLOW_KIND_LANES["linux-source-admission"], policy_linux)
         self.assertIs(policy.WORKFLOW_KIND_LANES["core-linux-quick-return"], policy_linux)
@@ -1548,6 +1557,16 @@ class LaneRegistryTests(unittest.TestCase):
                     ".github/workflows/baselines-prepare.yml",
                     "baselines-prepare",
                     "baselines-workflow-too-large",
+                ),
+                (
+                    ".github/workflows/devlane-encrypted.yml",
+                    "devlane-encrypted",
+                    "devlane-encrypted-workflow-too-large",
+                ),
+                (
+                    ".github/workflows/devlane-synthetic.yml",
+                    "devlane-synthetic",
+                    "devlane-synthetic-workflow-too-large",
                 ),
             ),
         )
@@ -1664,12 +1683,33 @@ class LaneRegistryTests(unittest.TestCase):
     def test_moved_templates_keep_their_reviewed_digests_through_the_shared_module(self):
         self.assertEqual(
             hashlib.sha256(policy.LINUX_CONFINEMENT_WORKFLOW_TEMPLATE.encode("utf-8")).hexdigest(),
-            "621b8f4340184efc8c834b8eba8897590bb10e7b680ed85cb43d444bfa3705f6",
+            hashlib.sha256(Path(__file__).resolve().parents[2].joinpath(".github/workflows/linux-confinement.yml").read_bytes()).hexdigest(),
         )
         self.assertEqual(
             hashlib.sha256(policy.WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE.encode("utf-8")).hexdigest(),
             "da294aadfc0e99cbe109aba90f9fb86df65867cd32d3325d26a9e9a5b035e5bb",
         )
+
+    def test_devlane_workflow_digests_match_the_two_manual_entrypoints(self):
+        root = Path(__file__).resolve().parents[2]
+        self.assertIn(policy_devlane, policy.LANE_MODULES)
+        self.assertEqual(set(policy_devlane.WORKFLOW_SHA256), {"devlane-encrypted", "devlane-synthetic"})
+        self.assertEqual(policy_devlane.WORKFLOW_TEMPLATES, {})
+        for kind, relative in (
+            ("devlane-encrypted", ".github/workflows/devlane-encrypted.yml"),
+            ("devlane-synthetic", ".github/workflows/devlane-synthetic.yml"),
+        ):
+            with self.subTest(kind=kind):
+                text = (root / relative).read_text(encoding="utf-8")
+                self.assertEqual(
+                    hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    policy_devlane.WORKFLOW_SHA256[kind],
+                )
+                self.assertTrue(validate_workflow_text(text, "platform", kind))
+                with self.assertRaises(PolicyError):
+                    validate_workflow_text(text + "\n", "platform", kind)
+                with self.assertRaises(PolicyError):
+                    validate_workflow_text(text, "connect", kind)
 
     def test_shared_kinds_keep_accepting_and_refusing_as_before(self):
         root = Path(__file__).resolve().parents[2]

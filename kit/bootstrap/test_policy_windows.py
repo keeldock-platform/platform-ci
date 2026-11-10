@@ -105,11 +105,13 @@ class WindowsConfinementWorkflowTests(unittest.TestCase):
             workflow.encode("utf-8"),
             policy_windows.WINDOWS_CONFINEMENT_WORKFLOW_TEMPLATE.encode("utf-8"),
         )
-        self.assertEqual(workflow.count("runs-on: windows-2025\n"), 1)
+        self.assertEqual(workflow.count("runs-on: windows-2025\n"), 2)
         self.assertIn("permissions: {}\n", workflow)
-        self.assertNotIn("  workflow_dispatch:\n", workflow)
-        self.assertIn("  push:\n", workflow)
-        self.assertIn("  pull_request:\n", workflow)
+        trigger = workflow.split("jobs:", 1)[0]
+        self.assertIn("on:\n  workflow_call:\n", trigger)
+        self.assertNotIn("workflow_dispatch", trigger)
+        self.assertNotIn("push:", trigger)
+        self.assertNotIn("pull_request", trigger)
         self.assertIn("windows_confinement.ps1 -Mode compile", workflow)
         parser_step = workflow.split("      - name: Parse every PowerShell file under kit\n", 1)[1].split("      - name:", 1)[0]
         self.assertIn("Get-ChildItem -LiteralPath (Join-Path $root 'kit') -Recurse -File -Force", parser_step)
@@ -124,7 +126,7 @@ class WindowsConfinementWorkflowTests(unittest.TestCase):
         self.assertIn("  windows-confinement-spike:\n", diagnostic)
         self.assertIn("windows_confinement.ps1 -Mode spike", diagnostic)
         self.assertNotIn("windows-policy", diagnostic)
-        policy_job = workflow.split("  windows-policy:\n", 1)[1]
+        policy_job = workflow.split("  windows-policy:\n", 1)[1].split("  windows-native-synthetic:\n", 1)[0]
         for forbidden in (
             "inputs:",
             "secrets.",
@@ -151,9 +153,9 @@ class WindowsConfinementWorkflowTests(unittest.TestCase):
     def test_confinement_workflow_rejects_trigger_runner_and_execution_changes(self):
         base = WINDOWS_CONFINEMENT_WORKFLOW.read_text(encoding="utf-8")
         mutations = (
-            base.replace("  pull_request:\n", "  pull_request_target:\n"),
-            base.replace("  push:\n", "  workflow_dispatch:\n"),
-            base.replace("      - uat\n", "      - develop\n"),
+            base.replace("  workflow_call:\n", "  workflow_dispatch:\n", 1),
+            base.replace("$env:CI_EVENT_NAME -ne 'workflow_dispatch'", "$env:CI_EVENT_NAME -ne 'push'", 1),
+            base.replace("{1,200}", "{1,2}", 1),
             base.replace("runs-on: windows-2025", "runs-on: windows-latest", 1),
             base.replace("permissions: {}\n", "permissions:\n  contents: read\n"),
             base.replace("      - name: Compile native confinement module\n", ""),

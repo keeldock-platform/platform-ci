@@ -8,30 +8,30 @@ import branch_promotion
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_CHECK_JOBS = {
-    ".github/workflows/public-policy.yml": ("policy",),
-    ".github/workflows/windows-handoff-synthetic.yml": ("handoff-unit",),
-    ".github/workflows/linux-confinement.yml": ("linux-policy",),
-    ".github/workflows/node-lock-smoke.yml": ("node-lock-smoke",),
-    ".github/workflows/windows-confinement.yml": ("windows-policy",),
-    ".github/workflows/development-feedback-smoke.yml": (
-        "feedback-smoke-producer", "feedback-smoke-audit",
+    ".github/workflows/public-policy.yml": (
+        "policy", "node-lock-smoke", "linux-confinement", "windows-confinement",
+        "windows-handoff-synthetic", "development-feedback-smoke", "devlane-synthetic", "control-audit",
     ),
 }
 EXPECTED_REQUIRED_CONTEXTS = frozenset((
     "policy-ubuntu-24.04",
     "policy-macos-15",
     "policy-windows-2025",
-    "handoff-unit-ubuntu-24.04",
-    "handoff-unit-windows-2025",
-    "linux-policy",
-    "node-lock-smoke-ubuntu-24.04",
-    "node-lock-smoke-macos-15",
-    "node-lock-smoke-windows-2025",
-    "windows-policy",
-    "feedback-smoke-producer ubuntu-24.04",
-    "feedback-smoke-producer macos-15",
-    "feedback-smoke-producer windows-2025",
-    "feedback-smoke-audit",
+    "node-lock-smoke / node-lock-smoke-ubuntu-24.04",
+    "node-lock-smoke / node-lock-smoke-macos-15",
+    "node-lock-smoke / node-lock-smoke-windows-2025",
+    "linux-confinement / linux-policy",
+    "linux-confinement / linux-harness",
+    "windows-confinement / windows-policy",
+    "windows-confinement / windows-native-synthetic",
+    "windows-handoff-synthetic / handoff-unit-ubuntu-24.04",
+    "windows-handoff-synthetic / handoff-unit-windows-2025",
+    "development-feedback-smoke / feedback-smoke-producer ubuntu-24.04",
+    "development-feedback-smoke / feedback-smoke-producer macos-15",
+    "development-feedback-smoke / feedback-smoke-producer windows-2025",
+    "development-feedback-smoke / feedback-smoke-audit",
+    "devlane-synthetic / devlane-synthetic",
+    "control-audit",
 ))
 
 
@@ -259,29 +259,19 @@ class BranchPromotionTests(unittest.TestCase):
                 "keeldock-platform/platform-ci", "200",
             ))
 
-    def test_promotion_workflows_do_not_run_on_protected_branch_pushes(self):
+    def test_promotion_control_is_manual_on_protected_branches(self):
         contexts = tuple(
             context
             for workflow_contexts in branch_promotion.WORKFLOW_CHECKS.values()
             for context in workflow_contexts
         )
-        self.assertEqual(len(contexts), 14)
+        self.assertEqual(len(contexts), 18)
         self.assertEqual(set(contexts), EXPECTED_REQUIRED_CONTEXTS)
-        push_filter = "  push:\n    branches-ignore:\n      - uat\n      - main\n"
-        for relative in WORKFLOW_CHECK_JOBS:
-            workflow = (ROOT / relative).read_text(encoding="utf-8")
-            with self.subTest(workflow=relative):
-                self.assertEqual(workflow.count(push_filter), 1)
-                if relative == ".github/workflows/public-policy.yml":
-                    bootstrap_trigger = (
-                        "on:\n  workflow_dispatch:\n    inputs:\n"
-                        "      control_wave_id:\n"
-                        "        description: Opaque control-wave identifier\n"
-                        "        required: true\n        type: string\n"
-                    )
-                    self.assertEqual(workflow.count(bootstrap_trigger), 1)
-                else:
-                    self.assertNotIn("  workflow_dispatch:\n", workflow)
+        workflow = (ROOT / ".github/workflows/public-policy.yml").read_text(encoding="utf-8")
+        self.assertIn("on:\n  workflow_dispatch:", workflow)
+        self.assertNotIn("  pull_request:\n", workflow)
+        self.assertNotIn("  push:\n", workflow)
+        self.assertIn('[[ "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]{1,200}$ ]]', workflow)
 
         diagnostics = {
             ".github/workflows/linux-confinement-diagnostic.yml": "linux-confinement",
@@ -293,6 +283,72 @@ class BranchPromotionTests(unittest.TestCase):
                 self.assertIn("  workflow_dispatch:\n", workflow)
                 self.assertIn(f"  {check_name}:\n", workflow)
                 self.assertNotIn(check_name, EXPECTED_REQUIRED_CONTEXTS)
+
+    def test_source_free_control_runs_on_any_branch_so_develop_checks_are_satisfiable(self):
+        """develop requires the same 18 contexts as uat and main; a pull request head into develop can only
+        satisfy them if the secret-free control may be dispatched from any branch, while the encrypted
+        lane and the durable evidence stay on main."""
+        branch_gate = "^refs/heads/[A-Za-z0-9._/-]{1,200}$"
+        old_gate = "(develop|uat|main)"
+        for relative in (
+            "public-policy.yml", "node-lock-smoke.yml", "linux-confinement.yml", "windows-confinement.yml",
+            "windows-handoff-synthetic.yml", "development-feedback-smoke.yml", "devlane-synthetic.yml",
+        ):
+            workflow = (ROOT / ".github/workflows" / relative).read_text(encoding="utf-8")
+            with self.subTest(workflow=relative):
+                self.assertIn(branch_gate, workflow)
+                self.assertNotIn(old_gate, workflow)
+                self.assertNotIn("secrets.", workflow)
+                self.assertNotIn("environment:", workflow)
+        control = (ROOT / ".github/workflows/public-policy.yml").read_text(encoding="utf-8")
+        self.assertIn("if: ${{ github.ref == 'refs/heads/main' }}\n        uses: actions/cache/save@", control)
+        self.assertEqual(control.count("actions/cache/save@"), 1)
+        encrypted = (ROOT / ".github/workflows/devlane-encrypted.yml").read_text(encoding="utf-8")
+        self.assertEqual(encrypted.count('[[ "$CI_REF" == "refs/heads/main" ]]'), 2)
+        self.assertNotIn(branch_gate, encrypted)
+        self.assertTrue(branch_promotion.control_dispatch_allowed("refs/heads/devlane/d1"))
+        self.assertTrue(branch_promotion.control_dispatch_allowed("refs/heads/main"))
+        for refused in ("refs/tags/v1", "refs/pull/1/merge", "refs/heads/", "refs/heads/a b", "main", None, ""):
+            self.assertFalse(branch_promotion.control_dispatch_allowed(refused), refused)
+        self.assertTrue(branch_promotion.durable_evidence_allowed("refs/heads/main"))
+        self.assertFalse(branch_promotion.durable_evidence_allowed("refs/heads/develop"))
+        full = {context: branch_promotion.GITHUB_ACTIONS_APP_ID for context in EXPECTED_REQUIRED_CONTEXTS}
+        self.assertTrue(branch_promotion.required_checks_satisfiable_before_merge(full))
+        self.assertFalse(branch_promotion.required_checks_satisfiable_before_merge({**full, "extra-required-check": None}))
+        self.assertFalse(branch_promotion.required_checks_satisfiable_before_merge({**full, "control-audit": 1}))
+        self.assertFalse(branch_promotion.required_checks_satisfiable_before_merge({}))
+        self.assertFalse(branch_promotion.required_checks_satisfiable_before_merge(
+            {key: value for key, value in list(full.items())[1:]}))
+        self.assertFalse(branch_promotion.required_checks_satisfiable_before_merge({**full, "control-audit": None}))
+        self.assertFalse(branch_promotion.required_checks_satisfiable_before_merge(
+            {**full, "control-audit": True}))
+        self.assertFalse(branch_promotion.required_checks_satisfiable_before_merge(None))
+        document = (ROOT / "docs/branch-promotion.md").read_text(encoding="utf-8")
+        listed = set(re.findall(r"(?m)^   - `([^`]+)`$", document))
+        self.assertEqual(listed, set(EXPECTED_REQUIRED_CONTEXTS))
+        self.assertIn("any branch", document)
+
+    def test_promotion_refuses_a_required_context_the_control_cannot_produce(self):
+        protections = {"contexts": ["policy-ubuntu-24.04", "extra-required-check"], "checks": []}
+        sha = "a" * 40
+
+        def fake_run(argv, cwd=None, timeout=30):
+            argv = tuple(argv)
+            if argv == ("git", "remote", "get-url", "origin"):
+                return "https://github.com/" + "keeldock" + "-platform/platform-ci.git"
+            if argv[:3] == ("git", "rev-parse", "refs/remotes/origin/develop"):
+                return sha
+            if argv[:3] == ("git", "rev-parse", "refs/remotes/origin/uat"):
+                return "b" * 40
+            return ""
+
+        with patch.object(branch_promotion, "_run", side_effect=fake_run) as run, \
+                patch.object(branch_promotion, "_api_json", side_effect=(protections, protections)), \
+                patch.object(branch_promotion.subprocess, "run",
+                             return_value=type("Result", (), {"returncode": 0})()):
+            with self.assertRaisesRegex(branch_promotion.PromotionRefusal, "protection"):
+                branch_promotion.promote(str(ROOT), "uat", sha, True)
+        self.assertFalse(any(call.args[0][:2] == ("git", "push") for call in run.call_args_list))
 
     def test_promotion_refuses_an_unchecked_sha_before_attempting_a_push(self):
         sha = "a" * 40

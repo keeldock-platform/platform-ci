@@ -86,6 +86,13 @@ def _fixture(*, retention_seconds=24 * 60 * 60 - 2, created_offset_seconds=-300,
             "head_sha": CONTROL_SHA,
             "status": "completed",
             "conclusion": "success",
+            "steps": [
+                {"name": name, "status": "completed",
+                 "conclusion": "skipped" if runner != "macos-15" and name in (
+                     "Upload the single macOS ciphertext fixture", "Record uploader identity"
+                 ) else "success"}
+                for name in subject.PRODUCER_STEP_NAMES
+            ],
             "check_run_url": (
                 "https://api.github.com/repos/keeldock-platform/platform-ci/check-runs/"
                 + str(check_id)
@@ -116,6 +123,10 @@ def _fixture(*, retention_seconds=24 * 60 * 60 - 2, created_offset_seconds=-300,
         "head_sha": CONTROL_SHA,
         "status": "in_progress",
         "conclusion": None,
+        "steps": [
+            {"name": subject.AUDITOR_STEP_NAMES[0], "status": "completed", "conclusion": "success"},
+            {"name": subject.AUDITOR_STEP_NAMES[1], "status": "in_progress", "conclusion": None},
+        ],
     })
     record = {
         "id": ARTIFACT_ID,
@@ -164,6 +175,39 @@ def _fixture(*, retention_seconds=24 * 60 * 60 - 2, created_offset_seconds=-300,
         "GITHUB_TOKEN": "ghs_" + "x" * 32,
     }
     return state, env
+
+
+def _composed_control_jobs(state):
+    jobs = copy.deepcopy(state["jobs"])
+    for job in jobs:
+        job["name"] = "development-feedback-smoke / " + job["name"]
+        if job["name"] == "development-feedback-smoke / feedback-smoke-audit":
+            job["check_run_url"] = "https://api.github.com/repos/keeldock-platform/platform-ci/check-runs/1204"
+    next_id = 500
+    for name in sorted(subject.control_audit.CONTROL_JOB_NAMES):
+        if any(job["name"] == name for job in jobs):
+            continue
+        if name == subject.control_audit.RUN_JOB:
+            """Real graph: control-audit needs development-feedback-smoke, so it is blocked (unstarted) while the feedback auditor runs."""
+            status, conclusion = "queued", None
+            steps = []
+        else:
+            status, conclusion = "completed", "success"
+            steps = []
+            for step_name in subject.control_audit.CONTROL_STEP_NAMES[name]:
+                skipped = (name.startswith("development-feedback-smoke / feedback-smoke-producer ")
+                           and not name.endswith("macos-15")
+                           and step_name in ("Upload the single macOS ciphertext fixture", "Record uploader identity"))
+                steps.append({"name": step_name, "status": "completed",
+                              "conclusion": "skipped" if skipped else "success"})
+        next_id += 1
+        jobs.append({
+            "id": next_id, "name": name, "run_id": int(RUN_ID), "run_attempt": 1,
+            "head_sha": CONTROL_SHA, "status": status, "conclusion": conclusion,
+            "check_run_url": "https://api.github.com/repos/keeldock-platform/platform-ci/check-runs/%d" % (next_id + 1000),
+            "steps": steps,
+        })
+    return jobs
 
 
 class FakeAPI:
@@ -427,6 +471,59 @@ class ProviderShapeTests(unittest.TestCase):
             mutate(state)
             with self.subTest(change=mutate), self.assertRaises(subject.SmokeAuditRefusal):
                 _audit(state, env)
+
+    def test_composed_mode_checks_the_complete_18_job_step_graph(self):
+        state, env = _fixture(branch="develop", event="workflow_dispatch")
+        env.update({"FEEDBACK_AUDIT_MODE": "composed-control", "GITHUB_WORKFLOW": "public-policy"})
+        identity = subject._validate_environment(env)
+        state["jobs"] = _composed_control_jobs(state)
+        _, valid = subject._validate_jobs(FakeAPI(state), identity)
+        self.assertTrue(valid)
+        state["jobs"][-1]["steps"][0]["name"] = "unreviewed-step"
+        _, valid = subject._validate_jobs(FakeAPI(state), identity)
+        self.assertFalse(valid)
+
+    def _composed_identity_and_jobs(self):
+        state, env = _fixture(branch="develop", event="workflow_dispatch")
+        env.update({"FEEDBACK_AUDIT_MODE": "composed-control", "GITHUB_WORKFLOW": "public-policy"})
+        identity = subject._validate_environment(env)
+        state["jobs"] = _composed_control_jobs(state)
+        return state, identity
+
+    def test_composed_phase_accepts_the_real_dependency_schedule(self):
+        """Fails on the old code: it required control-audit itself to be in progress, which its `needs` on the feedback auditor makes impossible."""
+        state, identity = self._composed_identity_and_jobs()
+        self.assertTrue(subject._validate_jobs(FakeAPI(state), identity)[1])
+        absent = [job for job in state["jobs"] if job["name"] != subject.control_audit.RUN_JOB]
+        state["jobs"] = absent
+        self.assertTrue(subject._validate_jobs(FakeAPI(state), identity)[1])
+
+    def test_composed_phase_accepts_incomplete_independent_children(self):
+        state, identity = self._composed_identity_and_jobs()
+        for job in state["jobs"]:
+            if job["name"] == "node-lock-smoke / node-lock-smoke-macos-15":
+                job.update({"status": "in_progress", "conclusion": None})
+                job["steps"] = job["steps"][:1] + [
+                    dict(step, status="queued", conclusion=None) for step in job["steps"][1:]
+                ]
+            if job["name"] == "devlane-synthetic / devlane-synthetic":
+                job.update({"status": "queued", "conclusion": None, "steps": []})
+        self.assertTrue(subject._validate_jobs(FakeAPI(state), identity)[1])
+
+    def test_composed_phase_rejects_started_or_finished_control_audit_and_idle_auditor(self):
+        for mutate in (
+            lambda jobs: next(job for job in jobs if job["name"] == "control-audit").update(status="in_progress"),
+            lambda jobs: next(job for job in jobs if job["name"] == "control-audit").update(
+                status="completed", conclusion="success"),
+            lambda jobs: next(job for job in jobs if job["name"].endswith("feedback-smoke-audit")).update(
+                status="queued"),
+            lambda jobs: next(job for job in jobs if "producer macos-15" in job["name"]).update(
+                status="in_progress", conclusion=None),
+        ):
+            state, identity = self._composed_identity_and_jobs()
+            mutate(state["jobs"])
+            with self.subTest(mutation=mutate):
+                self.assertFalse(subject._validate_jobs(FakeAPI(state), identity)[1])
 
     def test_manual_dispatch_is_not_an_accepted_feedback_smoke_run(self):
         state, env = _fixture(branch="main", event="workflow_dispatch")

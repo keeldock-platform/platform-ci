@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "kit/confinement"))
 
 from public_tree import MAX_FILE_BYTES, inspect_text
 from linux_channels import CHANNELS as LINUX_CHANNELS
+import policy_windows
 
 NATIVE = ROOT / "kit/confinement/windows_confinement.cs"
 WRAPPER = ROOT / "kit/confinement/windows_confinement.ps1"
@@ -543,23 +544,23 @@ foreach ($case in $cases) {
             for name in names:
                 with self.subTest(path=path.name, name=name):
                     self.assertNotIn(name, text)
-        template = (ROOT / "kit/bootstrap/policy_windows.py").read_text(encoding="utf-8")
-        start = template.index('WINDOWS_CONFINEMENT_WORKFLOW_TEMPLATE = r"""')
-        start = template.index('"""', start) + 3
-        end = template.index('"""', start)
-        diagnostic_start = template.index('WINDOWS_CONFINEMENT_DIAGNOSTIC_WORKFLOW_TEMPLATE = r"""')
-        diagnostic_start = template.index('"""', diagnostic_start) + 3
-        diagnostic_end = template.index('"""', diagnostic_start)
+        workflow_template = policy_windows.WORKFLOW_TEMPLATES["windows-confinement"]
+        diagnostic_template = policy_windows.WORKFLOW_TEMPLATES["windows-confinement-diagnostic"]
+        self.assertIn("windows_confinement.ps1 -Mode compile", workflow_template)
+        self.assertIn("windows_confinement.ps1 -Mode spike", diagnostic_template)
+        wrapper = WRAPPER.read_text(encoding="utf-8")
+        self.assertIn("windows_confinement.cs", wrapper)
+        self.assertIn("windows_probe.rs", wrapper)
         for path in sorted((ROOT / "kit/bootstrap").glob("policy_*.py")):
             text = path.read_text(encoding="utf-8")
             for name in names:
                 if path.name == "policy_windows.py":
-                    for match in re.finditer(re.escape(name), text):
-                        with self.subTest(path=path.name, name=name, offset=match.start()):
-                            self.assertTrue(
-                                start <= match.start() < end
-                                or diagnostic_start <= match.start() < diagnostic_end
-                            )
+                    if name == "windows_confinement.ps1":
+                        self.assertIn(name, workflow_template)
+                        self.assertIn(name, diagnostic_template)
+                    else:
+                        self.assertNotIn(name, workflow_template)
+                        self.assertNotIn(name, diagnostic_template)
                 else:
                     with self.subTest(path=path.name, name=name):
                         self.assertNotIn(name, text)
@@ -709,7 +710,7 @@ foreach ($case in $cases) {
         worst = ladders + downloads * attempts * per_attempt + staging_allowance + dns_after + self.channel_budget() + self.fixture_budget()
         workflow = WORKFLOW.read_text(encoding="utf-8")
         minutes = [int(value) for value in re.findall(r"timeout-minutes: ([0-9]+)", workflow)]
-        self.assertEqual(minutes, [15])
+        self.assertEqual(minutes, [15, 15])
         diagnostic = DIAGNOSTIC_WORKFLOW.read_text(encoding="utf-8")
         spike = re.search(r"(?ms)^  windows-confinement-spike:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", diagnostic)
         self.assertIsNotNone(spike)
@@ -805,7 +806,7 @@ foreach ($case in $cases) {
         workflow = WORKFLOW.read_text(encoding="utf-8")
         diagnostic = DIAGNOSTIC_WORKFLOW.read_text(encoding="utf-8")
         jobs = {}
-        for name in ("windows-policy",):
+        for name in ("windows-policy", "windows-native-synthetic"):
             match = re.search(
                 r"(?ms)^  " + re.escape(name) + r":\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
                 workflow,
@@ -825,13 +826,17 @@ foreach ($case in $cases) {
             "test_windows_confinement.py",
         ):
             with self.subTest(required=required):
-                self.assertIn(required, jobs["windows-policy"] + jobs["windows-confinement-spike"])
-        for job_name in ("windows-policy", "windows-confinement-spike"):
+                self.assertIn(required, jobs["windows-policy"] + jobs["windows-native-synthetic"] + jobs["windows-confinement-spike"])
+        for job_name in ("windows-policy", "windows-native-synthetic", "windows-confinement-spike"):
             for forbidden in ("secrets.", "source-read", "environment:", "id-token", "uses:"):
                 with self.subTest(job=job_name, forbidden=forbidden):
                     self.assertNotIn(forbidden, jobs[job_name])
 
-        self.assertNotIn("workflow_dispatch", workflow)
+        trigger = workflow.split("jobs:", 1)[0]
+        self.assertIn("on:\n  workflow_call:\n", trigger)
+        self.assertNotIn("workflow_dispatch", trigger)
+        self.assertNotIn("pull_request", trigger)
+        self.assertNotIn("push:", trigger)
         self.assertNotIn("promotion-check-reuse", workflow)
         self.assertIn("workflow_dispatch", diagnostic)
         self.assertIn("github.ref == 'refs/heads/main'", diagnostic)
@@ -1857,6 +1862,8 @@ foreach ($case in $cases) {
         return path
 
     def run_pwsh(self, body, timeout=180):
+        if sys.platform != "win32":
+            self.skipTest("native PowerShell runtime checks run in Windows CI")
         import tempfile
 
         with tempfile.TemporaryDirectory() as directory:

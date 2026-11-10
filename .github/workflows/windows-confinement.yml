@@ -1,10 +1,6 @@
 name: windows-confinement
 on:
-  push:
-    branches-ignore:
-      - uat
-      - main
-  pull_request:
+  workflow_call:
 permissions: {}
 jobs:
   windows-policy:
@@ -25,21 +21,18 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $ProgressPreference = 'SilentlyContinue'
-          if ($env:CI_REPOSITORY -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { exit 1 }
+          if ($env:CI_REPOSITORY -ne 'keeldock-platform/platform-ci') { exit 1 }
           if ($env:CI_SHA -notmatch '^[a-f0-9]{40}$') { exit 1 }
-          if ($env:CI_SERVER_URL -notmatch '^https://[A-Za-z0-9.-]+$') { exit 1 }
-          if ($env:CI_EVENT_NAME -eq 'pull_request') {
-            if ($env:CI_REF -notmatch '^refs/pull/[1-9][0-9]*/merge$') { exit 1 }
-          } else {
-            if ($env:CI_REF -notmatch '^refs/heads/[A-Za-z0-9._/-]+$') { exit 1 }
-          }
+          if ($env:CI_SERVER_URL -ne 'https://github.com') { exit 1 }
+          if ($env:CI_EVENT_NAME -ne 'workflow_dispatch') { exit 1 }
+          if ($env:CI_REF -notmatch '^refs/heads/[A-Za-z0-9._/-]{1,200}$') { exit 1 }
           git init --quiet . 2>$null
           if ($LASTEXITCODE -ne 0) { exit 1 }
           git config core.autocrlf false 2>$null
           if ($LASTEXITCODE -ne 0) { exit 1 }
           git remote add origin "$($env:CI_SERVER_URL)/$($env:CI_REPOSITORY).git" 2>$null
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          git fetch --quiet --no-tags --depth=1 origin $env:CI_REF 2>$null
+          git fetch --quiet --no-tags --depth=1 origin $env:CI_SHA 2>$null
           if ($LASTEXITCODE -ne 0) { exit 1 }
           git checkout --quiet --detach FETCH_HEAD 2>$null
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -56,6 +49,41 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           python -B kit/bootstrap/check_candidate.py --root $env:CI_WORKSPACE --pool platform --sha $env:CI_SHA
           if ($LASTEXITCODE -ne 0) { exit 1 }
+  windows-native-synthetic:
+    name: windows-native-synthetic
+    runs-on: windows-2025
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+    steps:
+      - name: Fetch public candidate
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          if ($env:CI_REPOSITORY -ne 'keeldock-platform/platform-ci') { exit 1 }
+          if ($env:CI_SHA -notmatch '^[a-f0-9]{40}$') { exit 1 }
+          if ($env:CI_SERVER_URL -ne 'https://github.com') { exit 1 }
+          if ($env:CI_EVENT_NAME -ne 'workflow_dispatch') { exit 1 }
+          if ($env:CI_REF -notmatch '^refs/heads/[A-Za-z0-9._/-]{1,200}$') { exit 1 }
+          git init --quiet . 2>$null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          git config core.autocrlf false 2>$null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          git remote add origin "$($env:CI_SERVER_URL)/$($env:CI_REPOSITORY).git" 2>$null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          git fetch --quiet --no-tags --depth=1 origin $env:CI_SHA 2>$null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          git checkout --quiet --detach FETCH_HEAD 2>$null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $actualSha = git rev-parse --verify HEAD 2>$null
+          if ($LASTEXITCODE -ne 0 -or $actualSha.Trim() -ne $env:CI_SHA) { exit 1 }
       - name: Parse every PowerShell file under kit
         run: |
           $ErrorActionPreference = 'Stop'

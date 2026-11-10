@@ -1,0 +1,296 @@
+name: devlane-encrypted
+run-name: devlane wave=${{ inputs.wave_id }} bundle=${{ inputs.bundle_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Reviewed fixed profile
+        required: true
+        type: choice
+        options:
+          - core-node
+          - core-rust
+      control_run_id:
+        description: Successful exact-SHA source-free public control run
+        required: true
+        type: string
+      wave_id:
+        description: Opaque one-run wave identifier
+        required: true
+        type: string
+      bundle_id:
+        description: Opaque encrypted-bundle identifier
+        required: true
+        type: string
+      bundle_asset_id:
+        description: Numeric temporary release-asset ID for the encrypted bundle
+        required: true
+        type: string
+      bundle_sha256:
+        description: SHA-256 of the encrypted bundle
+        required: true
+        type: string
+      bundle_size:
+        description: Encrypted bundle byte length
+        required: true
+        type: string
+      projection_asset_id:
+        description: Numeric temporary release-asset ID for the sanitized projection
+        required: true
+        type: string
+      projection_sha256:
+        description: SHA-256 of the sanitized dependency projection
+        required: true
+        type: string
+      projection_size:
+        description: Projection byte length
+        required: true
+        type: string
+      expires:
+        description: Unix expiry for this one-run request
+        required: true
+        type: string
+      cache_baseline_sha256:
+        description: Coordinator digest of the Actions cache inventory immediately before dispatch
+        required: true
+        type: string
+permissions: {}
+concurrency:
+  group: devlane-encrypted-${{ inputs.bundle_id }}
+  cancel-in-progress: false
+jobs:
+  devlane-encrypted-run:
+    name: devlane-encrypted-run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    environment: devlane-decrypt
+    permissions: {}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REPOSITORY_ID: ${{ github.repository_id }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      CI_RUN_ID: ${{ github.run_id }}
+      CI_RUN_ATTEMPT: ${{ github.run_attempt }}
+      CI_CONTROL_RUN_ID: ${{ inputs.control_run_id }}
+      DEVLANE_PROFILE: ${{ inputs.profile }}
+      DEVLANE_WAVE_ID: ${{ inputs.wave_id }}
+      DEVLANE_BUNDLE_ID: ${{ inputs.bundle_id }}
+      DEVLANE_BUNDLE_ASSET_ID: ${{ inputs.bundle_asset_id }}
+      DEVLANE_BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
+      DEVLANE_BUNDLE_SIZE: ${{ inputs.bundle_size }}
+      DEVLANE_PROJECTION_ASSET_ID: ${{ inputs.projection_asset_id }}
+      DEVLANE_PROJECTION_SHA256: ${{ inputs.projection_sha256 }}
+      DEVLANE_PROJECTION_SIZE: ${{ inputs.projection_size }}
+      DEVLANE_EXPIRES: ${{ inputs.expires }}
+      DEVLANE_CACHE_BASELINE_SHA256: ${{ inputs.cache_baseline_sha256 }}
+      RUN_ROOT: ${{ runner.temp }}/devlane-${{ github.run_id }}
+    steps:
+      - name: Fetch public control and validate dispatch
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" ]]
+          [[ "$CI_REPOSITORY_ID" == "1430960557" ]]
+          [[ "$CI_SERVER_URL" == "https://github.com" ]]
+          [[ "$CI_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$CI_REF" == "refs/heads/main" ]]
+          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
+          mkdir -m 700 "$RUN_ROOT"
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_SHA" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          [[ "$actual_sha" == "$CI_SHA" ]]
+          python3 -B -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; import cryptography; assert AESGCM is not None and cryptography.__version__'
+          python3 -B kit/devlane/fetch.py context --output "$RUN_ROOT/context.json"
+      - name: Restore exact source-free control evidence
+        uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/devlane-control-evidence/permit.json
+          key: devlane-control-v1-${{ inputs.control_run_id }}
+          fail-on-cache-miss: true
+      - name: Verify exact source-free control evidence
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/permit.py verify-control \
+            --file "$RUNNER_TEMP/devlane-control-evidence/permit.json" --control-sha "$CI_SHA" --run-id "$CI_CONTROL_RUN_ID"
+      - name: Restore one-run bundle permit
+        uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          key: devlane-permit-v1-${{ inputs.bundle_id }}
+      - name: Claim this bundle for one run before decryption
+        run: |
+          set -euo pipefail
+          mkdir -m 700 -p "$RUNNER_TEMP/devlane-bundle-permit"
+          python3 -B kit/devlane/permit.py claim --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json"
+      - name: Save one-run bundle permit
+        uses: actions/cache/save@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          key: devlane-permit-v1-${{ inputs.bundle_id }}
+      - name: Discard local permit copy before persisted verification
+        run: |
+          set -euo pipefail
+          rm -rf -- "$RUNNER_TEMP/devlane-bundle-permit"
+          [[ ! -e "$RUNNER_TEMP/devlane-bundle-permit" ]]
+      - name: Restore and verify persisted one-run permit
+        uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          key: devlane-permit-v1-${{ inputs.bundle_id }}
+          fail-on-cache-miss: true
+      - name: Verify permit and emit bound dispatch marker
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/permit.py verify-claim \
+            --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json"
+          printf 'KD-DEVLANE-DISPATCH schema=1 wave-id=%s bundle-id=%s control-sha=%s run-id=%s run-attempt=1\n' \
+            "$DEVLANE_WAVE_ID" "$DEVLANE_BUNDLE_ID" "$CI_SHA" "$CI_RUN_ID"
+      - name: Fetch ciphertext and sanitized dependency projection
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/fetch.py download --asset-id "$DEVLANE_BUNDLE_ASSET_ID" --size "$DEVLANE_BUNDLE_SIZE" --sha256 "$DEVLANE_BUNDLE_SHA256" --output "$RUN_ROOT/bundle.enc"
+          python3 -B kit/devlane/fetch.py download --maximum 16777216 --asset-id "$DEVLANE_PROJECTION_ASSET_ID" --size "$DEVLANE_PROJECTION_SIZE" --sha256 "$DEVLANE_PROJECTION_SHA256" --output "$RUN_ROOT/projection.json"
+          python3 -B kit/devlane/fetch.py check-projection --file "$RUN_ROOT/projection.json" --profile "$DEVLANE_PROFILE"
+          mkdir -m 700 "$RUN_ROOT/workspace"
+      - name: Set up pinned Node toolchain
+        if: ${{ inputs.profile == 'core-node' }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.22.1"
+          check-latest: false
+          cache: ""
+          package-manager-cache: false
+      - name: Install pinned Rust toolchain
+        if: ${{ inputs.profile == 'core-rust' }}
+        run: |
+          set -euo pipefail
+          rust_version="$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tools"]["cargo"])' "$RUN_ROOT/projection.json")"
+          [[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          rustup toolchain install "$rust_version" --profile minimal --component rustfmt >/dev/null 2>&1
+          rustup default "$rust_version" >/dev/null 2>&1
+      - name: Prepare dependencies before the cut
+        run: |
+          set -euo pipefail
+          for tool in unshare mount umount setpriv chroot ip nft shred; do command -v "$tool" >/dev/null 2>&1; done
+          owner_uid="$(id -u)"
+          owner_gid="$(id -g)"
+          node_path="$(command -v node || true)"
+          npm_path="$(command -v npm || true)"
+          cargo_path=""
+          rustc_path=""
+          if [[ "$DEVLANE_PROFILE" == "core-rust" ]]; then
+            rust_version="$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tools"]["cargo"])' "$RUN_ROOT/projection.json")"
+            [[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            cargo_path="$(rustup which --toolchain "$rust_version" cargo)"
+            rustc_path="$(rustup which --toolchain "$rust_version" rustc)"
+          fi
+          sudo -n unshare --mount --pid --ipc --fork --mount-proc --kill-child -- \
+            python3 -B kit/devlane/prepare.py \
+              --projection "$RUN_ROOT/projection.json" --output "$RUN_ROOT/prepared" \
+              --profile "$DEVLANE_PROFILE" --owner-uid "$owner_uid" --owner-gid "$owner_gid" \
+              --node-path "$node_path" --npm-path "$npm_path" --cargo-path "$cargo_path" --rustc-path "$rustc_path"
+      - name: Prove public connectivity before the cut
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/network_probe.py positive-control --output "$RUN_ROOT/positive-control.json"
+      - name: Cut network and start the isolated supervisor
+        run: |
+          set -euo pipefail
+          node_path="$(command -v node || true)"
+          npm_path="$(command -v npm || true)"
+          cargo_path=""
+          rustc_path=""
+          if [[ "$DEVLANE_PROFILE" == "core-rust" ]]; then
+            rust_version="$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tools"]["cargo"])' "$RUN_ROOT/projection.json")"
+            [[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            cargo_path="$(rustup which --toolchain "$rust_version" cargo)"
+            rustc_path="$(rustup which --toolchain "$rust_version" rustc)"
+          fi
+          python3 -B kit/devlane/supervisor.py start \
+            --state-dir "$RUN_ROOT/state" --context "$RUN_ROOT/context.json" \
+            --workspace "$GITHUB_WORKSPACE" --prepared "$RUN_ROOT/prepared" \
+            --bundle "$RUN_ROOT/bundle.enc" --projection "$RUN_ROOT/projection.json" \
+            --positive-control "$RUN_ROOT/positive-control.json" \
+            --node-path "$node_path" --npm-path "$npm_path" --cargo-path "$cargo_path" --rustc-path "$rustc_path"
+      - name: Probe isolation before decryption
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/supervisor.py probe --state-dir "$RUN_ROOT/state"
+      - name: Decrypt authenticated bundle
+        env:
+          DEVLANE_DECRYPT_KEY: ${{ secrets.DEVLANE_DECRYPT_KEY }}
+        run: |
+          set -euo pipefail
+          set +x
+          python3 -B kit/devlane/supervisor.py decrypt --state-dir "$RUN_ROOT/state"
+      - name: Execute offline profile and filter public summary
+        id: execute
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/supervisor.py execute --state-dir "$RUN_ROOT/state" --context "$RUN_ROOT/context.json"
+      - name: Shred runner-local workspace
+        id: cleanup
+        if: ${{ always() }}
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/host_cleanup.py --root "$RUN_ROOT" --runner-temp "$RUNNER_TEMP"
+          printf 'devlane_job=completed public_output=filtered cleanup=confirmed\n'
+  devlane-encrypted-audit:
+    name: devlane-encrypted-audit
+    if: ${{ always() }}
+    needs: devlane-encrypted-run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      checks: read
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REPOSITORY_ID: ${{ github.repository_id }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      DEVLANE_PROFILE: ${{ inputs.profile }}
+      CI_CONTROL_RUN_ID: ${{ inputs.control_run_id }}
+      DEVLANE_WAVE_ID: ${{ inputs.wave_id }}
+      DEVLANE_BUNDLE_ID: ${{ inputs.bundle_id }}
+      DEVLANE_CACHE_BASELINE_SHA256: ${{ inputs.cache_baseline_sha256 }}
+      GITHUB_RUN_ID: ${{ github.run_id }}
+      GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+    steps:
+      - name: Fetch public control and validate dispatch
+        run: |
+          set -euo pipefail
+          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" ]]
+          [[ "$CI_REPOSITORY_ID" == "1430960557" ]]
+          [[ "$CI_SERVER_URL" == "https://github.com" ]]
+          [[ "$CI_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$CI_REF" == "refs/heads/main" ]]
+          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_SHA" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          [[ "$actual_sha" == "$CI_SHA" ]]
+      - name: Audit exact two-job graph and public surfaces
+        id: audit
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/public_audit.py

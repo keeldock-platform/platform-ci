@@ -16,26 +16,26 @@ WORKFLOW_CHECKS = {
         "policy-ubuntu-24.04",
         "policy-macos-15",
         "policy-windows-2025",
-    ),
-    "windows-handoff-synthetic": (
-        "handoff-unit-ubuntu-24.04",
-        "handoff-unit-windows-2025",
-    ),
-    "linux-confinement": ("linux-policy",),
-    "node-lock-smoke": (
-        "node-lock-smoke-ubuntu-24.04",
-        "node-lock-smoke-macos-15",
-        "node-lock-smoke-windows-2025",
-    ),
-    "windows-confinement": ("windows-policy",),
-    "development-feedback-smoke": (
-        "feedback-smoke-producer ubuntu-24.04",
-        "feedback-smoke-producer macos-15",
-        "feedback-smoke-producer windows-2025",
-        "feedback-smoke-audit",
+        "node-lock-smoke / node-lock-smoke-ubuntu-24.04",
+        "node-lock-smoke / node-lock-smoke-macos-15",
+        "node-lock-smoke / node-lock-smoke-windows-2025",
+        "linux-confinement / linux-policy",
+        "linux-confinement / linux-harness",
+        "windows-confinement / windows-policy",
+        "windows-confinement / windows-native-synthetic",
+        "windows-handoff-synthetic / handoff-unit-ubuntu-24.04",
+        "windows-handoff-synthetic / handoff-unit-windows-2025",
+        "development-feedback-smoke / feedback-smoke-producer ubuntu-24.04",
+        "development-feedback-smoke / feedback-smoke-producer macos-15",
+        "development-feedback-smoke / feedback-smoke-producer windows-2025",
+        "development-feedback-smoke / feedback-smoke-audit",
+        "devlane-synthetic / devlane-synthetic",
+        "control-audit",
     ),
 }
 GITHUB_ACTIONS_APP_ID = 15368
+SOURCE_FREE_CONTROL_REF = re.compile(r"refs/heads/[A-Za-z0-9._/-]{1,200}\Z")
+MAIN_ONLY_REF = "refs/heads/main"
 REFUSALS = frozenset((
     "approval", "branch", "check", "fast-forward", "head", "protection", "repository", "usage",
 ))
@@ -45,6 +45,28 @@ class PromotionRefusal(ValueError):
     def __init__(self, reason):
         self.reason = reason if reason in REFUSALS else "usage"
         super().__init__(self.reason)
+
+
+def control_dispatch_allowed(ref):
+    """The source-free control holds no secret, so any branch may run it (a pull request head can then be checked)."""
+    return type(ref) is str and SOURCE_FREE_CONTROL_REF.fullmatch(ref) is not None
+
+
+def durable_evidence_allowed(ref):
+    """Only main may save control evidence for the encrypted lane, and only main may dispatch that lane."""
+    return ref == MAIN_ONLY_REF
+
+
+def control_contexts():
+    return frozenset(context for contexts in WORKFLOW_CHECKS.values() for context in contexts)
+
+
+def required_checks_satisfiable_before_merge(required):
+    """Exactly the contexts the source-free control produces, each pinned to the Actions app (no subset, no unpinned)."""
+    if type(required) is not dict:
+        return False
+    return (set(required) == control_contexts()
+            and all(type(app) is int and app == GITHUB_ACTIONS_APP_ID for app in required.values()))
 
 
 def promotion_branches(target):
@@ -254,6 +276,8 @@ def promote(root, target, sha, owner_approved):
     source_protection = _api_json(repository, "branches/" + source + "/protection/required_status_checks")
     target_protection = _api_json(repository, "branches/" + target + "/protection/required_status_checks")
     required = matching_required_checks(source_protection, target_protection)
+    if not required_checks_satisfiable_before_merge(required):
+        raise PromotionRefusal("protection")
     check_payload = _api_json(repository, "commits/" + sha + "/check-runs?filter=all&per_page=100", paginate=True)
     status_payload = _api_json(repository, "commits/" + sha + "/statuses?per_page=100", paginate=True)
     green_required_checks(required, _pages(check_payload, "check_runs"), _pages(status_payload), sha)

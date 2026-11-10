@@ -1,5 +1,4 @@
 name: public-policy
-run-name: public control=${{ inputs.control_wave_id }}
 on:
   workflow_dispatch:
     inputs:
@@ -7,12 +6,10 @@ on:
         description: Opaque control-wave identifier
         required: true
         type: string
-  push:
-    branches-ignore:
-      - uat
-      - main
-  pull_request:
 permissions: {}
+concurrency:
+  group: public-control-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   policy:
     name: policy-${{ matrix.runner }}
@@ -24,50 +21,117 @@ jobs:
           - macos-15
           - windows-2025
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
+    timeout-minutes: 15
     defaults:
       run:
         shell: bash
     env:
       CI_REPOSITORY: ${{ github.repository }}
+      CI_REPOSITORY_ID: ${{ github.repository_id }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}
       CI_SERVER_URL: ${{ github.server_url }}
       CI_EVENT_NAME: ${{ github.event_name }}
+      CI_WORKSPACE: ${{ github.workspace }}
+      CI_CONTROL_WAVE_ID: ${{ inputs.control_wave_id }}
+      CI_RUNNER: ${{ runner.os }}
     steps:
-      - name: Fetch public candidate
+      - name: Fetch public control and validate manual protected-branch dispatch
         run: |
           set -euo pipefail
-          if [[ ! "$CI_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-            exit 1
-          fi
-          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
-            exit 1
-          fi
-          if [[ ! "$CI_SERVER_URL" =~ ^https://[A-Za-z0-9.-]+$ ]]; then
-            exit 1
-          fi
-          if [[ "$CI_EVENT_NAME" == "pull_request" ]]; then
-            if [[ ! "$CI_REF" =~ ^refs/pull/[1-9][0-9]*/merge$ ]]; then
-              exit 1
-            fi
-            requested_ref="$CI_REF"
-          else
-            if [[ ! "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]+$ ]]; then
-              exit 1
-            fi
-            requested_ref="$CI_REF"
-          fi
+          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" ]]
+          [[ "$CI_REPOSITORY_ID" == "1430960557" ]]
+          [[ "$CI_SERVER_URL" == "https://github.com" ]]
+          [[ "$CI_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]{1,200}$ ]]
+          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$CI_CONTROL_WAVE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$ ]]
           git init -q . 2>/dev/null
           git config core.autocrlf false 2>/dev/null
           git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
-          git fetch --quiet --no-tags --depth=1 origin "$requested_ref" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_SHA" 2>/dev/null
           git checkout --quiet --detach FETCH_HEAD 2>/dev/null
           actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
-          if [[ "$actual_sha" != "$CI_SHA" ]]; then
-            exit 1
-          fi
-      - name: Run source-free policy checks
+          [[ "$actual_sha" == "$CI_SHA" ]]
+          printf 'KD-PLATFORM-CONTROL schema=1 wave-id=%s control-sha=%s run-id=%s attempt=1 runner=%s\n' \
+            "$CI_CONTROL_WAVE_ID" "$CI_SHA" "$GITHUB_RUN_ID" "$CI_RUNNER"
+      - name: Run source-free platform policy and candidate checks
         uses: ./kit/bootstrap
         with:
           pool: platform
+  node-lock-smoke:
+    name: node-lock-smoke
+    uses: ./.github/workflows/node-lock-smoke.yml
+  linux-confinement:
+    name: linux-confinement
+    uses: ./.github/workflows/linux-confinement.yml
+  windows-confinement:
+    name: windows-confinement
+    uses: ./.github/workflows/windows-confinement.yml
+  windows-handoff-synthetic:
+    name: windows-handoff-synthetic
+    uses: ./.github/workflows/windows-handoff-synthetic.yml
+  development-feedback-smoke:
+    name: development-feedback-smoke
+    permissions:
+      actions: read
+      checks: read
+    uses: ./.github/workflows/development-feedback-smoke.yml
+  devlane-synthetic:
+    name: devlane-synthetic
+    uses: ./.github/workflows/devlane-synthetic.yml
+  control-audit:
+    name: control-audit
+    if: ${{ always() }}
+    needs:
+      - policy
+      - node-lock-smoke
+      - linux-confinement
+      - windows-confinement
+      - windows-handoff-synthetic
+      - development-feedback-smoke
+      - devlane-synthetic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      checks: read
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REPOSITORY_ID: ${{ github.repository_id }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      CI_CONTROL_WAVE_ID: ${{ inputs.control_wave_id }}
+      GITHUB_RUN_ID: ${{ github.run_id }}
+      GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+      DEVLANE_CONTROL_EVIDENCE_PATH: ${{ runner.temp }}/devlane-control-evidence/permit.json
+    steps:
+      - name: Fetch public control and validate manual protected-branch dispatch
+        run: |
+          set -euo pipefail
+          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" ]]
+          [[ "$CI_REPOSITORY_ID" == "1430960557" ]]
+          [[ "$CI_SERVER_URL" == "https://github.com" ]]
+          [[ "$CI_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]{1,200}$ ]]
+          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$CI_CONTROL_WAVE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$ ]]
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_SHA" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          [[ "$actual_sha" == "$CI_SHA" ]]
+      - name: Audit the exact 18-job control graph
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B kit/devlane/control_audit.py
+      - name: Save exact source-free control evidence
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/devlane-control-evidence/permit.json
+          key: devlane-control-v1-${{ github.run_id }}

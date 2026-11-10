@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timedelta, timezone
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 from macos_public_audit import (
     API_ORIGIN,
@@ -22,12 +23,21 @@ from node_lock_receipt import (
     validate_ciphertext_archive,
 )
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "devlane"))
+import control_audit
+
 
 REPOSITORY = "keeldock-platform/platform-ci"
 WORKFLOW_PATH = ".github/workflows/development-feedback-smoke.yml"
 PRODUCER_PREFIX = "feedback-smoke-producer "
 RUNNERS = ("ubuntu-24.04", "macos-15", "windows-2025")
 AUDITOR_JOB = "feedback-smoke-audit"
+PRODUCER_STEP_NAMES = (
+    "Fetch public control", "Set up the pinned Node runtime", "Run source-free feedback tests",
+    "Create and round-trip encrypted fixture", "Upload the single macOS ciphertext fixture",
+    "Record uploader identity", "Remove local encrypted fixture", "Post Set up the pinned Node runtime",
+)
+AUDITOR_STEP_NAMES = ("Fetch public control", "Audit producer checks and uploaded ciphertext")
 ARTIFACT_PREFIX = "development-feedback-smoke-"
 SMOKE_PROFILE = FEEDBACK_PROFILES["core-build-diagnostic-return"]
 SMOKE_MEMBER = SMOKE_PROFILE["member_name"]
@@ -168,16 +178,23 @@ def _validate_environment(env):
     ref = _clean_ref(env.get("CI_REF"))
     sha = env.get("CI_SHA")
     event = env.get("CI_EVENT_NAME")
+    mode = env.get("FEEDBACK_AUDIT_MODE", "standalone")
     run_id = env.get("GITHUB_RUN_ID")
     attempt = env.get("GITHUB_RUN_ATTEMPT")
     repo_id = env.get("GITHUB_REPOSITORY_ID")
+    composed = mode == "composed-control"
+    if mode not in ("standalone", "composed-control"):
+        _fail("invalid_input")
+    expected_event = "workflow_dispatch" if composed else "push"
+    expected_ref = ref
+    expected_workflow = "public-policy" if composed else "development-feedback-smoke"
     if (repo != REPOSITORY or env.get("CI_SERVER_URL") != "https://github.com"
-            or event != "push"
+            or event != expected_event or ref != expected_ref
             or type(sha) is not str or SHA40_RE.fullmatch(sha) is None
             or not _positive_decimal(run_id) or not _positive_decimal(repo_id)
             or attempt != "1"):
         _fail("invalid_input")
-    if env.get("GITHUB_WORKFLOW") not in (None, "development-feedback-smoke"):
+    if env.get("GITHUB_WORKFLOW") not in (None, expected_workflow):
         _fail("invalid_input")
     return {
         "repository": repo,
@@ -186,6 +203,10 @@ def _validate_environment(env):
         "event": event,
         "run_id": run_id,
         "repository_id": int(repo_id),
+        "mode": mode,
+        "workflow_path": ".github/workflows/public-policy.yml" if composed else WORKFLOW_PATH,
+        "producer_prefix": "development-feedback-smoke / feedback-smoke-producer " if composed else PRODUCER_PREFIX,
+        "auditor_job": "development-feedback-smoke / feedback-smoke-audit" if composed else AUDITOR_JOB,
     }
 
 
@@ -199,7 +220,7 @@ def _validate_run(api, identity):
     head_repo = value.get("head_repository") if type(value) is dict else None
     if (type(value) is not dict or not _exact_int(value.get("id"), 1)
             or str(value["id"]) != identity["run_id"]
-            or value.get("path") != WORKFLOW_PATH
+            or value.get("path") != identity["workflow_path"]
             or value.get("head_branch") != identity["ref"].removeprefix("refs/heads/")
             or value.get("head_sha") != identity["sha"]
             or value.get("event") != identity["event"]
@@ -223,8 +244,12 @@ def _validate_jobs(api, identity):
         return {runner: [] for runner in RUNNERS}, False
     if type(value) is not dict or type(value.get("jobs")) is not list:
         return {runner: [] for runner in RUNNERS}, False
-    valid = (value.get("total_count") == 4 and len(value["jobs"]) == 4
-             and not headers.get("Link") and len(value["jobs"]) <= 100)
+    composed = identity["mode"] == "composed-control"
+    if composed:
+        count_ok = value.get("total_count") == len(value["jobs"]) and 4 <= len(value["jobs"]) <= 18
+    else:
+        count_ok = value.get("total_count") == 4 and len(value["jobs"]) == 4
+    valid = count_ok and not headers.get("Link") and len(value["jobs"]) <= 100
     by_name = {runner: [] for runner in RUNNERS}
     audit_jobs = []
     seen_ids = set()
@@ -232,7 +257,7 @@ def _validate_jobs(api, identity):
         if type(job) is not dict or type(job.get("name")) is not str:
             valid = False
             continue
-        if job["name"] == AUDITOR_JOB:
+        if job["name"] == identity["auditor_job"]:
             audit_jobs.append(job)
             audit_id = job.get("id")
             if not _exact_int(audit_id, 1) or audit_id in seen_ids:
@@ -245,11 +270,26 @@ def _validate_jobs(api, identity):
                     or job.get("head_sha") != identity["sha"]
                     or type(job.get("status")) is not str):
                 valid = False
+            steps = job.get("steps")
+            if (type(steps) is not list
+                    or [step.get("name") for step in steps if step.get("name") not in ("Set up job", "Complete job")]
+                    != list(AUDITOR_STEP_NAMES)):
+                valid = False
             continue
-        if not job["name"].startswith(PRODUCER_PREFIX):
+        if not job["name"].startswith(identity["producer_prefix"]):
+            if composed and job["name"] in control_audit.CONTROL_JOB_NAMES:
+                if (job["name"] == control_audit.RUN_JOB
+                        and (job.get("status") not in control_audit.NOT_STARTED
+                             or job.get("conclusion") is not None)):
+                    valid = False
+                elif job["name"] != control_audit.RUN_JOB and job.get("status") not in (
+                    "queued", "waiting", "pending", "requested", "in_progress", "completed"
+                ):
+                    valid = False
+                continue
             valid = False
             continue
-        runner = job["name"][len(PRODUCER_PREFIX):]
+        runner = job["name"][len(identity["producer_prefix"]):]
         if runner not in RUNNERS:
             valid = False
             continue
@@ -265,12 +305,34 @@ def _validate_jobs(api, identity):
             valid = False
         if job.get("status") != "completed" or job.get("conclusion") != "success":
             valid = False
+        steps = job.get("steps")
+        if (type(steps) is not list
+                or [step.get("name") for step in steps if step.get("name") not in ("Set up job", "Complete job")]
+                != list(PRODUCER_STEP_NAMES)):
+            valid = False
+        else:
+            for step in steps:
+                if step.get("name") in ("Set up job", "Complete job"):
+                    continue
+                skipped_upload = (runner != "macos-15"
+                                  and step.get("name") in ("Upload the single macOS ciphertext fixture", "Record uploader identity"))
+                if (step.get("status") != "completed"
+                        or step.get("conclusion") != ("skipped" if skipped_upload else "success")):
+                    valid = False
     for runner in RUNNERS:
         if len(by_name[runner]) != 1:
             valid = False
     if (len(audit_jobs) != 1 or audit_jobs[0].get("status") != "in_progress"
             or audit_jobs[0].get("conclusion") is not None):
         valid = False
+    if composed:
+        try:
+            control_audit.validate_feedback_phase(value["jobs"], {
+                "run_id": identity["run_id"], "control_sha": identity["sha"],
+                "ref": identity["ref"],
+            })
+        except Exception:
+            valid = False
     return by_name, valid
 
 

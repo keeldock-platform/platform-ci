@@ -1,10 +1,6 @@
 name: node-lock-smoke
 on:
-  push:
-    branches-ignore:
-      - uat
-      - main
-  pull_request:
+  workflow_call:
 permissions: {}
 jobs:
   node-lock-smoke:
@@ -31,28 +27,12 @@ jobs:
       - name: Fetch public candidate
         run: |
           set -euo pipefail
-          if [[ "$CI_EVENT_NAME" != "push" && "$CI_EVENT_NAME" != "pull_request" ]]; then
-            exit 1
-          fi
-          if [[ ! "$CI_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-            exit 1
-          fi
-          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
-            exit 1
-          fi
-          if [[ ! "$CI_SERVER_URL" =~ ^https://[A-Za-z0-9.-]+$ ]]; then
-            exit 1
-          fi
-          if [[ "$CI_EVENT_NAME" == "pull_request" ]]; then
-            if [[ ! "$CI_REF" =~ ^refs/pull/[1-9][0-9]*/merge$ ]]; then
-              exit 1
-            fi
-          else
-            if [[ ! "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]+$ ]]; then
-              exit 1
-            fi
-          fi
-          requested_ref="$CI_REF"
+          [[ "$CI_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" ]]
+          [[ "$CI_SERVER_URL" == "https://github.com" ]]
+          [[ "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]{1,200}$ ]]
+          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
+          requested_ref="$CI_SHA"
           git init -q . 2>/dev/null
           git config core.autocrlf false 2>/dev/null
           git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null

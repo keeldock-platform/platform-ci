@@ -1,0 +1,105 @@
+name: devlane-synthetic
+on:
+  workflow_call:
+permissions: {}
+jobs:
+  devlane-synthetic:
+    name: devlane-synthetic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions: {}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REPOSITORY_ID: ${{ github.repository_id }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      CI_WORKSPACE: ${{ github.workspace }}
+    steps:
+      - name: Fetch public control and validate protected-branch dispatch
+        run: |
+          set -euo pipefail
+          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" ]]
+          [[ "$CI_REPOSITORY_ID" == "1430960557" ]]
+          [[ "$CI_SERVER_URL" == "https://github.com" ]]
+          [[ "$CI_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]{1,200}$ ]]
+          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_SHA" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          [[ "$actual_sha" == "$CI_SHA" ]]
+      - name: Set up pinned Node toolchain
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.22.1"
+          check-latest: false
+          cache: ""
+          package-manager-cache: false
+      - name: Install fixed Rust acceptance toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt >/dev/null 2>&1
+      - name: Claim a synthetic bundle permit
+        run: |
+          set -euo pipefail
+          export CI_RUN_ID="$GITHUB_RUN_ID" CI_RUN_ATTEMPT=1 CI_CONTROL_RUN_ID="$GITHUB_RUN_ID"
+          export DEVLANE_PROFILE=core-node DEVLANE_WAVE_ID=synthetic-wave-0001 DEVLANE_BUNDLE_ID="synthetic-bundle-$GITHUB_RUN_ID"
+          export DEVLANE_EXPIRES="$(( $(date +%s) + 3000 ))"
+          mkdir -m 700 -p "$RUNNER_TEMP/devlane-bundle-permit"
+          python3 -B kit/devlane/permit.py claim --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json" >/dev/null
+          printf 'devlane_cache_permit=claimed\n'
+      - name: Save the synthetic permit through the Actions cache
+        uses: actions/cache/save@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          key: devlane-permit-v1-synthetic-bundle-${{ github.run_id }}
+      - name: Discard the local synthetic permit
+        run: |
+          set -euo pipefail
+          rm -rf -- "$RUNNER_TEMP/devlane-bundle-permit"
+          [[ ! -e "$RUNNER_TEMP/devlane-bundle-permit" ]]
+      - name: Restore the synthetic permit with the encrypted-lane path and key shape
+        uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          key: devlane-permit-v1-synthetic-bundle-${{ github.run_id }}
+          fail-on-cache-miss: true
+      - name: Verify the restored permit and refuse a second claim
+        run: |
+          set -euo pipefail
+          export CI_RUN_ID="$GITHUB_RUN_ID" CI_RUN_ATTEMPT=1 CI_CONTROL_RUN_ID="$GITHUB_RUN_ID"
+          export DEVLANE_PROFILE=core-node DEVLANE_WAVE_ID=synthetic-wave-0001 DEVLANE_BUNDLE_ID="synthetic-bundle-$GITHUB_RUN_ID"
+          export DEVLANE_EXPIRES="$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["expires"])' "$RUNNER_TEMP/devlane-bundle-permit/permit.json")"
+          python3 -B kit/devlane/permit.py verify-claim --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json" >/dev/null
+          if python3 -B kit/devlane/permit.py claim --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json" >/dev/null 2>&1; then
+            exit 1
+          fi
+          printf 'devlane_cache_permit=restored-and-single-use\n'
+      - name: Run full source-free production-path acceptance
+        run: |
+          set -euo pipefail
+          quiet() { local out="$RUNNER_TEMP/devlane-acceptance.log"; if "$@" >"$out" 2>&1; then return 0; fi; cat "$out"; return 1; }
+          quiet python3 -B -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; assert AESGCM is not None'
+          quiet python3 -B kit/devlane/test_acceptance.py
+          quiet python3 -B kit/devlane/test_coordinator.py
+          quiet python3 -B kit/devlane/test_rust_test_runner.py
+          quiet python3 -B kit/devlane/test_rust_report.py
+          quiet node --test kit/devlane/test_adapters.mjs
+          quiet python3 -B kit/devlane/test_audit_contracts.py
+          quiet python3 -B kit/devlane/test_rehearsal.py
+          quiet python3 -B kit/devlane/test_e2e.py
+          printf 'devlane_acceptance=pass\n'
+      - name: Probe the loopback-only Linux network boundary
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/devlane-linux-probe.log"
+          if ! python3 -B kit/devlane/test_linux_runtime.py >"$out" 2>&1; then cat "$out"; exit 1; fi
+          printf 'devlane_linux_probe=pass\n'

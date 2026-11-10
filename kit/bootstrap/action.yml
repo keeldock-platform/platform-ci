@@ -82,6 +82,7 @@ runs:
         fi
         "$python_bin" -B "$CI_ACTION_PATH/test_policy.py"
         "$python_bin" -B "$CI_ACTION_PATH/test_public_tree.py"
+        "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_audit_contracts.py"
         "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../promotion" -p "test_*.py"
         "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../selector" -p "test_*.py"
         "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../ci" -p "test_*.py"
@@ -102,6 +103,8 @@ runs:
         "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_confinement_gate_table.py"
         "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_windows_source_run.py"
         if [[ "${RUNNER_OS:-}" == "Linux" ]]; then
+          "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_acceptance.py"
+          "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_coordinator.py"
           "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_linux_source_build.py"
           if [[ "${CI_POOL:-}" == "platform" ]]; then
             "$python_bin" -m pip install --disable-pip-version-check --no-input --require-hashes --only-binary=:all: --no-deps --target "${RUNNER_TEMP:-/tmp}/kd-pydeps" -r "$CI_ACTION_PATH/../handoff/provider_requirements.txt"

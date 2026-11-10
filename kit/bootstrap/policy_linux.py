@@ -13,69 +13,7 @@ CANDIDATE_WORKFLOWS lists, in order, the path, workflow kind and size-failure
 code that the candidate checker validates when the pool is platform.
 """
 
-LINUX_CONFINEMENT_WORKFLOW_TEMPLATE = r"""name: linux-confinement
-on:
-  push:
-    branches-ignore:
-      - uat
-      - main
-  pull_request:
-permissions: {}
-jobs:
-  linux-policy:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    defaults:
-      run:
-        shell: bash
-    env:
-      CI_REPOSITORY: ${{ github.repository }}
-      CI_REF: ${{ github.ref }}
-      CI_SHA: ${{ github.sha }}
-      CI_SERVER_URL: ${{ github.server_url }}
-      CI_EVENT_NAME: ${{ github.event_name }}
-      CI_WORKSPACE: ${{ github.workspace }}
-    steps:
-      - name: Fetch public candidate
-        run: |
-          set -euo pipefail
-          if [[ ! "$CI_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-            exit 1
-          fi
-          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
-            exit 1
-          fi
-          if [[ ! "$CI_SERVER_URL" =~ ^https://[A-Za-z0-9.-]+$ ]]; then
-            exit 1
-          fi
-          if [[ "$CI_EVENT_NAME" == "pull_request" ]]; then
-            if [[ ! "$CI_REF" =~ ^refs/pull/[1-9][0-9]*/merge$ ]]; then
-              exit 1
-            fi
-            requested_ref="$CI_REF"
-          else
-            if [[ ! "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]+$ ]]; then
-              exit 1
-            fi
-            requested_ref="$CI_REF"
-          fi
-          git init -q . 2>/dev/null
-          git config core.autocrlf false 2>/dev/null
-          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
-          git fetch --quiet --no-tags --depth=1 origin "$requested_ref" 2>/dev/null
-          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
-          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
-          if [[ "$actual_sha" != "$CI_SHA" ]]; then
-            exit 1
-          fi
-      - name: Run unprivileged source-free checks
-        run: |
-          set -euo pipefail
-          python3 -B kit/bootstrap/test_policy.py
-          python3 -B kit/bootstrap/test_public_tree.py
-          python3 -B kit/confinement/test_linux_harness.py
-          python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
-"""
+LINUX_CONFINEMENT_WORKFLOW_TEMPLATE = 'name: linux-confinement\non:\n  workflow_call:\npermissions: {}\njobs:\n  linux-policy:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 10\n    defaults:\n      run:\n        shell: bash\n    env:\n      CI_REPOSITORY: ${{ github.repository }}\n      CI_REF: ${{ github.ref }}\n      CI_SHA: ${{ github.sha }}\n      CI_SERVER_URL: ${{ github.server_url }}\n      CI_EVENT_NAME: ${{ github.event_name }}\n      CI_WORKSPACE: ${{ github.workspace }}\n    steps:\n      - name: Fetch public candidate\n        run: |\n          set -euo pipefail\n          [[ "$CI_EVENT_NAME" == "workflow_dispatch" ]]\n          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" ]]\n          [[ "$CI_SERVER_URL" == "https://github.com" ]]\n          [[ "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]{1,200}$ ]]\n          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]\n          git init -q . 2>/dev/null\n          git config core.autocrlf false 2>/dev/null\n          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null\n          git fetch --quiet --no-tags --depth=1 origin "$CI_SHA" 2>/dev/null\n          git checkout --quiet --detach FETCH_HEAD 2>/dev/null\n          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"\n          if [[ "$actual_sha" != "$CI_SHA" ]]; then\n            exit 1\n          fi\n      - name: Run unprivileged source-free checks\n        run: |\n          set -euo pipefail\n          python3 -B kit/bootstrap/test_policy.py\n          python3 -B kit/bootstrap/test_public_tree.py\n          python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"\n  linux-harness:\n    name: linux-harness\n    runs-on: ubuntu-24.04\n    timeout-minutes: 10\n    defaults:\n      run:\n        shell: bash\n    env:\n      CI_REPOSITORY: ${{ github.repository }}\n      CI_REF: ${{ github.ref }}\n      CI_SHA: ${{ github.sha }}\n      CI_SERVER_URL: ${{ github.server_url }}\n      CI_EVENT_NAME: ${{ github.event_name }}\n    steps:\n      - name: Fetch public candidate\n        run: |\n          set -euo pipefail\n          [[ "$CI_EVENT_NAME" == "workflow_dispatch" ]]\n          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" ]]\n          [[ "$CI_SERVER_URL" == "https://github.com" ]]\n          [[ "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]{1,200}$ ]]\n          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]\n          git init -q . 2>/dev/null\n          git config core.autocrlf false 2>/dev/null\n          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null\n          git fetch --quiet --no-tags --depth=1 origin "$CI_SHA" 2>/dev/null\n          git checkout --quiet --detach FETCH_HEAD 2>/dev/null\n          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"\n          [[ "$actual_sha" == "$CI_SHA" ]]\n      - name: Run Linux namespace harness fixtures\n        run: python3 -B kit/confinement/test_linux_harness.py\n'
 
 LINUX_CONFINEMENT_DIAGNOSTIC_WORKFLOW_TEMPLATE = r"""name: linux-confinement-diagnostic
 on:

@@ -1,9 +1,6 @@
 name: development-feedback-smoke
 on:
-  push:
-    branches-ignore:
-      - uat
-      - main
+  workflow_call:
 permissions: {}
 jobs:
   feedback-smoke-producer:
@@ -30,22 +27,15 @@ jobs:
       - name: Fetch public control
         run: |
           set -euo pipefail
-          if [[ "$CI_EVENT_NAME" != "push" ]]; then
-            exit 1
-          fi
-          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
-            exit 1
-          fi
-          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
-            exit 1
-          fi
-          if [[ ! "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]+$ ]]; then
-            exit 1
-          fi
+          [[ "$CI_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" ]]
+          [[ "$CI_SERVER_URL" == "https://github.com" ]]
+          [[ "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]{1,200}$ ]]
+          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
           git init -q . 2>/dev/null
           git config core.autocrlf false 2>/dev/null
           git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
-          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_SHA" 2>/dev/null
           git checkout --quiet --detach FETCH_HEAD 2>/dev/null
           actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
           if [[ "$actual_sha" != "$CI_SHA" ]]; then
@@ -118,19 +108,21 @@ jobs:
         if: ${{ always() }}
         run: |
           set -euo pipefail
-          fixture_dir="${RUNNER_TEMP%/}/feedback-smoke"
-          fixture_file="$fixture_dir/build-diagnostic-return-v1.enc"
-          if [[ -e "$fixture_file" || -L "$fixture_file" ]]; then
-            if [[ ! -f "$fixture_file" || -L "$fixture_file" ]]; then
-              exit 1
-            fi
-            rm -f -- "$fixture_file"
+          python_command=python3
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            python_command=python
           fi
-          if [[ -d "$fixture_dir" && ! -L "$fixture_dir" ]]; then
-            rmdir -- "$fixture_dir"
-          elif [[ -e "$fixture_dir" || -L "$fixture_dir" ]]; then
-            exit 1
-          fi
+          "$python_command" -B -c 'import os, stat, sys; from pathlib import Path; base=Path(sys.argv[1]).resolve(strict=True); directory=base / "feedback-smoke"; target=directory / "build-diagnostic-return-v1.enc";
+if target.is_symlink(): raise SystemExit(1)
+try: metadata=target.lstat()
+except FileNotFoundError: metadata=None
+if metadata is not None:
+    if not stat.S_ISREG(metadata.st_mode): raise SystemExit(1)
+    target.unlink()
+if directory.is_symlink(): raise SystemExit(1)
+if directory.exists():
+    if not directory.is_dir(): raise SystemExit(1)
+    directory.rmdir()' "$RUNNER_TEMP"
   feedback-smoke-audit:
     if: ${{ always() }}
     needs: feedback-smoke-producer
@@ -148,28 +140,22 @@ jobs:
       CI_SHA: ${{ github.sha }}
       CI_SERVER_URL: ${{ github.server_url }}
       CI_EVENT_NAME: ${{ github.event_name }}
+      FEEDBACK_AUDIT_MODE: composed-control
       GITHUB_RUN_ID: ${{ github.run_id }}
       GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
     steps:
       - name: Fetch public control
         run: |
           set -euo pipefail
-          if [[ "$CI_EVENT_NAME" != "push" ]]; then
-            exit 1
-          fi
-          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
-            exit 1
-          fi
-          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
-            exit 1
-          fi
-          if [[ ! "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]+$ ]]; then
-            exit 1
-          fi
+          [[ "$CI_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" ]]
+          [[ "$CI_SERVER_URL" == "https://github.com" ]]
+          [[ "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]{1,200}$ ]]
+          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
           git init -q . 2>/dev/null
           git config core.autocrlf false 2>/dev/null
           git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
-          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_SHA" 2>/dev/null
           git checkout --quiet --detach FETCH_HEAD 2>/dev/null
           actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
           if [[ "$actual_sha" != "$CI_SHA" ]]; then

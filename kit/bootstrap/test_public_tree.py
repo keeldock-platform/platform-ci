@@ -459,7 +459,8 @@ class PublicTreeTests(unittest.TestCase):
         self.assertIn("Require status checks to pass", rules)
         self.assertIn("15368", rules)
         self.assertNotIn("promotion-check-reuse", rules)
-        self.assertIn("do not support manual dispatch", rules)
+        self.assertIn("a manual dispatch is accepted from any branch", rules)
+        self.assertIn("One-time migration order", rules)
         self.assertIn("does not modify GitHub branch protection", rules)
         action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
         self.assertIn('discover -s "$CI_ACTION_PATH/../promotion" -p "test_*.py"', action)
@@ -906,6 +907,41 @@ class PublicTreeTests(unittest.TestCase):
             "kit/ci/perf_shadow.py",
             "kit/ci/test_perf_shadow.py",
         }
+        expected.update({
+            '.github/workflows/devlane-encrypted.yml',
+            '.github/workflows/devlane-synthetic.yml',
+            'ci/devlane-profiles.json',
+            'kit/bootstrap/policy_devlane.py',
+            'kit/devlane/__init__.py',
+            'kit/devlane/rehearsal.py',
+            'kit/devlane/test_rehearsal.py',
+            'docs/devlane-procedure.md',
+            'kit/devlane/bundle.py',
+            'kit/devlane/control_audit.py',
+            'kit/devlane/coordinator.py',
+            'kit/devlane/decrypt_once.py',
+            'kit/devlane/fetch.py',
+            'kit/devlane/filter.py',
+            'kit/devlane/host_cleanup.py',
+            'kit/devlane/isolated_cleanup.py',
+            'kit/devlane/network_probe.py',
+            'kit/devlane/permit.py',
+            'kit/devlane/prepare.py',
+            'kit/devlane/project.py',
+            'kit/devlane/public_audit.py',
+            'kit/devlane/rust_test_runner.py',
+            'kit/devlane/safe_json.mjs',
+            'kit/devlane/supervisor.py',
+            'kit/devlane/test_acceptance.py',
+            'kit/devlane/test_adapters.mjs',
+            'kit/devlane/test_audit_contracts.py',
+            'kit/devlane/test_coordinator.py',
+            'kit/devlane/test_e2e.py',
+            'kit/devlane/test_linux_runtime.py',
+            'kit/devlane/test_rust_report.py',
+            'kit/devlane/test_rust_test_runner.py',
+            'kit/devlane/typescript_reporter.mjs',
+        })
         self.assertEqual(set(PINNED_FILE_SHA256), expected)
         self.assertTrue(expected.issubset(PLATFORM_FILES))
         with tempfile.TemporaryDirectory() as temporary:

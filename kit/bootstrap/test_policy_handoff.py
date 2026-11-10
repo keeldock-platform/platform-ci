@@ -70,7 +70,11 @@ class HandoffWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("kit/handoff/source_free.py", workflow)
         self.assertIn("- ubuntu-24.04", workflow)
         self.assertIn("- windows-2025", workflow)
-        self.assertNotIn("workflow_dispatch", workflow)
+        trigger = workflow.split("jobs:", 1)[0]
+        self.assertIn("on:\n  workflow_call:\n", trigger)
+        self.assertNotIn("workflow_dispatch", trigger)
+        self.assertNotIn("pull_request", trigger)
+        self.assertNotIn("push:", trigger)
         self.assertNotIn("promotion-check-reuse", workflow)
         unit = workflow.split("  handoff-unit:\n", 1)[1]
         for forbidden in (
@@ -101,7 +105,7 @@ class HandoffWorkflowPolicyTests(unittest.TestCase):
     def test_handoff_workflow_rejects_trigger_runner_permission_and_step_changes(self):
         base = HANDOFF_WORKFLOW.read_text(encoding="utf-8")
         mutations = (
-            base.replace("  pull_request:\n", "  pull_request_target:\n"),
+            base.replace("  workflow_call:\n", "  workflow_dispatch:\n", 1),
             base.replace("permissions: {}\n", "permissions:\n  contents: read\n"),
             base.replace("          - windows-2025\n", "          - windows-latest\n"),
             base.replace("    timeout-minutes: 10\n", "    timeout-minutes: 360\n"),

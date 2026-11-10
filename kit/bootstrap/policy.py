@@ -7,6 +7,7 @@ from types import MappingProxyType
 import policy_baselines
 import policy_handoff
 import policy_linux
+import policy_devlane
 import policy_windows
 from policy_linux import LINUX_CONFINEMENT_WORKFLOW_TEMPLATE
 from policy_windows import WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE
@@ -25,7 +26,7 @@ MACOS_RULES_SOURCE_READER_WORKFLOW_SHA256 = "cb9b70226175069e9c148c06f18d4d89cf8
 MACOS_RULES_BOOTSTRAP_WORKFLOW_SHA256 = "f56e0c0eb86493c320a72048201d4bfae6bedbec46ee85a8b027674d5cd62d3a"
 MACOS_CORE_BOOTSTRAP_WORKFLOW_SHA256 = "b140312f22310633089594255fb17d25aeece02869355e608408098c4e91a4eb"
 MACOS_CORE_CONTRACT_WORKFLOW_SHA256 = "38c33a1b30bc18378359910af0da73e493026e8105511062f96f6f80fafbe096"
-DEVELOPMENT_FEEDBACK_SMOKE_WORKFLOW_SHA256 = "edaaa6379f7cef3f76134948b937628a3b1c8084ee85769c73046eb50c02bf2c"
+DEVELOPMENT_FEEDBACK_SMOKE_WORKFLOW_SHA256 = "8b9d13aec533e4a1b3637e4cc117cad67d820558cb309891aef51e9e8f623160"
 
 
 class PolicyError(ValueError):
@@ -117,7 +118,6 @@ def load_policy_document(path, expected_pool=None):
 
 
 PLATFORM_WORKFLOW_TEMPLATE = r"""name: public-policy
-run-name: public control=${{ inputs.control_wave_id }}
 on:
   workflow_dispatch:
     inputs:
@@ -125,12 +125,10 @@ on:
         description: Opaque control-wave identifier
         required: true
         type: string
-  push:
-    branches-ignore:
-      - uat
-      - main
-  pull_request:
 permissions: {}
+concurrency:
+  group: public-control-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   policy:
     name: policy-${{ matrix.runner }}
@@ -142,55 +140,121 @@ jobs:
           - macos-15
           - windows-2025
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
+    timeout-minutes: 15
     defaults:
       run:
         shell: bash
     env:
       CI_REPOSITORY: ${{ github.repository }}
+      CI_REPOSITORY_ID: ${{ github.repository_id }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}
       CI_SERVER_URL: ${{ github.server_url }}
       CI_EVENT_NAME: ${{ github.event_name }}
+      CI_WORKSPACE: ${{ github.workspace }}
+      CI_CONTROL_WAVE_ID: ${{ inputs.control_wave_id }}
+      CI_RUNNER: ${{ runner.os }}
     steps:
-      - name: Fetch public candidate
+      - name: Fetch public control and validate manual protected-branch dispatch
         run: |
           set -euo pipefail
-          if [[ ! "$CI_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-            exit 1
-          fi
-          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
-            exit 1
-          fi
-          if [[ ! "$CI_SERVER_URL" =~ ^https://[A-Za-z0-9.-]+$ ]]; then
-            exit 1
-          fi
-          if [[ "$CI_EVENT_NAME" == "pull_request" ]]; then
-            if [[ ! "$CI_REF" =~ ^refs/pull/[1-9][0-9]*/merge$ ]]; then
-              exit 1
-            fi
-            requested_ref="$CI_REF"
-          else
-            if [[ ! "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]+$ ]]; then
-              exit 1
-            fi
-            requested_ref="$CI_REF"
-          fi
+          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" ]]
+          [[ "$CI_REPOSITORY_ID" == "1430960557" ]]
+          [[ "$CI_SERVER_URL" == "https://github.com" ]]
+          [[ "$CI_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]{1,200}$ ]]
+          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$CI_CONTROL_WAVE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$ ]]
           git init -q . 2>/dev/null
           git config core.autocrlf false 2>/dev/null
           git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
-          git fetch --quiet --no-tags --depth=1 origin "$requested_ref" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_SHA" 2>/dev/null
           git checkout --quiet --detach FETCH_HEAD 2>/dev/null
           actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
-          if [[ "$actual_sha" != "$CI_SHA" ]]; then
-            exit 1
-          fi
-      - name: Run source-free policy checks
+          [[ "$actual_sha" == "$CI_SHA" ]]
+          printf 'KD-PLATFORM-CONTROL schema=1 wave-id=%s control-sha=%s run-id=%s attempt=1 runner=%s\n' \
+            "$CI_CONTROL_WAVE_ID" "$CI_SHA" "$GITHUB_RUN_ID" "$CI_RUNNER"
+      - name: Run source-free platform policy and candidate checks
         uses: ./kit/bootstrap
         with:
           pool: platform
+  node-lock-smoke:
+    name: node-lock-smoke
+    uses: ./.github/workflows/node-lock-smoke.yml
+  linux-confinement:
+    name: linux-confinement
+    uses: ./.github/workflows/linux-confinement.yml
+  windows-confinement:
+    name: windows-confinement
+    uses: ./.github/workflows/windows-confinement.yml
+  windows-handoff-synthetic:
+    name: windows-handoff-synthetic
+    uses: ./.github/workflows/windows-handoff-synthetic.yml
+  development-feedback-smoke:
+    name: development-feedback-smoke
+    permissions:
+      actions: read
+      checks: read
+    uses: ./.github/workflows/development-feedback-smoke.yml
+  devlane-synthetic:
+    name: devlane-synthetic
+    uses: ./.github/workflows/devlane-synthetic.yml
+  control-audit:
+    name: control-audit
+    if: ${{ always() }}
+    needs:
+      - policy
+      - node-lock-smoke
+      - linux-confinement
+      - windows-confinement
+      - windows-handoff-synthetic
+      - development-feedback-smoke
+      - devlane-synthetic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      checks: read
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REPOSITORY_ID: ${{ github.repository_id }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      CI_CONTROL_WAVE_ID: ${{ inputs.control_wave_id }}
+      GITHUB_RUN_ID: ${{ github.run_id }}
+      GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+      DEVLANE_CONTROL_EVIDENCE_PATH: ${{ runner.temp }}/devlane-control-evidence/permit.json
+    steps:
+      - name: Fetch public control and validate manual protected-branch dispatch
+        run: |
+          set -euo pipefail
+          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" ]]
+          [[ "$CI_REPOSITORY_ID" == "1430960557" ]]
+          [[ "$CI_SERVER_URL" == "https://github.com" ]]
+          [[ "$CI_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]{1,200}$ ]]
+          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$CI_CONTROL_WAVE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$ ]]
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_SHA" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          [[ "$actual_sha" == "$CI_SHA" ]]
+      - name: Audit the exact 18-job control graph
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B kit/devlane/control_audit.py
+      - name: Save exact source-free control evidence
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/devlane-control-evidence/permit.json
+          key: devlane-control-v1-${{ github.run_id }}
 """
-
 MACOS_CAPABILITY_WORKFLOW_TEMPLATE = """name: macos-capability
 on:
   workflow_dispatch:
@@ -1200,93 +1264,7 @@ jobs:
 """
 
 
-NODE_LOCK_SMOKE_WORKFLOW_TEMPLATE = r"""name: node-lock-smoke
-on:
-  push:
-    branches-ignore:
-      - uat
-      - main
-  pull_request:
-permissions: {}
-jobs:
-  node-lock-smoke:
-    name: node-lock-smoke-${{ matrix.runner }}
-    strategy:
-      fail-fast: true
-      matrix:
-        runner:
-          - ubuntu-24.04
-          - macos-15
-          - windows-2025
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    defaults:
-      run:
-        shell: bash
-    env:
-      CI_REPOSITORY: ${{ github.repository }}
-      CI_REF: ${{ github.ref }}
-      CI_SHA: ${{ github.sha }}
-      CI_SERVER_URL: ${{ github.server_url }}
-      CI_EVENT_NAME: ${{ github.event_name }}
-    steps:
-      - name: Fetch public candidate
-        run: |
-          set -euo pipefail
-          if [[ "$CI_EVENT_NAME" != "push" && "$CI_EVENT_NAME" != "pull_request" ]]; then
-            exit 1
-          fi
-          if [[ ! "$CI_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-            exit 1
-          fi
-          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
-            exit 1
-          fi
-          if [[ ! "$CI_SERVER_URL" =~ ^https://[A-Za-z0-9.-]+$ ]]; then
-            exit 1
-          fi
-          if [[ "$CI_EVENT_NAME" == "pull_request" ]]; then
-            if [[ ! "$CI_REF" =~ ^refs/pull/[1-9][0-9]*/merge$ ]]; then
-              exit 1
-            fi
-          else
-            if [[ ! "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]+$ ]]; then
-              exit 1
-            fi
-          fi
-          requested_ref="$CI_REF"
-          git init -q . 2>/dev/null
-          git config core.autocrlf false 2>/dev/null
-          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
-          git fetch --quiet --no-tags --depth=1 origin "$requested_ref" 2>/dev/null
-          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
-          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
-          if [[ "$actual_sha" != "$CI_SHA" ]]; then
-            exit 1
-          fi
-      - name: Set up the pinned Node runtime
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
-        with:
-          node-version: "24.22.1"
-          check-latest: false
-          cache: ""
-          package-manager-cache: false
-      - name: Run source-free helper tests
-        run: |
-          set -euo pipefail
-          [[ "$(node --version)" == "v24.22.1" ]]
-          [[ "$(npm --version)" == "11.19.1" ]]
-          node --test kit/confinement/test_node_lock_envelope.mjs kit/confinement/test_node_lock_manifest.mjs
-          python_command=python3
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            python_command=python
-          fi
-          "$python_command" -B -m unittest discover -s kit/confinement -p "test_node_lock_receipt.py"
-          "$python_command" -B -m unittest discover -s kit/confinement -p "test_sbom_normalizer.py"
-          if [[ "$RUNNER_OS" == "macOS" ]]; then
-            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_sbom_normalizer.py"
-          fi
-"""
+NODE_LOCK_SMOKE_WORKFLOW_TEMPLATE = 'name: node-lock-smoke\non:\n  workflow_call:\npermissions: {}\njobs:\n  node-lock-smoke:\n    name: node-lock-smoke-${{ matrix.runner }}\n    strategy:\n      fail-fast: true\n      matrix:\n        runner:\n          - ubuntu-24.04\n          - macos-15\n          - windows-2025\n    runs-on: ${{ matrix.runner }}\n    timeout-minutes: 10\n    defaults:\n      run:\n        shell: bash\n    env:\n      CI_REPOSITORY: ${{ github.repository }}\n      CI_REF: ${{ github.ref }}\n      CI_SHA: ${{ github.sha }}\n      CI_SERVER_URL: ${{ github.server_url }}\n      CI_EVENT_NAME: ${{ github.event_name }}\n    steps:\n      - name: Fetch public candidate\n        run: |\n          set -euo pipefail\n          [[ "$CI_EVENT_NAME" == "workflow_dispatch" ]]\n          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" ]]\n          [[ "$CI_SERVER_URL" == "https://github.com" ]]\n          [[ "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]{1,200}$ ]]\n          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]\n          requested_ref="$CI_SHA"\n          git init -q . 2>/dev/null\n          git config core.autocrlf false 2>/dev/null\n          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null\n          git fetch --quiet --no-tags --depth=1 origin "$requested_ref" 2>/dev/null\n          git checkout --quiet --detach FETCH_HEAD 2>/dev/null\n          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"\n          if [[ "$actual_sha" != "$CI_SHA" ]]; then\n            exit 1\n          fi\n      - name: Set up the pinned Node runtime\n        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1\n        with:\n          node-version: "24.22.1"\n          check-latest: false\n          cache: ""\n          package-manager-cache: false\n      - name: Run source-free helper tests\n        run: |\n          set -euo pipefail\n          [[ "$(node --version)" == "v24.22.1" ]]\n          [[ "$(npm --version)" == "11.19.1" ]]\n          node --test kit/confinement/test_node_lock_envelope.mjs kit/confinement/test_node_lock_manifest.mjs\n          python_command=python3\n          if [[ "$RUNNER_OS" == "Windows" ]]; then\n            python_command=python\n          fi\n          "$python_command" -B -m unittest discover -s kit/confinement -p "test_node_lock_receipt.py"\n          "$python_command" -B -m unittest discover -s kit/confinement -p "test_sbom_normalizer.py"\n          if [[ "$RUNNER_OS" == "macOS" ]]; then\n            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_sbom_normalizer.py"\n          fi\n'
 
 CONSUMER_ACTION_PREFIX = "keeldock-platform/platform-ci/kit/bootstrap@"
 
@@ -1386,7 +1364,7 @@ SHARED_WORKFLOW_KINDS = frozenset(
         "macos-rules-source-reader",
     )
 ) | frozenset(FEEDBACK_RETURN_WORKFLOW_SHA256)
-LANE_MODULES = (policy_linux, policy_windows, policy_handoff, policy_baselines)
+LANE_MODULES = (policy_linux, policy_windows, policy_handoff, policy_baselines, policy_devlane)
 LANE_DIGEST_PATTERN = re.compile(r"[a-f0-9]{64}\Z")
 
 

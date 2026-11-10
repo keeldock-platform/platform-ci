@@ -26,7 +26,7 @@ QUICK_MODULE = ROOT / "core-ci/linux_quick_return.py"
 STANDIN = "kd-synthetic-standin-NOT-A-SECRET-0123456789abcdef0123456789abcd"
 ENVIRONMENT_LINE = "    environment: ${{ inputs.mode == 'source' && 'linux-source-read' || '' }}\n"
 MAIN_ENVIRONMENT_LINE = "    environment: ${{ inputs.mode == 'source' && github.ref == 'refs/heads/main' && 'linux-source-read-main' || inputs.mode == 'source' && 'linux-source-read' || '' }}\n"
-LINUX_CONFINEMENT_WORKFLOW_SHA256 = "621b8f4340184efc8c834b8eba8897590bb10e7b680ed85cb43d444bfa3705f6"
+LINUX_CONFINEMENT_WORKFLOW_SHA256 = "4911ae082a7afe855a24e3f5259db33c41c00e4d558a7a42b576a52595e3841c"
 LINUX_LANE_FILES = (
     ".github/workflows/linux-confinement.yml",
     ".github/workflows/linux-confinement-diagnostic.yml",
@@ -62,7 +62,11 @@ class LinuxWorkflowPolicyTests(unittest.TestCase):
     def test_actual_linux_workflow_matches_closed_supported_shape(self):
         workflow = LINUX_WORKFLOW.read_text(encoding="utf-8")
         self.assertTrue(validate_workflow_text(workflow, "platform", "linux-confinement"))
-        self.assertNotIn("workflow_dispatch", workflow)
+        trigger = workflow.split("jobs:", 1)[0]
+        self.assertIn("on:\n  workflow_call:\n", trigger)
+        self.assertNotIn("workflow_dispatch", trigger)
+        self.assertNotIn("pull_request", trigger)
+        self.assertNotIn("push:", trigger)
         self.assertNotIn("promotion-check-reuse", workflow)
         self.assertNotIn("sudo ", workflow)
         self.assertNotIn("inputs:", workflow)
@@ -84,16 +88,15 @@ class LinuxWorkflowPolicyTests(unittest.TestCase):
     def test_linux_workflow_rejects_skips_masking_extra_execution_and_weak_permissions(self):
         base = LINUX_WORKFLOW.read_text(encoding="utf-8")
         mutations = (
+            base.replace("  workflow_call:\n", "  workflow_dispatch:\n", 1),
             base.replace("      - name: Run unprivileged source-free checks\n", "      - name: Extra execution\n        run: echo extra\n      - name: Run unprivileged source-free checks\n"),
             base.replace("      - name: Run unprivileged source-free checks\n        run: |", "      - name: Run unprivileged source-free checks\n        if: ${{ false }}\n        run: |"),
             base.replace("      - name: Run unprivileged source-free checks\n", "      - name: Run unprivileged source-free checks\n        continue-on-error: true\n"),
             base.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-latest\n"),
             base.replace("permissions: {}\n", "permissions:\n  contents: read\n"),
             base.replace("    timeout-minutes: 10\n", "    timeout-minutes: 0\n"),
-            base.replace("  pull_request:\n", "  pull_request:\n    branches: []\n"),
             base + "  extra:\n    runs-on: ubuntu-24.04\n    steps: []\n",
-            base.replace("  push:\n", "  workflow_dispatch:\n"),
-            base.replace("      - uat\n", "      - develop\n"),
+            base.replace("{1,200}", "{1,2}", 1),
         )
         for index, changed in enumerate(mutations):
             with self.subTest(mutation_index=index):
