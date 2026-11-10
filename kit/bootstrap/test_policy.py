@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import types
@@ -177,6 +178,78 @@ class WorkflowPolicyTests(unittest.TestCase):
             validate_workflow_text(workflow, "connect", "development-feedback-smoke")
         with self.assertRaises(PolicyError):
             validate_workflow_text(workflow + "\npermissions: write-all\n", "platform", "development-feedback-smoke")
+
+    def test_workflow_compiler_rejects_runner_context_in_job_env_and_malformed_feedback_yaml(self):
+        actionlint = shutil.which("actionlint")
+        if actionlint is None:
+            self.skipTest("actionlint is not installed")
+
+        workflow_paths = (
+            PLATFORM_WORKFLOW,
+            Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml",
+            Path(__file__).resolve().parents[2] / ".github/workflows/development-feedback-smoke.yml",
+        )
+        for path in workflow_paths:
+            with self.subTest(workflow=path.name):
+                result = subprocess.run(
+                    [actionlint, "-ignore", "SC2174", "-ignore", "SC2016", "-oneline", str(path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        feedback_text = workflow_paths[2].read_text(encoding="utf-8")
+        block_start = feedback_text.index("          if target.is_symlink():")
+        block_end = feedback_text.index("\n  feedback-smoke-audit:", block_start)
+        malformed_block = "\n".join(
+            line[10:] if line.startswith("          ") else line
+            for line in feedback_text[block_start:block_end].splitlines()
+        )
+        invalid_yaml = feedback_text[:block_start] + malformed_block + feedback_text[block_end:]
+        with tempfile.TemporaryDirectory() as temporary:
+            invalid_contexts = (
+                (
+                    "runner-os-context-negative.yml",
+                    "CI_RUNNER: ${{ runner.os }}",
+                ),
+                (
+                    "runner-temp-context-negative.yml",
+                    "PRIVATE_SCRATCH: ${{ runner.temp }}",
+                ),
+            )
+            for name, environment_line in invalid_contexts:
+                invalid_context = (
+                    "name: runner-context-negative\non: workflow_dispatch\njobs:\n  verify:\n"
+                    "    runs-on: ubuntu-24.04\n    env:\n      " + environment_line + "\n"
+                    "    steps:\n      - run: test -n \"${PRIVATE_SCRATCH:-$CI_RUNNER}\"\n"
+                )
+                path = Path(temporary) / name
+                path.write_text(invalid_context, encoding="utf-8")
+                result = subprocess.run(
+                    [actionlint, "-oneline", str(path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('context "runner" is not allowed here', result.stdout + result.stderr)
+            for name, text, expected in (
+                ("feedback-syntax-negative.yml", invalid_yaml, "could not find expected ':'"),
+            ):
+                path = Path(temporary) / name
+                path.write_text(text, encoding="utf-8")
+                result = subprocess.run(
+                    [actionlint, "-oneline", str(path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stdout + result.stderr)
 
     def test_attestation_probe_requires_exact_reviewed_workflow(self):
         path = Path(__file__).resolve().parents[2] / ".github/workflows/attestation-probe.yml"
@@ -431,7 +504,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("github.ref == 'refs/heads/main'", workflow)
         self.assertIn("runs-on: macos-15", workflow)
-        self.assertEqual(workflow.count("cache-mode: none"), 4)
+        self.assertEqual(workflow.count("KD_CACHE_POLICY_MODE: none"), 4)
         self.assertIn("permissions: {}", workflow)
         self.assertIn("needs: [macos-public-snapshot, macos-reviewed-smoke]", workflow)
         self.assertIn("if: ${{ always() }}", workflow)
@@ -526,8 +599,8 @@ class WorkflowPolicyTests(unittest.TestCase):
         workflow = MACOS_RUST_TOOLCHAIN_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(workflow, MACOS_RUST_TOOLCHAIN_WORKFLOW_TEMPLATE)
         self.assertTrue(validate_workflow_text(workflow, "platform", "macos-rust-toolchain-smoke"))
-        self.assertIn("workflow_dispatch:\ncache-mode: none\npermissions: {}", workflow)
-        self.assertEqual(workflow.count("cache-mode: none"), 4)
+        self.assertIn("workflow_dispatch:\nenv:\n  KD_CACHE_POLICY_MODE: none\npermissions: {}", workflow)
+        self.assertEqual(workflow.count("KD_CACHE_POLICY_MODE: none"), 4)
         self.assertIn("github.ref == 'refs/heads/main'", workflow)
         self.assertIn("runs-on: macos-15", workflow)
         self.assertIn("needs: macos-rust-toolchain-snapshot", workflow)
@@ -648,8 +721,8 @@ class WorkflowPolicyTests(unittest.TestCase):
             base.replace("  workflow_dispatch:\n", "  push:\n"),
             base.replace("github.ref == 'refs/heads/main'", "github.ref == 'refs/heads/feature'"),
             base.replace("runs-on: macos-15", "runs-on: macos-latest"),
-            base.replace("cache-mode: none\n", "cache-mode: read\n", 1),
-            base.replace("    cache-mode: none\n", "", 1),
+            base.replace("KD_CACHE_POLICY_MODE: none\n", "KD_CACHE_POLICY_MODE: read\n", 1),
+            base.replace("      KD_CACHE_POLICY_MODE: none\n", "", 1),
             base.replace("    if: ${{ always() }}\n", "    if: ${{ success() }}\n"),
             base.replace("      actions: read\n      checks: read\n", "      actions: write\n      checks: write\n"),
             base.replace("permissions: {}\n", "permissions:\n  contents: read\n", 1),
@@ -679,8 +752,8 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_macos_reviewed_build_workflow_rejects_cache_source_and_audit_bypasses(self):
         base = MACOS_REVIEWED_BUILD_WORKFLOW.read_text(encoding="utf-8")
         mutations = (
-            base.replace("cache-mode: none\n", "cache-mode: read\n", 1),
-            base.replace("    cache-mode: none\n", "", 1),
+            base.replace("KD_CACHE_POLICY_MODE: none\n", "KD_CACHE_POLICY_MODE: read\n", 1),
+            base.replace("      KD_CACHE_POLICY_MODE: none\n", "", 1),
             base.replace("github.ref == 'refs/heads/main'", "github.ref == 'refs/heads/feature'"),
             base.replace("runs-on: macos-15", "runs-on: macos-latest"),
             base.replace("needs: [macos-public-snapshot, macos-reviewed-smoke]", "needs: macos-reviewed-smoke"),
@@ -707,14 +780,14 @@ class WorkflowPolicyTests(unittest.TestCase):
         workflow = MACOS_CACHE_PROOF_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(workflow, MACOS_CACHE_PROOF_WORKFLOW_TEMPLATE)
         self.assertTrue(validate_workflow_text(workflow, "platform", "macos-cache-proof"))
-        self.assertIn("workflow_dispatch:\ncache-mode: none\npermissions: {}", workflow)
+        self.assertIn("workflow_dispatch:\nenv:\n  KD_CACHE_POLICY_MODE: none\npermissions: {}", workflow)
         self.assertIn("github.ref == 'refs/heads/main'", workflow)
         self.assertEqual(workflow.count("runs-on: macos-15"), 3)
-        self.assertEqual(workflow.count("cache-mode: none"), 5)
+        self.assertEqual(workflow.count("KD_CACHE_POLICY_MODE: none"), 5)
         self.assertIn("  macos-cache-seed:\n", workflow)
-        self.assertIn("    cache-mode: write\n", workflow)
+        self.assertIn("      KD_CACHE_POLICY_MODE: write\n", workflow)
         self.assertIn("  macos-cache-positive:\n", workflow)
-        self.assertIn("    cache-mode: read\n", workflow)
+        self.assertIn("      KD_CACHE_POLICY_MODE: read\n", workflow)
         self.assertIn("  macos-cache-none-probe:\n", workflow)
         self.assertNotIn("ACTIONS_CACHE_MODE:", workflow)
         self.assertIn("fail-on-cache-miss: true", workflow)
@@ -825,16 +898,20 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_macos_cache_proof_rejects_mode_pin_scope_and_evidence_bypasses(self):
         base = MACOS_CACHE_PROOF_WORKFLOW.read_text(encoding="utf-8")
         mutations = (
-            base.replace("cache-mode: none\n", "cache-mode: read\n", 1),
-            base.replace("    cache-mode: write\n", "    cache-mode: none\n", 1),
-            base.replace("    cache-mode: read\n", "    cache-mode: none\n", 1),
+            base.replace("KD_CACHE_POLICY_MODE: none\n", "KD_CACHE_POLICY_MODE: read\n", 1),
+            base.replace("      KD_CACHE_POLICY_MODE: write\n", "      KD_CACHE_POLICY_MODE: none\n", 1),
+            base.replace("      KD_CACHE_POLICY_MODE: read\n", "      KD_CACHE_POLICY_MODE: none\n", 1),
             base.replace(
                 "  macos-cache-none-probe:\n    needs: macos-cache-positive\n"
                 "    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}\n"
-                "    runs-on: macos-15\n    cache-mode: none\n",
+                "    runs-on: macos-15\n    timeout-minutes: 10\n    permissions: {}\n"
+                "    defaults:\n      run:\n        shell: bash\n    env:\n"
+                "      KD_CACHE_POLICY_MODE: none\n",
                 "  macos-cache-none-probe:\n    needs: macos-cache-positive\n"
                 "    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}\n"
-                "    runs-on: macos-15\n    cache-mode: read\n",
+                "    runs-on: macos-15\n    timeout-minutes: 10\n    permissions: {}\n"
+                "    defaults:\n      run:\n        shell: bash\n    env:\n"
+                "      KD_CACHE_POLICY_MODE: read\n",
             ),
             base.replace("          mode: read\n          path: ${{ runner.temp }}/macos-public-cache/fixture.txt\n",
                          "          mode: write\n          path: ${{ runner.temp }}/macos-public-cache/fixture.txt\n"),
@@ -887,7 +964,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                 self.assertTrue(workflow.startswith(
                     "name: " + workflow_name + "\non:\n  workflow_dispatch:\n"
                 ))
-                self.assertIn("cache-mode: none\npermissions: {}", workflow)
+                self.assertIn("env:\n  KD_CACHE_POLICY_MODE: none\npermissions: {}", workflow)
                 self.assertIn("github.ref == 'refs/heads/main'", workflow)
                 self.assertIn("environment: " + environment, workflow)
                 self.assertEqual(workflow.count("environment:"), 1)
@@ -1225,7 +1302,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                     self.assertNotIn("macos-core-source-binding=verified", workflow)
                     self.assertNotIn('{"metadata":', workflow)
                 for changed in (
-                    workflow.replace("permissions: {}", "cache-mode: none\npermissions: {}", 1),
+                    workflow.replace("permissions: {}", "KD_CACHE_POLICY_MODE: none\npermissions: {}", 1),
                     workflow.replace(environment, "invalid-environment", 1),
                     workflow.replace(MACOS_SOURCE_READER_ACTION_SHA, "0" * 40),
                     workflow.replace("actions: read\n      checks: read", "actions: write\n      checks: read"),
@@ -1239,7 +1316,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(workflow.encode("utf-8")).hexdigest(), MACOS_CORE_CONTRACT_WORKFLOW_SHA256)
         self.assertTrue(validate_workflow_text(workflow, "platform", "macos-core-contract"))
         self.assertTrue(workflow.startswith("name: macos-core-contract\non:\n  workflow_dispatch:\n"))
-        self.assertIn("cache-mode: none\npermissions: {}", workflow)
+        self.assertIn("env:\n  KD_CACHE_POLICY_MODE: none\npermissions: {}", workflow)
         self.assertIn("github.ref == 'refs/heads/main'", workflow)
         self.assertIn("environment: source-read", workflow)
         self.assertEqual(workflow.count("environment:"), 1)
@@ -1302,7 +1379,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, workflow)
         for changed in (
-            workflow.replace("cache-mode: none", "cache-mode: write", 1),
+            workflow.replace("KD_CACHE_POLICY_MODE: none", "KD_CACHE_POLICY_MODE: write", 1),
             workflow.replace("environment: source-read", "environment: untrusted", 1),
             workflow.replace(MACOS_SOURCE_READER_ACTION_SHA, "0" * 40),
             workflow.replace("actions: read\n      checks: read", "actions: write\n      checks: read"),
@@ -1708,6 +1785,14 @@ class LaneRegistryTests(unittest.TestCase):
                 self.assertTrue(validate_workflow_text(text, "platform", kind))
                 with self.assertRaises(PolicyError):
                     validate_workflow_text(text + "\n", "platform", kind)
+                if kind == "devlane-encrypted":
+                    initialize = 'RUN_ROOT="$RUNNER_TEMP/devlane-$CI_RUN_ID"'
+                    persist = 'printf \'RUN_ROOT=%s\\n\' "$RUN_ROOT" >> "$GITHUB_ENV"'
+                    self.assertIn(initialize, text)
+                    self.assertIn("          export RUN_ROOT\n", text)
+                    self.assertIn(persist, text)
+                    self.assertLess(text.index(initialize), text.index('mkdir -m 700 "$RUN_ROOT"'))
+                    self.assertLess(text.index(persist), text.index('mkdir -m 700 "$RUN_ROOT"'))
                 with self.assertRaises(PolicyError):
                     validate_workflow_text(text, "connect", kind)
 

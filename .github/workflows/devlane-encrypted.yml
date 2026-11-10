@@ -89,13 +89,15 @@ jobs:
       DEVLANE_PROJECTION_SIZE: ${{ inputs.projection_size }}
       DEVLANE_EXPIRES: ${{ inputs.expires }}
       DEVLANE_CACHE_BASELINE_SHA256: ${{ inputs.cache_baseline_sha256 }}
-      RUN_ROOT: ${{ runner.temp }}/devlane-${{ github.run_id }}
     steps:
       - name: Fetch public control and validate dispatch
         timeout-minutes: 10
         run: |
           set -euo pipefail
           umask 077
+          RUN_ROOT="$RUNNER_TEMP/devlane-$CI_RUN_ID"
+          export RUN_ROOT
+          printf 'RUN_ROOT=%s\n' "$RUN_ROOT" >> "$GITHUB_ENV"
           [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" ]]
           [[ "$CI_REPOSITORY_ID" == "1430960557" ]]
           [[ "$CI_SERVER_URL" == "https://github.com" ]]

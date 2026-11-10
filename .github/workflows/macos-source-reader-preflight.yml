@@ -1,13 +1,13 @@
 name: macos-source-reader-preflight
 on:
   workflow_dispatch:
-cache-mode: none
+env:
+  KD_CACHE_POLICY_MODE: none
 permissions: {}
 jobs:
   macos-source-reader-settings:
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
-    cache-mode: none
     timeout-minutes: 15
     permissions:
       actions: read
@@ -17,6 +17,7 @@ jobs:
       run:
         shell: bash
     env:
+      KD_CACHE_POLICY_MODE: none
       CI_REPOSITORY: ${{ github.repository }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}
@@ -66,13 +67,13 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     environment: source-read
     runs-on: ubuntu-24.04
-    cache-mode: none
     timeout-minutes: 10
     permissions: {}
     defaults:
       run:
         shell: bash
     env:
+      KD_CACHE_POLICY_MODE: none
       CI_REPOSITORY: ${{ github.repository }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}
@@ -195,7 +196,6 @@ jobs:
     if: ${{ always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     needs: [macos-source-reader-settings, macos-source-reader-token]
     runs-on: ubuntu-24.04
-    cache-mode: none
     timeout-minutes: 10
     permissions:
       actions: read
@@ -204,6 +204,7 @@ jobs:
       run:
         shell: bash
     env:
+      KD_CACHE_POLICY_MODE: none
       CI_REPOSITORY: ${{ github.repository }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}

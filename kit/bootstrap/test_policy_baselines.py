@@ -47,7 +47,7 @@ class BaselinesWorkflowPolicyTests(unittest.TestCase):
             workflow,
         )
         self.assertIn("permissions: {}\n", workflow)
-        self.assertEqual(workflow.count("cache-mode: none\n"), 2)
+        self.assertEqual(workflow.count("KD_CACHE_POLICY_MODE: none\n"), 2)
         self.assertIn("fail-fast: false", workflow)
         for forbidden in (
             "inputs:",
@@ -80,7 +80,7 @@ class BaselinesWorkflowPolicyTests(unittest.TestCase):
             base.replace("runner: windows-2025\n", "runner: windows-latest\n"),
             base.replace("\npermissions: {}\n", "\npermissions:\n  contents: read\n", 1),
             base.replace("    permissions: {}\n", "    permissions:\n      contents: read\n", 1),
-            base.replace("cache-mode: none\n", "", 1),
+            base.replace("KD_CACHE_POLICY_MODE: none\n", "", 1),
             base.replace("    fail-fast: false\n", "    fail-fast: true\n"),
             base.replace("      - name: Validate source-free control tree\n", ""),
             base.replace(

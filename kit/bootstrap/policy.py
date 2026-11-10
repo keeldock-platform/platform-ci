@@ -21,12 +21,12 @@ MAX_RESULT_BYTES = 2048
 MAX_COUNT = 100000
 MAX_DURATION_MS = 86400000
 MACOS_SOURCE_READER_ACTION_SHA = "64ab729a6294000f5aa4a4bc0b73d1f32bc45510"
-MACOS_SOURCE_READER_WORKFLOW_SHA256 = "6c7e82c8a9d91436ae98f1357fd0fe4f09847f5fd17abc4843eadb130405b626"
-MACOS_RULES_SOURCE_READER_WORKFLOW_SHA256 = "cb9b70226175069e9c148c06f18d4d89cf8b6d5b33b39e02579a4aa2de5ee8a6"
+MACOS_SOURCE_READER_WORKFLOW_SHA256 = "e6082feb71990ef2590c791f09927d6a33a277d0bfc60cf2a6ab472ab4f417fc"
+MACOS_RULES_SOURCE_READER_WORKFLOW_SHA256 = "c0f145c306a6fff9739496d2a6b352016f4203cb5836807cefc3b862facf8431"
 MACOS_RULES_BOOTSTRAP_WORKFLOW_SHA256 = "f56e0c0eb86493c320a72048201d4bfae6bedbec46ee85a8b027674d5cd62d3a"
 MACOS_CORE_BOOTSTRAP_WORKFLOW_SHA256 = "b140312f22310633089594255fb17d25aeece02869355e608408098c4e91a4eb"
-MACOS_CORE_CONTRACT_WORKFLOW_SHA256 = "38c33a1b30bc18378359910af0da73e493026e8105511062f96f6f80fafbe096"
-DEVELOPMENT_FEEDBACK_SMOKE_WORKFLOW_SHA256 = "8b9d13aec533e4a1b3637e4cc117cad67d820558cb309891aef51e9e8f623160"
+MACOS_CORE_CONTRACT_WORKFLOW_SHA256 = "e55f8d95bb4666a965912b2832aa68aded0f6c166c324082e61ca599b7bac9cc"
+DEVELOPMENT_FEEDBACK_SMOKE_WORKFLOW_SHA256 = "380f71c2f95239492dea787383eadc648077d75ce676d9640186ff3b88dc65a9"
 
 
 class PolicyError(ValueError):
@@ -154,9 +154,10 @@ jobs:
       CI_EVENT_NAME: ${{ github.event_name }}
       CI_WORKSPACE: ${{ github.workspace }}
       CI_CONTROL_WAVE_ID: ${{ inputs.control_wave_id }}
-      CI_RUNNER: ${{ runner.os }}
     steps:
       - name: Fetch public control and validate manual protected-branch dispatch
+        env:
+          CI_RUNNER: ${{ runner.os }}
         run: |
           set -euo pipefail
           [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" ]]
@@ -226,7 +227,6 @@ jobs:
       CI_CONTROL_WAVE_ID: ${{ inputs.control_wave_id }}
       GITHUB_RUN_ID: ${{ github.run_id }}
       GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
-      DEVLANE_CONTROL_EVIDENCE_PATH: ${{ runner.temp }}/devlane-control-evidence/permit.json
     steps:
       - name: Fetch public control and validate manual protected-branch dispatch
         run: |
@@ -248,6 +248,7 @@ jobs:
       - name: Audit the exact 18-job control graph
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          DEVLANE_CONTROL_EVIDENCE_PATH: ${{ runner.temp }}/devlane-control-evidence/permit.json
         run: python3 -B kit/devlane/control_audit.py
       - name: Save exact source-free control evidence
         if: ${{ github.ref == 'refs/heads/main' }}
@@ -430,13 +431,13 @@ jobs:
 MACOS_REVIEWED_BUILD_WORKFLOW_TEMPLATE = r"""name: macos-reviewed-build
 on:
   workflow_dispatch:
-cache-mode: none
+env:
+  KD_CACHE_POLICY_MODE: none
 permissions: {}
 jobs:
   macos-public-snapshot:
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
-    cache-mode: none
     timeout-minutes: 10
     defaults:
       run:
@@ -446,6 +447,7 @@ jobs:
     outputs:
       cache_snapshot: ${{ steps.snapshot.outputs.cache_snapshot }}
     env:
+      KD_CACHE_POLICY_MODE: none
       CI_REPOSITORY: ${{ github.repository }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}
@@ -482,13 +484,13 @@ jobs:
     needs: macos-public-snapshot
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: macos-15
-    cache-mode: none
     timeout-minutes: 20
     permissions: {}
     defaults:
       run:
         shell: bash
     env:
+      KD_CACHE_POLICY_MODE: none
       CI_REPOSITORY: ${{ github.repository }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}
@@ -590,7 +592,6 @@ jobs:
     if: ${{ always() }}
     needs: [macos-public-snapshot, macos-reviewed-smoke]
     runs-on: ubuntu-24.04
-    cache-mode: none
     timeout-minutes: 10
     defaults:
       run:
@@ -599,6 +600,7 @@ jobs:
       actions: read
       checks: read
     env:
+      KD_CACHE_POLICY_MODE: none
       CI_REPOSITORY: ${{ github.repository }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}
@@ -637,13 +639,13 @@ jobs:
 MACOS_RUST_TOOLCHAIN_WORKFLOW_TEMPLATE = r"""name: macos-rust-toolchain-smoke
 on:
   workflow_dispatch:
-cache-mode: none
+env:
+  KD_CACHE_POLICY_MODE: none
 permissions: {}
 jobs:
   macos-rust-toolchain-snapshot:
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
-    cache-mode: none
     timeout-minutes: 10
     defaults:
       run:
@@ -653,6 +655,7 @@ jobs:
     outputs:
       cache_snapshot: ${{ steps.snapshot.outputs.cache_snapshot }}
     env:
+      KD_CACHE_POLICY_MODE: none
       CI_REPOSITORY: ${{ github.repository }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}
@@ -689,13 +692,13 @@ jobs:
     needs: macos-rust-toolchain-snapshot
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: macos-15
-    cache-mode: none
     timeout-minutes: 35
     permissions: {}
     defaults:
       run:
         shell: bash
     env:
+      KD_CACHE_POLICY_MODE: none
       CI_REPOSITORY: ${{ github.repository }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}
@@ -863,7 +866,6 @@ jobs:
     if: ${{ always() }}
     needs: [macos-rust-toolchain-snapshot, macos-rust-toolchain-smoke]
     runs-on: ubuntu-24.04
-    cache-mode: none
     timeout-minutes: 10
     defaults:
       run:
@@ -872,6 +874,7 @@ jobs:
       actions: read
       checks: read
     env:
+      KD_CACHE_POLICY_MODE: none
       CI_REPOSITORY: ${{ github.repository }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}
@@ -911,13 +914,13 @@ MACOS_CACHE_PROOF_ACTION_SHA = "3edfce9056124e459a23f683a21433670d47daca"
 MACOS_CACHE_PROOF_WORKFLOW_TEMPLATE = r"""name: macos-cache-proof
 on:
   workflow_dispatch:
-cache-mode: none
+env:
+  KD_CACHE_POLICY_MODE: none
 permissions: {}
 jobs:
   macos-cache-public-snapshot:
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
-    cache-mode: none
     timeout-minutes: 10
     defaults:
       run:
@@ -927,6 +930,7 @@ jobs:
     outputs:
       cache_snapshot: ${{ steps.snapshot.outputs.cache_snapshot }}
     env:
+      KD_CACHE_POLICY_MODE: none
       CI_REPOSITORY: ${{ github.repository }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}
@@ -963,13 +967,13 @@ jobs:
     needs: macos-cache-public-snapshot
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: macos-15
-    cache-mode: write
     timeout-minutes: 10
     permissions: {}
     defaults:
       run:
         shell: bash
     env:
+      KD_CACHE_POLICY_MODE: write
       CI_REPOSITORY: ${{ github.repository }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}
@@ -1022,13 +1026,13 @@ jobs:
     needs: macos-cache-seed
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: macos-15
-    cache-mode: read
     timeout-minutes: 10
     permissions: {}
     defaults:
       run:
         shell: bash
     env:
+      KD_CACHE_POLICY_MODE: read
       CI_REPOSITORY: ${{ github.repository }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}
@@ -1079,13 +1083,13 @@ jobs:
     needs: macos-cache-positive
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: macos-15
-    cache-mode: none
     timeout-minutes: 10
     permissions: {}
     defaults:
       run:
         shell: bash
     env:
+      KD_CACHE_POLICY_MODE: none
       CI_REPOSITORY: ${{ github.repository }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}
@@ -1178,7 +1182,6 @@ jobs:
     if: ${{ always() }}
     needs: [macos-cache-public-snapshot, macos-cache-seed, macos-cache-positive, macos-cache-none-probe]
     runs-on: ubuntu-24.04
-    cache-mode: none
     timeout-minutes: 10
     defaults:
       run:
@@ -1187,6 +1190,7 @@ jobs:
       actions: read
       checks: read
     env:
+      KD_CACHE_POLICY_MODE: none
       CI_REPOSITORY: ${{ github.repository }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}
@@ -1223,7 +1227,6 @@ jobs:
     if: ${{ always() }}
     needs: [macos-cache-public-snapshot, macos-cache-seed, macos-cache-positive, macos-cache-none-probe, macos-cache-public-audit]
     runs-on: ubuntu-24.04
-    cache-mode: none
     timeout-minutes: 10
     defaults:
       run:
@@ -1231,6 +1234,7 @@ jobs:
     permissions:
       actions: write
     env:
+      KD_CACHE_POLICY_MODE: none
       CI_REPOSITORY: ${{ github.repository }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}

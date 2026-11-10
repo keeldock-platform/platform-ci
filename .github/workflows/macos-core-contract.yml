@@ -18,19 +18,20 @@ on:
           - main
           - develop
           - uat
-cache-mode: none
+env:
+  KD_CACHE_POLICY_MODE: none
 permissions: {}
 jobs:
   macos-core-contract-settings:
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
-    cache-mode: none
     timeout-minutes: 10
     permissions:
       actions: read
     outputs:
       cache_snapshot: ${{ steps.snapshot.outputs.cache_snapshot }}
     env:
+      KD_CACHE_POLICY_MODE: none
       CI_REPOSITORY: ${{ github.repository }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}
@@ -87,7 +88,6 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: macos-15
     environment: source-read
-    cache-mode: none
     timeout-minutes: 60
     permissions: {}
     outputs:
@@ -96,6 +96,7 @@ jobs:
       run:
         shell: bash
     env:
+      KD_CACHE_POLICY_MODE: none
       CI_REPOSITORY: ${{ github.repository }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}
@@ -547,7 +548,6 @@ jobs:
       - macos-core-contract-settings
       - macos-core-contract
     runs-on: ubuntu-24.04
-    cache-mode: none
     timeout-minutes: 15
     permissions:
       actions: read
@@ -556,6 +556,7 @@ jobs:
       run:
         shell: bash
     env:
+      KD_CACHE_POLICY_MODE: none
       CI_REPOSITORY: ${{ github.repository }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}

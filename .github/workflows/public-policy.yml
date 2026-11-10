@@ -35,9 +35,10 @@ jobs:
       CI_EVENT_NAME: ${{ github.event_name }}
       CI_WORKSPACE: ${{ github.workspace }}
       CI_CONTROL_WAVE_ID: ${{ inputs.control_wave_id }}
-      CI_RUNNER: ${{ runner.os }}
     steps:
       - name: Fetch public control and validate manual protected-branch dispatch
+        env:
+          CI_RUNNER: ${{ runner.os }}
         run: |
           set -euo pipefail
           [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" ]]
@@ -107,7 +108,6 @@ jobs:
       CI_CONTROL_WAVE_ID: ${{ inputs.control_wave_id }}
       GITHUB_RUN_ID: ${{ github.run_id }}
       GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
-      DEVLANE_CONTROL_EVIDENCE_PATH: ${{ runner.temp }}/devlane-control-evidence/permit.json
     steps:
       - name: Fetch public control and validate manual protected-branch dispatch
         run: |
@@ -129,6 +129,7 @@ jobs:
       - name: Audit the exact 18-job control graph
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          DEVLANE_CONTROL_EVIDENCE_PATH: ${{ runner.temp }}/devlane-control-evidence/permit.json
         run: python3 -B kit/devlane/control_audit.py
       - name: Save exact source-free control evidence
         if: ${{ github.ref == 'refs/heads/main' }}

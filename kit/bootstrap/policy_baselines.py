@@ -15,7 +15,8 @@ code that the candidate checker validates when the pool is platform.
 BASELINES_PREPARE_WORKFLOW_TEMPLATE = """name: baselines-prepare
 on:
   workflow_dispatch:
-cache-mode: none
+env:
+  KD_CACHE_POLICY_MODE: none
 permissions: {}
 jobs:
   baselines-prepare:
@@ -32,13 +33,13 @@ jobs:
           - platform: macos
             runner: macos-15
     runs-on: ${{ matrix.runner }}
-    cache-mode: none
     timeout-minutes: 20
     permissions: {}
     defaults:
       run:
         shell: bash
     env:
+      KD_CACHE_POLICY_MODE: none
       CI_REPOSITORY: ${{ github.repository }}
       CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}

@@ -113,16 +113,16 @@ jobs:
             python_command=python
           fi
           "$python_command" -B -c 'import os, stat, sys; from pathlib import Path; base=Path(sys.argv[1]).resolve(strict=True); directory=base / "feedback-smoke"; target=directory / "build-diagnostic-return-v1.enc";
-if target.is_symlink(): raise SystemExit(1)
-try: metadata=target.lstat()
-except FileNotFoundError: metadata=None
-if metadata is not None:
-    if not stat.S_ISREG(metadata.st_mode): raise SystemExit(1)
-    target.unlink()
-if directory.is_symlink(): raise SystemExit(1)
-if directory.exists():
-    if not directory.is_dir(): raise SystemExit(1)
-    directory.rmdir()' "$RUNNER_TEMP"
+          if target.is_symlink(): raise SystemExit(1)
+          try: metadata=target.lstat()
+          except FileNotFoundError: metadata=None
+          if metadata is not None:
+              if not stat.S_ISREG(metadata.st_mode): raise SystemExit(1)
+              target.unlink()
+          if directory.is_symlink(): raise SystemExit(1)
+          if directory.exists():
+              if not directory.is_dir(): raise SystemExit(1)
+              directory.rmdir()' "$RUNNER_TEMP"
   feedback-smoke-audit:
     if: ${{ always() }}
     needs: feedback-smoke-producer

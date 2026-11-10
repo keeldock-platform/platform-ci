@@ -318,14 +318,15 @@ class ActionPinTests(unittest.TestCase):
 
 
 class JobPermissionTests(unittest.TestCase):
-    def test_actual_lane_workflow_has_closed_permissions_and_cache_mode(self):
+    def test_actual_lane_workflow_has_closed_permissions_and_cache_policy_metadata(self):
         self.assertEqual(validate_job_permissions(ROOT), 1)
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(validate_lane_controls(text), 1)
         for expected in (
             "  workflow_dispatch:\n",
             "permissions: {}\n",
-            "cache-mode: none\n",
+            "env:\n  KD_CACHE_POLICY_MODE: none\n",
+            "      KD_CACHE_POLICY_MODE: none\n",
             "runs-on: ${{ matrix.runner }}\n",
             "runner: ubuntu-24.04\n",
             "runner: windows-2025\n",
@@ -356,9 +357,12 @@ class JobPermissionTests(unittest.TestCase):
             ("permissions_invalid", base.replace("\npermissions: {}\n", "\n", 1)),
             ("permissions_invalid", base.replace("PYTHONDONTWRITEBYTECODE", "TOKEN: ${{ secrets.TOKEN }}\n      PYTHONDONTWRITEBYTECODE", 1)),
             ("permissions_invalid", base.replace("    timeout-minutes: 20\n", "    timeout-minutes: 20\n    secrets: inherit\n", 1)),
-            ("cache_mode_invalid", base.replace("\ncache-mode: none\n", "\n", 1)),
-            ("cache_mode_invalid", base.replace("    cache-mode: none\n", "", 1)),
-            ("cache_mode_invalid", base.replace("    cache-mode: none\n", "    cache-mode: read\n", 1)),
+            ("cache_mode_invalid", base.replace("  KD_CACHE_POLICY_MODE: none\n", "", 1)),
+            ("cache_mode_invalid", base.replace("      KD_CACHE_POLICY_MODE: none\n", "", 1)),
+            ("cache_mode_invalid", base.replace("      KD_CACHE_POLICY_MODE: none\n", "      KD_CACHE_POLICY_MODE: read\n", 1)),
+            ("cache_mode_invalid", base.replace("  KD_CACHE_POLICY_MODE: none\n", "  KD_CACHE_POLICY_MODE: read\n", 1)),
+            ("cache_mode_invalid", base.replace("  KD_CACHE_POLICY_MODE: none\n", "  cache-mode: none\n", 1)),
+            ("cache_mode_invalid", base.replace("      KD_CACHE_POLICY_MODE: none\n", "      cache-mode: none\n", 1)),
         )
         for code, changed in mutations:
             with self.subTest(code=code, size=len(changed)):

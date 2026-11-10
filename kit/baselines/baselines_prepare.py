@@ -1,7 +1,7 @@
 """Source-free baselines preparation slice.
 
 This lane covers only the slice named SLICE_NAME: action pin validation, job
-permission and cache-mode validation, runner identity, native tool presence and
+permission and cache-policy metadata validation, runner identity, native tool presence and
 the closed record schema with its summary channel. It is not the full
 preparation gate. The proofs listed in OUTSTANDING_PROOFS are not performed, so
 a later source-bearing check must never read this output as the complete gate.
@@ -459,18 +459,22 @@ def validate_lane_controls(text):
     in_jobs = False
     jobs = 0
     job_permissions = 0
-    job_cache = 0
+    job_cache = []
     top_permissions = 0
-    top_cache = 0
+    top_cache = []
     for line in text.split("\n"):
         stripped = line.strip()
         if "secrets" in line or "inherit" in line:
             raise BaselinesRefusal("permissions_invalid")
-        if stripped.startswith("cache-mode:") and line not in (
-            "cache-mode: none",
-            "    cache-mode: none",
-        ):
+        if stripped.startswith("cache-mode:"):
             raise BaselinesRefusal("cache_mode_invalid")
+        if "KD_CACHE_POLICY_MODE:" in line:
+            if line.startswith("      KD_CACHE_POLICY_MODE:") and in_jobs:
+                job_cache.append(line.removeprefix("      KD_CACHE_POLICY_MODE:").strip())
+            elif line.startswith("  KD_CACHE_POLICY_MODE:") and not in_jobs:
+                top_cache.append(line.removeprefix("  KD_CACHE_POLICY_MODE:").strip())
+            else:
+                raise BaselinesRefusal("cache_mode_invalid")
         if ACCESS_LEVEL_RE.match(line) is not None:
             raise BaselinesRefusal("permissions_invalid")
         if stripped.startswith("permissions:") and line not in (
@@ -483,8 +487,6 @@ def validate_lane_controls(text):
             in_jobs = top.group(1) == "jobs"
             if line == "permissions: {}":
                 top_permissions += 1
-            elif line == "cache-mode: none":
-                top_cache += 1
             continue
         if not in_jobs:
             continue
@@ -492,11 +494,11 @@ def validate_lane_controls(text):
             jobs += 1
         elif line == "    permissions: {}":
             job_permissions += 1
-        elif line == "    cache-mode: none":
-            job_cache += 1
     if top_permissions != 1 or jobs < 1 or job_permissions != jobs:
         raise BaselinesRefusal("permissions_invalid")
-    if top_cache != 1 or job_cache != jobs:
+    if top_cache != ["none"] or len(job_cache) != jobs or any(
+        value != "none" for value in job_cache
+    ):
         raise BaselinesRefusal("cache_mode_invalid")
     return jobs
 
