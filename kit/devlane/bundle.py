@@ -233,6 +233,25 @@ def _manifest(payload, expected, inventory):
     for path in value["allowed_files"]:
         if _safe_member_name(path) not in inventory:
             _refuse("inner-allowlist-file")
+    if value["profile"] == "core-rust":
+        scopes = ("root", "runtime", "fuzz", "listener")
+        required = {"root", "runtime", "listener"}
+        found = set()
+        for test_name in value["allowed_tests"]:
+            parts = test_name.split("::", 2)
+            if (len(parts) != 3 or parts[0] not in scopes or not parts[1].endswith("Cargo.toml")
+                    or not parts[2] or ".." in parts[1].split("/") or "\\" in parts[1]):
+                _refuse("inner-rust-test-identity")
+            if (parts[0] == "root" and (parts[1].startswith("runtime/") or parts[1].startswith("fuzz/"))
+                    or parts[0] == "runtime" and not parts[1].startswith("runtime/")
+                    or parts[0] == "fuzz" and parts[1] != "fuzz/Cargo.toml"
+                    or parts[0] == "listener" and parts[1] != "runtime/crates/services/listener/Cargo.toml"):
+                _refuse("inner-rust-test-scope")
+            found.add(parts[0])
+        if not required.issubset(found):
+            _refuse("inner-rust-test-map-incomplete")
+        if set(value["original_lockfiles"]) != {"Cargo.lock", "fuzz/Cargo.lock", "runtime/Cargo.lock"}:
+            _refuse("inner-rust-lockfile-set")
     if value["limits"] != {
         "ciphertext_bytes": MAX_CIPHERTEXT,
         "expanded_bytes": MAX_EXPANDED,

@@ -7,11 +7,13 @@ import io
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
 import zipfile
 import stat
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "confinement"))
@@ -30,18 +32,32 @@ LEDGER_FIELDS = {
     "bundle_sha256", "bundle_size", "projection_asset_id", "projection_sha256",
     "projection_size", "expires", "cache_baseline_sha256", "state", "created_at", "updated_at",
     "run_id", "authorized_run_id", "run_attempt", "cleanup_attempts", "cleanup_obligations",
-    "dispatch_requested_at",
+    "dispatch_requested_at", "dispatch_completed_at", "reconcile_deadline_at", "dispatch_result",
 }
 SECRET_NAME = "DEVLANE_DECRYPT_KEY"
 DECRYPT_STEP = "Decrypt authenticated bundle"
 RUN_JOB_NAME = "devlane-encrypted-run"
 MAX_REVOKE_LATENCY_SECONDS = 120
+GH_STATUS_TIMEOUT_SECONDS = 15
+DISPATCH_RECONCILE_SECONDS = 300
+CONTROL_RECONCILE_SECONDS = 300
 DECRYPT_ENVIRONMENT = "devlane-decrypt"
 TERMINAL = {"success", "failure", "cancelled", "skipped", "timed_out", "action_required", "neutral", "stale"}
 
 
 class Refusal(ValueError):
     pass
+
+
+def _raise_interrupted(signum, frame):
+    raise KeyboardInterrupt
+
+
+def _verify_signal_handlers():
+    for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+        number = getattr(signal, name, None)
+        if number is not None:
+            signal.signal(number, _raise_interrupted)
 
 
 def _fail(code):
@@ -175,32 +191,90 @@ def _control_record(root, control_sha, control_run_id):
         record = bundle.strict_json(path.read_bytes(), 4096)
     except (OSError, bundle.Refusal):
         _fail("control-evidence-required")
-    if (type(record) is not dict or set(record) != {"schema", "control_sha", "control_run_id", "status", "verified_at"}
-            or record.get("schema") != 1 or record.get("control_sha") != control_sha
-            or record.get("control_run_id") != control_run_id or record.get("status") != "passed"):
+    if (type(record) is not dict or set(record) != {
+            "schema", "control_sha", "control_run_id", "control_wave_id", "status", "verified_at"}
+            or type(record.get("schema")) is not int or record["schema"] != 1
+            or record.get("control_sha") != control_sha
+            or record.get("control_run_id") != control_run_id or record.get("status") != "passed"
+            or type(record.get("control_wave_id")) is not str
+            or not control_audit.OPAQUE.fullmatch(record["control_wave_id"])
+            or type(record.get("verified_at")) is not str
+            or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z", record["verified_at"])
+            or _epoch(record["verified_at"]) is None):
         _fail("control-evidence-invalid")
     return record
 
 
-def record_control_evidence(ledger, control_run_id, control_sha):
+def _read_control_evidence_file(root, path):
+    match = re.fullmatch(r"control-evidence-([a-f0-9]{40})-([1-9][0-9]{0,18})\.json", path.name)
+    if match is None:
+        _fail("control-evidence-namespace")
+    return _control_record(root, match.group(1), match.group(2))
+
+
+def _pending_secret_waves(root):
+    pending = []
+    for current in root.glob("*.json"):
+        if current.name.startswith("control-dispatch-"):
+            wave_id = current.name[len("control-dispatch-"):-len(".json")]
+            _validate_wave_id(wave_id, "control-wave-id")
+            _read_control_dispatch(root, wave_id)
+            continue
+        if current.name.startswith("control-evidence-"):
+            _read_control_evidence_file(root, current)
+            continue
+        if current.name != current.stem + ".json" or not bundle.OPAQUE_ID.fullmatch(current.stem):
+            _fail("ledger-record-namespace")
+        record = _read(current)
+        if record["wave_id"] != current.stem:
+            _fail("ledger-wave-mismatch")
+        obligation = record["cleanup_obligations"].get("secret")
+        if type(obligation) is not dict or type(obligation.get("state")) is not str:
+            _fail("secret-obligation-invalid")
+        if obligation["state"] in ("installation-pending", "installed", "secret-delete-pending"):
+            pending.append(record["wave_id"])
+    return pending
+
+
+def recover_pending_secrets(ledger):
+    """Retry every durable secret cleanup obligation left by an interrupted coordinator."""
     root = _ledger_root(ledger)
-    if not re.fullmatch(r"[1-9][0-9]{0,18}", str(control_run_id)) or not bundle.GIT_SHA.fullmatch(control_sha):
+    pending = _pending_secret_waves(root)
+    for wave_id in pending:
+        revoke_secret(root, wave_id)
+    if _pending_secret_waves(root):
+        _fail("secret-recovery-incomplete")
+    print("secret_recovery=complete waves=" + str(len(pending)))
+
+
+def record_control_evidence(ledger, control_run_id, control_sha, control_wave_id):
+    root = _ledger_root(ledger)
+    if (not re.fullmatch(r"[1-9][0-9]{0,18}", str(control_run_id))
+            or not bundle.GIT_SHA.fullmatch(control_sha)
+            or type(control_wave_id) is not str or not control_audit.OPAQUE.fullmatch(control_wave_id)):
         _fail("control-evidence-input")
     run_id = str(control_run_id)
+    dispatch = _read_control_dispatch(root, control_wave_id)
+    if dispatch["control_sha"] != control_sha or dispatch["run_id"] != run_id:
+        _fail("control-dispatch-binding")
     run = _gh_json("repos/%s/actions/runs/%s" % (fetch.REPOSITORY, run_id))
     jobs_record = _gh_json("repos/%s/actions/runs/%s/jobs?filter=all&per_page=100&page=1" % (fetch.REPOSITORY, run_id))
     if (type(jobs_record) is not dict or jobs_record.get("total_count") != 18
             or type(jobs_record.get("jobs")) is not list or len(jobs_record["jobs"]) != 18):
         _fail("control-evidence-jobs")
-    control_audit.validate_terminal_control_run(run, jobs_record["jobs"], run_id, control_sha, require_main=True)
+    control_audit.validate_terminal_control_run(
+        run, jobs_record["jobs"], run_id, control_sha, require_main=True,
+        expected_wave_id=control_wave_id,
+    )
     key = "devlane-control-v1-" + run_id
     matches = [cache for cache in _cache_records() if type(cache) is dict and cache.get("key") == key]
     if len(matches) != 1 or type(matches[0].get("size_in_bytes")) is not int or matches[0]["size_in_bytes"] > 16 * 1024:
         _fail("control-evidence-cache")
     record = {
         "schema": 1, "control_sha": control_sha, "control_run_id": run_id,
-        "status": "passed", "verified_at": _timestamp(),
+        "control_wave_id": control_wave_id, "status": "passed", "verified_at": _timestamp(),
     }
+    _verify_remote_main(control_sha)
     _write_atomic(root / ("control-evidence-" + control_sha + "-" + run_id + ".json"), record)
     print("control_evidence=passed sha=" + control_sha + " run-id=" + run_id)
 
@@ -224,6 +298,8 @@ def reserve_wave(ledger, request):
         _fail("reservation-bounds")
     control_run_id = str(request["control_run_id"])
     _control_record(root, request["control_sha"], control_run_id)
+    if _pending_secret_waves(root):
+        _fail("secret-recovery-required")
     _verify_secret_absent()
     if type(request["release_id"]) is not str or not re.fullmatch(r"[1-9][0-9]{0,18}", request["release_id"]):
         _fail("reservation-release")
@@ -231,8 +307,16 @@ def reserve_wave(ledger, request):
     lock_descriptor = _acquire_lock(global_lock)
     try:
         for current in root.glob("*.json"):
-            if current.name.startswith("control-evidence-"):
+            if current.name.startswith("control-dispatch-"):
+                wave_id = current.name[len("control-dispatch-"):-len(".json")]
+                _validate_wave_id(wave_id, "control-wave-id")
+                _read_control_dispatch(root, wave_id)
                 continue
+            if current.name.startswith("control-evidence-"):
+                _read_control_evidence_file(root, current)
+                continue
+            if current.name != current.stem + ".json" or not bundle.OPAQUE_ID.fullmatch(current.stem):
+                _fail("ledger-record-namespace")
             record = _read(current)
             if record["wave_id"] != current.stem:
                 _fail("ledger-wave-mismatch")
@@ -253,6 +337,8 @@ def reserve_wave(ledger, request):
             "state": "reserved", "created_at": _timestamp(), "updated_at": None,
             "run_id": None, "authorized_run_id": None, "run_attempt": None,
             "dispatch_requested_at": None, "cleanup_attempts": [],
+            "dispatch_completed_at": None, "reconcile_deadline_at": None,
+            "dispatch_result": None,
             "cleanup_obligations": {
                 "secret": {"state": "not-installed"},
                 "bundle_asset": {"state": "not-uploaded"},
@@ -373,14 +459,22 @@ def transition(ledger, wave_id, action, run_id=None):
             _fail("ledger-transition")
         if recovering and record["authorized_run_id"] is not None:
             _fail("ledger-transition")
+        if action in ("mark-secret-installing", "mark-dispatch-requested", "attach-run"):
+            _verify_remote_main(record["control_sha"])
         if action == "mark-secret-installing":
+            _verify_secret_absent()
             _verify_environment()
         if action == "mark-secret-installed":
             _verify_environment()
             _verify_secret_present()
             record["cleanup_obligations"]["secret"] = {"state": "installed", "verified_at": _timestamp()}
+            if (type(record.get("reconcile_deadline_at")) is not int
+                    or record["reconcile_deadline_at"] <= int(time.time())):
+                record["reconcile_deadline_at"] = int(time.time()) + DISPATCH_RECONCILE_SECONDS
         if action == "mark-dispatch-requested":
             record["dispatch_requested_at"] = _timestamp()
+            if type(record.get("reconcile_deadline_at")) is not int:
+                record["reconcile_deadline_at"] = int(time.time()) + DISPATCH_RECONCILE_SECONDS
             record["cleanup_obligations"]["run"] = {"state": "dispatch-ambiguous"}
         if action == "attach-run":
             if type(run_id) is not str or not re.fullmatch(r"[1-9][0-9]{0,18}", run_id):
@@ -694,16 +788,35 @@ def _gh_delete(endpoint):
 
 
 def _gh_status(endpoint):
+    process = None
     try:
         process = subprocess.Popen(["gh", "api", "--include", endpoint], stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                    close_fds=True, env=os.environ.copy())
-        line = process.stdout.readline(256)
-        process.kill()
-        process.wait(timeout=5)
+        try:
+            output, _ = process.communicate(timeout=GH_STATUS_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _fail("github-verify-timeout-reap")
+            _fail("github-verify-timeout")
     except (OSError, subprocess.SubprocessError):
         _fail("github-verify-unavailable")
-    match = re.match(rb"^HTTP/[^ \r\n]+[ \t]+([0-9]{3})(?:[ \t]|\r?$)", line)
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
+    if len(output) > 16 * 1024 * 1024:
+        _fail("github-verify-response-too-large")
+    first = output.splitlines()[0] if output.splitlines() else b""
+    match = re.match(rb"^HTTP/[^ \r\n]+[ \t]+([0-9]{3})(?:[ \t]|\r?$)", first)
     if match is None:
         _fail("github-verify-unavailable")
     return int(match.group(1))
@@ -761,7 +874,7 @@ def _workflow_run_pages(endpoint):
     if result.returncode != 0:
         _fail("dispatch-run-inventory-unavailable")
     pages = bundle.strict_json(result.stdout, 16 * 1024 * 1024)
-    if type(pages) is not list or not pages:
+    if type(pages) is not list or not pages or len(pages) > 100:
         _fail("dispatch-run-inventory")
     runs, total_count = [], None
     for page in pages:
@@ -777,6 +890,141 @@ def _workflow_run_pages(endpoint):
     if total_count != len(runs):
         _fail("dispatch-run-inventory-incomplete")
     return runs
+
+
+def _verify_remote_main(expected_sha):
+    ref = _gh_json("repos/%s/git/ref/heads/main" % fetch.REPOSITORY)
+    value = (ref.get("object") or {}).get("sha") if type(ref) is dict else None
+    if value != expected_sha:
+        _fail("remote-main-moved")
+
+
+def _control_dispatch_path(root, wave_id):
+    return root / ("control-dispatch-" + wave_id + ".json")
+
+
+def _read_control_dispatch(root, wave_id):
+    path = _control_dispatch_path(root, wave_id)
+    try:
+        record = bundle.strict_json(path.read_bytes(), 4096)
+    except (OSError, bundle.Refusal):
+        _fail("control-dispatch-required")
+    expected = {"schema", "wave_id", "control_sha", "ref", "dispatch_started_at",
+                "reconcile_deadline_at", "dispatch_completed_at", "dispatch_result", "run_id"}
+    if (type(record) is not dict or set(record) != expected
+            or type(record.get("schema")) is not int or record["schema"] != 1
+            or record.get("wave_id") != wave_id or record.get("ref") != "main"
+            or type(record.get("control_sha")) is not str
+            or not bundle.GIT_SHA.fullmatch(record["control_sha"])
+            or type(record.get("dispatch_started_at")) is not int
+            or type(record.get("reconcile_deadline_at")) is not int
+            or record["reconcile_deadline_at"] <= record["dispatch_started_at"]
+            or record.get("dispatch_result") not in ("requested", "accepted", "ambiguous")
+            or (record.get("run_id") is not None and (type(record["run_id"]) is not str
+                or not re.fullmatch(r"[1-9][0-9]{0,18}", record["run_id"])))):
+        _fail("control-dispatch-invalid")
+    completed = record["dispatch_completed_at"]
+    if record["dispatch_result"] == "requested":
+        if completed is not None:
+            _fail("control-dispatch-invalid")
+    elif type(completed) is not int or completed < record["dispatch_started_at"]:
+        _fail("control-dispatch-invalid")
+    return record
+
+
+def _control_run_candidates(record):
+    endpoint = ("repos/%s/actions/workflows/public-policy.yml/runs?event=workflow_dispatch&branch=main&per_page=100"
+                % fetch.REPOSITORY)
+    candidates = []
+    expected_title = "public control=" + record["wave_id"]
+    start, end = record["dispatch_started_at"], record["reconcile_deadline_at"]
+    for run in _workflow_run_pages(endpoint):
+        if type(run) is not dict:
+            _fail("control-run-inventory-invalid")
+        repository = run.get("repository")
+        head_repository = run.get("head_repository")
+        created = _epoch(run.get("created_at"))
+        if (run.get("path") == control_audit.WORKFLOW_PATH
+                and run.get("event") == "workflow_dispatch"
+                and run.get("head_branch") == "main"
+                and run.get("head_sha") == record["control_sha"]
+                and run.get("run_attempt") == 1
+                and run.get("display_title") == expected_title
+                and type(repository) is dict and repository.get("full_name") == fetch.REPOSITORY
+                and str(repository.get("id")) == fetch.REPOSITORY_ID
+                and type(head_repository) is dict and head_repository.get("full_name") == fetch.REPOSITORY
+                and str(head_repository.get("id")) == fetch.REPOSITORY_ID
+                and created is not None and start <= created <= end):
+            run_id = str(run.get("id", ""))
+            if re.fullmatch(r"[1-9][0-9]{0,18}", run_id):
+                candidates.append(run_id)
+    return candidates
+
+
+def dispatch_control(ledger, control_sha, control_wave_id, *, poll_seconds=10,
+                     timeout_seconds=CONTROL_RECONCILE_SECONDS, sleep=time.sleep, clock=time.time):
+    """Dispatch the source-free main control once, then reconcile only this persisted wave."""
+    root = _ledger_root(ledger)
+    if (not bundle.GIT_SHA.fullmatch(control_sha) or type(control_wave_id) is not str
+            or not control_audit.OPAQUE.fullmatch(control_wave_id)
+            or not 1 <= poll_seconds <= 30 or not 30 <= timeout_seconds <= 600):
+        _fail("control-dispatch-input")
+    target = _control_dispatch_path(root, control_wave_id)
+    if target.exists():
+        _fail("control-wave-replay")
+    _verify_remote_main(control_sha)
+    started = int(clock())
+    record = {
+        "schema": 1, "wave_id": control_wave_id, "control_sha": control_sha, "ref": "main",
+        "dispatch_started_at": started, "reconcile_deadline_at": started + timeout_seconds,
+        "dispatch_completed_at": None, "dispatch_result": "requested", "run_id": None,
+    }
+    _write_atomic(target, record)
+    try:
+        _verify_remote_main(control_sha)
+        result = subprocess.run(
+            ["gh", "workflow", "run", "public-policy.yml", "--repo", fetch.REPOSITORY,
+             "--ref", "main", "-f", "control_wave_id=" + control_wave_id],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=30, check=False, env=os.environ.copy(),
+        )
+        record["dispatch_completed_at"] = int(clock())
+        record["dispatch_result"] = "accepted" if result.returncode == 0 else "ambiguous"
+        _write_atomic(target, record)
+    except (OSError, subprocess.SubprocessError):
+        record["dispatch_completed_at"] = int(clock())
+        record["dispatch_result"] = "ambiguous"
+        _write_atomic(target, record)
+    return wait_control_run(root, control_wave_id, poll_seconds, sleep=sleep, clock=clock)
+
+
+def wait_control_run(ledger, control_wave_id, poll_seconds=10, *, sleep=time.sleep, clock=time.time):
+    """Poll zero results to the persisted absolute deadline; never dispatches again."""
+    root = _ledger_root(ledger)
+    if type(control_wave_id) is not str or not control_audit.OPAQUE.fullmatch(control_wave_id):
+        _fail("control-wave-id")
+    if not 1 <= poll_seconds <= 30:
+        _fail("control-reconcile-poll")
+    record = _read_control_dispatch(root, control_wave_id)
+    _verify_remote_main(record["control_sha"])
+    if record["run_id"] is not None:
+        print("control_reconciliation=attached run-id=" + record["run_id"])
+        return record["run_id"]
+    while True:
+        _verify_remote_main(record["control_sha"])
+        candidates = _control_run_candidates(record)
+        if len(candidates) > 1:
+            _fail("control-dispatch-ambiguous")
+        if len(candidates) == 1:
+            _verify_remote_main(record["control_sha"])
+            record["run_id"] = candidates[0]
+            _write_atomic(_control_dispatch_path(root, control_wave_id), record)
+            print("control_reconciliation=attached run-id=" + candidates[0])
+            return candidates[0]
+        if int(clock()) >= record["reconcile_deadline_at"]:
+            _fail("control-reconcile-deadline")
+        print("control_reconciliation=pending")
+        sleep(min(poll_seconds, max(1, record["reconcile_deadline_at"] - int(clock()))))
 
 
 def _preserve_diagnostics(root, record, records):
@@ -1101,19 +1349,32 @@ def reconcile_dispatch(ledger, wave_id):
     record = _wave_record(root, wave_id)
     if record["state"] not in ("dispatch-requested", "cleanup-failed", "cleanup-in-progress"):
         _fail("reconcile-state")
+    _verify_remote_main(record["control_sha"])
     endpoint = ("repos/%s/actions/workflows/%s/runs?event=workflow_dispatch&branch=main&per_page=100"
                 % (fetch.REPOSITORY, fetch.WORKFLOW_PATH.rsplit("/", 1)[-1]))
     runs = _workflow_run_pages(endpoint)
     candidates = []
+    started = _epoch(record.get("dispatch_requested_at"))
+    deadline = record.get("reconcile_deadline_at")
+    if started is None or type(deadline) is not int or deadline <= started:
+        _fail("dispatch-interval-invalid")
     for run in runs:
         if type(run) is not dict:
             _fail("dispatch-run-inventory")
         run_id = str(run.get("id", ""))
         if not re.fullmatch(r"[1-9][0-9]{0,18}", run_id):
             continue
+        repository = run.get("repository")
+        head_repository = run.get("head_repository")
+        created = _epoch(run.get("created_at"))
         if (run.get("path") != fetch.WORKFLOW_PATH or run.get("head_branch") != "main"
                 or run.get("head_sha") != record["control_sha"] or run.get("event") != "workflow_dispatch"
-                or run.get("run_attempt") != 1):
+                or run.get("run_attempt") != 1
+                or type(repository) is not dict or repository.get("full_name") != fetch.REPOSITORY
+                or str(repository.get("id")) != fetch.REPOSITORY_ID
+                or type(head_repository) is not dict or head_repository.get("full_name") != fetch.REPOSITORY
+                or str(head_repository.get("id")) != fetch.REPOSITORY_ID
+                or created is None or not started <= created <= deadline):
             continue
         try:
             _verify_run_binding(run_id, record, run)
@@ -1123,17 +1384,222 @@ def reconcile_dispatch(ledger, wave_id):
     if len(candidates) > 1:
         _fail("dispatch-multiple-matches")
     if not candidates:
+        if int(time.time()) >= deadline:
+            _fail("dispatch-reconcile-deadline")
         print("dispatch_reconciliation=pending")
         return False
     transition(ledger, wave_id, "attach-run", candidates[0])
+    root = _ledger_root(ledger)
+    record = _wave_record(root, wave_id)
+    record["dispatch_completed_at"] = _timestamp()
+    _write_atomic(root / (wave_id + ".json"), record)
     print("dispatch_reconciliation=attached run-id=" + candidates[0])
     return True
 
 
-def _epoch(value):
+def _read_key_file(path):
+    descriptor = None
+    handle = None
     try:
-        return datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=datetime.timezone.utc).timestamp()
+        descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        metadata = os.fstat(descriptor)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                or metadata.st_mode & 0o077 or metadata.st_size != 64):
+            _fail("key-file-permissions")
+        handle = os.fdopen(descriptor, "rb")
+        descriptor = None
+        content = handle.read(65)
+        if re.fullmatch(rb"[a-f0-9]{64}", content) is None:
+            _fail("key-file-content")
+        handle.seek(0)
+        return handle
+    except OSError:
+        if handle is not None:
+            handle.close()
+        if descriptor is not None:
+            os.close(descriptor)
+        _fail("key-file-unavailable")
+    except Exception:
+        if handle is not None:
+            handle.close()
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+
+
+def _watch_installed_key(ledger, wave_id, stop, done, outcome, *, poll_seconds, decrypt_timeout_seconds,
+                         sleep=time.sleep, clock=time.time):
+    """Armed immediately after installation: attach to the exact ledger run or revoke at its deadline."""
+    try:
+        root = _ledger_root(ledger)
+        while not stop.is_set():
+            record = _wave_record(root, wave_id)
+            if record["state"] == "run-attached" and record.get("authorized_run_id") == record.get("run_id"):
+                outcome["timely"] = await_decrypt_and_revoke(
+                    ledger, wave_id, poll_seconds=2, timeout_seconds=decrypt_timeout_seconds,
+                    sleep=sleep, clock=clock,
+                )
+                return
+            deadline = record.get("reconcile_deadline_at")
+            if type(deadline) is not int:
+                _fail("dispatch-deadline-missing")
+            if int(clock()) >= deadline:
+                revoke_secret(ledger, wave_id)
+                outcome["timely"] = False
+                return
+            sleep(min(poll_seconds, max(1, deadline - int(clock()))))
+    except BaseException as error:
+        outcome["error"] = error
+    finally:
+        done.set()
+
+
+def dispatch_wave(ledger, wave_id, key_file, *, poll_seconds=10, timeout_seconds=DISPATCH_RECONCILE_SECONDS,
+                  decrypt_timeout_seconds=7200, sleep=time.sleep, clock=time.time):
+    """Install once, dispatch once, reconcile, and revoke on handled in-process exit paths."""
+    root = _ledger_root(ledger)
+    key_path = Path(key_file)
+    if (key_path.name != "key.hex" or key_path.parent.is_symlink()
+            or key_path.parent.resolve() != root.parent.resolve()):
+        _fail("key-file-path")
+    key_handle = None
+    installation_started = False
+    watcher_stop = threading.Event()
+    watcher_done = threading.Event()
+    watcher_outcome = {}
+    watcher = None
+    try:
+        _validate_wave_id(wave_id, "wave-id")
+        if (not 1 <= poll_seconds <= 30 or not 30 <= timeout_seconds <= 600
+                or not 60 <= decrypt_timeout_seconds <= 14400):
+            _fail("dispatch-wave-bounds")
+        record = _wave_record(root, wave_id)
+        if record["state"] != "assets-attached":
+            _fail("dispatch-wave-state")
+        _verify_remote_main(record["control_sha"])
+        _verify_secret_absent()
+        transition(ledger, wave_id, "mark-secret-installing")
+        record = _wave_record(root, wave_id)
+        record["cleanup_obligations"]["secret"] = {"state": "installation-pending", "attempted_at": _timestamp()}
+        record["reconcile_deadline_at"] = int(clock()) + timeout_seconds
+        _write_atomic(root / (wave_id + ".json"), record)
+        key_handle = _read_key_file(key_path)
+        _verify_remote_main(record["control_sha"])
+        _verify_secret_absent()
+        installation_started = True
+        installed = subprocess.run(
+            ["gh", "secret", "set", SECRET_NAME, "--env", DECRYPT_ENVIRONMENT,
+             "--repo", fetch.REPOSITORY],
+            stdin=key_handle, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=30, check=False, env=os.environ.copy(),
+        )
+        if installed.returncode != 0:
+            _fail("secret-install-ambiguous")
+        record = _wave_record(root, wave_id)
+        record["reconcile_deadline_at"] = int(clock()) + timeout_seconds
+        _write_atomic(root / (wave_id + ".json"), record)
+        watcher = threading.Thread(
+            target=_watch_installed_key,
+            args=(ledger, wave_id, watcher_stop, watcher_done, watcher_outcome),
+            kwargs={"poll_seconds": poll_seconds, "decrypt_timeout_seconds": decrypt_timeout_seconds,
+                    "sleep": sleep, "clock": clock},
+            name="devlane-secret-revocation", daemon=True,
+        )
+        watcher.start()
+        transition(ledger, wave_id, "mark-secret-installed")
+
+        if watcher_done.is_set() and "error" in watcher_outcome:
+            _fail("revocation-watcher-failed")
+        if watcher_done.is_set() and watcher_outcome.get("timely") is not True:
+            _fail("dispatch-reconcile-deadline")
+        _verify_remote_main(record["control_sha"])
+        transition(ledger, wave_id, "mark-dispatch-requested")
+        record = _wave_record(root, wave_id)
+        if watcher_done.is_set() and "error" in watcher_outcome:
+            _fail("revocation-watcher-failed")
+        if watcher_done.is_set() and watcher_outcome.get("timely") is not True:
+            _fail("dispatch-reconcile-deadline")
+        _verify_remote_main(record["control_sha"])
+        try:
+            result = subprocess.run(
+                ["gh", "workflow", "run", "devlane-encrypted.yml", "--repo", fetch.REPOSITORY,
+                 "--ref", "main", "-f", "profile=" + record["profile"],
+                 "-f", "control_run_id=" + record["control_run_id"], "-f", "wave_id=" + record["wave_id"],
+                 "-f", "bundle_id=" + record["bundle_id"], "-f", "bundle_asset_id=" + record["bundle_asset_id"],
+                 "-f", "bundle_sha256=" + record["bundle_sha256"], "-f", "bundle_size=" + str(record["bundle_size"]),
+                 "-f", "projection_asset_id=" + record["projection_asset_id"],
+                 "-f", "projection_sha256=" + record["projection_sha256"],
+                 "-f", "projection_size=" + str(record["projection_size"]),
+                 "-f", "expires=" + str(record["expires"]),
+                 "-f", "cache_baseline_sha256=" + record["cache_baseline_sha256"]],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=30, check=False, env=os.environ.copy(),
+            )
+            record["dispatch_result"] = "accepted" if result.returncode == 0 else "ambiguous"
+        except (OSError, subprocess.SubprocessError):
+            record["dispatch_result"] = "ambiguous"
+        _write_atomic(root / (wave_id + ".json"), record)
+
+        while True:
+            if watcher_done.is_set() and "error" in watcher_outcome:
+                _fail("revocation-watcher-failed")
+            if watcher_done.is_set() and watcher_outcome.get("timely") is not True:
+                _fail("dispatch-reconcile-deadline")
+            _verify_remote_main(record["control_sha"])
+            if reconcile_dispatch(ledger, wave_id):
+                break
+            record = _wave_record(root, wave_id)
+            deadline = record.get("reconcile_deadline_at")
+            if type(deadline) is not int or int(clock()) >= deadline:
+                _fail("dispatch-reconcile-deadline")
+            sleep(min(poll_seconds, max(1, deadline - int(clock()))))
+        attached = _wave_record(root, wave_id)
+        run_id = attached["run_id"]
+        watcher.join(timeout=decrypt_timeout_seconds + timeout_seconds + 60)
+        if watcher.is_alive():
+            _fail("revocation-watcher-stuck")
+        if "error" in watcher_outcome:
+            error = watcher_outcome["error"]
+            if isinstance(error, Refusal):
+                raise error
+            _fail("revocation-watcher-failed")
+        if watcher_outcome.get("timely") is not True:
+            _fail("decrypt-revocation-late")
+        print("dispatch_wave=attached run-id=" + run_id)
+        return run_id
+    finally:
+        if key_handle is not None:
+            key_handle.close()
+        try:
+            key_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        watcher_stop.set()
+        if watcher is not None and watcher.is_alive():
+            watcher.join(timeout=1)
+        try:
+            secret_obligation = _wave_record(root, wave_id)["cleanup_obligations"]["secret"]
+        except Exception:
+            secret_obligation = None
+        if installation_started and (secret_obligation is None or secret_obligation.get("state") != "absent"):
+            for attempt in range(10):
+                try:
+                    revoke_secret(ledger, wave_id)
+                    break
+                except Refusal as error:
+                    if str(error) != "ledger-busy" or attempt == 9:
+                        raise
+                    sleep(1)
+
+
+def _epoch(value):
+    if type(value) is not str:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return None
+        return parsed.timestamp()
     except (TypeError, ValueError):
         return None
 
@@ -1212,6 +1678,16 @@ def main(argv=None):
     evidence.add_argument("--ledger", required=True)
     evidence.add_argument("--control-run-id", required=True)
     evidence.add_argument("--control-sha", required=True)
+    evidence.add_argument("--control-wave-id", required=True)
+    dispatch_control_cmd = sub.add_parser("dispatch-control")
+    dispatch_control_cmd.add_argument("--ledger", required=True)
+    dispatch_control_cmd.add_argument("--control-sha", required=True)
+    dispatch_control_cmd.add_argument("--control-wave-id", required=True)
+    dispatch_control_cmd.add_argument("--poll-seconds", type=int, default=10)
+    dispatch_control_cmd.add_argument("--timeout-seconds", type=int, default=CONTROL_RECONCILE_SECONDS)
+    reconcile_control_cmd = sub.add_parser("reconcile-control")
+    reconcile_control_cmd.add_argument("--ledger", required=True)
+    reconcile_control_cmd.add_argument("--control-wave-id", required=True)
     reserve = sub.add_parser("reserve-wave")
     reserve.add_argument("--ledger", required=True)
     reserve.add_argument("--request", required=True)
@@ -1231,6 +1707,8 @@ def main(argv=None):
     revoke = sub.add_parser("revoke-secret")
     revoke.add_argument("--ledger", required=True)
     revoke.add_argument("--wave-id", required=True)
+    recover = sub.add_parser("recover-pending-secrets")
+    recover.add_argument("--ledger", required=True)
     awaiting = sub.add_parser("await-decrypt-and-revoke")
     awaiting.add_argument("--ledger", required=True)
     awaiting.add_argument("--wave-id", required=True)
@@ -1239,6 +1717,13 @@ def main(argv=None):
     reconcile = sub.add_parser("reconcile-dispatch")
     reconcile.add_argument("--ledger", required=True)
     reconcile.add_argument("--wave-id", required=True)
+    dispatch_wave_cmd = sub.add_parser("dispatch-wave")
+    dispatch_wave_cmd.add_argument("--ledger", required=True)
+    dispatch_wave_cmd.add_argument("--wave-id", required=True)
+    dispatch_wave_cmd.add_argument("--key-file", required=True)
+    dispatch_wave_cmd.add_argument("--poll-seconds", type=int, default=10)
+    dispatch_wave_cmd.add_argument("--timeout-seconds", type=int, default=DISPATCH_RECONCILE_SECONDS)
+    dispatch_wave_cmd.add_argument("--decrypt-timeout-seconds", type=int, default=7200)
     cleanup = sub.add_parser("cleanup-terminal")
     cleanup.add_argument("--ledger", required=True)
     cleanup.add_argument("--wave-id", required=True)
@@ -1246,7 +1731,12 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.operation == "record-control-evidence":
-            record_control_evidence(args.ledger, args.control_run_id, args.control_sha)
+            record_control_evidence(args.ledger, args.control_run_id, args.control_sha, args.control_wave_id)
+        elif args.operation == "dispatch-control":
+            dispatch_control(args.ledger, args.control_sha, args.control_wave_id,
+                             poll_seconds=args.poll_seconds, timeout_seconds=args.timeout_seconds)
+        elif args.operation == "reconcile-control":
+            return 0 if wait_control_run(args.ledger, args.control_wave_id) else 3
         elif args.operation == "reserve-wave":
             reserve_wave(args.ledger, bundle.strict_json(Path(args.request).read_bytes(), 64 * 1024))
         elif args.operation == "stage-bundle":
@@ -1259,6 +1749,8 @@ def main(argv=None):
             cleanup_terminal(args.ledger, args.wave_id)
         elif args.operation == "revoke-secret":
             revoke_secret(args.ledger, args.wave_id)
+        elif args.operation == "recover-pending-secrets":
+            recover_pending_secrets(args.ledger)
         elif args.operation == "await-decrypt-and-revoke":
             """Exit 0 only when revoked within the limit; 3 means revoked but late or after a timeout."""
             if not 1 <= args.poll_seconds <= 30 or not 60 <= args.timeout_seconds <= 14400:
@@ -1267,16 +1759,26 @@ def main(argv=None):
         elif args.operation == "reconcile-dispatch":
             """Exit 0 only when a run was attached; 3 means still pending (not an error, not done)."""
             return 0 if reconcile_dispatch(args.ledger, args.wave_id) else 3
+        elif args.operation == "dispatch-wave":
+            return 0 if dispatch_wave(
+                args.ledger, args.wave_id, args.key_file, poll_seconds=args.poll_seconds,
+                timeout_seconds=args.timeout_seconds,
+                decrypt_timeout_seconds=args.decrypt_timeout_seconds,
+            ) else 3
         else:
             transition(args.ledger, args.wave_id, args.operation, getattr(args, "run_id", None))
         return 0
     except (Refusal, bundle.Refusal) as error:
         print("devlane_coordinator_refusal=" + str(error), file=sys.stderr)
         return 2
+    except KeyboardInterrupt:
+        print("devlane_coordinator_interrupted; revoke-secret must be retried until absent", file=sys.stderr)
+        return 130
     except Exception:
         print("devlane_coordinator_refusal=operation-failed", file=sys.stderr)
         return 2
 
 
 if __name__ == "__main__":
+    _verify_signal_handlers()
     raise SystemExit(main())

@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 
 import bundle
+import deadline as deadline_budget
 import fetch
 import filter as output_filter
 import network_probe
@@ -124,7 +125,7 @@ def _rpc(state_dir, request):
         _refuse("control-protocol-size")
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     operation = request.get("op") if type(request) is dict else None
-    timeout = 105 * 60 if operation == "execute" else 10 * 60 if operation == "decrypt" else 90
+    timeout = 9900 if operation == "execute" else 10 * 60 if operation == "decrypt" else 90
     connection.settimeout(timeout)
     try:
         connection.connect(str(Path(state_dir) / SOCKET_NAME))
@@ -326,12 +327,14 @@ def _worker_environment(stage, root, tools):
     return env
 
 
-def _limited_child():
+def _limited_child(cpu_seconds=1200):
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     resource.setrlimit(resource.RLIMIT_FSIZE, (bundle.MAX_EXPANDED // 2, bundle.MAX_EXPANDED // 2))
     resource.setrlimit(resource.RLIMIT_NOFILE, (8192, 8192))
     resource.setrlimit(resource.RLIMIT_NPROC, (1024, 1024))
-    resource.setrlimit(resource.RLIMIT_CPU, (1200, 1200))
+    if type(cpu_seconds) is not int or not 1 <= cpu_seconds <= 9900:
+        raise ValueError("cpu-limit-invalid")
+    resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
     os.umask(0o077)
 
 
@@ -408,10 +411,15 @@ def _wait_child(process, timeout):
         time.sleep(min(0.1, remaining))
 
 
-def _run_profile_command(root, command, stage, log_path, tools, timeout=1200):
+def _run_profile_command(root, command, stage, log_path, tools, timeout=1200, deadline=None):
     environment = _worker_environment(stage, root, tools)
     if CANCEL_REQUESTED.is_set():
         return 130
+    if deadline is not None:
+        try:
+            timeout = min(timeout, deadline_budget.remaining(deadline))
+        except deadline_budget.DeadlineRefusal:
+            return 124
     argv = _chroot_worker_command(root, command)
     target = root / log_path.lstrip("/")
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -441,16 +449,21 @@ def _run_profile_command(root, command, stage, log_path, tools, timeout=1200):
     return code
 
 
-def _run_control_adapter(root, command, stage, tools, log_name, timeout=60):
+def _run_control_adapter(root, command, stage, tools, log_name, timeout=60, deadline=None, cpu_seconds=1200):
     if CANCEL_REQUESTED.is_set():
         return 130
+    if deadline is not None:
+        try:
+            timeout = min(timeout, deadline_budget.remaining(deadline))
+        except deadline_budget.DeadlineRefusal:
+            return 124
     target = root / "workspace/raw" / log_name
     with target.open("xb") as log:
         try:
             process = subprocess.Popen(
                 _chroot_worker_command(root, command), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                 env=_worker_environment(stage, root, tools), cwd="/", close_fds=True,
-                start_new_session=True, preexec_fn=_limited_child,
+                start_new_session=True, preexec_fn=lambda: _limited_child(cpu_seconds),
             )
         except OSError:
             return 125
@@ -495,6 +508,7 @@ def _manifest_allowlists(manifest, profile, source_root):
         "frames": {public_id: public_id for public_id in manifest["frames"].values()},
         "stages": stages,
         "codes": sorted(set(codes)),
+        "suites": sorted(profile.get("rust_matrix", {}).get("coverage_ids", [])),
         "max_lines": max_lines,
     }
 
@@ -634,6 +648,7 @@ def _summary_failed(summary):
         except output_filter.FilterRefusal:
             return True
         if (record.get("kind") == "test"
+                or record.get("kind") == "coverage" and (record.get("failed", 0) > 0 or record.get("ignored", 0) > 0)
                 or record.get("kind") == "frame" and record.get("status") == "fail"
                 or record.get("kind") == "control" and record.get("status") == "fail"
                 or record.get("kind") == "diagnostic" and record.get("level") == "error"):
@@ -742,70 +757,35 @@ def _adapter_records(root, profile, manifest, outcomes, tools, adapter_results=N
     adapter_results = adapter_results or {}
     records = []
     if profile == "core-rust":
-        log = root / "workspace/raw/unit.log"
-        unit_code = next((code for stage, code in outcomes if stage == "unit"), 125)
+        output = root / "scratch/reports/rust-matrix.jsonl"
+        result = adapter_results.get("rust_matrix", 125)
         try:
-            payload = _read_regular(log, output_filter.MAX_RAW_CAPTURE_BYTES)
-            if not payload:
-                _refuse("rust-report-empty")
-            finished = []
-            for raw_line in payload.splitlines():
-                if not raw_line or len(raw_line) > output_filter.MAX_RAW_RECORD_BYTES:
-                    _refuse("rust-report-line")
-                message = bundle.strict_json(raw_line, output_filter.MAX_RAW_RECORD_BYTES)
-                if type(message) is not dict or type(message.get("reason")) is not str:
-                    _refuse("rust-report-shape")
-                reason = message["reason"]
-                if reason == "compiler-message":
-                    diagnostic = message.get("message")
-                    if (type(diagnostic) is not dict
-                            or diagnostic.get("level") not in ("error", "warning", "note", "help", "failure-note")):
-                        _refuse("rust-report-diagnostic")
-                    code_object = diagnostic.get("code")
-                    code = code_object.get("code") if type(code_object) is dict else "DEVLANE_FAILURE"
-                    if type(code) is not str:
-                        _refuse("rust-report-code")
-                    spans = diagnostic.get("spans")
-                    if type(spans) is not list:
-                        _refuse("rust-report-spans")
-                    primary = [span for span in spans if type(span) is dict and span.get("is_primary") is True]
-                    if len(primary) > 1:
-                        _refuse("rust-report-primary-span")
-                    if diagnostic["level"] in ("error", "warning"):
-                        record = {"kind": "diagnostic", "stage": "unit", "code": code,
-                                  "level": diagnostic["level"]}
-                        if primary:
-                            span = primary[0]
-                            name = span.get("file_name")
-                            if type(name) is str and name.startswith("/workspace/source/"):
-                                name = name[len("/workspace/source/"):]
-                            if type(name) is str and name in manifest["allowed_files"]:
-                                record["file"] = name
-                                record["line"] = span.get("line_start")
-                        records.append(json.dumps(record, separators=(",", ":")).encode("ascii"))
-                elif reason == "build-finished":
-                    if type(message.get("success")) is not bool:
-                        _refuse("rust-report-finish")
-                    finished.append(message["success"])
-                elif reason not in ("compiler-artifact", "build-script-executed", "future-incompat-report"):
-                    _refuse("rust-report-reason")
-                if len(records) > output_filter.MAX_RECORDS:
-                    _refuse("record-count")
-            if len(finished) != 1 or finished[0] != (unit_code == 0):
-                _refuse("rust-report-outcome")
-            if unit_code != 0:
-                records.append(_control_failure("unit"))
-            else:
-                output = root / "scratch/reports/rust-tests.jsonl"
-                if os.path.lexists(output):
-                    output.unlink()
-                command = [
-                    "/usr/bin/python3", "-B", "-I", "-S", "/control/devlane/rust_test_runner.py",
-                    "/workspace/raw/unit.log", "/trusted/adapter-config.json", "/scratch/reports/rust-tests.jsonl",
-                ]
-                result = _run_control_adapter(root, command, "unit", tools, "rust-adapter.log", timeout=60 * 30)
-                records.extend(_adapter_lines(output, result, "unit", rule="tests"))
-        except (SupervisorRefusal, bundle.Refusal, OSError):
+            if result not in (0, 1) or not os.path.lexists(output):
+                _refuse("rust-matrix-report-unavailable")
+            payload = _read_regular(output, output_filter.MAX_RAW_CAPTURE_BYTES)
+            if payload and not payload.endswith(b"\n"):
+                _refuse("rust-matrix-report-incomplete")
+            records = [bundle.strict_json(line, output_filter.MAX_RAW_RECORD_BYTES)
+                       for line in payload.splitlines()]
+            if any(type(record) is not dict for record in records) or len(records) > output_filter.MAX_RECORDS:
+                _refuse("rust-matrix-report-invalid")
+            profile_path = root / "control/profiles.json"
+            profile_document = bundle.strict_json(_read_regular(profile_path, 1024 * 1024), 1024 * 1024)
+            matrix = profile_document["profiles"]["core-rust"]["rust_matrix"]
+            expected = matrix["coverage_ids"]
+            coverage = [record for record in records if record.get("kind") == "coverage"]
+            suites = [record.get("suite") for record in coverage]
+            if len(suites) != len(set(suites)) or set(suites) != set(expected):
+                _refuse("rust-matrix-coverage-incomplete")
+            failed = any(record.get("kind") == "test"
+                         or record.get("kind") == "control" and record.get("status") == "fail"
+                         or record.get("kind") == "coverage" and (record.get("failed", 0) > 0 or record.get("ignored", 0) > 0)
+                         for record in records)
+            if (result == 0) == failed:
+                _refuse("rust-matrix-status-mismatch")
+            records = [json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+                       for record in records]
+        except (SupervisorRefusal, bundle.Refusal, OSError, KeyError, TypeError):
             records = [_control_failure("unit")]
     if profile == "core-node":
         typescript_report = root / "scratch/reports/typescript.jsonl"
@@ -891,7 +871,7 @@ def _shred_tree(root):
 
 class Service:
     def __init__(self, state_dir, context_path, workspace, prepared, bundle_path, projection_path,
-                 host_net_inode, owner_uid, tool_paths):
+                 host_net_inode, owner_uid, tool_paths, deadline_file):
         self.state_dir = Path(state_dir)
         self.context = _context_from_file(context_path)
         self.workspace = Path(workspace).resolve(strict=True)
@@ -901,6 +881,8 @@ class Service:
         self.host_net_inode = host_net_inode
         self.owner_uid = owner_uid
         self.tool_paths = tool_paths
+        self.deadline_file = Path(deadline_file).resolve(strict=True)
+        self.deadline = None
         self.root = self.state_dir / "namespace-root"
         self.manifest = None
         self.profile_config = None
@@ -914,6 +896,11 @@ class Service:
         self.mounts = []
 
     def prepare(self):
+        try:
+            self.deadline = deadline_budget._read(self.deadline_file)["work_deadline"]
+            deadline_budget.remaining(self.deadline_file)
+        except (OSError, deadline_budget.DeadlineRefusal):
+            _refuse("total-deadline-unavailable")
         _require_linux_root()
         _require_swap_disabled()
         _mount_private()
@@ -987,6 +974,10 @@ class Service:
     def _decrypt(self, key_hex):
         if not self.probe_passed or self.decrypted or self.execution_done:
             _refuse("decrypt-order")
+        try:
+            decrypt_timeout = min(120, deadline_budget.remaining(self.deadline_file))
+        except deadline_budget.DeadlineRefusal:
+            _refuse("total-deadline-exhausted")
         self._verify_network_cut()
         if type(key_hex) is not str or len(key_hex) != 64 or any(char not in "0123456789abcdef" for char in key_hex):
             _refuse("key-invalid")
@@ -1019,7 +1010,7 @@ class Service:
                 env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1"},
                 close_fds=True, start_new_session=True,
             )
-            output, _ = process.communicate(bytes(request), timeout=120)
+            output, _ = process.communicate(bytes(request), timeout=decrypt_timeout)
         except subprocess.TimeoutExpired:
             if process is not None:
                 try:
@@ -1085,12 +1076,11 @@ class Service:
                 _refuse("cargo-lock-projection-invalid")
             if manifest != self.projection_value["cargo_manifest"] or lock != self.projection_value["cargo_lock"]:
                 _refuse("cargo-projection-mismatch")
-            workspace_locks = sorted(
-                path for path in self.manifest["original_lockfiles"]
-                if path != "Cargo.lock" and Path(path).name == "Cargo.lock"
-            )
+            workspace_locks = ["fuzz/Cargo.lock", "runtime/Cargo.lock"]
+            if set(self.manifest["original_lockfiles"]) != {"Cargo.lock", *workspace_locks}:
+                _refuse("cargo-workspace-lock-set")
             workspace_projections = self.projection_value["cargo_workspaces"]
-            if len(workspace_locks) != len(workspace_projections):
+            if ([item.get("path") for item in workspace_projections] != workspace_locks):
                 _refuse("cargo-workspace-count-mismatch")
             for path, workspace_projection in zip(workspace_locks, workspace_projections):
                 try:
@@ -1108,9 +1098,56 @@ class Service:
         profile = self.profile_config["profiles"].get(profile_name)
         if type(profile) is not dict or profile.get("revision") != 1:
             _refuse("profile-unknown")
+        try:
+            deadline_budget.remaining(self.deadline_file)
+        except deadline_budget.DeadlineRefusal:
+            _refuse("total-deadline-exhausted")
         source_root = self.root / "workspace/source"
         commands = profile.get("commands")
         stages = profile.get("stages")
+        if profile_name == "core-rust":
+            if commands != [] or stages != ["format", "deny", "audit", "vet", "unit"]:
+                _refuse("profile-command-set")
+            output = self.root / "scratch/reports/rust-matrix.jsonl"
+            if os.path.lexists(output):
+                _refuse("rust-matrix-report-exists")
+            command = [
+                "/usr/bin/python3", "-B", "-I", "-S", "/control/devlane/rust_matrix_runner.py",
+                "/control/profiles.json", "/trusted/adapter-config.json", "/scratch/reports/rust-matrix.jsonl",
+                "--deadline", str(self.deadline),
+            ]
+            try:
+                matrix_timeout = deadline_budget.remaining(self.deadline_file)
+            except deadline_budget.DeadlineRefusal:
+                _refuse("total-deadline-exhausted")
+            result = _run_control_adapter(self.root, command, "unit", self.tool_info,
+                                          "rust-matrix-adapter.log", timeout=matrix_timeout,
+                                          deadline=self.deadline_file, cpu_seconds=9900)
+            adapter_results = {"rust_matrix": result}
+            self.outcomes = [("unit", result)]
+            allowlists = _manifest_allowlists(self.manifest, profile, source_root)
+            records = _adapter_records(self.root, profile_name, self.manifest, [],
+                                       self.tool_info, adapter_results)
+            try:
+                self.summary = output_filter.filter_records(records, allowlists)
+                filter_failed = False
+            except output_filter.FilterRefusal:
+                filter_failed = True
+                self.summary = output_filter._ascii_json({
+                    "kind": "control", "stage": "unit", "status": "fail", "code": "DEVLANE_FAILURE",
+                })
+            self.execution_done = True
+            status = "pass" if result == 0 and not filter_failed and not _summary_failed(self.summary) else "fail"
+            catalogs = {
+                "files": sorted(set(self.manifest["allowed_files"].values())),
+                "tests": sorted(set(self.manifest["allowed_tests"].values())),
+                "frames": sorted(set(self.manifest["frames"].values())),
+                "stages": list(profile["stages"]),
+                "codes": sorted(set(profile.get("diagnostic_codes", []) + ["DEVLANE_FAILURE"])),
+                "suites": sorted(profile["rust_matrix"]["coverage_ids"]),
+            }
+            return {"ok": True, "status": status,
+                    "summary": base64.b64encode(self.summary).decode("ascii"), "catalogs": catalogs}
         if self.manifest["frames"]:
             commands = commands + [profile.get("browser_command")]
             stages = stages + ["browser"]
@@ -1121,7 +1158,13 @@ class Service:
             if CANCEL_REQUESTED.is_set():
                 _refuse("execution-cancelled")
             stage = stages[index]
-            result = _run_profile_command(self.root, command, stage, "/workspace/raw/" + stage + ".log", self.tool_info)
+            try:
+                phase_timeout = min(1200, deadline_budget.remaining(self.deadline_file))
+            except deadline_budget.DeadlineRefusal:
+                result = 124
+            else:
+                result = _run_profile_command(self.root, command, stage, "/workspace/raw/" + stage + ".log",
+                                              self.tool_info, timeout=phase_timeout, deadline=self.deadline_file)
             if result == 130:
                 _refuse("execution-cancelled")
             outcomes.append((stage, result))
@@ -1136,8 +1179,13 @@ class Service:
                 "/trusted/manifest.json", "/scratch/reports/typescript.jsonl",
                 "/prepared/node_modules/typescript/lib/typescript.js",
             ]
+            try:
+                ts_timeout = min(600, deadline_budget.remaining(self.deadline_file))
+            except deadline_budget.DeadlineRefusal:
+                ts_timeout = 0
             ts_result = _run_control_adapter(self.root, command, "typecheck", self.tool_info,
-                                             "typecheck-adapter.log", timeout=600)
+                                             "typecheck-adapter.log", timeout=ts_timeout,
+                                             deadline=self.deadline_file)
             adapter_results["typescript"] = ts_result
             if ts_result != 0:
                 outcomes.append(("typecheck", 1))
@@ -1161,6 +1209,7 @@ class Service:
             "frames": sorted(set(self.manifest["frames"].values())),
             "stages": list(profile["stages"]) + (["browser"] if self.manifest["frames"] else []),
             "codes": sorted(set(profile.get("diagnostic_codes", []) + ["DEVLANE_FAILURE"])),
+        "suites": sorted(profile.get("rust_matrix", {}).get("coverage_ids", [])),
         }
         return {"ok": True, "status": status, "summary": base64.b64encode(self.summary).decode("ascii"),
                 "catalogs": catalogs}
@@ -1243,7 +1292,7 @@ def _serve(args):
             args.state_dir, args.context, args.workspace, args.prepared,
             args.bundle, args.projection, args.host_net_inode, args.owner_uid,
             {"node": args.node_path or None, "npm": args.npm_path or None,
-             "cargo": args.cargo_path or None, "rustc": args.rustc_path or None},
+             "cargo": args.cargo_path or None, "rustc": args.rustc_path or None}, args.deadline_file,
         )
         service.prepare()
         socket_path = Path(args.state_dir) / SOCKET_NAME
@@ -1261,7 +1310,7 @@ def _serve(args):
 
         def handle(connection):
             with connection:
-                connection.settimeout(110 * 60)
+                connection.settimeout(9900)
                 try:
                     request = bundle.strict_json(_recv_frame(connection), MAX_RPC)
                     operation = request.get("op") if type(request) is dict else None
@@ -1373,6 +1422,7 @@ def _start(args):
         "--prepared", str(Path(args.prepared).resolve(strict=True)),
         "--bundle", str(Path(args.bundle).resolve(strict=True)),
         "--projection", str(Path(args.projection).resolve(strict=True)),
+        "--deadline-file", str(Path(args.deadline_file).resolve(strict=True)),
         "--host-net-inode", str(host_net_inode), "--owner-uid", str(os.getuid()),
         "--node-path", tool_paths["node"], "--npm-path", tool_paths["npm"],
         "--cargo-path", tool_paths["cargo"], "--rustc-path", tool_paths["rustc"],
@@ -1436,9 +1486,9 @@ def _client(args):
         profiles = json.loads((Path(__file__).resolve().parents[2] / PROFILE_FILE).read_text(encoding="utf-8"))
         profile = profiles["profiles"][context["profile"]]
         catalogs = response.get("catalogs")
-        if type(catalogs) is not dict or set(catalogs) != {"files", "tests", "frames", "stages", "codes"}:
+        if type(catalogs) is not dict or set(catalogs) != {"files", "tests", "frames", "stages", "codes", "suites"}:
             _refuse("summary-catalog-invalid")
-        for name in ("files", "tests", "frames", "codes"):
+        for name in ("files", "tests", "frames", "codes", "suites"):
             values = catalogs[name]
             if type(values) is not list or len(values) > 10_000 or any(type(item) is not str for item in values):
                 _refuse("summary-catalog-invalid")
@@ -1452,8 +1502,9 @@ def _client(args):
         if catalogs["frames"]:
             expected_stages.append("browser")
         expected_codes = sorted(set(profile.get("diagnostic_codes", []) + ["DEVLANE_FAILURE"]))
+        expected_suites = sorted(profile.get("rust_matrix", {}).get("coverage_ids", []))
         if (type(catalogs["stages"]) is not list or catalogs["stages"] != expected_stages
-                or catalogs["codes"] != expected_codes):
+                or catalogs["codes"] != expected_codes or catalogs["suites"] != expected_suites):
             _refuse("summary-catalog-invalid")
         allowlists = {
             "files": {identifier: identifier for identifier in catalogs["files"]},
@@ -1461,6 +1512,7 @@ def _client(args):
             "frames": {identifier: identifier for identifier in catalogs["frames"]},
             "stages": catalogs["stages"], "codes": catalogs["codes"],
             "max_lines": {identifier: 10_000_000 for identifier in catalogs["files"]},
+            "suites": catalogs["suites"],
         }
         _validate_host_records(summary, allowlists, profile)
         sys.stdout.buffer.write(summary)
@@ -1507,11 +1559,13 @@ def main(argv=None):
     for name in ("state-dir", "context", "workspace", "prepared", "bundle", "projection"):
         start.add_argument("--" + name, required=True)
     start.add_argument("--positive-control", required=True)
+    start.add_argument("--deadline-file", required=True)
     for name in ("node-path", "npm-path", "cargo-path", "rustc-path"):
         start.add_argument("--" + name, default="")
     client = sub.add_parser("_serve")
     for name in ("state-dir", "context", "workspace", "prepared", "bundle", "projection"):
         client.add_argument("--" + name, required=True)
+    client.add_argument("--deadline-file", required=True)
     client.add_argument("--host-net-inode", type=int, required=True)
     client.add_argument("--owner-uid", type=int, required=True)
     for name in ("node-path", "npm-path", "cargo-path", "rustc-path"):

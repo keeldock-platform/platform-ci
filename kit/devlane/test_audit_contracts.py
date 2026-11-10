@@ -511,12 +511,23 @@ class ControlAuditorMutationTests(unittest.TestCase):
     def test_terminal_graph_checks_all_child_steps_and_branch_specific_cache_step(self):
         run = {
             "id": 12345, "path": control_audit.WORKFLOW_PATH, "event": "workflow_dispatch",
+            "display_title": "public control=control-wave-0001",
             "head_branch": "main", "head_sha": SHA, "run_attempt": 1,
             "status": "completed", "conclusion": "success",
             "repository": {"full_name": control_audit.REPOSITORY, "id": control_audit.REPOSITORY_ID},
             "head_repository": {"full_name": control_audit.REPOSITORY, "id": control_audit.REPOSITORY_ID},
         }
-        control_audit.validate_terminal_control_run(run, _terminal_control_jobs(), "12345", SHA)
+        control_audit.validate_terminal_control_run(
+            run, _terminal_control_jobs(), "12345", SHA, expected_wave_id="control-wave-0001")
+        with self.assertRaises(control_audit.ControlAuditRefusal):
+            control_audit.validate_terminal_control_run(
+                dict(run, display_title="public control=control-wave-0002"),
+                _terminal_control_jobs(), "12345", SHA, expected_wave_id="control-wave-0001")
+        in_progress = dict(run, status="in_progress", conclusion=None)
+        control_audit.validate_run_record(in_progress, self.identity)
+        with self.assertRaises(control_audit.ControlAuditRefusal):
+            control_audit.validate_run_record(
+                dict(in_progress, display_title="public control=control-wave-0002"), self.identity)
         develop_run = dict(run, head_branch="develop")
         jobs = _terminal_control_jobs(require_main=False)
         control_audit.validate_terminal_control_run(develop_run, jobs, "12345", SHA, require_main=False)
@@ -601,7 +612,8 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
         self.assertIn("permissions: {}", control)
         self.assertIn("group: public-control-${{ github.ref }}\n", control)
         self.assertNotIn("group: public-control\n", control)
-        self.assertNotIn("inputs.control_wave_id", control)
+        self.assertIn("run-name: public control=${{ inputs.control_wave_id }}", control)
+        self.assertIn("inputs.control_wave_id", control)
         self.assertNotIn("pull_request", control)
         self.assertNotIn("  push:", control)
 

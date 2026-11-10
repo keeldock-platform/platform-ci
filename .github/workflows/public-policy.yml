@@ -1,4 +1,5 @@
 name: public-policy
+run-name: public control=${{ inputs.control_wave_id }}
 on:
   workflow_dispatch:
     inputs:

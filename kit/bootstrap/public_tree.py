@@ -305,6 +305,13 @@ PLATFORM_FILES = frozenset(
         'kit/ci/future-stage-inventory.json',
         'kit/ci/perf_shadow.py',
         'kit/ci/test_perf_shadow.py',
+        'kit/devlane/deadline.py',
+        'kit/devlane/rust_matrix_runner.py',
+        'kit/devlane/rust_tooling.py',
+        'kit/devlane/test_deadline.py',
+        'kit/devlane/test_network_probe.py',
+        'kit/devlane/test_rust_matrix_runner.py',
+        'kit/devlane/test_rust_public_audit.py',
     )
 )
 CONSUMER_FILES = frozenset((".github/workflows/public-policy.yml", "ci/policy.json"))
@@ -323,7 +330,7 @@ SELF_PIN_LINE_PATTERN = re.compile(
 PINNED_FILE_SHA256 = {
     'kit/devlane/test_rehearsal.py': 'f8d5a56a57aa2d2dc31503436af83c79e19557c4e776b2a4a57151a8f2156c6e',
     'kit/devlane/rehearsal.py': 'd6e651ed27142133554ac7a64bf30e3b0586c208451ec4802624a63e0ef6a54c',
-    'docs/devlane-procedure.md': '90f334404b92ac1817fcac8fe6bd510a81c870d1779371e8dd2404d2bfb9fd3a',
+    'docs/devlane-procedure.md': 'cc979efce10666363d0b24e9312149e4160ccdfd694947ab76944adbd6313451',
     '.github/workflows/appium-ci.yml': '961eaa4fc03e0fe687fa437673116e68479af9437dcb69173444ec57098db2d3',
     '.github/workflows/baselines-prepare.yml': '970eec0b3be196ab2c0e02f7652a06e186b9ab2f76df704daba53a935af0388d',
     '.github/workflows/capsule-vectors.yml': '7366acdb58988c5675e86268abe268e71f71bc16681ab560ba8e33f37fc9f9f7',
@@ -333,7 +340,7 @@ PINNED_FILE_SHA256 = {
     '.github/workflows/core-linux-quick-return.yml': 'ecfcff18ffbb03fbbe058132590a675ddd2407b92ae2be1a2d4bfeeb95674298',
     '.github/workflows/core-rust-format-return.yml': 'c56fc9e8199681d2dab689f7f09a9fbb57825549c0f6132c27a7016ce72c79ab',
     '.github/workflows/development-feedback-smoke.yml': '8b9d13aec533e4a1b3637e4cc117cad67d820558cb309891aef51e9e8f623160',
-    '.github/workflows/devlane-encrypted.yml': '4c356e0a51e6586f0fdeba385c27bd16fb0f317351fb9a6328559cae627dff3d',
+    '.github/workflows/devlane-encrypted.yml': '5923c23e3ca4b8bcb9f731b3bcf0cca935fb9e1ea5cb2576f3c29766dd78d9b4',
     '.github/workflows/devlane-synthetic.yml': 'ad283ebf2799536cd19fed58ebda14d9577364ddbd0ec9223d321648b44813af',
     '.github/workflows/lane-h-capsule-attester.yml': '192d78328f8bf093a68bef0f1dd323a88772e2929d79c92b24a8864d17c1b48c',
     '.github/workflows/lane-h-linux-fetch-encrypt.yml': 'c173b2298dca7757b37a67669ad6ae4abf6eaf32cf1dea94b8b0a17a1c50d423',
@@ -347,28 +354,28 @@ PINNED_FILE_SHA256 = {
     '.github/workflows/performance-shadow.yml': '9a64b2eb8240c1806e669de1e7a1fa42a3631d9988a205482872d3af68cc9d46',
     '.github/workflows/windows-native-preflight.yml': 'da294aadfc0e99cbe109aba90f9fb86df65867cd32d3325d26a9e9a5b035e5bb',
     '.github/workflows/windows-source-admission.yml': 'ef10b21b69f841f6c2b69bc22497400e89e959fdfd6e24740a24e4b00139b5a8',
-    'ci/devlane-profiles.json': '4ed50f385c8206125e656f44d8cbef1b8a87eeb39efd17c550c85adb2f7c56ac',
+    'ci/devlane-profiles.json': 'd84fdf8168122dbd3cb8dd6a97b304b07596d760258522df817144e953043daa',
     'ci/revoked-signer-fingerprints': 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
     'core-ci/linux_quick_return.py': 'b711e81a2779d891cbba6d11becfe07d730331acc71c7ed2a9841f41439b5fd8',
     'core-ci/test_linux_quick_return.py': 'f6653e9db604a7a3a2213c285ab30567f8c39d46632b1650e4a15c4d8ee8b634',
     'core-ci/test_separation.py': 'e7ff85c8f45a7ecd03f98f72c4123018a5d39847fcb49442fbdf7f9225d9cb3b',
-    'docs/branch-promotion.md': 'd9148951786250d18d31293b6216b05827ea27ed07320c805c8da0a6af2e8643',
+    'docs/branch-promotion.md': '262f255484f36319dbc401afe714f14482edc0ca125428c71b42b73d252fc773',
     'kit/baselines/baselines_prepare.py': 'b51af2756756c1fe2db08eaa8eb097df58b635bd6caef75f68da013a49e2a2f5',
     'kit/baselines/test_baselines_prepare.py': 'e32265ac4159db206af4e2c6516a370713ae060d32b52e30e6e854e476516a55',
-    'kit/bootstrap/action.yml': '8ef334781a134940c72a8027518fa0f910628ad267c404ff73e71e7171a5f3f3',
+    'kit/bootstrap/action.yml': '236745bfd3f0cc3aa8ea6b71c7e647044d4149142d8e68fe57710a86ef325d04',
     'kit/bootstrap/policy_baselines.py': '62878db53091a36a743d10e6e3355f7b9bb8227ae763337082608e9935edd8b8',
-    'kit/bootstrap/policy_devlane.py': '4afcb69570450819e15493054f9365560dfe9ae1cb527c873d53a33e5a1c79bb',
+    'kit/bootstrap/policy_devlane.py': '2a07a5c63d75565eb445ab7747a113b47e30e9dd7d9be2a204dc6b7388b0ad19',
     'kit/bootstrap/policy_handoff.py': '743e8c4431b80c260b0fdfabc1e08bccc67b3cce59a2b311e18cd36eeb065c60',
     'kit/bootstrap/policy_linux.py': '0b314a645e43f2aaec58ca23150386b5865e8a27c3101459d00d42370e7d5a5f',
     'kit/bootstrap/policy_npm.py': 'b110b4573b2919003792e05bdcec60a0108f9e2ea1ebc1ce820ff77216271794',
     'kit/bootstrap/policy_rust.py': '4306a55701a5a04c884b2b21091a6d06307134e3570f0d5d65cb103ff84023ec',
-    'kit/bootstrap/public_tree.py': '52a1d1a0caeeb64d15dc0ed70dcdb01fba401c55e71f93b114d7a4faeb4cc058',
+    'kit/bootstrap/public_tree.py': '882ed69ade24c5dbfd1f887a00d2d09d87c486934724812a75b5c490aece8175',
     'kit/bootstrap/test_policy_baselines.py': '3e9041e973239aaf75c57ada33356b94f422c9941747a45b13f608de65f939aa',
     'kit/bootstrap/test_policy_handoff.py': '3cf707fec6cc1a62e49a948b496fe00765a04ec171fd4cdc57b07d214d3100a2',
     'kit/bootstrap/test_policy_linux.py': 'f1c62480d608d680e73cdbf0ca8b7c83552919bd5de4caa095d5e04e8c3e5f8c',
     'kit/bootstrap/test_policy_npm.py': '8893c4a89ab447a8813806afd2b35bbedbc78d530f1c5a1c8bdf67fc55865eed',
     'kit/bootstrap/test_policy_rust.py': '2465451eb33dec7787807d27ae9ef574b7447a52953c2c3f1951003243b6294a',
-    'kit/bootstrap/test_public_tree.py': '9fff8e2359a6f9d0ab3f849bac8d671d8d3ae7353202d916e2e016a2984ba04d',
+    'kit/bootstrap/test_public_tree.py': '710cb4d23747b2fd8010228dcc5952b14a1fe1e506835bc71f88d83ad86f53d4',
     'kit/ci/feature_states.py': 'e058de49cf9e96b61e8037ee533a095082f3210429586d4183d6c44c4f57d479',
     'kit/ci/future-stage-inventory.json': '185663fbc7c94b010dc4c74f7e6867898b5186a0d88acb95e61414f15cb695aa',
     'kit/ci/future_stage.py': '11023901b556599b0f5f747b84ed540c45eae5a2d2ad65ea3a1ba95f81775d41',
@@ -519,31 +526,38 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/windows_probe.rs': 'cf9e58d8f31e2a9773f2c4eba935fd1ed531d94397ac53e530a93c5169d08727',
     'kit/confinement/windows_source_run.ps1': '2b37591c61db5394dce725e15546df0dff466d3f2d28d529aa91e2329ee50eb6',
     'kit/devlane/__init__.py': 'e19ad6f4a13d793137d6cffdba831912e2e7da6c739bc538dcfce9f3171a704f',
-    'kit/devlane/bundle.py': '7959cc8d9032cd17cd8469f5c1dd83ad6a61ee6813273bab3f07d21bb0d90a21',
-    'kit/devlane/control_audit.py': 'b04a19444c4c4e4e494801eb5e2467c5c357febf90551384d19de5738596cd33',
-    'kit/devlane/coordinator.py': '634eebd31f7c25163207c65f27e99dcc1f63d9d4308e0d115307878d1de3374d',
+    'kit/devlane/bundle.py': 'a2c7143612f05f1731b87865a23146c929a67f32bed5b2370287413f49428d80',
+    'kit/devlane/control_audit.py': 'e01b21b1c11ebdee8356cb6b653ba4fb73e27a9c53f68f27a12357c0598b361d',
+    'kit/devlane/coordinator.py': '5651a0acc1e2ba60bc446fb48bf5dccb3b41c26114e528443095451abf3fda94',
     'kit/devlane/decrypt_once.py': '664f91b548f5ba7265d77c88b9c6d723fc1068ca7c3701b93cf9cf9960682552',
-    'kit/devlane/fetch.py': 'c4f63f2e86a9c3137fa2ccc504874d39f6cf7c2dce0bf941f28581c5802b63be',
-    'kit/devlane/filter.py': '791275aab195700eb3a9b89433585e1ec5c42d8c5a2fdaa9356cb2a6d966d2cc',
+    'kit/devlane/fetch.py': '48845cb5b10a4b06ec36a6efe4d89f204e11c735d6746d9432acf00de24f5151',
+    'kit/devlane/filter.py': 'f9b3b633d754f15981bb6197ac1ff03247792e9b92bf2210e7bacd6978ad1d30',
     'kit/devlane/host_cleanup.py': '635a0293e8748bb3ca61fda2791539bd61e795f5789eafbd48b82b957f7c4e4b',
     'kit/devlane/isolated_cleanup.py': 'e741009b048345643f03a7af485b60a40f288b51637647fafd1f66d825668d66',
-    'kit/devlane/network_probe.py': 'b468d6aa56a68070a9a801a9889f0b6e830f18d614d2e8c96469ca911e0f47a4',
+    'kit/devlane/network_probe.py': '23a6467a9c25624704beb2bfcd43fb5d34b6870d8db3c507cc11872ef608b697',
     'kit/devlane/permit.py': 'ee7c1cab0245ecbb86517bb4acae2a53b05802a37920af4322bde69091e95702',
     'kit/devlane/prepare.py': '759acce512b0c15bc02b1fc1cfc433f27831aae0040eeff48e29805a25a6232e',
-    'kit/devlane/project.py': '00673e59eee045f08b506a050dedba15db4ef2b9dfe9a47a9f5373a40268dde0',
-    'kit/devlane/public_audit.py': '26fd5d0742c7703fd47c29de707fe6159385bd444b79717ae4cca609790a7b83',
-    'kit/devlane/rust_test_runner.py': 'fa33d0e9244f4891e904a0ff0c6824d6021227f709a4f993ce411b1fd598b0bc',
+    'kit/devlane/project.py': 'bb957c6a0318ec28121d084d68d0cece414482c6948cc589cf3a766c081aa5d3',
+    'kit/devlane/public_audit.py': '854fca7de95aa7db9801b0212fe5b28ebfd175cf1228095524527deb8ecd208d',
+    'kit/devlane/rust_test_runner.py': 'd0e93a2b5c08369464db30a781a4f48abcaebbf1a316e8a2c38dfb1616061727',
     'kit/devlane/safe_json.mjs': '17d44acd9970efeea8b9b2c80d746efc940460008287f75e7dc2a749239ee169',
-    'kit/devlane/supervisor.py': '7ebaabfe51f2dd6badf31bd0e56bc9adc42f575d0df737b185dabb7c9da90464',
-    'kit/devlane/test_acceptance.py': 'fbb32d1e2fb099a523b4a068061dfec8bac1ee1ef37ed716950e322aede8d614',
+    'kit/devlane/supervisor.py': '8c3eb4cb172a76bc253f95949ac837d6ec4d05d170ea8c188e93e183ca1d23ed',
+    'kit/devlane/test_acceptance.py': '483a7b4d46c9c3716b94027cbc812790db1c989d8e5261e7b48ae6fe6b9e582c',
     'kit/devlane/test_adapters.mjs': '72eefa32c212af17202c0d0e5df0113327b9649f988f57c1101edd825ff742c0',
-    'kit/devlane/test_audit_contracts.py': '048c817764341f6958a42d9a18383e749fa274d3dac403344b4710f9deb7e755',
-    'kit/devlane/test_coordinator.py': 'd2b39df962672871dbfab49a18ce8b6476849363a249169ed66ffd1a5fb03a3e',
-    'kit/devlane/test_e2e.py': '474f76e53e5beea97ce895ac33fa6874d39b1afe4c69b459190023939d929aea',
+    'kit/devlane/test_audit_contracts.py': 'b44914d6b53a7c1636d1935c5306e0a1b0180ce2500e7fe034a8117bbe13ec44',
+    'kit/devlane/test_coordinator.py': 'a7b53ef06eec003c29ffe607ba1a2d328380704209e3ceaa5340adc3cfee10bd',
+    'kit/devlane/test_e2e.py': 'c3094dc0449cf14ddbaaf728524681d9fb4ea0997ed81976043f6b09c4abaab0',
     'kit/devlane/test_linux_runtime.py': '482a626731eb6e7bd91d74e911aa00f5f112bad053caf7432356f7905b159606',
-    'kit/devlane/test_rust_report.py': '7c5e5a2a7e6a54aeaefc81e262372d6de874d57f471ce94cfb9c90ba9ac8a4a8',
-    'kit/devlane/test_rust_test_runner.py': 'b02808a225fd5946524e9961b6f7bc7c06f9ffdf4a2fdb88fe41dc3b673242f8',
+    'kit/devlane/test_rust_report.py': '24c1574d01a8f2a8e1e042f947b1eabe480667c52cadfa9c1e2171ce93938799',
+    'kit/devlane/test_rust_test_runner.py': '4ca721b0a527ce12a5ce0068ff05d8ea5821f00b47febef3555f0fe794236ce3',
     'kit/devlane/typescript_reporter.mjs': '0542c293ad79aa277dc34548de6e1aecb7a0b0067c4670bf4c068bb5c70082fd',
+    'kit/devlane/deadline.py': '31a883121fa467774fe72c08f75687d1089c4f6de54f9b5ddcaa77289bdd3410',
+    'kit/devlane/rust_matrix_runner.py': '7f021e301678d09952319a37b996d6944736c3c2ec2176209c47a22786406218',
+    'kit/devlane/rust_tooling.py': '5678e8db5381d492e2eb4822b8576ad4a0331dac80bc4dfb8887245bd3aafd26',
+    'kit/devlane/test_deadline.py': 'ab01ffd321b12083183e636bc2323f0841363038ef6068efacadff74610dacb4',
+    'kit/devlane/test_network_probe.py': '08ce8c0ca4cc070fdef3069bf9a0fde31743c4b11ad14f33fe4cfa9bc7b5efe4',
+    'kit/devlane/test_rust_matrix_runner.py': '80b2f6745563f489d233941c47f1db84e5c6b832185871ed01c3238298a22088',
+    'kit/devlane/test_rust_public_audit.py': '47bc82c21f5cd2b4165090ad578bf0fbe8c3c6885a386233cc314f462611d9e0',
     'kit/handoff/provider_requirements.txt': 'c812f3c3f036921e86568feaa3bc934040b68f3d743072cefce8ea758bd56150',
     'kit/handoff/source_capsule.py': 'a1369abb354f0723bd3cfc3209aa15c4769bfb113b2fe6369023c7f95e4546ac',
     'kit/handoff/test_source_capsule.py': '6ea11945a8e08040b78faa4d4861abdd600901ed048abe22a2edfc3b97bfcd57',
@@ -582,6 +596,16 @@ PINNED_DEPENDENCY_CHECKS_REPOSITORIES = frozenset((
     "https:" + "//github.com/" + "RustSec/rustsec",
     "https:" + "//github.com/" + "mozilla/cargo-vet",
 ))
+PINNED_RUST_TOOLING_PATH = "kit/devlane/rust_tooling.py"
+PINNED_RUST_TOOLING_URLS = frozenset((
+    "https:" + "//github.com/" + 'EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz',
+    "https:" + "//github.com/" + 'RustSec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz',
+    "https:" + "//github.com/" + 'mozilla/cargo-vet/releases/download/v0.10.3/cargo-vet-x86_64-unknown-linux-gnu.tar.xz',
+    "https:" + "//github.com/" + 'RustSec/advisory-db.git',
+))
+RUST_TOOLING_URL_PATTERN = re.compile(
+    re.escape("https:" + "//github.com/") + r"[^\s\"'<>]+"
+)
 PINNED_CARGO_FIXTURE_REGISTRY = "https:" + "//github.com/" + "rust-lang/crates.io-index"
 PINNED_CARGO_FIXTURE_LOCKS = frozenset((
     "kit/confinement/fixtures/cargo-deny/issue-910-cycle/Cargo.lock",
@@ -706,8 +730,12 @@ def inspect_text(text, pool, relative_path=None):
         relative_path in PINNED_CARGO_FIXTURE_LOCKS
         and repository_urls == {PINNED_CARGO_FIXTURE_REGISTRY}
     )
+    rust_tooling_exception = (
+        pool == "platform" and relative_path == PINNED_RUST_TOOLING_PATH
+        and set(RUST_TOOLING_URL_PATTERN.findall(text)) == PINNED_RUST_TOOLING_URLS
+    )
     if repository_urls and not (
-        dependency_checks_repository_exception or fixture_registry_exception
+        dependency_checks_repository_exception or fixture_registry_exception or rust_tooling_exception
     ):
         raise PublicTreeError("repository-url-present")
     allowed_prefixes = ("keeldock" + "-" + pool, PUBLIC_REPOSITORY_PREFIX)

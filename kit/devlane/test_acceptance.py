@@ -110,6 +110,7 @@ class FilterAcceptanceTests(unittest.TestCase):
             "stages": ["typecheck", "unit"],
             "codes": ["TS2322", "DEVLANE_FAILURE"],
             "max_lines": {"src/example.ts": 200},
+            "suites": [],
         }
 
     def test_source_secret_and_unknown_code_never_reach_public_summary(self):
@@ -341,12 +342,14 @@ class FetchProjectionAcceptanceTests(unittest.TestCase):
         sync_manifest, sync_lock, _ = fetch.project_cargo_lock(lock)
         projection = {
             "schema": 1, "profile": "core-rust", "npm": [], "cargo": cargo,
-            "playwright": [], "tools": {"cargo": "1.91.0", "rustc": "1.91.0"},
+            "playwright": [], "tools": {"cargo": "1.99.1", "rustc": "1.99.1"},
             "cargo_manifest": root_manifest, "cargo_lock": root_lock,
-            "cargo_workspaces": [{"manifest": sync_manifest, "lock": sync_lock}],
+            "cargo_workspaces": [{"path": "fuzz/Cargo.lock", "manifest": sync_manifest, "lock": sync_lock},
+                                 {"path": "runtime/Cargo.lock", "manifest": sync_manifest, "lock": sync_lock}],
         }
         sanitized = fetch.validate_projection(json.dumps(projection).encode("utf-8"), "core-rust")
-        self.assertEqual(len(sanitized["cargo_workspaces"]), 1)
+        self.assertEqual([item["path"] for item in sanitized["cargo_workspaces"]],
+                         ["fuzz/Cargo.lock", "runtime/Cargo.lock"])
         self.assertNotIn("private/workspace/path", json.dumps(sanitized))
 
 
@@ -495,6 +498,7 @@ class SupervisorOrderAcceptanceTests(unittest.TestCase):
         args = type("Args", (), {
             "state_dir": tempfile.mkdtemp(), "context": "context", "workspace": "workspace",
             "prepared": "prepared", "bundle": "bundle", "projection": "projection",
+            "deadline_file": "deadline",
             "host_net_inode": 1, "owner_uid": 1000, "node_path": "", "npm_path": "",
             "cargo_path": "", "rustc_path": "",
         })()

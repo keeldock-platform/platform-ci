@@ -3,6 +3,11 @@
 import contextlib
 import io
 import json
+import os
+import re
+import signal
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -38,7 +43,8 @@ def _ledger_record(wave_id="wave-test-0001", bundle_id="bundle-test-0001", state
         "expires": int(time.time()) + 1800, "cache_baseline_sha256": CACHE_SHA,
         "state": state, "created_at": coordinator._timestamp(), "updated_at": None,
         "run_id": None, "authorized_run_id": None, "run_attempt": None,
-        "cleanup_attempts": [], "dispatch_requested_at": None,
+        "cleanup_attempts": [], "dispatch_requested_at": None, "dispatch_completed_at": None,
+        "reconcile_deadline_at": None, "dispatch_result": None,
         "cleanup_obligations": {
             "secret": {"state": "installed"},
             "bundle_asset": {"state": "upload-pending", "name": "devlane-" + wave_id + "-" + bundle_id + ".enc"},
@@ -62,6 +68,7 @@ class CoordinatorLedgerAcceptanceTests(unittest.TestCase):
         ledger.mkdir(mode=0o700)
         record = {
             "schema": 1, "control_sha": CONTROL_SHA, "control_run_id": "12345",
+            "control_wave_id": "control-wave-0001",
             "status": "passed", "verified_at": coordinator._timestamp(),
         }
         (ledger / ("control-evidence-" + CONTROL_SHA + "-12345.json")).write_bytes(bundle.canonical_json(record))
@@ -109,7 +116,8 @@ class CoordinatorLedgerAcceptanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             ledger = self._new_ledger(temporary)
             path = _write_record(ledger, _ledger_record(state="dispatch-requested"))
-            with mock.patch.object(coordinator, "_verify_run_identity", return_value={"status": "completed"}), \
+            with mock.patch.object(coordinator, "_verify_remote_main"), \
+                    mock.patch.object(coordinator, "_verify_run_identity", return_value={"status": "completed"}), \
                     mock.patch.object(coordinator, "_verify_dispatch_log", side_effect=coordinator.Refusal("run-wave-binding")), \
                     contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(coordinator.Refusal, "run-wave-binding"):
@@ -123,19 +131,27 @@ class CoordinatorLedgerAcceptanceTests(unittest.TestCase):
             ledger = self._new_ledger(temporary)
             record = _ledger_record(state="dispatch-requested")
             record["dispatch_requested_at"] = coordinator._timestamp()
+            record["reconcile_deadline_at"] = int(time.time()) + 300
             _write_record(ledger, record)
             def run(identifier):
                 return {
                     "id": identifier, "path": coordinator.fetch.WORKFLOW_PATH,
                     "head_branch": "main", "head_sha": CONTROL_SHA,
                     "event": "workflow_dispatch", "run_attempt": 1,
+                    "display_title": coordinator.expected_run_title(record),
+                    "created_at": coordinator._timestamp(),
+                    "repository": {"full_name": coordinator.fetch.REPOSITORY,
+                                   "id": int(coordinator.fetch.REPOSITORY_ID)},
+                    "head_repository": {"full_name": coordinator.fetch.REPOSITORY,
+                                        "id": int(coordinator.fetch.REPOSITORY_ID)},
                 }
             pages = [
                 {"total_count": 2, "workflow_runs": [run(54321)]},
                 {"total_count": 2, "workflow_runs": [run(54322)]},
             ]
             result = type("Result", (), {"returncode": 0, "stdout": json.dumps(pages).encode()})()
-            with mock.patch.object(coordinator.subprocess, "run", return_value=result) as command, \
+            with mock.patch.object(coordinator, "_verify_remote_main"), \
+                    mock.patch.object(coordinator.subprocess, "run", return_value=result) as command, \
                     mock.patch.object(coordinator, "_verify_dispatch_log"), \
                     mock.patch.object(coordinator, "transition") as transition, \
                     contextlib.redirect_stdout(io.StringIO()):
@@ -150,14 +166,22 @@ class CoordinatorLedgerAcceptanceTests(unittest.TestCase):
             ledger = self._new_ledger(temporary)
             record = _ledger_record(state="dispatch-requested")
             record["dispatch_requested_at"] = coordinator._timestamp()
+            record["reconcile_deadline_at"] = int(time.time()) + 300
             _write_record(ledger, record)
             page = [{"total_count": 1, "workflow_runs": [{
                 "id": 54321, "path": coordinator.fetch.WORKFLOW_PATH,
                 "head_branch": "main", "head_sha": CONTROL_SHA,
                 "event": "workflow_dispatch", "run_attempt": 1,
+                "display_title": "devlane wave=other bundle=other",
+                "created_at": coordinator._timestamp(),
+                "repository": {"full_name": coordinator.fetch.REPOSITORY,
+                               "id": int(coordinator.fetch.REPOSITORY_ID)},
+                "head_repository": {"full_name": coordinator.fetch.REPOSITORY,
+                                    "id": int(coordinator.fetch.REPOSITORY_ID)},
             }]}]
             result = type("Result", (), {"returncode": 0, "stdout": json.dumps(page).encode()})()
-            with mock.patch.object(coordinator.subprocess, "run", return_value=result), \
+            with mock.patch.object(coordinator, "_verify_remote_main"), \
+                    mock.patch.object(coordinator.subprocess, "run", return_value=result), \
                     mock.patch.object(coordinator, "_verify_dispatch_log",
                                       side_effect=coordinator.Refusal("run-wave-binding")), \
                     contextlib.redirect_stdout(io.StringIO()):
@@ -488,10 +512,15 @@ class RunLifecycleTests(unittest.TestCase):
             _write_record(ledger, record)
             with mock.patch.object(coordinator, "_verify_environment",
                                    side_effect=coordinator.Refusal("environment-unrestricted")), \
+                    mock.patch.object(coordinator, "_verify_remote_main"), \
+                    mock.patch.object(coordinator, "_verify_secret_absent"), \
                     self.assertRaisesRegex(coordinator.Refusal, "environment-unrestricted"):
                 coordinator.transition(ledger, "wave-test-0001", "mark-secret-installing")
             self.assertEqual(coordinator._read(ledger / "wave-test-0001.json")["state"], "assets-attached")
-            with mock.patch.object(coordinator, "_verify_environment"), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(coordinator, "_verify_remote_main"), \
+                    mock.patch.object(coordinator, "_verify_secret_absent"), \
+                    mock.patch.object(coordinator, "_verify_environment"), \
+                    contextlib.redirect_stdout(io.StringIO()):
                 coordinator.transition(ledger, "wave-test-0001", "mark-secret-installing")
             self.assertEqual(coordinator._read(ledger / "wave-test-0001.json")["state"], "secret-installing")
 
@@ -555,7 +584,8 @@ class RunLifecycleTests(unittest.TestCase):
                 record["dispatch_requested_at"] = coordinator._timestamp()
                 record["cleanup_obligations"]["run"] = {"state": "dispatch-ambiguous"}
                 _write_record(ledger, record)
-                with mock.patch.object(coordinator, "_verify_run_identity", return_value={"status": "completed"}), \
+                with mock.patch.object(coordinator, "_verify_remote_main"), \
+                        mock.patch.object(coordinator, "_verify_run_identity", return_value={"status": "completed"}), \
                         mock.patch.object(coordinator, "_verify_run_binding"), \
                         contextlib.redirect_stdout(io.StringIO()):
                     coordinator.transition(ledger, "wave-test-0001", "attach-run", "54321")
@@ -751,6 +781,669 @@ class TimedRevocationTests(unittest.TestCase):
         self.assertEqual(coordinator.MAX_REVOKE_LATENCY_SECONDS, 120)
 
 
+class SingleDispatchOwnerTests(unittest.TestCase):
+    """The install/dispatch/reconcile interval is one fail-closed coordinator operation."""
+
+    def _ready_wave(self, temporary):
+        ledger = CoordinatorLedgerAcceptanceTests()._new_ledger(temporary)
+        record = _ledger_record(state="assets-attached")
+        record["bundle_asset_id"] = "111"
+        record["projection_asset_id"] = "222"
+        record["cache_baseline_sha256"] = CACHE_SHA
+        _write_record(ledger, record)
+        key_path = Path(temporary) / "key.hex"
+        key_path.write_bytes(b"a" * 64)
+        key_path.chmod(0o600)
+        return ledger, key_path
+
+    def _attach(self, ledger, wave_id="wave-test-0001"):
+        path = Path(ledger) / (wave_id + ".json")
+        record = coordinator._read(path)
+        record.update({"state": "run-attached", "run_id": "54321", "authorized_run_id": "54321",
+                       "run_attempt": 1, "dispatch_completed_at": coordinator._timestamp()})
+        coordinator._write_atomic(path, record)
+
+    def test_dispatch_owner_refuses_to_unlink_a_key_outside_the_private_owner_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger, _ = self._ready_wave(temporary)
+            unrelated = Path(temporary) / "other.txt"
+            unrelated.write_text("preserve", encoding="ascii")
+            with self.assertRaisesRegex(coordinator.Refusal, "key-file-path"):
+                coordinator.dispatch_wave(ledger, "wave-test-0001", unrelated)
+            self.assertEqual(unrelated.read_text(encoding="ascii"), "preserve")
+
+    def test_dispatch_owner_removes_its_private_key_file_on_preflight_refusal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger, key_path = self._ready_wave(temporary)
+            with self.assertRaisesRegex(coordinator.Refusal, "dispatch-wave-bounds"):
+                coordinator.dispatch_wave(ledger, "wave-test-0001", key_path, timeout_seconds=10)
+            self.assertFalse(key_path.exists())
+
+    def test_key_file_requires_exact_lowercase_hex_without_echoing_contents(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            key_path = Path(temporary) / "key.hex"
+            key_path.write_bytes(b"g" * 64)
+            key_path.chmod(0o600)
+            with self.assertRaisesRegex(coordinator.Refusal, "key-file-content") as raised:
+                coordinator._read_key_file(key_path)
+            self.assertNotIn("g" * 64, str(raised.exception))
+
+    def test_ambiguous_dispatch_is_reconciled_once_and_revoked(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger, key_path = self._ready_wave(temporary)
+            calls, revoked = [], []
+
+            def dispatch(*args, **kwargs):
+                calls.append(args[0])
+                return type("Result", (), {"returncode": 1 if "workflow" in args[0] else 0})()
+
+            def reconcile(*args):
+                self._attach(ledger)
+                return True
+
+            with mock.patch.object(coordinator, "_verify_remote_main"), \
+                    mock.patch.object(coordinator, "_verify_secret_absent"), \
+                    mock.patch.object(coordinator, "_verify_environment"), \
+                    mock.patch.object(coordinator, "_verify_secret_present"), \
+                    mock.patch.object(coordinator.subprocess, "run", side_effect=dispatch), \
+                    mock.patch.object(coordinator, "reconcile_dispatch", side_effect=reconcile), \
+                    mock.patch.object(coordinator, "await_decrypt_and_revoke", return_value=True), \
+                    mock.patch.object(coordinator, "revoke_secret", side_effect=lambda *a: revoked.append(a)), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(coordinator.dispatch_wave(ledger, "wave-test-0001", key_path), "54321")
+            self.assertEqual(sum("workflow" in command for command in calls), 1)
+            self.assertGreaterEqual(len(revoked), 1)
+            self.assertFalse(key_path.exists())
+            self.assertEqual(coordinator._read(ledger / "wave-test-0001.json")["dispatch_result"], "ambiguous")
+
+    def test_pending_forever_hits_absolute_deadline_and_revokes_without_run_guess(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger, key_path = self._ready_wave(temporary)
+            revoked = []
+            def gh(*args, **kwargs):
+                return type("Result", (), {"returncode": 0})()
+            virtual_time = [time.time()]
+            def clock():
+                return virtual_time[0]
+            def advance(seconds):
+                virtual_time[0] += seconds
+            with mock.patch.object(coordinator, "_verify_remote_main"), \
+                    mock.patch.object(coordinator, "_verify_secret_absent"), \
+                    mock.patch.object(coordinator, "_verify_environment"), \
+                    mock.patch.object(coordinator, "_verify_secret_present"), \
+                    mock.patch.object(coordinator, "_gh_status", return_value=404), \
+                    mock.patch.object(coordinator.subprocess, "run", side_effect=gh), \
+                    mock.patch.object(coordinator, "reconcile_dispatch", return_value=False), \
+                    mock.patch.object(coordinator, "revoke_secret", side_effect=lambda *a: revoked.append(a)), \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    self.assertRaisesRegex(coordinator.Refusal, "dispatch-reconcile-deadline"):
+                coordinator.dispatch_wave(
+                    ledger, "wave-test-0001", key_path, timeout_seconds=30,
+                    sleep=advance, clock=clock,
+                )
+            self.assertGreaterEqual(len(revoked), 1)
+            self.assertIsNone(coordinator._read(ledger / "wave-test-0001.json")["run_id"])
+
+    def test_reconciliation_api_refusal_and_interruption_both_revoke(self):
+        for failure in (coordinator.Refusal("github-api-unavailable"), KeyboardInterrupt()):
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as temporary:
+                ledger, key_path = self._ready_wave(temporary)
+                revoked = []
+                def gh(*args, **kwargs):
+                    return type("Result", (), {"returncode": 0})()
+                with mock.patch.object(coordinator, "_verify_remote_main"), \
+                        mock.patch.object(coordinator, "_verify_secret_absent"), \
+                        mock.patch.object(coordinator, "_verify_environment"), \
+                        mock.patch.object(coordinator, "_verify_secret_present"), \
+                        mock.patch.object(coordinator.subprocess, "run", side_effect=gh), \
+                        mock.patch.object(coordinator, "reconcile_dispatch", side_effect=failure), \
+                        mock.patch.object(coordinator, "revoke_secret", side_effect=lambda *a: revoked.append(a)), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(type(failure)):
+                        coordinator.dispatch_wave(ledger, "wave-test-0001", key_path)
+                self.assertGreaterEqual(len(revoked), 1)
+                self.assertFalse(key_path.exists())
+
+    def test_revocation_refusal_leaves_persisted_retry_obligation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger, key_path = self._ready_wave(temporary)
+            def gh(*args, **kwargs):
+                return type("Result", (), {"returncode": 0})()
+            with mock.patch.object(coordinator, "_verify_remote_main"), \
+                    mock.patch.object(coordinator, "_verify_secret_absent"), \
+                    mock.patch.object(coordinator, "_verify_environment"), \
+                    mock.patch.object(coordinator, "_verify_secret_present"), \
+                    mock.patch.object(coordinator, "_gh_status", return_value=404), \
+                    mock.patch.object(coordinator.subprocess, "run", side_effect=gh), \
+                    mock.patch.object(coordinator, "reconcile_dispatch", side_effect=coordinator.Refusal("api-refused")), \
+                    mock.patch.object(coordinator, "_revoke_secret", side_effect=coordinator.Refusal("api-refused")), \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    self.assertRaisesRegex(coordinator.Refusal, "api-refused"):
+                coordinator.dispatch_wave(ledger, "wave-test-0001", key_path)
+            record = coordinator._read(ledger / "wave-test-0001.json")
+            self.assertEqual(record["cleanup_obligations"]["secret"]["state"], "secret-delete-pending")
+            self.assertFalse(key_path.exists())
+
+
+class RecoveryObligationTests(unittest.TestCase):
+    def _pending_ledger(self, temporary):
+        ledger = Path(temporary) / "ledger"
+        ledger.mkdir(mode=0o700)
+        record = _ledger_record(state="secret-installing")
+        record["cleanup_obligations"]["secret"] = {
+            "state": "installation-pending", "attempted_at": coordinator._timestamp(),
+        }
+        _write_record(ledger, record)
+        return ledger
+
+    def _fake_gh(self, folder, marker, ready):
+        script = chr(35) + """!/bin/sh
+if [ "$GH_MODE" = silent ]; then exec /bin/sleep 30; fi
+case "$*" in
+  *"secret set"*) touch "$SECRET_MARKER"; touch "$SECRET_READY"; exec /bin/sleep 30 ;;
+  *"--include --method DELETE"*)
+    for arg in "$@"; do endpoint=$arg; done
+    case "$endpoint" in *"/environments/devlane-decrypt/secrets/"*) rm -f "$SECRET_MARKER";; esac
+    printf 'HTTP/2 204 response\\r\\n\\r\\n{}\\n'; exit 0 ;;
+  *"--include"*)
+    for arg in "$@"; do endpoint=$arg; done
+    case "$endpoint" in
+      *"/environments/devlane-decrypt/secrets/"*)
+        if [ -e "$SECRET_MARKER" ]; then code=200; else code=404; fi ;;
+      *"/actions/secrets/"*) code=404 ;;
+      *) code=404 ;;
+    esac
+    printf 'HTTP/2 %s response\\r\\n\\r\\n{}\\n' "$code"; exit 0 ;;
+  *"git/ref/heads/main"*) printf '{"object":{"sha":"%s"}}\\n' "$CONTROL_SHA"; exit 0 ;;
+  *"deployment-branch-policies"*) printf '{"total_count":1,"branch_policies":[{"id":7,"name":"main","type":"branch"}]}\\n'; exit 0 ;;
+  *"/environments/devlane-decrypt"*) printf '{"name":"devlane-decrypt","can_admins_bypass":false,"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}\\n'; exit 0 ;;
+esac
+exit 2
+"""
+        path = Path(folder) / "gh"
+        path.write_text(script, encoding="utf-8")
+        path.chmod(0o700)
+        return {"PATH": str(folder) + ":/usr/bin:/bin", "SECRET_MARKER": str(marker),
+                "SECRET_READY": str(ready), "CONTROL_SHA": CONTROL_SHA}
+
+    def test_silent_gh_is_killed_and_pending_obligation_can_be_recovered(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ledger = self._pending_ledger(root)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            env = self._fake_gh(bin_dir, root / "secret-present", root / "secret-ready")
+            env.update(os.environ)
+            env["PATH"] = str(bin_dir) + ":/usr/bin:/bin"
+            env["GH_MODE"] = "silent"
+            with mock.patch.object(coordinator, "GH_STATUS_TIMEOUT_SECONDS", 0.15), \
+                    mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stderr(io.StringIO()) as errors:
+                started = time.monotonic()
+                status = coordinator.main(["recover-pending-secrets", "--ledger", str(ledger)])
+                elapsed = time.monotonic() - started
+            self.assertEqual(status, 2)
+            self.assertLess(elapsed, 3)
+            self.assertIn("github-verify-timeout", errors.getvalue())
+            self.assertEqual(coordinator._read(ledger / "wave-test-0001.json")["cleanup_obligations"]["secret"]["state"],
+                             "secret-delete-pending")
+
+            env["GH_MODE"] = "normal"
+            with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(coordinator.main(["recover-pending-secrets", "--ledger", str(ledger)]), 0)
+            self.assertIn("secret_recovery=complete waves=1", output.getvalue())
+            self.assertEqual(coordinator._read(ledger / "wave-test-0001.json")["cleanup_obligations"]["secret"]["state"],
+                             "absent")
+
+    def test_sigkill_after_install_request_preserves_fsynced_obligation_for_recovery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ledger = root / "ledger"
+            ledger.mkdir(mode=0o700)
+            record = _ledger_record(state="assets-attached")
+            record["bundle_asset_id"] = "111"
+            record["projection_asset_id"] = "222"
+            record["cache_baseline_sha256"] = CACHE_SHA
+            _write_record(ledger, record)
+            key_path = root / "key.hex"
+            key_path.write_bytes(b"a" * 64)
+            key_path.chmod(0o600)
+            marker, ready = root / "secret-present", root / "secret-ready"
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            env = os.environ.copy()
+            env.update(self._fake_gh(bin_dir, marker, ready))
+            env["GH_MODE"] = "normal"
+            coordinator_path = str(Path(coordinator.__file__))
+            process = subprocess.Popen([
+                sys.executable, "-B", coordinator_path, "dispatch-wave", "--ledger", str(ledger),
+                "--wave-id", "wave-test-0001", "--key-file", str(key_path),
+            ], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+               stderr=subprocess.DEVNULL, start_new_session=True)
+            try:
+                deadline = time.monotonic() + 10
+                while not ready.exists() and time.monotonic() < deadline:
+                    if process.poll() is not None:
+                        self.fail("coordinator exited before synthetic secret install")
+                    time.sleep(0.02)
+                self.assertTrue(ready.exists(), "synthetic gh did not reach install")
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=5)
+            surviving = coordinator._read(ledger / "wave-test-0001.json")
+            self.assertEqual(surviving["state"], "secret-installing")
+            self.assertEqual(surviving["cleanup_obligations"]["secret"]["state"], "installation-pending")
+            self.assertTrue(marker.exists())
+            with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(coordinator.main(["recover-pending-secrets", "--ledger", str(ledger)]), 0)
+            self.assertIn("secret_recovery=complete waves=1", output.getvalue())
+            self.assertFalse(marker.exists())
+            self.assertEqual(coordinator._read(ledger / "wave-test-0001.json")["cleanup_obligations"]["secret"]["state"],
+                             "absent")
+
+    def test_reservation_refuses_until_pending_secret_obligation_is_recovered(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = self._pending_ledger(temporary)
+            (ledger / ("control-evidence-" + CONTROL_SHA + "-12345.json")).write_bytes(bundle.canonical_json({
+                "schema": 1, "control_sha": CONTROL_SHA, "control_run_id": "12345",
+                "control_wave_id": "control-wave-0001", "status": "passed", "verified_at": coordinator._timestamp(),
+            }))
+            with mock.patch.object(coordinator, "_verify_secret_absent") as verify, \
+                    self.assertRaisesRegex(coordinator.Refusal, "secret-recovery-required"):
+                coordinator.reserve_wave(ledger, _request())
+            verify.assert_not_called()
+
+    def test_control_evidence_is_bound_to_persisted_dispatch_and_current_main(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = CoordinatorLedgerAcceptanceTests()._new_ledger(temporary)
+            record = {
+                "schema": 1, "wave_id": "control-wave-0001", "control_sha": CONTROL_SHA, "ref": "main",
+                "dispatch_started_at": int(time.time()), "reconcile_deadline_at": int(time.time()) + 300,
+                "dispatch_completed_at": int(time.time()) + 1, "dispatch_result": "accepted", "run_id": "54321",
+            }
+            coordinator._write_atomic(coordinator._control_dispatch_path(ledger, record["wave_id"]), record)
+            jobs = [{"id": index} for index in range(18)]
+            with mock.patch.object(coordinator, "_gh_json", side_effect=[{}, {"total_count": 18, "jobs": jobs}]), \
+                    mock.patch.object(coordinator, "_cache_records", return_value=[{
+                        "key": "devlane-control-v1-54321", "size_in_bytes": 1,
+                    }]), \
+                    mock.patch.object(coordinator.control_audit, "validate_terminal_control_run"), \
+                    mock.patch.object(coordinator, "_verify_remote_main") as verify_main, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                coordinator.record_control_evidence(
+                    ledger, "54321", CONTROL_SHA, "control-wave-0001")
+            verify_main.assert_called_once_with(CONTROL_SHA)
+            evidence = coordinator._control_record(Path(ledger), CONTROL_SHA, "54321")
+            self.assertEqual(evidence["control_wave_id"], "control-wave-0001")
+            record["run_id"] = "54322"
+            coordinator._write_atomic(coordinator._control_dispatch_path(ledger, record["wave_id"]), record)
+            with mock.patch.object(coordinator, "_gh_json") as no_api:
+                with self.assertRaisesRegex(coordinator.Refusal, "control-dispatch-binding"):
+                    coordinator.record_control_evidence(
+                        ledger, "54321", CONTROL_SHA, "control-wave-0001")
+            no_api.assert_not_called()
+
+
+class ControlDispatchReconciliationTests(unittest.TestCase):
+    def _dispatch_record(self, ledger, wave="control-wave-0001"):
+        started = int(time.time())
+        record = {
+            "schema": 1, "wave_id": wave, "control_sha": CONTROL_SHA, "ref": "main",
+            "dispatch_started_at": started, "reconcile_deadline_at": started + 30,
+            "dispatch_completed_at": started + 1, "dispatch_result": "ambiguous", "run_id": None,
+        }
+        coordinator._write_atomic(coordinator._control_dispatch_path(Path(ledger), wave), record)
+        return record
+
+    def test_inventory_rejects_malformed_typed_control_dispatch_records(self):
+        for changes in ({"schema": True}, {"run_id": 12345},
+                        {"dispatch_completed_at": {"invalid": "timestamp"}},
+                        {"dispatch_completed_at": True}, {"dispatch_completed_at": None},
+                        {"dispatch_completed_at": -1},
+                        {"dispatch_result": "requested"},
+                        {"control_sha": 123}):
+            with self.subTest(changes=changes), tempfile.TemporaryDirectory() as temporary:
+                ledger = Path(temporary)
+                record = self._dispatch_record(ledger)
+                record.update(changes)
+                coordinator._write_atomic(coordinator._control_dispatch_path(ledger, record["wave_id"]), record)
+                with self.assertRaisesRegex(coordinator.Refusal, "control-dispatch-invalid"):
+                    coordinator._pending_secret_waves(ledger)
+
+    def test_inventory_rejects_malformed_typed_control_evidence_records(self):
+        for changes in ({"schema": True}, {"verified_at": {"invalid": "timestamp"}},
+                        {"verified_at": None}, {"verified_at": 12345},
+                        {"verified_at": "2026-13-01T00:00:00Z"},
+                        {"verified_at": "2026-11-10T00:00:00"},
+                        {"verified_at": "2026-11-10T24:00:00Z"},
+                        {"verified_at": "2026-11-10T23:60:00Z"},
+                        {"verified_at": "2026-11-10T23:59:60Z"},
+                        {"control_run_id": 12345}):
+            with self.subTest(changes=changes), tempfile.TemporaryDirectory() as temporary:
+                ledger = Path(temporary)
+                record = {"schema": 1, "control_sha": CONTROL_SHA,
+                          "control_run_id": "12345", "control_wave_id": "control-wave-0001",
+                          "status": "passed", "verified_at": coordinator._timestamp()}
+                record.update(changes)
+                coordinator._write_atomic(ledger / ("control-evidence-" + CONTROL_SHA + "-12345.json"), record)
+                with self.assertRaisesRegex(coordinator.Refusal, "control-evidence-invalid"):
+                    coordinator._pending_secret_waves(ledger)
+
+    def test_control_matches_exact_wave_identity_and_persisted_dispatch_interval(self):
+        record = {
+            "wave_id": "control-wave-0001", "control_sha": CONTROL_SHA,
+            "dispatch_started_at": 1_800_000_000, "reconcile_deadline_at": 1_800_000_300,
+        }
+        run = {
+            "id": 54321, "path": coordinator.control_audit.WORKFLOW_PATH,
+            "event": "workflow_dispatch", "head_branch": "main", "head_sha": CONTROL_SHA,
+            "run_attempt": 1, "display_title": "public control=control-wave-0001",
+            "created_at": "2027-01-15T08:00:01Z",
+            "repository": {"full_name": coordinator.fetch.REPOSITORY, "id": coordinator.fetch.REPOSITORY_ID},
+            "head_repository": {"full_name": coordinator.fetch.REPOSITORY, "id": coordinator.fetch.REPOSITORY_ID},
+        }
+        with mock.patch.object(coordinator, "_workflow_run_pages", return_value=[run]):
+            self.assertEqual(coordinator._control_run_candidates(record), ["54321"])
+        for changes in (
+            {"display_title": "public control=control-wave-0002"},
+            {"head_sha": "b" * 40}, {"run_attempt": 2}, {"head_branch": "develop"},
+            {"created_at": "2027-01-15T08:10:00Z"},
+            {"repository": {"full_name": "other/repo", "id": "1"}},
+            {"path": ".github/workflows/other.yml"},
+            {"head_repository": {"full_name": "fork/platform-ci", "id": "2"}},
+        ):
+            with self.subTest(changes=changes), mock.patch.object(
+                    coordinator, "_workflow_run_pages", return_value=[dict(run, **changes)]):
+                self.assertEqual(coordinator._control_run_candidates(record), [])
+
+    def test_incomplete_paginated_control_inventory_refuses(self):
+        pages = [{"total_count": 2, "workflow_runs": [{"id": 1}]}]
+        result = type("Result", (), {"returncode": 0, "stdout": json.dumps(pages).encode()})()
+        with mock.patch.object(coordinator.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(coordinator.Refusal, "dispatch-run-inventory-incomplete"):
+                coordinator._workflow_run_pages("repos/test/actions/workflows/public-policy.yml/runs")
+
+    def test_dispatch_api_ambiguity_is_reconciled_without_a_second_dispatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            calls = []
+            def dispatch(command, **kwargs):
+                calls.append(command)
+                return type("Result", (), {"returncode": 1})()
+            with mock.patch.object(coordinator, "_verify_remote_main"), \
+                    mock.patch.object(coordinator.subprocess, "run", side_effect=dispatch), \
+                    mock.patch.object(coordinator, "_control_run_candidates", return_value=["54321"]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(coordinator.dispatch_control(
+                    temporary, CONTROL_SHA, "control-wave-0001"), "54321")
+            self.assertEqual(len(calls), 1)
+            self.assertIn("workflow", calls[0])
+            record = coordinator._read_control_dispatch(Path(temporary), "control-wave-0001")
+            self.assertEqual(record["dispatch_result"], "ambiguous")
+            self.assertEqual(record["run_id"], "54321")
+            with self.assertRaisesRegex(coordinator.Refusal, "control-wave-replay"):
+                coordinator.dispatch_control(temporary, CONTROL_SHA, "control-wave-0001")
+
+    def test_real_cli_dispatch_control_success_and_refusal_use_transport_mocks(self):
+        result = type("Result", (), {"returncode": 0})()
+        with tempfile.TemporaryDirectory() as temporary:
+            calls = []
+            with mock.patch.object(coordinator, "_verify_remote_main"), \
+                    mock.patch.object(coordinator.subprocess, "run", side_effect=lambda *a, **k: calls.append(a) or result), \
+                    mock.patch.object(coordinator, "_control_run_candidates", return_value=["54321"]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                status = coordinator.main([
+                    "dispatch-control", "--ledger", temporary, "--control-sha", CONTROL_SHA,
+                    "--control-wave-id", "control-wave-0001", "--poll-seconds", "2", "--timeout-seconds", "30",
+                ])
+            self.assertEqual(status, 0)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(coordinator._read_control_dispatch(Path(temporary), "control-wave-0001")["run_id"], "54321")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(coordinator, "_verify_remote_main"), \
+                    mock.patch.object(coordinator.subprocess, "run", return_value=result) as transport, \
+                    mock.patch.object(coordinator, "_control_run_candidates", return_value=["54321", "54322"]), \
+                    contextlib.redirect_stderr(io.StringIO()) as errors:
+                status = coordinator.main([
+                    "dispatch-control", "--ledger", temporary, "--control-sha", CONTROL_SHA,
+                    "--control-wave-id", "control-wave-0002",
+                ])
+            self.assertEqual(status, 2)
+            self.assertIn("control-dispatch-ambiguous", errors.getvalue())
+            transport.assert_called_once()
+
+    def test_control_dispatch_evidence_and_wave_reservation_share_one_ledger(self):
+        self._assert_control_to_reservation_flow()
+
+    def test_requested_crash_state_reconciles_then_records_evidence_and_reserves(self):
+        self._assert_control_to_reservation_flow(crashed=True)
+
+    def _assert_control_to_reservation_flow(self, crashed=False):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = CoordinatorLedgerAcceptanceTests()._new_ledger(temporary)
+            result = type("Result", (), {"returncode": 0})()
+            with mock.patch.object(coordinator, "_verify_remote_main"), \
+                    mock.patch.object(coordinator.subprocess, "run", return_value=result), \
+                    mock.patch.object(coordinator, "_control_run_candidates", return_value=["54321"]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                if crashed:
+                    record = self._dispatch_record(ledger, "control-wave-composed")
+                    record.update(dispatch_result="requested", dispatch_completed_at=None)
+                    coordinator._write_atomic(coordinator._control_dispatch_path(ledger, record["wave_id"]), record)
+                    self.assertEqual(coordinator._pending_secret_waves(ledger), [])
+                    self.assertEqual(coordinator.wait_control_run(ledger, record["wave_id"]), "54321")
+                    saved = coordinator._read_control_dispatch(ledger, record["wave_id"])
+                    self.assertEqual(saved["dispatch_result"], "requested")
+                    self.assertIsNone(saved["dispatch_completed_at"])
+                    self.assertEqual(saved["run_id"], "54321")
+                    self.assertEqual(coordinator._pending_secret_waves(ledger), [])
+                else:
+                    self.assertEqual(coordinator.main([
+                        "dispatch-control", "--ledger", str(ledger), "--control-sha", CONTROL_SHA,
+                        "--control-wave-id", "control-wave-composed",
+                    ]), 0)
+
+            jobs = [{"id": index} for index in range(18)]
+            with mock.patch.object(coordinator, "_verify_remote_main"), \
+                    mock.patch.object(coordinator, "_gh_json", side_effect=[{}, {"total_count": 18, "jobs": jobs}]), \
+                    mock.patch.object(coordinator, "_cache_records", return_value=[{
+                        "key": "devlane-control-v1-54321", "size_in_bytes": 1,
+                    }]), \
+                    mock.patch.object(coordinator.control_audit, "validate_terminal_control_run"), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(coordinator.main([
+                    "record-control-evidence", "--ledger", str(ledger), "--control-run-id", "54321",
+                    "--control-sha", CONTROL_SHA, "--control-wave-id", "control-wave-composed",
+                ]), 0)
+
+            request_path = Path(temporary) / "reserve.json"
+            request = _request("wave-composed-0001", "bundle-composed-0001")
+            request["control_run_id"] = "54321"
+            request_path.write_bytes(bundle.canonical_json(request))
+            with mock.patch.object(coordinator, "_verify_secret_absent"), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(coordinator.main([
+                    "reserve-wave", "--ledger", str(ledger), "--request", str(request_path),
+                ]), 0)
+            self.assertTrue((ledger / "control-dispatch-control-wave-composed.json").exists())
+            self.assertTrue((ledger / ("control-evidence-" + CONTROL_SHA + "-54321.json")).exists())
+            self.assertEqual(coordinator._read(ledger / "wave-composed-0001.json")["state"], "reserved")
+
+    def test_real_cli_dispatch_wave_routes_transport_refusal_and_keeps_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = CoordinatorLedgerAcceptanceTests()._new_ledger(temporary)
+            record = _ledger_record(state="assets-attached")
+            record["bundle_asset_id"] = "111"
+            record["projection_asset_id"] = "222"
+            record["cache_baseline_sha256"] = CACHE_SHA
+            _write_record(ledger, record)
+            key_path = Path(temporary) / "key.hex"
+            key_path.write_bytes(b"a" * 64)
+            key_path.chmod(0o600)
+            result = type("Result", (), {"returncode": 1})()
+            with mock.patch.object(coordinator, "_verify_remote_main"), \
+                    mock.patch.object(coordinator, "_verify_secret_absent"), \
+                    mock.patch.object(coordinator, "_verify_environment"), \
+                    mock.patch.object(coordinator.subprocess, "run", return_value=result) as transport, \
+                    mock.patch.object(coordinator, "_gh_status", return_value=404), \
+                    contextlib.redirect_stderr(io.StringIO()) as errors:
+                status = coordinator.main([
+                    "dispatch-wave", "--ledger", str(ledger), "--wave-id", "wave-test-0001",
+                    "--key-file", str(key_path), "--poll-seconds", "2", "--timeout-seconds", "30",
+                    "--decrypt-timeout-seconds", "60",
+                ])
+            self.assertEqual(status, 2)
+            self.assertIn("secret-install-ambiguous", errors.getvalue())
+            transport.assert_called_once()
+            updated = coordinator._read(ledger / "wave-test-0001.json")
+            self.assertEqual(updated["cleanup_obligations"]["secret"]["state"], "absent")
+            self.assertFalse(key_path.exists())
+
+    def test_real_cli_dispatch_wave_success_uses_transport_mocks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = CoordinatorLedgerAcceptanceTests()._new_ledger(temporary)
+            record = _ledger_record(state="assets-attached")
+            record["bundle_asset_id"] = "111"
+            record["projection_asset_id"] = "222"
+            record["cache_baseline_sha256"] = CACHE_SHA
+            _write_record(ledger, record)
+            key_path = Path(temporary) / "key.hex"
+            key_path.write_bytes(b"a" * 64)
+            key_path.chmod(0o600)
+            calls = []
+
+            class FinishedWatcher:
+                def __init__(self, target, args, kwargs, **_ignored):
+                    self.args = args
+                    self.alive = False
+
+                def start(self):
+                    self.args[4]["timely"] = True
+                    self.args[3].set()
+
+                def join(self, timeout=None):
+                    return None
+
+                def is_alive(self):
+                    return self.alive
+
+            def gh(command, **_kwargs):
+                calls.append(command)
+                return type("Result", (), {"returncode": 0})()
+
+            def attach(_ledger, wave_id):
+                attached = coordinator._read(ledger / (wave_id + ".json"))
+                attached.update({"state": "run-attached", "run_id": "54321", "authorized_run_id": "54321",
+                                 "run_attempt": 1, "dispatch_completed_at": coordinator._timestamp()})
+                coordinator._write_atomic(ledger / (wave_id + ".json"), attached)
+                return True
+
+            with mock.patch.object(coordinator, "_verify_remote_main"), \
+                    mock.patch.object(coordinator, "_verify_secret_absent"), \
+                    mock.patch.object(coordinator, "_verify_environment"), \
+                    mock.patch.object(coordinator, "_verify_secret_present"), \
+                    mock.patch.object(coordinator.subprocess, "run", side_effect=gh), \
+                    mock.patch.object(coordinator.threading, "Thread", side_effect=FinishedWatcher), \
+                    mock.patch.object(coordinator, "reconcile_dispatch", side_effect=attach), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                status = coordinator.main([
+                    "dispatch-wave", "--ledger", str(ledger), "--wave-id", "wave-test-0001",
+                    "--key-file", str(key_path), "--poll-seconds", "2", "--timeout-seconds", "30",
+                    "--decrypt-timeout-seconds", "60",
+                ])
+            self.assertEqual(status, 0)
+            self.assertEqual(len(calls), 2)
+            self.assertIn("secret set", " ".join(calls[0]))
+            self.assertIn("workflow run", " ".join(calls[1]))
+            self.assertIn("dispatch_wave=attached run-id=54321", output.getvalue())
+            self.assertFalse(key_path.exists())
+
+    def test_zero_matches_poll_only_until_fixed_deadline_and_ambiguity_refuses(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            record = self._dispatch_record(temporary)
+            with mock.patch.object(coordinator, "_verify_remote_main"), \
+                    mock.patch.object(coordinator, "_control_run_candidates", return_value=[]), \
+                    mock.patch.object(coordinator.subprocess, "run") as no_dispatch, \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    self.assertRaisesRegex(coordinator.Refusal, "control-reconcile-deadline"):
+                coordinator.wait_control_run(temporary, record["wave_id"], clock=lambda: record["reconcile_deadline_at"])
+            no_dispatch.assert_not_called()
+        with tempfile.TemporaryDirectory() as temporary:
+            record = self._dispatch_record(temporary)
+            with mock.patch.object(coordinator, "_verify_remote_main"), \
+                    mock.patch.object(coordinator, "_control_run_candidates", return_value=["54321", "54322"]), \
+                    mock.patch.object(coordinator.subprocess, "run") as no_dispatch, \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    self.assertRaisesRegex(coordinator.Refusal, "control-dispatch-ambiguous"):
+                coordinator.wait_control_run(temporary, record["wave_id"])
+            no_dispatch.assert_not_called()
+
+
+class DocumentedControlShellFlowTests(unittest.TestCase):
+    def _fixture(self, *, corrupt_parent_read=False, fail_watch=False):
+        document = (Path(coordinator.__file__).parents[2] / "docs/devlane-procedure.md").read_text(encoding="utf-8")
+        section = document.split("1. Run the source-free control", 1)[1]
+        match = re.search(r"```sh\n(.*?)```", section, re.DOTALL)
+        self.assertIsNotNone(match)
+        flow = "set -euo pipefail\n" + match.group(1) + '\nprintf \'%s\\n\' "$CONTROL_RUN_ID" > "$DEVLANE_PRIVATE/flow-result.txt"\n'
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        owner = root / "owner"
+        private_bin = root / "bin"
+        owner.mkdir(mode=0o700)
+        private_bin.mkdir()
+        log = root / "commands.log"
+
+        def executable(name, contents):
+            path = private_bin / name
+            path.write_text(contents, encoding="utf-8")
+            path.chmod(0o700)
+
+        executable("git", chr(35) + "!/bin/sh\n[ \"$1\" = branch ] && [ \"$2\" = --show-current ] && { echo main; exit 0; }\nexit 2\n")
+        executable("gh", chr(35) + "!/bin/sh\nprintf '%s\\n' \"gh $*\" >> \"$FLOW_LOG\"\nif [ \"$1\" = api ]; then echo \"$CONTROL_SHA\"; exit 0; fi\nif [ \"$1\" = run ] && [ \"$2\" = watch ]; then exit \"$WATCH_EXIT\"; fi\nexit 2\n")
+        executable("python3", chr(35) + "!/bin/sh\nprintf '%s\\n' \"python3 $*\" >> \"$FLOW_LOG\"\ncase \"$*\" in *dispatch-control*) echo 'control_reconciliation=attached run-id=54321';; esac\nexit 0\n")
+        if corrupt_parent_read:
+            executable("cat", chr(35) + "!/bin/sh\nif [ \"$2\" = \"$DEVLANE_PRIVATE/control-run-id.txt\" ]; then echo invalid; exit 0; fi\nexec /bin/cat \"$@\"\n")
+        env = os.environ.copy()
+        env.update({
+            "PATH": str(private_bin) + ":/usr/bin:/bin", "FLOW_LOG": str(log),
+            "DEVLANE_PRIVATE": str(owner), "REPO": "keeldock-platform/platform-ci",
+            "CONTROL_SHA": CONTROL_SHA, "CONTROL_WAVE_ID": "control-wave-shell-0001",
+            "WATCH_EXIT": "7" if fail_watch else "0",
+        })
+        return temporary, flow, env, log, owner
+
+    def test_documented_subshell_transfers_run_id_and_parent_rejects_bad_saved_id(self):
+        for corrupt, expected, message in ((False, 0, "54321"), (True, 2, "saved control run id invalid")):
+            with self.subTest(corrupt_parent_read=corrupt):
+                temporary, flow, env, log, owner = self._fixture(corrupt_parent_read=corrupt)
+                try:
+                    result = subprocess.run(["/bin/bash", "-c", flow], env=env, text=True,
+                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    if corrupt:
+                        self.assertIn(message, result.stderr)
+                        self.assertFalse((owner / "flow-result.txt").exists())
+                    else:
+                        self.assertEqual((owner / "flow-result.txt").read_text().strip(), message)
+                        self.assertIn("record-control-evidence", log.read_text())
+                        self.assertIn("--control-run-id 54321", log.read_text())
+                finally:
+                    temporary.cleanup()
+
+    def test_documented_control_flow_stops_after_watch_failure(self):
+        temporary, flow, env, log, owner = self._fixture(fail_watch=True)
+        try:
+            result = subprocess.run(["/bin/bash", "-c", flow], env=env, text=True,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("record-control-evidence", log.read_text())
+            self.assertFalse((owner / "flow-result.txt").exists())
+        finally:
+            temporary.cleanup()
+
+
 def _epoch_of(value):
     return coordinator._epoch(value)
 
@@ -774,8 +1467,11 @@ class OwnerSequenceTests(unittest.TestCase):
                 return {"id": 54321, "path": coordinator.fetch.WORKFLOW_PATH, "event": "workflow_dispatch",
                         "run_attempt": 1, "head_branch": "main", "head_sha": CONTROL_SHA, "status": status,
                         "conclusion": "failure", "display_title": title,
+                        "created_at": coordinator._timestamp(),
                         "repository": {"full_name": coordinator.fetch.REPOSITORY,
-                                       "id": int(coordinator.fetch.REPOSITORY_ID)}}
+                                       "id": int(coordinator.fetch.REPOSITORY_ID)},
+                        "head_repository": {"full_name": coordinator.fetch.REPOSITORY,
+                                            "id": int(coordinator.fetch.REPOSITORY_ID)}}
 
             def status(endpoint):
                 if endpoint.endswith("/environments/devlane-decrypt/secrets/DEVLANE_DECRYPT_KEY"):
@@ -823,6 +1519,7 @@ class OwnerSequenceTests(unittest.TestCase):
             patches = [
                 mock.patch.object(coordinator, "_gh_status", side_effect=status),
                 mock.patch.object(coordinator, "_gh_json", side_effect=gh_json),
+                mock.patch.object(coordinator, "_verify_remote_main"),
                 mock.patch.object(coordinator, "_gh_delete", side_effect=delete),
                 mock.patch.object(coordinator, "_release_assets", side_effect=lambda _release: list(github["assets"].values())),
                 mock.patch.object(coordinator, "_artifact_ids", side_effect=lambda _run: list(github["artifacts"])),

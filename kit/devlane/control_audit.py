@@ -155,6 +155,7 @@ def validate_run_record(run, identity):
     repository = run.get("repository")
     head_repository = run.get("head_repository")
     if (str(run.get("id")) != identity["run_id"] or run.get("path") != WORKFLOW_PATH
+            or run.get("display_title") != "public control=" + identity["wave_id"]
             or run.get("head_branch") != identity["ref"].removeprefix("refs/heads/") or run.get("head_sha") != identity["control_sha"]
             or run.get("event") != "workflow_dispatch" or run.get("run_attempt") != 1
             or run.get("status") != "in_progress" or run.get("conclusion") is not None
@@ -278,7 +279,8 @@ def validate_feedback_phase(jobs, identity):
     return by_name
 
 
-def validate_terminal_control_run(run, jobs, control_run_id, control_sha, *, require_main=True):
+def validate_terminal_control_run(run, jobs, control_run_id, control_sha, *, require_main=True,
+                                  expected_wave_id=None):
     repository = run.get("repository") if type(run) is dict else None
     head_repository = run.get("head_repository") if type(run) is dict else None
     head_branch = run.get("head_branch") if type(run) is dict else None
@@ -286,6 +288,9 @@ def validate_terminal_control_run(run, jobs, control_run_id, control_sha, *, req
         type(head_branch) is str and re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", head_branch) is not None)
     if (type(run) is not dict or str(run.get("id")) != str(control_run_id)
             or run.get("path") != WORKFLOW_PATH or run.get("event") != "workflow_dispatch"
+            or (expected_wave_id is not None
+                and (type(expected_wave_id) is not str or not OPAQUE.fullmatch(expected_wave_id)
+                     or run.get("display_title") != "public control=" + expected_wave_id))
             or run.get("head_sha") != control_sha or run.get("run_attempt") != 1
             or run.get("status") != "completed" or run.get("conclusion") != "success" or not valid_branch
             or type(repository) is not dict or repository.get("full_name") != REPOSITORY

@@ -1,6 +1,7 @@
 """Structural and active network-isolation probe for the Linux dev lane."""
 
 import argparse
+import errno
 import json
 import os
 import select
@@ -27,9 +28,33 @@ def positive_control(timeout=3.0, connector=None):
             connection = connect(address, timeout=timeout)
             connection.close()
             return {"connected": True, "target": "public-tls-control"}
-        except (OSError, TimeoutError) as error:
-            del error
+        except (OSError, TimeoutError):
+            continue
+        except Exception:
+            _refuse("positive-control-error")
     _refuse("positive-control-unavailable")
+
+
+def require_external_blocked(operation):
+    """Accept only an explicit failed external attempt; any connection is a refusal."""
+    try:
+        connected = operation()
+    except TimeoutError:
+        return False
+    except OSError as error:
+        if error.errno in {
+            errno.ETIMEDOUT, errno.ECONNREFUSED, errno.ENETUNREACH,
+            errno.EHOSTUNREACH, errno.EPERM, errno.EACCES,
+        }:
+            return False
+        _refuse("external-probe-error")
+    except Exception:
+        _refuse("external-probe-error")
+    if type(connected) is not bool:
+        _refuse("external-probe-result-invalid")
+    if connected:
+        _refuse("external-connectivity")
+    return False
 
 
 def _run_json(argv):
@@ -192,12 +217,14 @@ def _validate_firewall_rows(tables, chains, rows, rule_count=None):
 
 
 def _attempt_tcp(host, port, timeout=0.75):
+    connection = socket.create_connection((host, port), timeout=timeout)
     try:
-        connection = socket.create_connection((host, port), timeout=timeout)
-    except (OSError, TimeoutError):
-        return False
-    connection.close()
-    return True
+        return True
+    finally:
+        try:
+            connection.close()
+        except OSError:
+            pass
 
 
 def _attempt_https(host, port=443, timeout=0.75, doh=False):
@@ -207,47 +234,55 @@ def _attempt_https(host, port=443, timeout=0.75, doh=False):
         if doh else
         b"HEAD / HTTP/1.1\r\nHost: cloudflare-dns.com\r\nConnection: close\r\n\r\n"
     )
+    raw = socket.create_connection((host, port), timeout=timeout)
     try:
-        raw = socket.create_connection((host, port), timeout=timeout)
-        with ssl.create_default_context().wrap_socket(raw, server_hostname="cloudflare-dns.com") as connection:
-            connection.settimeout(timeout)
-            connection.sendall(request)
-            return bool(connection.recv(1))
-    except (OSError, TimeoutError, ssl.SSLError):
-        return False
+        try:
+            with ssl.create_default_context().wrap_socket(raw, server_hostname="cloudflare-dns.com") as connection:
+                connection.settimeout(timeout)
+                connection.sendall(request)
+                connection.recv(1)
+        except (OSError, TimeoutError, ssl.SSLError):
+            pass
+        return True
+    finally:
+        try:
+            raw.close()
+        except OSError:
+            pass
 
 
 def _attempt_udp_dns(host, timeout=0.75):
     query = bytes.fromhex("123401000001000000000000076578616d706c6503636f6d0000010001")
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
-            connection.settimeout(timeout)
-            connection.connect((host, 53))
-            connection.send(query)
-            connection.recv(512)
-    except (OSError, TimeoutError):
-        return False
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
+        connection.settimeout(timeout)
+        connection.connect((host, 53))
+        connection.send(query)
     return True
 
 
 def _attempt_tcp_dns(host, timeout=0.75):
+    connection = socket.create_connection((host, 53), timeout=timeout)
     try:
-        with socket.create_connection((host, 53), timeout=timeout) as connection:
+        try:
             connection.sendall(bytes.fromhex("001c123401000001000000000000076578616d706c6503636f6d0000010001"))
-            connection.settimeout(timeout)
-            return bool(connection.recv(512))
-    except (OSError, TimeoutError):
-        return False
+        except (OSError, TimeoutError):
+            pass
+        return True
+    finally:
+        try:
+            connection.close()
+        except OSError:
+            pass
 
 
 def active_probes():
     return {
-        "ipv4_https": _attempt_https("1.1.1.1"),
-        "ipv6_https": _attempt_https("2606:4700:4700::1111"),
-        "dns_udp": _attempt_udp_dns("1.1.1.1"),
-        "dns_tcp": _attempt_tcp_dns("1.1.1.1"),
-        "doh_direct_ip": _attempt_https("1.1.1.1", doh=True),
-        "metadata": _attempt_tcp("169.254.169.254", 80),
+        "ipv4_https": require_external_blocked(lambda: _attempt_https("1.1.1.1")),
+        "ipv6_https": require_external_blocked(lambda: _attempt_https("2606:4700:4700::1111")),
+        "dns_udp": require_external_blocked(lambda: _attempt_udp_dns("1.1.1.1")),
+        "dns_tcp": require_external_blocked(lambda: _attempt_tcp_dns("1.1.1.1")),
+        "doh_direct_ip": require_external_blocked(lambda: _attempt_https("1.1.1.1", doh=True)),
+        "metadata": require_external_blocked(lambda: _attempt_tcp("169.254.169.254", 80)),
     }
 
 

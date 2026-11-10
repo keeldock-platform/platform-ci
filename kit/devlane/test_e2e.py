@@ -56,7 +56,7 @@ KEY_BYTES = KEY_CANARY + bytes(range(16))
 COMMAND_CANARIES = ("::add-mask::SYNTHETIC_SOURCE_CANARY_7f8c", "::error::SYNTHETIC_SOURCE_CANARY_7f8c",
                     chr(35) * 2 + "[group]SYNTHETIC_SOURCE_CANARY_7f8c", "::set-output name=x::SYNTHETIC_SOURCE_CANARY_7f8c")
 BACKGROUND_MARKER = "DEVLANE_E2E_BACKGROUND_MARKER"
-RUST_VERSION = "1.88.0"
+RUST_VERSION = "1.99.1"
 PLAYWRIGHT_VERSION = "1.54.2"
 SYNTHETIC_LOCK = ROOT / "kit/confinement/synthetic_project/package-lock.json"
 
@@ -163,10 +163,15 @@ def _generated_lock(manifest_text, *, node):
 
 def _rust_projection(lock_bytes):
     cargo_manifest, cargo_lock, cargo_rows = fetch.project_cargo_lock(lock_bytes)
+    workspace_manifest, workspace_lock, _ = fetch.project_cargo_lock(lock_bytes)
     projection = {
         "schema": 1, "profile": "core-rust", "tools": {"cargo": RUST_VERSION, "rustc": RUST_VERSION},
         "npm": [], "cargo": cargo_rows, "playwright": [], "cargo_manifest": cargo_manifest,
-        "cargo_lock": cargo_lock, "cargo_workspaces": [],
+        "cargo_lock": cargo_lock,
+        "cargo_workspaces": [
+            {"path": "fuzz/Cargo.lock", "manifest": workspace_manifest, "lock": workspace_lock},
+            {"path": "runtime/Cargo.lock", "manifest": workspace_manifest, "lock": workspace_lock},
+        ],
     }
     payload = bundle.canonical_json(projection)
     fetch.validate_projection(payload, "core-rust")

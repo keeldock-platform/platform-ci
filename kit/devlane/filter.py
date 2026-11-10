@@ -18,12 +18,13 @@ LEVELS = frozenset(("error", "warning"))
 STATUS = frozenset(("pass", "fail", "skip"))
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 CODE = re.compile(r"(?:TS[0-9]{4,5}|E[0-9]{4}|DEVLANE_[A-Z_]{1,32})\Z")
-ALLOWED_STAGES = frozenset(("fetch", "prepare", "network", "decrypt", "format", "typecheck", "unit", "browser", "d15", "cleanup"))
+ALLOWED_STAGES = frozenset(("fetch", "prepare", "network", "decrypt", "format", "deny", "audit", "vet", "typecheck", "style", "unit", "browser", "d15", "cleanup"))
 RECORD_FIELDS = {
     "diagnostic": frozenset(("kind", "stage", "code", "file", "line", "level")),
     "test": frozenset(("kind", "stage", "test")),
     "frame": frozenset(("kind", "frame", "status")),
     "control": frozenset(("kind", "stage", "status", "code")),
+    "coverage": frozenset(("kind", "stage", "suite", "total", "passed", "failed", "ignored")),
 }
 
 
@@ -81,7 +82,7 @@ def _line_value(value, path):
 
 
 def _validate_allowlists(allowlists):
-    required = {"files", "tests", "frames", "stages", "codes", "max_lines"}
+    required = {"files", "tests", "frames", "stages", "codes", "max_lines", "suites"}
     if type(allowlists) is not dict or set(allowlists) != required:
         _reject("allowlist-shape")
     for key in ("files", "tests", "frames"):
@@ -103,6 +104,10 @@ def _validate_allowlists(allowlists):
         _reject("allowlist-stage")
     if any(type(code) is not str or not CODE.fullmatch(code) for code in allowlists["codes"]):
         _reject("allowlist-code")
+    if (type(allowlists["suites"]) is not list or len(allowlists["suites"]) > 512
+            or any(type(item) is not str or not IDENTIFIER.fullmatch(item) for item in allowlists["suites"])
+            or allowlists["suites"] != sorted(set(allowlists["suites"]))):
+        _reject("allowlist-suite")
 
 
 def _normalize(record, allowlists):
@@ -147,6 +152,25 @@ def _normalize(record, allowlists):
         if type(frame) is not str or frame not in allowlists["frames"] or status not in ("pass", "fail"):
             _reject("frame-identity")
         return {"kind": "frame", "frame": allowlists["frames"][frame], "status": status}
+    if kind == "coverage":
+        stage = record.get("stage")
+        suite = record.get("suite")
+        counts = [record.get(name) for name in ("total", "passed", "failed", "ignored")]
+        expected_stage = (
+            "format" if type(suite) is str and suite.startswith("fmt-") else
+            "deny" if type(suite) is str and suite.startswith("deny-") else
+            "audit" if type(suite) is str and suite.startswith("audit-") else
+            "vet" if type(suite) is str and suite.startswith("vet-") else "unit"
+        )
+        if (stage not in allowlists["stages"] or suite not in allowlists["suites"]
+                or stage != expected_stage
+                or any(type(value) is not int or value < 0 or value > 1_000_000 for value in counts)
+                or suite.startswith(("root-", "runtime-", "listener-")) and counts[0] < 1
+                or suite.startswith("fuzz-replay-") and counts[0] < 1
+                or counts[1] + counts[2] + counts[3] != counts[0]):
+            _reject("coverage-identity")
+        return {"kind": "coverage", "stage": stage, "suite": suite,
+                "total": counts[0], "passed": counts[1], "failed": counts[2], "ignored": counts[3]}
     stage = record.get("stage")
     status = record.get("status")
     code = record.get("code")

@@ -62,7 +62,7 @@ jobs:
   devlane-encrypted-run:
     name: devlane-encrypted-run
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
     environment: devlane-decrypt
     permissions: {}
     defaults:
@@ -92,6 +92,7 @@ jobs:
       RUN_ROOT: ${{ runner.temp }}/devlane-${{ github.run_id }}
     steps:
       - name: Fetch public control and validate dispatch
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           umask 077
@@ -102,6 +103,7 @@ jobs:
           [[ "$CI_REF" == "refs/heads/main" ]]
           [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
           mkdir -m 700 "$RUN_ROOT"
+          python3 -B -c 'import os,sys,time; fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600); os.write(fd,repr(time.monotonic()).encode("ascii")); os.fsync(fd); os.close(fd)' "$RUN_ROOT/deadline-start"
           git init -q . 2>/dev/null
           git config core.autocrlf false 2>/dev/null
           git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
@@ -109,9 +111,14 @@ jobs:
           git checkout --quiet --detach FETCH_HEAD 2>/dev/null
           actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
           [[ "$actual_sha" == "$CI_SHA" ]]
-          python3 -B -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; import cryptography; assert AESGCM is not None and cryptography.__version__'
-          python3 -B kit/devlane/fetch.py context --output "$RUN_ROOT/context.json"
+          python3 -B kit/devlane/deadline.py create --file "$RUN_ROOT/deadline.json" --budget-seconds 8700 --cleanup-reserve-seconds 2100 --job-seconds 10800 --started-at-file "$RUN_ROOT/deadline-start"
+          python3 -B kit/devlane/deadline.py check --file "$RUN_ROOT/deadline.json"
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            python3 -B -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; import cryptography; assert AESGCM is not None and cryptography.__version__'
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            python3 -B kit/devlane/fetch.py context --output "$RUN_ROOT/context.json"
       - name: Restore exact source-free control evidence
+        timeout-minutes: 1
         uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
         with:
           path: ${{ runner.temp }}/devlane-control-evidence/permit.json
@@ -123,6 +130,7 @@ jobs:
           python3 -B kit/devlane/permit.py verify-control \
             --file "$RUNNER_TEMP/devlane-control-evidence/permit.json" --control-sha "$CI_SHA" --run-id "$CI_CONTROL_RUN_ID"
       - name: Restore one-run bundle permit
+        timeout-minutes: 1
         uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
         with:
           path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
@@ -133,6 +141,7 @@ jobs:
           mkdir -m 700 -p "$RUNNER_TEMP/devlane-bundle-permit"
           python3 -B kit/devlane/permit.py claim --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json"
       - name: Save one-run bundle permit
+        timeout-minutes: 1
         uses: actions/cache/save@3edfce9056124e459a23f683a21433670d47daca
         with:
           path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
@@ -143,6 +152,7 @@ jobs:
           rm -rf -- "$RUNNER_TEMP/devlane-bundle-permit"
           [[ ! -e "$RUNNER_TEMP/devlane-bundle-permit" ]]
       - name: Restore and verify persisted one-run permit
+        timeout-minutes: 1
         uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
         with:
           path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
@@ -158,11 +168,14 @@ jobs:
       - name: Fetch ciphertext and sanitized dependency projection
         run: |
           set -euo pipefail
-          python3 -B kit/devlane/fetch.py download --asset-id "$DEVLANE_BUNDLE_ASSET_ID" --size "$DEVLANE_BUNDLE_SIZE" --sha256 "$DEVLANE_BUNDLE_SHA256" --output "$RUN_ROOT/bundle.enc"
-          python3 -B kit/devlane/fetch.py download --maximum 16777216 --asset-id "$DEVLANE_PROJECTION_ASSET_ID" --size "$DEVLANE_PROJECTION_SIZE" --sha256 "$DEVLANE_PROJECTION_SHA256" --output "$RUN_ROOT/projection.json"
-          python3 -B kit/devlane/fetch.py check-projection --file "$RUN_ROOT/projection.json" --profile "$DEVLANE_PROFILE"
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- bash -euo pipefail -c '
+            python3 -B kit/devlane/fetch.py download --asset-id "$DEVLANE_BUNDLE_ASSET_ID" --size "$DEVLANE_BUNDLE_SIZE" --sha256 "$DEVLANE_BUNDLE_SHA256" --output "$RUN_ROOT/bundle.enc"
+            python3 -B kit/devlane/fetch.py download --maximum 16777216 --asset-id "$DEVLANE_PROJECTION_ASSET_ID" --size "$DEVLANE_PROJECTION_SIZE" --sha256 "$DEVLANE_PROJECTION_SHA256" --output "$RUN_ROOT/projection.json"
+            python3 -B kit/devlane/fetch.py check-projection --file "$RUN_ROOT/projection.json" --profile "$DEVLANE_PROFILE"
+          '
           mkdir -m 700 "$RUN_ROOT/workspace"
       - name: Set up pinned Node toolchain
+        timeout-minutes: 5
         if: ${{ inputs.profile == 'core-node' }}
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -176,8 +189,13 @@ jobs:
           set -euo pipefail
           rust_version="$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tools"]["cargo"])' "$RUN_ROOT/projection.json")"
           [[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          rustup toolchain install "$rust_version" --profile minimal --component rustfmt >/dev/null 2>&1
-          rustup default "$rust_version" >/dev/null 2>&1
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            rustup toolchain install "$rust_version" --profile minimal --component rustfmt >/dev/null 2>&1
+          python3 -B kit/devlane/deadline.py check --file "$RUN_ROOT/deadline.json"
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            rustup default "$rust_version" >/dev/null 2>&1
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            python3 -B kit/devlane/rust_tooling.py fetch --output "$RUN_ROOT/rust-tooling"
       - name: Prepare dependencies before the cut
         run: |
           set -euo pipefail
@@ -194,15 +212,21 @@ jobs:
             cargo_path="$(rustup which --toolchain "$rust_version" cargo)"
             rustc_path="$(rustup which --toolchain "$rust_version" rustc)"
           fi
-          sudo -n unshare --mount --pid --ipc --fork --mount-proc --kill-child -- \
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            sudo -n unshare --mount --pid --ipc --fork --mount-proc --kill-child -- \
             python3 -B kit/devlane/prepare.py \
               --projection "$RUN_ROOT/projection.json" --output "$RUN_ROOT/prepared" \
               --profile "$DEVLANE_PROFILE" --owner-uid "$owner_uid" --owner-gid "$owner_gid" \
               --node-path "$node_path" --npm-path "$npm_path" --cargo-path "$cargo_path" --rustc-path "$rustc_path"
+          if [[ "$DEVLANE_PROFILE" == "core-rust" ]]; then
+            python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              python3 -B kit/devlane/rust_tooling.py install --source "$RUN_ROOT/rust-tooling" --prepared "$RUN_ROOT/prepared"
+          fi
       - name: Prove public connectivity before the cut
         run: |
           set -euo pipefail
-          python3 -B kit/devlane/network_probe.py positive-control --output "$RUN_ROOT/positive-control.json"
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            python3 -B kit/devlane/network_probe.py positive-control --output "$RUN_ROOT/positive-control.json"
       - name: Cut network and start the isolated supervisor
         run: |
           set -euo pipefail
@@ -216,31 +240,37 @@ jobs:
             cargo_path="$(rustup which --toolchain "$rust_version" cargo)"
             rustc_path="$(rustup which --toolchain "$rust_version" rustc)"
           fi
-          python3 -B kit/devlane/supervisor.py start \
-            --state-dir "$RUN_ROOT/state" --context "$RUN_ROOT/context.json" \
-            --workspace "$GITHUB_WORKSPACE" --prepared "$RUN_ROOT/prepared" \
-            --bundle "$RUN_ROOT/bundle.enc" --projection "$RUN_ROOT/projection.json" \
-            --positive-control "$RUN_ROOT/positive-control.json" \
-            --node-path "$node_path" --npm-path "$npm_path" --cargo-path "$cargo_path" --rustc-path "$rustc_path"
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            python3 -B kit/devlane/supervisor.py start \
+              --state-dir "$RUN_ROOT/state" --context "$RUN_ROOT/context.json" \
+              --workspace "$GITHUB_WORKSPACE" --prepared "$RUN_ROOT/prepared" \
+              --bundle "$RUN_ROOT/bundle.enc" --projection "$RUN_ROOT/projection.json" \
+              --deadline-file "$RUN_ROOT/deadline.json" \
+              --positive-control "$RUN_ROOT/positive-control.json" \
+              --node-path "$node_path" --npm-path "$npm_path" --cargo-path "$cargo_path" --rustc-path "$rustc_path"
       - name: Probe isolation before decryption
         run: |
           set -euo pipefail
-          python3 -B kit/devlane/supervisor.py probe --state-dir "$RUN_ROOT/state"
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            python3 -B kit/devlane/supervisor.py probe --state-dir "$RUN_ROOT/state"
       - name: Decrypt authenticated bundle
         env:
           DEVLANE_DECRYPT_KEY: ${{ secrets.DEVLANE_DECRYPT_KEY }}
         run: |
           set -euo pipefail
           set +x
-          python3 -B kit/devlane/supervisor.py decrypt --state-dir "$RUN_ROOT/state"
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            python3 -B kit/devlane/supervisor.py decrypt --state-dir "$RUN_ROOT/state"
       - name: Execute offline profile and filter public summary
         id: execute
         run: |
           set -euo pipefail
-          python3 -B kit/devlane/supervisor.py execute --state-dir "$RUN_ROOT/state" --context "$RUN_ROOT/context.json"
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            python3 -B kit/devlane/supervisor.py execute --state-dir "$RUN_ROOT/state" --context "$RUN_ROOT/context.json"
       - name: Shred runner-local workspace
         id: cleanup
         if: ${{ always() }}
+        timeout-minutes: 15
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: |

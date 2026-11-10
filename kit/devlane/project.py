@@ -37,10 +37,8 @@ def build_projection(request):
     lockfiles = [bundle._safe_member_name(item) for item in lockfiles]
     if len(lockfiles) != len(set(lockfiles)):
         bundle._refuse("projection-lockfile-duplicate")
-    if profile == "core-rust" and lockfiles[0] != "Cargo.lock":
-        bundle._refuse("projection-root-lockfile")
-    if profile == "core-rust" and lockfiles[1:] != sorted(lockfiles[1:]):
-        bundle._refuse("projection-lockfile-order")
+    if profile == "core-rust" and lockfiles != ["Cargo.lock", "fuzz/Cargo.lock", "runtime/Cargo.lock"]:
+        bundle._refuse("projection-rust-lockfile-set")
     tree = bundle.subprocess.run(
         ["git", "-C", str(repository), "ls-tree", "-r", "-z", "--full-tree", revision],
         check=False, stdout=bundle.subprocess.PIPE, stderr=bundle.subprocess.DEVNULL, timeout=60,
@@ -75,9 +73,9 @@ def build_projection(request):
     else:
         manifest, lock, cargo = fetch.project_cargo_lock(lock_bytes)
         workspaces = []
-        for payload in lock_payloads[1:]:
+        for path, payload in zip(lockfiles[1:], lock_payloads[1:]):
             workspace_manifest, workspace_lock, _ = fetch.project_cargo_lock(payload)
-            workspaces.append({"manifest": workspace_manifest, "lock": workspace_lock})
+            workspaces.append({"path": path, "manifest": workspace_manifest, "lock": workspace_lock})
         result = {
             "schema": 1, "profile": profile, "tools": tools,
             "npm": [], "cargo": cargo, "playwright": [],

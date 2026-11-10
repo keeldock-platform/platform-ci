@@ -940,6 +940,13 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/test_linux_runtime.py',
             'kit/devlane/test_rust_report.py',
             'kit/devlane/test_rust_test_runner.py',
+            'kit/devlane/deadline.py',
+            'kit/devlane/rust_matrix_runner.py',
+            'kit/devlane/rust_tooling.py',
+            'kit/devlane/test_deadline.py',
+            'kit/devlane/test_network_probe.py',
+            'kit/devlane/test_rust_matrix_runner.py',
+            'kit/devlane/test_rust_public_audit.py',
             'kit/devlane/typescript_reporter.mjs',
         })
         self.assertEqual(set(PINNED_FILE_SHA256), expected)
@@ -1313,6 +1320,25 @@ class PublicTreeTests(unittest.TestCase):
         self.assertIn("X" + "1", why_is_node_running_integrity)
         self.assertIn(r"\u0052", raw_text)
         self.assertIn(r"\u0058", raw_text)
+
+    def test_rust_tooling_allows_only_exact_public_destinations_at_the_owned_path(self):
+        from public_tree import PINNED_RUST_TOOLING_URLS
+        source = "\n".join('destination = "' + url + '"' for url in sorted(PINNED_RUST_TOOLING_URLS))
+        inspect_text(source, "platform", "kit/devlane/rust_tooling.py")
+        bad_sources = (
+            source.replace("0.20.2", "0.20.3"),
+            source + '\ndestination = "https:' + '//github.com/unapproved/private-source"',
+            source + '\ndestination = "https:' + '//github.com/RustSec/rustsec/private"',
+            source.replace("advisory-db.git", "advisory-db.git?ref=changed"),
+        )
+        for text, pool, path in (
+            *((text, "platform", "kit/devlane/rust_tooling.py") for text in bad_sources),
+            (source, "platform", "kit/devlane/other.py"),
+            (source, "connect", "kit/devlane/rust_tooling.py"),
+        ):
+            with self.subTest(pool=pool, path=path):
+                with self.assertRaisesRegex(PublicTreeError, "repository-url-present"):
+                    inspect_text(text, pool, path)
 
     def test_public_cross_pool_references_remain_allowed(self):
         inspect_text("uses: keeldock-platform/platform-ci/kit/bootstrap@" + "a" * 40, "connect")

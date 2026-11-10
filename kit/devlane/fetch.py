@@ -313,8 +313,10 @@ def validate_projection(payload, expected_profile):
     if type(cargo_workspaces) is not list or len(cargo_workspaces) > 64:
         _fail("projection-cargo-workspaces")
     for item in cargo_workspaces:
-        if type(item) is not dict or set(item) != {"manifest", "lock"}:
+        if type(item) is not dict or set(item) != {"path", "manifest", "lock"}:
             _fail("projection-cargo-workspace")
+        if type(item["path"]) is not str or item["path"] not in ("fuzz/Cargo.lock", "runtime/Cargo.lock"):
+            _fail("projection-cargo-workspace-path")
         if type(item["manifest"]) is not str or len(item["manifest"]) > 2 * 1024 * 1024:
             _fail("projection-cargo-manifest")
         if type(item["lock"]) is not str or len(item["lock"]) > 8 * 1024 * 1024:
@@ -331,7 +333,7 @@ def validate_projection(payload, expected_profile):
         _fail("projection-tools")
     if expected_profile == "core-node" and tools != {"node": "24.22.1", "npm": "11.19.1"}:
         _fail("projection-tool-version")
-    if expected_profile == "core-rust" and (tools.get("cargo") != tools.get("rustc") or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", tools.get("cargo", ""))):
+    if expected_profile == "core-rust" and tools != {"cargo": "1.99.1", "rustc": "1.99.1"}:
         _fail("projection-tool-version")
     for version in tools.values():
         if type(version) is not str or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", version):
@@ -350,6 +352,8 @@ def validate_projection(payload, expected_profile):
         if cargo_workspaces:
             _fail("projection-node-workspaces")
     if expected_profile == "core-rust":
+        if [item["path"] for item in cargo_workspaces] != ["fuzz/Cargo.lock", "runtime/Cargo.lock"]:
+            _fail("projection-cargo-workspace-set")
         if type(value["cargo_manifest"]) is not str or len(value["cargo_manifest"]) > 2 * 1024 * 1024:
             _fail("projection-cargo-manifest")
         if type(value["cargo_lock"]) is not str or len(value["cargo_lock"]) > 8 * 1024 * 1024:

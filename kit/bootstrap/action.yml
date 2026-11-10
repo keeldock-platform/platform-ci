@@ -103,6 +103,12 @@ runs:
         "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_confinement_gate_table.py"
         "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_windows_source_run.py"
         if [[ "${RUNNER_OS:-}" == "Linux" ]]; then
+          "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_deadline.py"
+          "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_network_probe.py"
+          "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_rust_matrix_runner.py"
+          "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_rust_public_audit.py"
+          "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_rust_test_runner.py"
+          "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_rust_report.py"
           "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_acceptance.py"
           "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_coordinator.py"
           "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_linux_source_build.py"

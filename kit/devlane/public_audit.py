@@ -67,6 +67,7 @@ SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 TIME_PREFIX = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z ")
 PUBLIC_FILE_ID = re.compile(r"file_[0-9]{4,6}\Z")
 PUBLIC_TEST_ID = re.compile(r"case_[0-9]{4,6}\Z")
+PUBLIC_SUITE_ID = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 PUBLIC_FRAME_ID = re.compile(r"frame_[0-9]{4,6}\Z")
 RUNNER_HOME = chr(47) + "home" + chr(47) + "runner"
 TEMP = RUNNER_HOME + "/work/_temp"
@@ -295,6 +296,7 @@ class _Grammar:
             "Fetch public control and validate dispatch": {"dispatch_context=validated"},
             "Verify exact source-free control evidence": {"devlane_permit=verify_control=pass"},
             "Claim this bundle for one run before decryption": {"devlane_permit=claim=pass"},
+            "Install pinned Rust toolchain": {"rust_offline_tools=prepared"},
             "Prepare dependencies before the cut": {"dependency_preparation=complete"},
             "Prove public connectivity before the cut": {"network_positive_control=pass"},
             "Cut network and start the isolated supervisor": {"offline_supervisor=ready"},
@@ -311,6 +313,8 @@ class _Grammar:
             "Run full source-free production-path acceptance": {"devlane_acceptance=pass"},
             "Probe the loopback-only Linux network boundary": {"devlane_linux_probe=pass"},
         }.get(step_name, set())
+        if step_name == "Prepare dependencies before the cut" and self.identity.get("profile") == "core-rust":
+            exact = exact | {"rust_offline_tools=installed"}
         if line in exact:
             public_counts[line] = public_counts.get(line, 0) + 1
             return public_counts[line] == 1
@@ -347,6 +351,10 @@ def _record_ok(normalized):
         elif kind == "frame":
             if type(record.get("frame")) is not str or not PUBLIC_FRAME_ID.fullmatch(record["frame"]):
                 return False
+        elif kind == "coverage":
+            if (type(record.get("suite")) is not str or not PUBLIC_SUITE_ID.fullmatch(record["suite"])
+                    or any(type(record.get(name)) is not int for name in ("total", "passed", "failed", "ignored"))):
+                return False
         elif kind == "control":
             if record.get("code") not in (None, *PUBLIC_CODES):
                 return False
@@ -371,6 +379,7 @@ def validate_summary_records(record_lines, profile):
         "tests": {item["test"]: item["test"] for item in parsed if "test" in item},
         "frames": {item["frame"]: item["frame"] for item in parsed if "frame" in item},
         "stages": stages, "codes": codes, "max_lines": {name: 10_000_000 for name in files},
+        "suites": sorted(profile_config.get("rust_matrix", {}).get("coverage_ids", [])),
     }
     try:
         output_filter.validate_public_summary(payload, allowlists)
