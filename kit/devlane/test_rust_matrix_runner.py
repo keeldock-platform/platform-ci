@@ -1,5 +1,8 @@
 """Source-free regressions for the closed Core PR1 Rust matrix."""
 
+import argparse
+import contextlib
+import io
 import json
 import inspect
 import os
@@ -147,13 +150,191 @@ class RustMatrixRunnerTests(unittest.TestCase):
             ["supervisor.py", "start"], 2, b"",
             b"devlane_supervisor_refusal=projection-binding-mismatch\n",
         )
-        test_e2e._assert_startup_projection_refusal(good)
-        parser_error = subprocess.CompletedProcess(
-            ["supervisor.py", "start"], 2, b"",
-            b"usage: supervisor.py start --deadline-file DEADLINE_FILE\n",
+        self.assertIsNone(test_e2e._assert_startup_projection_refusal(good))
+
+        refusals = test_e2e.STARTUP_REFUSAL_CODES - {"projection-binding-mismatch"}
+        failures = [
+            ("unexpected-success", subprocess.CompletedProcess(["supervisor.py", "start"], 0, b"", b""),
+             "startup-unexpected-success"),
+            ("exit-one", subprocess.CompletedProcess(["supervisor.py", "start"], 1, b"", b""),
+             "startup-exit-one"),
+            ("signal", subprocess.CompletedProcess(["supervisor.py", "start"], -9, b"", b""),
+             "startup-exit-signal"),
+            ("unexpected-exit", subprocess.CompletedProcess(["supervisor.py", "start"], 3, b"", b""),
+             "startup-exit-unexpected"),
+            ("parser", subprocess.CompletedProcess(["supervisor.py", "start"], 2, b"",
+             b"usage: supervisor.py start --deadline-file DEADLINE_FILE\n"), "startup-parser-refusal"),
+            ("import", subprocess.CompletedProcess(["supervisor.py", "start"], 1, b"",
+             b"Traceback (most recent call last):\nModuleNotFoundError: private-path\n"),
+             "startup-import-failure"),
+            ("traceback", subprocess.CompletedProcess(["supervisor.py", "start"], 1, b"",
+             b"Traceback (most recent call last):\nRuntimeError: private-canary\n"), "startup-traceback"),
+            ("stdout", subprocess.CompletedProcess(["supervisor.py", "start"], 2, b"private-path", b""),
+             "startup-stdout-unexpected"),
+            ("canary", subprocess.CompletedProcess(["supervisor.py", "start"], 2, b"",
+             b"devlane_supervisor_refusal=KEYCANARY-73A10X\n"), "startup-output-canary"),
+            ("empty-stderr", subprocess.CompletedProcess(["supervisor.py", "start"], 2, b"", b""),
+             "startup-stderr-empty"),
+            ("malformed-stderr", subprocess.CompletedProcess(["supervisor.py", "start"], 2, b"",
+             b"private path and raw diagnostic\n"), "startup-stderr-invalid"),
+            ("unknown-refusal", subprocess.CompletedProcess(["supervisor.py", "start"], 2, b"",
+             b"devlane_supervisor_refusal=unknown-private-code\n"), "startup-refusal-unlisted"),
+        ]
+        failures.extend(
+            (code, subprocess.CompletedProcess(["supervisor.py", "start"], 2, b"",
+             ("devlane_supervisor_refusal=" + code + "\n").encode("ascii")), code)
+            for code in sorted(refusals)
         )
-        with self.assertRaisesRegex(RuntimeError, "startup-refusal-wrong-boundary"):
-            test_e2e._assert_startup_projection_refusal(parser_error)
+        for name, result, category in failures:
+            with self.subTest(result=name):
+                with self.assertRaises(test_e2e.StartupRefusalMismatch) as caught:
+                    test_e2e._assert_startup_projection_refusal(result)
+                self.assertEqual(caught.exception.category, category)
+                state = test_e2e._DiagnosticState()
+                state.capture("variant-startup-refusal-check", caught.exception)
+                line = state.refusal_line(caught.exception)
+                self.assertRegex(line, r"stage=variant-startup-refusal-check exception=[a-z0-9-]{1,32}$")
+                for marker in ("private-path", "private-canary", "KEYCANARY-73A10X", "unknown-private-code"):
+                    self.assertNotIn(marker, line)
+
+    def _write_projection_startup_fixture(self, root):
+        workspace = root / "workspace"
+        prepared = root / "prepared"
+        workspace.mkdir()
+        prepared.mkdir()
+        bundle_path = root / "bundle.enc"
+        bundle_bytes = b"source-free encrypted envelope placeholder"
+        bundle_path.write_bytes(bundle_bytes)
+        projection_path = root / "projection.json"
+        _projection, projection_bytes = test_e2e._node_projection(
+            test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
+        )
+        projection_path.write_bytes(projection_bytes + b" ")
+        now = int(time.time())
+        context = {
+            "repository": test_e2e.fetch.REPOSITORY, "repository_id": test_e2e.fetch.REPOSITORY_ID,
+            "server_url": "https://github.com", "event": "workflow_dispatch", "ref": "refs/heads/main",
+            "control_sha": "a" * 40, "control_run_id": "123456", "workflow_path": test_e2e.fetch.WORKFLOW_PATH,
+            "run_attempt": 1, "profile": "core-node", "wave_id": "startup-wave-0001",
+            "bundle_id": "startup-bundle-0001", "bundle_asset_id": "1234567",
+            "bundle_sha256": test_e2e.hashlib.sha256(bundle_bytes).hexdigest(), "bundle_size": len(bundle_bytes),
+            "projection_asset_id": "1234568", "projection_sha256": test_e2e.hashlib.sha256(projection_bytes).hexdigest(),
+            "projection_size": len(projection_bytes), "expires": now + 1800,
+        }
+        context_path = root / "context.json"
+        context_path.write_bytes(test_e2e.bundle.canonical_json(context) + b"\n")
+        positive_path = root / "positive-control.json"
+        positive_path.write_bytes(test_e2e.bundle.canonical_json(
+            {"connected": True, "target": "public-tls-control"}
+        ) + b"\n")
+        deadline_path = root / "deadline.json"
+        deadline_budget.create(deadline_path, 60, 5, 65)
+        return argparse.Namespace(
+            state_dir=str(root / "state"), context=str(context_path), workspace=str(workspace),
+            prepared=str(prepared), bundle=str(bundle_path), projection=str(projection_path),
+            positive_control=str(positive_path), deadline_file=str(deadline_path),
+            node_path="", npm_path="", cargo_path="", rustc_path="",
+        )
+
+    def _bind_projection_payload(self, args, value):
+        payload = test_e2e.bundle.canonical_json(value)
+        Path(args.projection).write_bytes(payload)
+        context = json.loads(Path(args.context).read_text(encoding="ascii"))
+        context["projection_sha256"] = test_e2e.hashlib.sha256(payload).hexdigest()
+        context["projection_size"] = len(payload)
+        Path(args.context).write_bytes(test_e2e.bundle.canonical_json(context) + b"\n")
+
+    def test_actual_start_refuses_a_tampered_projection_before_state_or_child_setup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self._write_projection_startup_fixture(root)
+            command = ["start"]
+            for name in ("state_dir", "context", "workspace", "prepared", "bundle", "projection",
+                         "positive_control", "deadline_file"):
+                command.extend(("--" + name.replace("_", "-"), getattr(args, name)))
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with patch.object(supervisor.sys, "platform", "linux"), \
+                    patch.object(supervisor.subprocess, "Popen") as spawn:
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    result = supervisor.main(command)
+            self.assertEqual(result, 2)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(stderr.getvalue(), "devlane_supervisor_refusal=projection-binding-mismatch\n")
+            self.assertIsNone(test_e2e._assert_startup_projection_refusal(subprocess.CompletedProcess(
+                ["supervisor.py", *command], result, stdout.getvalue().encode(), stderr.getvalue().encode(),
+            )))
+            self.assertFalse(Path(args.state_dir).exists())
+            spawn.assert_not_called()
+
+    def test_actual_service_prepare_binds_projection_before_root_swap_firewall_or_mounts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self._write_projection_startup_fixture(root)
+            previous_deadline_file = supervisor.ACTIVE_DEADLINE_FILE
+            try:
+                service = supervisor.Service(
+                    args.state_dir, args.context, args.workspace, args.prepared, args.bundle,
+                    args.projection, 1, os.getuid(), {}, args.deadline_file,
+                )
+                with patch.object(supervisor, "_require_linux_root") as linux_root, \
+                        patch.object(supervisor, "_require_swap_disabled") as swap, \
+                        patch.object(supervisor, "_mount_private") as private_mount, \
+                        patch.object(supervisor, "_configure_firewall") as firewall, \
+                        patch.object(supervisor, "_mount_minimal_root") as minimal_root, \
+                        patch.object(supervisor, "_mount_bind") as bind:
+                    with self.assertRaises(supervisor.SupervisorRefusal) as caught:
+                        service.prepare()
+                self.assertEqual(caught.exception.code, "projection-binding-mismatch")
+                for setup in (linux_root, swap, private_mount, firewall, minimal_root, bind):
+                    setup.assert_not_called()
+            finally:
+                supervisor.ACTIVE_DEADLINE_FILE = previous_deadline_file
+
+    def test_invalid_bound_projection_has_a_fixed_refusal_before_service_setup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self._write_projection_startup_fixture(root)
+            projection, _payload = test_e2e._node_projection(
+                test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
+            )
+            projection["playwright"] = [{}]
+            self._bind_projection_payload(args, projection)
+            previous_deadline_file = supervisor.ACTIVE_DEADLINE_FILE
+            try:
+                service = supervisor.Service(
+                    args.state_dir, args.context, args.workspace, args.prepared, args.bundle,
+                    args.projection, 1, os.getuid(), {}, args.deadline_file,
+                )
+                with patch.object(supervisor, "_require_linux_root") as linux_root, \
+                        patch.object(supervisor, "_require_swap_disabled") as swap, \
+                        patch.object(supervisor, "_mount_private") as private_mount, \
+                        patch.object(supervisor, "_configure_firewall") as firewall, \
+                        patch.object(supervisor, "_mount_minimal_root") as minimal_root:
+                    with self.assertRaises(supervisor.SupervisorRefusal) as caught:
+                        service.prepare()
+                self.assertEqual(caught.exception.code, "projection-invalid")
+                for setup in (linux_root, swap, private_mount, firewall, minimal_root):
+                    setup.assert_not_called()
+
+                command = ["start"]
+                for name in ("state_dir", "context", "workspace", "prepared", "bundle", "projection",
+                             "positive_control", "deadline_file"):
+                    command.extend(("--" + name.replace("_", "-"), getattr(args, name)))
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with patch.object(supervisor.sys, "platform", "linux"), \
+                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    result = supervisor.main(command)
+                self.assertEqual(result, 2)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), "devlane_supervisor_refusal=projection-invalid\n")
+                with self.assertRaises(test_e2e.StartupRefusalMismatch) as mismatch:
+                    test_e2e._assert_startup_projection_refusal(subprocess.CompletedProcess(
+                        ["supervisor.py", *command], result, stdout.getvalue().encode(), stderr.getvalue().encode(),
+                    ))
+                self.assertEqual(mismatch.exception.category, "projection-invalid")
+                self.assertFalse(Path(args.state_dir).exists())
+            finally:
+                supervisor.ACTIVE_DEADLINE_FILE = previous_deadline_file
 
     def test_isolated_rust_runner_launch_imports_only_the_trusted_control_siblings(self):
         root = Path(__file__).resolve().parents[2]

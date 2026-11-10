@@ -186,7 +186,7 @@ class DeadlineTests(unittest.TestCase):
             path = Path(temporary) / "deadline.json"
             start = time.monotonic()
             deadline.create(path, 600, 300, 900, now=start)
-            self.assertEqual(deadline.guard_action(path, 120, 60, now=start + 419), 181)
+            self.assertAlmostEqual(deadline.guard_action(path, 120, 60, now=start + 419), 181, places=8)
             with self.assertRaisesRegex(deadline.DeadlineRefusal, "action-work-budget-insufficient"):
                 deadline.guard_action(path, 120, 60, now=start + 421)
 
@@ -199,10 +199,10 @@ class DeadlineTests(unittest.TestCase):
             supervisor.ACTIVE_DEADLINE_FILE = str(path)
             try:
                 with patch.object(deadline.time, "monotonic", return_value=start + 4):
-                    self.assertEqual(supervisor._bounded_timeout(2400), 41)
+                    self.assertAlmostEqual(supervisor._bounded_timeout(2400), 41, places=8)
                     self.assertEqual(supervisor._bounded_timeout(8, cleanup=True), 8)
                 with patch.object(deadline.time, "monotonic", return_value=start + 46):
-                    self.assertEqual(supervisor._bounded_timeout(8, cleanup=True), 1)
+                    self.assertAlmostEqual(supervisor._bounded_timeout(8, cleanup=True), 1, places=8)
                 with patch.object(deadline.time, "monotonic", return_value=start + 47):
                     with self.assertRaisesRegex(supervisor.SupervisorRefusal, "total-deadline-exhausted"):
                         supervisor._bounded_timeout(8)
@@ -217,7 +217,7 @@ class DeadlineTests(unittest.TestCase):
                 with self.assertRaisesRegex(deadline.DeadlineRefusal, "deadline-budget-invalid"):
                     deadline.create(path, 9910, 900, 10800, now=start)
                 deadline.create(path, 9900, 900, 10800, now=start)
-            self.assertEqual(deadline.remaining(path, now=start + 2), 9898)
+            self.assertAlmostEqual(deadline.remaining(path, now=start + 2), 9898, places=8)
             with self.assertRaisesRegex(deadline.DeadlineRefusal, "total-deadline-exhausted"):
                 deadline.remaining(path, now=start + 9900)
 

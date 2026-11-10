@@ -86,7 +86,8 @@ DIAGNOSTIC_PHASES = frozenset((
     "variant-projection-write", "variant-source-build", "variant-archive-build", "variant-rust-archive-verify",
     "variant-envelope-build", "variant-context-build", "variant-context-validate", "variant-context-write",
     "variant-positive-control",
-    "variant-supervisor-start", "variant-startup-refusal-check", "variant-supervisor-probe",
+    "variant-supervisor-start", "variant-startup-tamper", "variant-startup-command",
+    "variant-startup-refusal-check", "variant-supervisor-probe",
     "variant-key-create", "variant-decrypt", "variant-key-cleanup", "variant-execute",
     "variant-summary-validate", "variant-host-cleanup", "variant-teardown-confirm",
     "variant-host-cleanup-finally", "variant-teardown-confirm-finally",
@@ -125,6 +126,35 @@ _EXCEPTION_CATEGORIES = {
     rust_tooling.ToolingRefusal: "tooling-refusal",
 }
 
+STARTUP_REFUSAL_CODES = frozenset((
+    "deadline-file-invalid", "dispatch-context-invalid", "dispatch-context-unavailable",
+    "firewall-unavailable", "input-size", "input-unavailable", "linux-root-required",
+    "linux-runner-required", "mount-source-unavailable", "node-tool-layout",
+    "node-toolchain-missing", "node-toolchain-version", "positive-control-failed",
+    "positive-control-unavailable", "profile-config-invalid", "profile-config-unavailable",
+    "profile-unknown", "projection-binding-mismatch", "projection-invalid", "report-file-changed",
+    "report-file-invalid", "report-file-size", "rust-tool-layout", "rust-toolchain-missing",
+    "rust-toolchain-path", "state-directory-not-empty", "state-directory-permissions",
+    "supervisor-failed", "supervisor-operation-failed", "supervisor-start-failed",
+    "supervisor-start-timeout", "swap-enabled", "swap-state-unavailable", "tool-manifest-invalid",
+    "tool-path-invalid", "tool-version-mismatch", "tool-version-unavailable",
+    "total-deadline-exhausted", "total-deadline-unavailable",
+))
+_STARTUP_DIAGNOSTIC_CATEGORIES = STARTUP_REFUSAL_CODES | frozenset((
+    "startup-exit-one", "startup-exit-signal", "startup-exit-unexpected",
+    "startup-import-failure", "startup-output-canary", "startup-parser-refusal",
+    "startup-refusal-unlisted", "startup-stderr-empty", "startup-stderr-invalid",
+    "startup-traceback", "startup-unexpected-success", "startup-stdout-unexpected",
+))
+
+
+class StartupRefusalMismatch(RuntimeError):
+    """A startup result that differs from the one exact expected refusal."""
+
+    def __init__(self, category):
+        self.category = category if category in _STARTUP_DIAGNOSTIC_CATEGORIES else "startup-refusal-unlisted"
+        super().__init__("startup-refusal-contract-mismatch")
+
 
 class _DiagnosticState:
     """Keep one bounded trusted phase and exception category for the first failure."""
@@ -137,7 +167,8 @@ class _DiagnosticState:
 
     def capture(self, phase, error):
         if self.first_failure is None:
-            category = _EXCEPTION_CATEGORIES.get(type(error), "unclassified")
+            category = (error.category if type(error) is StartupRefusalMismatch
+                        else _EXCEPTION_CATEGORIES.get(type(error), "unclassified"))
             self.first_failure = (phase, category)
 
     @contextmanager
@@ -183,8 +214,14 @@ def _process_run(argv, **kwargs):
 
 
 def _scan_output(data, code):
-    for canary in (SOURCE_CANARY.encode("ascii"), KEY_CANARY, b"::add-mask::", b"::error::", (chr(35) * 2 + "[group]SYNTHETIC").encode("ascii")):
-        _require(canary not in data, code)
+    _require(not _contains_output_canary(data), code)
+
+
+def _contains_output_canary(data):
+    return any(canary in data for canary in (
+        SOURCE_CANARY.encode("ascii"), KEY_CANARY, b"::add-mask::", b"::error::",
+        (chr(35) * 2 + "[group]SYNTHETIC").encode("ascii"),
+    ))
 
 
 def _run(argv, *, env=None, timeout=900, expected=0, scan=True, cwd=None):
@@ -996,9 +1033,39 @@ def _supervisor(*arguments):
 
 
 def _assert_startup_projection_refusal(result):
-    _require(result.returncode == 2 and result.stdout == b"" and result.stderr.strip() ==
-             b"devlane_supervisor_refusal=projection-binding-mismatch",
-             "startup-refusal-wrong-boundary")
+    stdout = result.stdout if type(result.stdout) is bytes else b""
+    stderr = result.stderr if type(result.stderr) is bytes else b""
+    if _contains_output_canary(stdout + stderr):
+        raise StartupRefusalMismatch("startup-output-canary")
+    if result.stdout != b"":
+        raise StartupRefusalMismatch("startup-stdout-unexpected")
+    if b"ModuleNotFoundError:" in stderr or b"ImportError:" in stderr:
+        raise StartupRefusalMismatch("startup-import-failure")
+    if b"Traceback (most recent call last):" in stderr:
+        raise StartupRefusalMismatch("startup-traceback")
+    if result.returncode != 2:
+        if result.returncode == 0:
+            category = "startup-unexpected-success"
+        elif result.returncode == 1:
+            category = "startup-exit-one"
+        elif type(result.returncode) is int and result.returncode < 0:
+            category = "startup-exit-signal"
+        else:
+            category = "startup-exit-unexpected"
+        raise StartupRefusalMismatch(category)
+    if stderr == b"devlane_supervisor_refusal=projection-binding-mismatch\n":
+        return
+    if stderr.startswith(b"usage: ") or b"error: the following arguments are required" in stderr:
+        raise StartupRefusalMismatch("startup-parser-refusal")
+    refusal = re.fullmatch(rb"devlane_supervisor_refusal=([a-z][a-z0-9-]{0,63})\n", stderr)
+    if refusal is not None:
+        code = refusal.group(1).decode("ascii")
+        raise StartupRefusalMismatch(code if code in STARTUP_REFUSAL_CODES else "startup-refusal-unlisted")
+    if not stderr:
+        raise StartupRefusalMismatch("startup-stderr-empty")
+    if b"usage:" in stderr or b"error:" in stderr:
+        raise StartupRefusalMismatch("startup-parser-refusal")
+    raise StartupRefusalMismatch("startup-stderr-invalid")
 
 
 class _SupervisorLifecycle:
@@ -1096,8 +1163,8 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
         _phase_call("variant-positive-control", _positive_control, positive_path)
         state_path = root / "state"
         if variant == "startup-refusal":
-            """Startup fails after the supervisor process exists: cleanup must still confirm and leave nothing."""
-            _phase_call("variant-startup-refusal-check", projection_path.write_bytes, projection_bytes + b" ")
+            """A tampered projection must be rejected before namespace or mount setup."""
+            _phase_call("variant-startup-tamper", projection_path.write_bytes, projection_bytes + b" ")
         with DIAGNOSTICS.phase("variant-supervisor-start"):
             start = _supervisor("start", "--state-dir", str(state_path), "--context", str(context_path),
                                 "--workspace", str(ROOT), "--prepared", str(prepared_path),
@@ -1107,7 +1174,10 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
                 start.extend(("--" + name + "-path", tool_paths[name]))
             lifecycle.note_start_attempt()
         if variant == "startup-refusal":
-            refused = _phase_call("variant-startup-refusal-check", _run, start, timeout=90, expected=2)
+            refused = _phase_call(
+                "variant-startup-command", _process_run, start, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90, close_fds=True, check=False,
+            )
             _phase_call("variant-startup-refusal-check", _assert_startup_projection_refusal, refused)
             _phase_call("variant-host-cleanup", host_cleanup.clean, str(root), str(RUNNER_TEMP),
                         deadline_file=DEADLINE_FILE)

@@ -303,6 +303,19 @@ def _hash_file(path, maximum):
     return size, digest.hexdigest()
 
 
+def _bound_projection(context, path):
+    """Read the projection without following its final path component and bind it to dispatch."""
+    payload = _read_regular(path, fetch.MAX_PROJECTION)
+    if (len(payload) != context["projection_size"]
+            or hashlib.sha256(payload).hexdigest() != context["projection_sha256"]):
+        _refuse("projection-binding-mismatch")
+    try:
+        value = fetch.validate_projection(payload, context["profile"])
+    except (fetch.Refusal, TypeError, KeyError, RecursionError):
+        _refuse("projection-invalid")
+    return payload, value
+
+
 def _read_profiles(root):
     path = root / "control/profiles.json"
     try:
@@ -903,7 +916,7 @@ class Service:
         self.workspace = Path(workspace).resolve(strict=True)
         self.prepared = Path(prepared).resolve(strict=True)
         self.bundle_path = Path(bundle_path).resolve(strict=True)
-        self.projection_path = Path(projection_path).resolve(strict=True)
+        self.projection_path = Path(projection_path).absolute()
         self.host_net_inode = host_net_inode
         self.owner_uid = owner_uid
         self.tool_paths = tool_paths
@@ -928,6 +941,7 @@ class Service:
             deadline_budget.remaining(self.deadline_file)
         except (OSError, deadline_budget.DeadlineRefusal):
             _refuse("total-deadline-unavailable")
+        _projection_bytes, projection_value = _bound_projection(self.context, self.projection_path)
         _require_linux_root()
         _require_swap_disabled()
         _mount_private()
@@ -936,10 +950,6 @@ class Service:
         _mount_bind(self.bundle_path, self.root / "control/bundle.enc", readonly=True)
         _ensure_directory(self.root / "tools/node")
         _ensure_directory(self.root / "tools/rust")
-        projection_size, projection_digest = _hash_file(self.projection_path, fetch.MAX_PROJECTION)
-        if projection_size != self.context["projection_size"] or projection_digest != self.context["projection_sha256"]:
-            _refuse("projection-binding-mismatch")
-        projection_value = fetch.validate_projection(self.projection_path.read_bytes(), self.context["profile"])
         self.tool_info = _preflight_tools(self.context["profile"], projection_value, self.tool_paths)
         if self.tool_info["node_root"]:
             _mount_bind(self.tool_info["node_root"], self.root / "tools/node", readonly=True)
@@ -1429,13 +1439,14 @@ def _start(args):
         start_deadline = time.monotonic() + min(30, deadline_budget.remaining(args.deadline_file))
     except deadline_budget.DeadlineRefusal:
         _refuse("total-deadline-unavailable")
+    context = _context_from_file(args.context)
+    _projection_bytes, projection_value = _bound_projection(context, args.projection)
     state_dir = Path(args.state_dir)
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if state_dir.is_symlink() or state_dir.stat().st_uid != os.getuid() or stat.S_IMODE(state_dir.stat().st_mode) & 0o077:
         _refuse("state-directory-permissions")
     if any(state_dir.iterdir()):
         _refuse("state-directory-not-empty")
-    context = _context_from_file(args.context)
     try:
         positive = bundle.strict_json(Path(args.positive_control).read_bytes(), 1024)
     except (OSError, bundle.Refusal):
@@ -1446,7 +1457,6 @@ def _start(args):
                   for name in ("node", "npm", "cargo", "rustc")}
     if context["profile"] == "core-rust":
         try:
-            fetch.validate_projection(Path(args.projection).read_bytes(), "core-rust")
             for name in ("cargo", "rustc"):
                 """Real toolchain binaries only: a rustup proxy cannot run in the offline root."""
                 target = Path(tool_paths[name]).resolve(strict=True)
@@ -1466,7 +1476,7 @@ def _start(args):
         "--workspace", str(Path(args.workspace).resolve(strict=True)),
         "--prepared", str(Path(args.prepared).resolve(strict=True)),
         "--bundle", str(Path(args.bundle).resolve(strict=True)),
-        "--projection", str(Path(args.projection).resolve(strict=True)),
+        "--projection", str(Path(args.projection).absolute()),
         "--deadline-file", str(Path(args.deadline_file).resolve(strict=True)),
         "--host-net-inode", str(host_net_inode), "--owner-uid", str(os.getuid()),
         "--node-path", tool_paths["node"], "--npm-path", tool_paths["npm"],
