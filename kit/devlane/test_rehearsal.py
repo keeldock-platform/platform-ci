@@ -274,6 +274,46 @@ def bundle_request_digest(owner):
 
 
 class ProductionFailureDiagnosticsTests(unittest.TestCase):
+    def test_fixture_loader_checks_the_real_snapshot_before_projection_validation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            files = dict(test_e2e.RUST_FIXTURE_SOURCES)
+            files.update(test_e2e._rust_fixture_source_map())
+            files.update({name: b"synthetic-lock-loader-only" for name in test_e2e.RUST_LOCKFILES})
+            for name, body in files.items():
+                target = root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(body)
+            projection_bytes = b"synthetic-projection-loader-only"
+            snapshot = {"schema": 1, "toolchain": test_e2e.RUST_VERSION,
+                        "lockfiles": {}, "projection_sha256": "a" * 64}
+            (root / ".devlane-projection.json").write_bytes(projection_bytes)
+            snapshot_path = root / ".devlane-lock-snapshot.json"
+            snapshot_path.write_bytes(bundle.canonical_json(snapshot))
+            projection = {"synthetic": True}
+            with mock.patch.object(test_e2e.fetch, "validate_projection", return_value=projection) as validate, \
+                    mock.patch.object(test_e2e, "_validate_rust_fixture") as verify:
+                actual = test_e2e._load_rust_fixture(root)
+                self.assertEqual(actual, (projection, projection_bytes, snapshot, files))
+                validate.assert_called_once_with(projection_bytes, "core-rust")
+                verify.assert_called_once_with(root, files, projection, projection_bytes, snapshot)
+                snapshot["projection_sha256"] = "invalid"
+                snapshot_path.write_bytes(bundle.canonical_json(snapshot))
+                validate.reset_mock()
+                verify.reset_mock()
+                with self.assertRaisesRegex(RuntimeError, "rust-matrix-projection-snapshot-shape"):
+                    test_e2e._load_rust_fixture(root)
+                validate.assert_not_called()
+                verify.assert_not_called()
+
+    def test_name_errors_keep_a_finite_diagnostic_category(self):
+        state = test_e2e._DiagnosticState()
+        with self.assertRaises(NameError):
+            with state.phase("fixture-load"):
+                raise NameError("private-canary-must-not-be-rendered")
+        self.assertEqual(state.refusal_line(NameError()),
+                         "devlane_production_e2e=refused stage=fixture-load exception=name-error")
+
     def test_every_production_phase_has_a_bounded_allowlisted_failure_line(self):
         private_path = chr(47) + "private/runner"
         secret_marker = "SYNTHETIC_SOURCE_CANARY KEYCANARY-73A10X " + private_path + "/candidate"

@@ -29,6 +29,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import signal
 import shutil
 import subprocess
@@ -98,6 +99,7 @@ _EXCEPTION_CATEGORIES = {
     FileNotFoundError: "file-not-found",
     IsADirectoryError: "is-directory",
     KeyError: "key-error",
+    NameError: "name-error",
     NotADirectoryError: "not-directory",
     OSError: "os-error",
     PermissionError: "permission-denied",

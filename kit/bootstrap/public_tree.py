@@ -329,7 +329,7 @@ SELF_PIN_LINE_PATTERN = re.compile(
     rb"(?m)^    'kit/bootstrap/public_tree\.py': '[0-9a-f]{64}',$"
 )
 PINNED_FILE_SHA256 = {
-    'kit/devlane/test_rehearsal.py': 'f6f15b4972a793fcbe2a0366f2a4da63c95ee8a9508dc6a1092ff00a5200ac08',
+    'kit/devlane/test_rehearsal.py': '155e769f28e0125c28bd2629a3cf6df5cd5c5b3bf716abb44edea203e60bcfa2',
     'kit/devlane/rehearsal.py': 'd6e651ed27142133554ac7a64bf30e3b0586c208451ec4802624a63e0ef6a54c',
     'docs/devlane-procedure.md': 'cc979efce10666363d0b24e9312149e4160ccdfd694947ab76944adbd6313451',
     '.github/workflows/appium-ci.yml': '961eaa4fc03e0fe687fa437673116e68479af9437dcb69173444ec57098db2d3',
@@ -370,7 +370,7 @@ PINNED_FILE_SHA256 = {
     'kit/bootstrap/policy_linux.py': '0b314a645e43f2aaec58ca23150386b5865e8a27c3101459d00d42370e7d5a5f',
     'kit/bootstrap/policy_npm.py': 'b110b4573b2919003792e05bdcec60a0108f9e2ea1ebc1ce820ff77216271794',
     'kit/bootstrap/policy_rust.py': '4306a55701a5a04c884b2b21091a6d06307134e3570f0d5d65cb103ff84023ec',
-    'kit/bootstrap/public_tree.py': 'e12e8e308c6b3c7ffd4511bdfd4d6976cac8171dd68de8aa956a638e478083df',
+    'kit/bootstrap/public_tree.py': '096db55adafe459772bcdeadba0c1e003e50857382c5dfc295055fff422adcb8',
     'kit/bootstrap/test_policy_baselines.py': '690980cc3a140970d2b813d854823e3e9f32d8b09db9e25c0ca143140c3af627',
     'kit/bootstrap/test_policy_handoff.py': '3cf707fec6cc1a62e49a948b496fe00765a04ec171fd4cdc57b07d214d3100a2',
     'kit/bootstrap/test_policy_linux.py': 'f1c62480d608d680e73cdbf0ca8b7c83552919bd5de4caa095d5e04e8c3e5f8c',
@@ -548,7 +548,7 @@ PINNED_FILE_SHA256 = {
     'kit/devlane/test_adapters.mjs': '72eefa32c212af17202c0d0e5df0113327b9649f988f57c1101edd825ff742c0',
     'kit/devlane/test_audit_contracts.py': 'a5af93d2feac7192e4dfcfb5094c797518d04293531b28dc5343392d0b1802e5',
     'kit/devlane/test_coordinator.py': 'eb33d700feba5b7c244b4d2b754d096dc56050e7149fa348f2df658e50d95e95',
-    'kit/devlane/test_e2e.py': '120b0c1c9f05ee515db1a67ade10179d4204a78759016b621d35bfb892d3b3e2',
+    'kit/devlane/test_e2e.py': '9dbc3e09301c076429e1c62eee9c339f65451bcf19822bdf2f6e0724d7c9fc13',
     'kit/devlane/test_linux_runtime.py': '482a626731eb6e7bd91d74e911aa00f5f112bad053caf7432356f7905b159606',
     'kit/devlane/test_rust_report.py': '24c1574d01a8f2a8e1e042f947b1eabe480667c52cadfa9c1e2171ce93938799',
     'kit/devlane/test_rust_test_runner.py': '4ca721b0a527ce12a5ce0068ff05d8ea5821f00b47febef3555f0fe794236ce3',
