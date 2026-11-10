@@ -267,12 +267,21 @@ class BranchPromotionTests(unittest.TestCase):
         )
         self.assertEqual(len(contexts), 14)
         self.assertEqual(set(contexts), EXPECTED_REQUIRED_CONTEXTS)
-        push_filter = "on:\n  push:\n    branches-ignore:\n      - uat\n      - main\n"
+        push_filter = "  push:\n    branches-ignore:\n      - uat\n      - main\n"
         for relative in WORKFLOW_CHECK_JOBS:
             workflow = (ROOT / relative).read_text(encoding="utf-8")
             with self.subTest(workflow=relative):
                 self.assertEqual(workflow.count(push_filter), 1)
-                self.assertNotIn("  workflow_dispatch:\n", workflow)
+                if relative == ".github/workflows/public-policy.yml":
+                    bootstrap_trigger = (
+                        "on:\n  workflow_dispatch:\n    inputs:\n"
+                        "      control_wave_id:\n"
+                        "        description: Opaque control-wave identifier\n"
+                        "        required: true\n        type: string\n"
+                    )
+                    self.assertEqual(workflow.count(bootstrap_trigger), 1)
+                else:
+                    self.assertNotIn("  workflow_dispatch:\n", workflow)
 
         diagnostics = {
             ".github/workflows/linux-confinement-diagnostic.yml": "linux-confinement",
