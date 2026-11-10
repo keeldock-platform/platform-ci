@@ -164,6 +164,52 @@ class SourceReaderCallerValidationTests(unittest.TestCase):
             self.assertIn("GITHUB_TOKEN: ${{ github.token }}", match.group(1))
 
 
+class PromotionDocumentationTests(unittest.TestCase):
+    def test_promotion_docs_match_current_control_and_bootstrap(self):
+        root = Path(__file__).resolve().parents[2]
+        docs = (root / "docs/branch-promotion.md").read_text(encoding="utf-8")
+        promotion_source = (root / "kit/promotion/branch_promotion.py").read_text(encoding="utf-8")
+        promotion_context_block = promotion_source.split("WORKFLOW_CHECKS = {", 1)[1].split("\n}", 1)[0]
+        current_control_contexts = re.findall(r'^\s+"([^"]+)",$', promotion_context_block, re.MULTILINE)
+        documented_context_block = docs.split("The contexts checked by the promotion tool are:", 1)[1].split(
+            "Use the job check names GitHub reports:", 1
+        )[0]
+        documented_contexts = re.findall(r"^\s+- `([^`]+)`$", documented_context_block, re.MULTILINE)
+        self.assertEqual(len(current_control_contexts), 18)
+        self.assertEqual(len(documented_contexts), 18)
+        self.assertEqual(len(current_control_contexts), len(set(current_control_contexts)))
+        self.assertEqual(len(documented_contexts), len(set(documented_contexts)))
+        self.assertEqual(set(current_control_contexts), set(documented_contexts))
+        self.assertIn("pull request 173 merged by protected linear fast-forward", docs)
+        self.assertIn("5ef503e19fbeb600c3bbef9b047a15c238602efc", docs)
+        self.assertNotIn("current `main` copy has only `push` and `pull_request`", docs)
+        self.assertIn("Use only the approved public encrypted devlane", docs)
+        self.assertIn("Private product source must not run through private-repository Actions", docs)
+
+
+    def test_promotion_docs_reject_duplicate_context(self):
+        root = Path(__file__).resolve().parents[2]
+        docs_path = root / "docs/branch-promotion.md"
+        docs = docs_path.read_text(encoding="utf-8")
+        before, remaining = docs.split("The contexts checked by the promotion tool are:", 1)
+        contexts, after = remaining.split("Use the job check names GitHub reports:", 1)
+        first = re.search(r"(?m)^\s+- `([^`]+)`$", contexts)
+        self.assertIsNotNone(first)
+        duplicated = contexts[:first.end()] + "\n" + first.group(0) + contexts[first.end():]
+        altered = before + "The contexts checked by the promotion tool are:" + duplicated
+        altered += "Use the job check names GitHub reports:" + after
+        original_read = Path.read_text
+
+        def read_with_duplicate(path, *args, **kwargs):
+            if path == docs_path:
+                return altered
+            return original_read(path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", read_with_duplicate):
+            with self.assertRaises(AssertionError):
+                self.test_promotion_docs_match_current_control_and_bootstrap()
+
+
 @unittest.skipIf(_LINUX_ONLY, "the Linux source build suite runs only on Linux")
 class LinuxSourceBuildTests(unittest.TestCase):
     def _cache_identity(self, event="pull_request", ref="refs/pull/42/merge", trust_class="primary"):
@@ -418,7 +464,6 @@ class LinuxSourceBuildTests(unittest.TestCase):
         admission = (root / ".github/workflows/linux-source-admission.yml").read_text(encoding="utf-8")
         quick = (root / ".github/workflows/core-linux-quick-return.yml").read_text(encoding="utf-8")
         reusable = (root / ".github/workflows/core-dependency-checks.yml").read_text(encoding="utf-8")
-        docs = (root / "docs/branch-promotion.md").read_text(encoding="utf-8")
 
         self.assertIn("'linux-source-read-main'", admission)
         self.assertIn("github.ref == 'refs/heads/main'", admission)
@@ -447,30 +492,6 @@ class LinuxSourceBuildTests(unittest.TestCase):
                     directory in declared_paths or any(directory.startswith(path + "/") for path in declared_paths),
                     f"{directory} has no matching checkout path",
                 )
-
-        callee_jobs = {}
-        in_jobs = False
-        current = None
-        for line in reusable.splitlines():
-            if line == "jobs:":
-                in_jobs = True
-                continue
-            if not in_jobs:
-                continue
-            job_match = re.match(r"^  ([A-Za-z0-9_-]+):$", line)
-            if job_match:
-                current = job_match.group(1)
-                callee_jobs[current] = current
-                continue
-            name_match = re.match(r"^    name: ([A-Za-z0-9_.-]+)$", line)
-            if current and name_match:
-                callee_jobs[current] = name_match.group(1)
-        actual_contexts = {
-            "dependencies / " + callee_jobs[job]
-            for job in ("dependency-preflight", "rust", "runtime-workspace", "npm")
-        }
-        for context in actual_contexts:
-            self.assertIn(context, docs)
 
     def test_optional_cache_validation_refuses_cache_without_failing_the_uncached_path(self):
         with tempfile.TemporaryDirectory() as temporary:

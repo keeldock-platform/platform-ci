@@ -1302,6 +1302,8 @@ class ControlDispatchReconciliationTests(unittest.TestCase):
 
     def test_real_cli_dispatch_wave_success_uses_transport_mocks(self):
         with tempfile.TemporaryDirectory() as temporary:
+            fixed_now = 1_794_322_800
+            fixed_timestamp = "2026-11-10T15:00:00Z"
             ledger = CoordinatorLedgerAcceptanceTests()._new_ledger(temporary)
             record = _ledger_record(state="assets-attached")
             record["bundle_asset_id"] = "111"
@@ -1311,7 +1313,10 @@ class ControlDispatchReconciliationTests(unittest.TestCase):
             key_path = Path(temporary) / "key.hex"
             key_path.write_bytes(b"a" * 64)
             key_path.chmod(0o600)
+            unrelated_cwd = Path(temporary) / "unrelated-cwd"
+            unrelated_cwd.mkdir()
             calls = []
+            cleanup_calls = []
 
             class FinishedWatcher:
                 def __init__(self, target, args, kwargs, **_ignored):
@@ -1335,28 +1340,50 @@ class ControlDispatchReconciliationTests(unittest.TestCase):
             def attach(_ledger, wave_id):
                 attached = coordinator._read(ledger / (wave_id + ".json"))
                 attached.update({"state": "run-attached", "run_id": "54321", "authorized_run_id": "54321",
-                                 "run_attempt": 1, "dispatch_completed_at": coordinator._timestamp()})
+                                 "run_attempt": 1, "dispatch_completed_at": fixed_now})
                 coordinator._write_atomic(ledger / (wave_id + ".json"), attached)
                 return True
 
-            with mock.patch.object(coordinator, "_verify_remote_main"), \
-                    mock.patch.object(coordinator, "_verify_secret_absent"), \
-                    mock.patch.object(coordinator, "_verify_environment"), \
-                    mock.patch.object(coordinator, "_verify_secret_present"), \
-                    mock.patch.object(coordinator.subprocess, "run", side_effect=gh), \
-                    mock.patch.object(coordinator.threading, "Thread", side_effect=FinishedWatcher), \
-                    mock.patch.object(coordinator, "reconcile_dispatch", side_effect=attach), \
-                    contextlib.redirect_stdout(io.StringIO()) as output:
-                status = coordinator.main([
-                    "dispatch-wave", "--ledger", str(ledger), "--wave-id", "wave-test-0001",
-                    "--key-file", str(key_path), "--poll-seconds", "2", "--timeout-seconds", "30",
-                    "--decrypt-timeout-seconds", "60",
-                ])
+            def revoke_without_live_github(ledger_path, wave_id):
+                cleanup_calls.append((Path(ledger_path), wave_id))
+                record = coordinator._read(Path(ledger_path) / (wave_id + ".json"))
+                record["cleanup_obligations"]["secret"] = {"state": "absent", "verified_at": fixed_timestamp}
+                coordinator._write_atomic(Path(ledger_path) / (wave_id + ".json"), record)
+
+            original_cwd = Path.cwd()
+            try:
+                os.chdir(unrelated_cwd)
+                with mock.patch.object(coordinator, "_verify_remote_main"), \
+                        mock.patch.object(coordinator, "_verify_secret_absent"), \
+                        mock.patch.object(coordinator, "_verify_environment"), \
+                        mock.patch.object(coordinator, "_verify_secret_present"), \
+                        mock.patch.object(coordinator, "revoke_secret", side_effect=revoke_without_live_github), \
+                        mock.patch.object(coordinator, "_timestamp", return_value=fixed_timestamp), \
+                        mock.patch.object(coordinator.time, "time", return_value=fixed_now), \
+                        mock.patch.dict(coordinator.os.environ, {}, clear=True), \
+                        mock.patch.object(coordinator.subprocess, "run", side_effect=gh), \
+                        mock.patch.object(coordinator.subprocess, "Popen", side_effect=AssertionError("live process")) as live_process, \
+                        mock.patch.object(coordinator.threading, "Thread", side_effect=FinishedWatcher), \
+                        mock.patch.object(coordinator, "reconcile_dispatch", side_effect=attach), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    status = coordinator.main([
+                        "dispatch-wave", "--ledger", str(ledger), "--wave-id", "wave-test-0001",
+                        "--key-file", str(key_path), "--poll-seconds", "2", "--timeout-seconds", "30",
+                        "--decrypt-timeout-seconds", "60",
+                    ])
+                    live_process.assert_not_called()
+            finally:
+                os.chdir(original_cwd)
             self.assertEqual(status, 0)
             self.assertEqual(len(calls), 2)
             self.assertIn("secret set", " ".join(calls[0]))
             self.assertIn("workflow run", " ".join(calls[1]))
             self.assertIn("dispatch_wave=attached run-id=54321", output.getvalue())
+            self.assertEqual(cleanup_calls, [(ledger, "wave-test-0001")])
+            updated = coordinator._read(ledger / "wave-test-0001.json")
+            self.assertEqual(updated["reconcile_deadline_at"], fixed_now + 30)
+            self.assertEqual(updated["cleanup_obligations"]["secret"],
+                             {"state": "absent", "verified_at": fixed_timestamp})
             self.assertFalse(key_path.exists())
 
     def test_zero_matches_poll_only_until_fixed_deadline_and_ambiguity_refuses(self):

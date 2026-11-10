@@ -147,7 +147,7 @@ class DeadlineTests(unittest.TestCase):
             started.write_text(repr(start), encoding="ascii")
             with patch.object(deadline.time, "monotonic", return_value=start):
                 deadline.create(deadline_path, 20, 5, 30, started_at_file=started)
-            self.assertEqual(deadline.remaining(deadline_path, now=start + 4), 16)
+            self.assertAlmostEqual(deadline.remaining(deadline_path, now=start + 4), 16, places=12)
             link = root / "deadline-link"
             link.symlink_to(deadline_path)
             with self.assertRaises(OSError):

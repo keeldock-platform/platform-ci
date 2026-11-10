@@ -1455,8 +1455,10 @@ def _watch_installed_key(ledger, wave_id, stop, done, outcome, *, poll_seconds, 
 
 
 def dispatch_wave(ledger, wave_id, key_file, *, poll_seconds=10, timeout_seconds=DISPATCH_RECONCILE_SECONDS,
-                  decrypt_timeout_seconds=7200, sleep=time.sleep, clock=time.time):
+                  decrypt_timeout_seconds=7200, sleep=time.sleep, clock=None):
     """Install once, dispatch once, reconcile, and revoke on handled in-process exit paths."""
+    if clock is None:
+        clock = time.time
     root = _ledger_root(ledger)
     key_path = Path(key_file)
     if (key_path.name != "key.hex" or key_path.parent.is_symlink()
