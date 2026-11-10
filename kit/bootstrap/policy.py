@@ -117,7 +117,14 @@ def load_policy_document(path, expected_pool=None):
 
 
 PLATFORM_WORKFLOW_TEMPLATE = r"""name: public-policy
+run-name: public control=${{ inputs.control_wave_id }}
 on:
+  workflow_dispatch:
+    inputs:
+      control_wave_id:
+        description: Opaque control-wave identifier
+        required: true
+        type: string
   push:
     branches-ignore:
       - uat

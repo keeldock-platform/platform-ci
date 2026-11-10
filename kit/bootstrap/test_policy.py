@@ -1308,6 +1308,18 @@ class WorkflowPolicyTests(unittest.TestCase):
             with self.assertRaises(PolicyError):
                 validate_workflow_text(changed, "platform", "macos-core-contract")
 
+    def test_manual_bootstrap_trigger_preserves_exact_old_control_contract(self):
+        workflow = self._platform_workflow()
+        self.assertTrue(validate_workflow_text(workflow, "platform"))
+        self.assertIn("run-name: public control=${{ inputs.control_wave_id }}", workflow)
+        self.assertIn("workflow_dispatch:", workflow.split("jobs:", 1)[0])
+        for changed in (
+            workflow.replace("permissions: {}", "permissions:\n  contents: read", 1),
+            workflow.replace("  policy:\n", "  unauthorized-job:\n    runs-on: ubuntu-24.04\n    steps: []\n  policy:\n", 1),
+        ):
+            with self.assertRaises(PolicyError):
+                validate_workflow_text(changed, "platform")
+
     def test_actual_workflow_rejects_skips_masking_extra_execution_and_filters(self):
         base = self._platform_workflow()
         mutations = (
