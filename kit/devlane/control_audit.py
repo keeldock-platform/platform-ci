@@ -47,11 +47,14 @@ CONTROL_AUDIT_FINAL_STEPS = (
 )
 SYNTHETIC_STEP_NAMES = (
     "Fetch public control and validate protected-branch dispatch",
+    "Reserve work time for pinned Node action",
     "Set up pinned Node toolchain",
     "Install fixed Rust acceptance toolchain",
     "Claim a synthetic bundle permit",
+    "Reserve work time for permit cache save",
     "Save the synthetic permit through the Actions cache",
     "Discard the local synthetic permit",
+    "Reserve work time for permit cache restore",
     "Restore the synthetic permit with the encrypted-lane path and key shape",
     "Verify the restored permit and refuse a second claim",
     "Run full source-free production-path acceptance",

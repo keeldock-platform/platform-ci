@@ -690,7 +690,7 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
         self.assertIn("kit/devlane/test_acceptance.py", workflow)
         self.assertIn("kit/devlane/test_linux_runtime.py", workflow)
         self.assertIn("kit/devlane/test_e2e.py", workflow)
-        self.assertIn("^refs/heads/[A-Za-z0-9._/-]{1,200}$", workflow)
+        self.assertRegex(workflow, r're.fullmatch\(r"refs/heads/\[A-Za-z0-9\._/-\]\{1,200\}"')
         self.assertNotIn("(develop|uat|main)", workflow)
         self.assertNotIn("environment:", workflow)
 
@@ -699,7 +699,7 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
         synthetic = self._workflow("devlane-synthetic.yml")
         expression = r"^refs/heads/[A-Za-z0-9._/-]{1,200}$"
         self.assertIn(expression, policy)
-        self.assertIn(expression, synthetic)
+        self.assertRegex(synthetic, r're.fullmatch\(r"refs/heads/\[A-Za-z0-9\._/-\]\{1,200\}"')
         self.assertEqual(control_audit.SOURCE_FREE_BRANCH_REF.pattern, expression[1:-1] + r"\Z")
 
     def test_control_and_lane_workflows_request_no_write_permission(self):

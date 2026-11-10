@@ -923,6 +923,7 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/fetch.py',
             'kit/devlane/filter.py',
             'kit/devlane/host_cleanup.py',
+            'kit/devlane/owned_tree_cleanup.py',
             'kit/devlane/isolated_cleanup.py',
             'kit/devlane/network_probe.py',
             'kit/devlane/permit.py',

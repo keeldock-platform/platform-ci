@@ -1,4 +1,10 @@
-"""Fixed offline PR1 Rust matrix; never invokes a candidate-provided command."""
+"""Fixed offline PR1 Rust matrix; never invokes a candidate-provided command.
+
+The supervisor launches this file from the read-only /control/devlane bind mount
+with -I -S. Isolated Python omits the script directory, so restore only this
+runner's trusted control directory before importing its siblings. The caller
+uses the literal /control/devlane path; candidate source never selects imports.
+"""
 
 import argparse
 import json
@@ -11,6 +17,9 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+if sys.flags.isolated:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import bundle
 import rust_test_runner
@@ -43,6 +52,7 @@ SOURCE_ROOT = "/workspace/source"
 TARGET = "/scratch/target"
 RAW = "/scratch/raw"
 REPORTS = "/scratch/reports"
+ADVISORY_DB_DIRECTORY = "advisory-db-3157b0e258782691"
 
 
 class MatrixRefusal(ValueError):
@@ -169,15 +179,19 @@ def _emit_failure(records, stage):
     records.append({"kind": "control", "stage": stage, "status": "fail", "code": "DEVLANE_FAILURE"})
 
 
-def _copy_advisory_database(deadline):
+def _copy_advisory_database(deadline, cargo_home="/scratch/cargo-home"):
     _remaining(deadline)
     source = Path(TOOLS_ROOT) / "advisory-db"
-    cargo_home = Path("/scratch/cargo-home")
+    cargo_home = Path(cargo_home)
     if source.is_symlink() or not source.is_dir():
         raise MatrixRefusal("advisory-database-missing")
-    destination = cargo_home / "advisory-db"
+    database_root = cargo_home / "advisory-dbs"
+    destination = database_root / ADVISORY_DB_DIRECTORY
+    if database_root.exists() or database_root.is_symlink():
+        raise MatrixRefusal("advisory-database-copy-exists")
     if destination.exists() or destination.is_symlink():
         raise MatrixRefusal("advisory-database-copy-exists")
+    database_root.mkdir(mode=0o700)
     shutil.copytree(source, destination, symlinks=False)
     _remaining(deadline)
     for root, directories, files in os.walk(destination, followlinks=False):
@@ -284,18 +298,19 @@ def run(matrix, config_path, report_path, deadline):
     for workspace in workspaces:
         identifier = workspace["id"]
         deny_args = [str(deny), "--manifest-path", workspace["manifest"], "--config",
-                     SOURCE_ROOT + "/deny.toml", "--workspace", "--all-features", "check"]
+                     SOURCE_ROOT + "/deny.toml", "--workspace", "--all-features", "--offline", "--locked", "check"]
         _simple_check(records, "deny-" + identifier, deny_args, deadline, timeout=1800)
     for workspace in workspaces:
         identifier = workspace["id"]
-        audit_args = [str(audit), "audit", "--no-fetch", "--db", "/scratch/cargo-home/advisory-db",
+        audit_args = [str(audit), "audit", "--deny", "unsound", "--no-fetch", "--db",
+                      "/scratch/cargo-home/advisory-dbs/" + ADVISORY_DB_DIRECTORY,
                       "--file", workspace["lock"]]
         _simple_check(records, "audit-" + identifier, audit_args, deadline, timeout=900)
     for workspace in workspaces:
         identifier = workspace["id"]
         store = SOURCE_ROOT + ("/runtime/supply-chain" if identifier == "runtime" else "/supply-chain")
         vet_args = [str(vet), "vet", "check", "--manifest-path", workspace["manifest"],
-                    "--store-path", store, "--locked"]
+                    "--store-path", store, "--locked", "--frozen"]
         _simple_check(records, "vet-" + identifier, vet_args, deadline, timeout=900)
     arms = [(item["id"], item["manifest"], item["mode"]) for item in workspaces]
     arms.append((matrix["listener"]["id"], matrix["listener"]["manifest"], matrix["listener"]["mode"]))

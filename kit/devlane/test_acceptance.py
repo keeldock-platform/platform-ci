@@ -499,7 +499,7 @@ class SupervisorOrderAcceptanceTests(unittest.TestCase):
             "state_dir": tempfile.mkdtemp(), "context": "context", "workspace": "workspace",
             "prepared": "prepared", "bundle": "bundle", "projection": "projection",
             "deadline_file": "deadline",
-            "host_net_inode": 1, "owner_uid": 1000, "node_path": "", "npm_path": "",
+            "host_net_inode": 1, "owner_uid": os.getuid(), "node_path": "", "npm_path": "",
             "cargo_path": "", "rustc_path": "",
         })()
         service = type("Service", (), {
@@ -513,6 +513,10 @@ class SupervisorOrderAcceptanceTests(unittest.TestCase):
                 self.assertEqual(supervisor._serve(args), 2)
                 self.assertEqual(service.cleanup_calls, 1)
                 self.assertGreaterEqual(kill_children.call_count, 1)
+                refusal = bundle.strict_json(
+                    (Path(args.state_dir) / supervisor.STARTUP_REFUSAL_NAME).read_bytes(), 1024,
+                )
+                self.assertEqual(refusal, {"code": "startup-refused"})
         finally:
             supervisor.CANCEL_REQUESTED.clear()
             import shutil
@@ -673,7 +677,7 @@ class CleanupLifecycleTests(unittest.TestCase):
         self.assertEqual(isolated_cleanup.CLEANUP_BUDGET_SECONDS, client_worst_case)
         self.assertGreater(host_cleanup.HOST_DEADLINE_SECONDS, client_worst_case)
         source = inspect.getsource(host_cleanup.clean)
-        self.assertIn("timeout=HOST_DEADLINE_SECONDS", source)
+        self.assertIn("_cleanup_timeout(deadline_file, HOST_DEADLINE_SECONDS)", source)
         self.assertNotIn("timeout=30", source)
         sleeps = inspect.getsource(isolated_cleanup._fallback_terminate)
         for fixed in ("timeout=5", "_wait_absent(pid, 3)", "_wait_process_group_absent(parent_pid, 5)"):
@@ -768,8 +772,16 @@ class RealLockfileAndFixtureTests(unittest.TestCase):
 
     def test_a_cargo_generated_lock_with_real_dependencies_projects_to_a_valid_projection(self):
         """Captured from `cargo generate-lockfile` (cargo 1.97, lock version 4) for two pinned crates."""
-        projection, payload = test_e2e._rust_projection(self.REAL_CARGO_LOCK.encode("utf-8"))
+        fuzz_lock = (b'version = 4\n\n[[package]]\nname = "devlane-matrix-fuzz-replay"\n'
+                     b'version = "0.0.0"\n')
+        runtime_lock = (b'version = 4\n\n[[package]]\nname = "devlane-matrix-listener"\n'
+                        b'version = "0.0.0"\n')
+        projection, payload = test_e2e._rust_projection(
+            self.REAL_CARGO_LOCK.encode("utf-8"), fuzz_lock, runtime_lock,
+        )
         self.assertEqual([row["name"] for row in projection["cargo"]], ["fastrand", "itoa"])
+        self.assertEqual([item["path"] for item in projection["cargo_workspaces"]],
+                         ["fuzz/Cargo.lock", "runtime/Cargo.lock"])
         fetch.validate_projection(payload, "core-rust")
 
     def test_unsafe_lock_shapes_and_specs_are_still_refused(self):

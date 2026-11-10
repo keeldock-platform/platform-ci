@@ -18,12 +18,14 @@ from pathlib import Path
 
 import bundle
 import fetch
+import deadline as deadline_budget
 
 
 UID = 65534
 GID = 65534
 MAX_LOG = 256 * 1024 * 1024
 MOUNT_TARGETS = []
+DEADLINE_FILE = ""
 """Package lifecycle scripts never run during preparation, at three independent layers: the project .npmrc, this environment, and the explicit install flag. A package that declares an install script is installed as inert files."""
 NPMRC_TEXT = ("ignore-scripts=true\naudit=false\nfund=false\nupdate-notifier=false\n"
               "registry=https://registry.npmjs.org/\n")
@@ -35,16 +37,28 @@ def refuse(code):
     raise bundle.Refusal(code)
 
 
+def _bounded_timeout(cap, *, cleanup=False):
+    if not DEADLINE_FILE:
+        refuse("total-deadline-unavailable")
+    try:
+        remaining = (deadline_budget.cleanup_remaining(DEADLINE_FILE) if cleanup
+                     else deadline_budget.remaining(DEADLINE_FILE))
+        return min(cap, remaining)
+    except deadline_budget.DeadlineRefusal:
+        refuse("total-deadline-exhausted")
+
+
 def run(argv, *, timeout, log, environment, cwd=None):
     target = Path(log)
     target.parent.mkdir(parents=True, exist_ok=True)
+    bounded = _bounded_timeout(timeout)
     with target.open("xb") as output:
         try:
             process = subprocess.Popen(
                 argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
                 env=environment, close_fds=True, start_new_session=True, preexec_fn=_limits,
             )
-            code = process.wait(timeout=timeout)
+            code = process.wait(timeout=bounded)
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -104,14 +118,15 @@ def _resolve_rust_tool(path, name):
 def _mount(source, target):
     source = Path(source).resolve(strict=True)
     subprocess.run(["mount", "--bind", str(source), str(target)], check=True,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=_bounded_timeout(10))
     subprocess.run(["mount", "-o", "remount,bind,ro,nosuid,nodev", str(target)], check=True,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=_bounded_timeout(10))
     MOUNT_TARGETS.append(Path(target))
 
 
 def _mount_fs(argv, target):
-    subprocess.run(argv, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    subprocess.run(argv, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   timeout=_bounded_timeout(10))
     MOUNT_TARGETS.append(Path(target))
 
 
@@ -358,9 +373,17 @@ def main(argv=None):
     parser.add_argument("--profile", choices=("core-node", "core-rust"), required=True)
     parser.add_argument("--owner-uid", type=int, required=True)
     parser.add_argument("--owner-gid", type=int, required=True)
+    parser.add_argument("--deadline-file", required=True)
     for name in ("node", "npm", "cargo", "rustc"):
         parser.add_argument("--" + name + "-path", default="")
     args = parser.parse_args(argv)
+    global DEADLINE_FILE
+    DEADLINE_FILE = args.deadline_file
+    try:
+        deadline_budget.remaining(DEADLINE_FILE)
+    except deadline_budget.DeadlineRefusal:
+        print("dependency_preparation_refusal=total-deadline-exhausted", file=sys.stderr)
+        return 2
     if not sys.platform.startswith("linux") or os.geteuid() != 0:
         print("dependency_preparation_refusal=linux-root-required", file=sys.stderr)
         return 2
@@ -381,16 +404,18 @@ def main(argv=None):
         if args.profile == "core-node":
             if not paths["node"] or not paths["npm"]:
                 refuse("node-toolchain-missing")
-            if subprocess.run([paths["node"], "--version"], capture_output=True, timeout=10).stdout.strip() != b"v24.22.1":
+            if subprocess.run([paths["node"], "--version"], capture_output=True,
+                              timeout=_bounded_timeout(10)).stdout.strip() != b"v24.22.1":
                 refuse("node-toolchain-version")
-            if subprocess.run([paths["npm"], "--version"], capture_output=True, timeout=10).stdout.strip() != b"11.19.1":
+            if subprocess.run([paths["npm"], "--version"], capture_output=True,
+                              timeout=_bounded_timeout(10)).stdout.strip() != b"11.19.1":
                 refuse("npm-toolchain-version")
         elif not paths["cargo"] or not paths["rustc"]:
             refuse("rust-toolchain-missing")
         if args.profile == "core-rust":
             for name in ("cargo", "rustc"):
                 version_result = subprocess.run([paths[name], "--version"], stdout=subprocess.PIPE,
-                                                stderr=subprocess.DEVNULL, timeout=10, check=False,
+                                                stderr=subprocess.DEVNULL, timeout=_bounded_timeout(10), check=False,
                                                 env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
                 words = version_result.stdout.decode("ascii", "strict").split()
                 if version_result.returncode != 0 or len(words) < 2 or words[1] != projection["tools"][name]:
@@ -409,7 +434,7 @@ def main(argv=None):
             tool_roots = {"node": None, "rust": cargo_root}
         root = Path(tempfile.mkdtemp(prefix="kd-devlane-prep-", dir="/tmp"))
         subprocess.run(["mount", "--make-rprivate", "/"], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=_bounded_timeout(10))
         _prepare_root(root, tool_roots)
         _run_worker(root, projection, args.profile, args.output, paths, args.owner_uid, args.owner_gid)
         print("dependency_preparation=complete")
@@ -426,7 +451,7 @@ def main(argv=None):
         for target in reversed(MOUNT_TARGETS):
             try:
                 subprocess.run(["umount", str(target)], check=True, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, timeout=5)
+                               stderr=subprocess.DEVNULL, timeout=_bounded_timeout(5, cleanup=True))
             except (OSError, subprocess.SubprocessError):
                 clean = False
         MOUNT_TARGETS.clear()

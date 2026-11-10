@@ -1,18 +1,25 @@
 """Source-free regressions for the closed Core PR1 Rust matrix."""
 
 import json
+import inspect
 import os
 import signal
 import sys
 import subprocess
 import tempfile
 import time
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import public_audit
+import filter as output_filter
 import rust_matrix_runner
+import rust_tooling
+import deadline as deadline_budget
+import supervisor
+import test_e2e
 
 
 def _term_split_group(marker):
@@ -69,6 +76,378 @@ def _coverage(records, suite):
 
 
 class RustMatrixRunnerTests(unittest.TestCase):
+    def _summary_scenario(self):
+        return {
+            "profile": "core-rust", "allowed_files": {},
+            "allowed_tests": test_e2e.RUST_FIXTURE_TESTS, "frames": {},
+        }
+
+    def _summary_payload(self, records):
+        profile_root = json.loads((Path(__file__).resolve().parents[2] / "ci/devlane-profiles.json").read_text())
+        profile = profile_root["profiles"]["core-rust"]
+        allowlists = {
+            "files": {}, "tests": {item: item for item in test_e2e.RUST_FIXTURE_TESTS.values()},
+            "frames": {}, "stages": profile["stages"],
+            "codes": sorted(set(profile["diagnostic_codes"] + ["DEVLANE_FAILURE"])),
+            "max_lines": {}, "suites": sorted(profile["rust_matrix"]["coverage_ids"]),
+        }
+        return output_filter.filter_records(
+            [json.dumps(row, sort_keys=True, separators=(",", ":")).encode() for row in records],
+            allowlists,
+        )
+
+    def _coverage_rows(self):
+        rows = []
+        for suite in rust_matrix_runner.EXPECTED_MATRIX["coverage_ids"]:
+            total = 2 if suite.startswith("fuzz-replay-") else 1
+            rows.append({
+                "kind": "coverage", "stage": rust_matrix_runner._stage_for(suite),
+                "suite": suite, "total": total, "passed": total, "failed": 0, "ignored": 0,
+            })
+        return rows
+
+    def test_harness_parses_complete_producer_shaped_rust_summary(self):
+        payload = self._summary_payload(self._coverage_rows())
+        records = test_e2e._summary_records(payload, self._summary_scenario())
+        self.assertEqual({row["suite"] for row in records if row["kind"] == "coverage"},
+                         set(rust_matrix_runner.EXPECTED_MATRIX["coverage_ids"]))
+
+    def test_harness_rejects_every_incomplete_or_nonpassing_rust_summary_shape(self):
+        rows = self._coverage_rows()
+        mutations = {
+            "missing-suite": rows[:-1],
+            "extra-suite": rows + [{
+                "kind": "coverage", "stage": "unit", "suite": "unexpected-suite",
+                "total": 1, "passed": 1, "failed": 0, "ignored": 0,
+            }],
+            "duplicate-suite": rows + [dict(rows[0]), {
+                "kind": "control", "stage": "unit", "status": "fail", "code": "DEVLANE_FAILURE",
+            }],
+            "skipped-suite": rows + [{
+                "kind": "control", "stage": "unit", "status": "skip",
+            }],
+            "failure-record-in-pass-summary": rows + [{
+                "kind": "test", "stage": "unit",
+                "test": next(iter(test_e2e.RUST_FIXTURE_TESTS.values())),
+            }],
+            "invalid-counts": [dict(rows[0], ignored=1)] + rows[1:],
+            "invalid-total-type": [dict(rows[0], total=True)] + rows[1:],
+        }
+        for label, changed in mutations.items():
+            with self.subTest(label=label):
+                try:
+                    payload = self._summary_payload(changed)
+                except output_filter.FilterRefusal:
+                    continue
+                with self.assertRaises((RuntimeError, output_filter.FilterRefusal)):
+                    test_e2e._summary_records(payload, self._summary_scenario())
+
+    def test_startup_negative_requires_the_intended_projection_refusal(self):
+        good = subprocess.CompletedProcess(
+            ["supervisor.py", "start"], 2, b"",
+            b"devlane_supervisor_refusal=projection-binding-mismatch\n",
+        )
+        test_e2e._assert_startup_projection_refusal(good)
+        parser_error = subprocess.CompletedProcess(
+            ["supervisor.py", "start"], 2, b"",
+            b"usage: supervisor.py start --deadline-file DEADLINE_FILE\n",
+        )
+        with self.assertRaisesRegex(RuntimeError, "startup-refusal-wrong-boundary"):
+            test_e2e._assert_startup_projection_refusal(parser_error)
+
+    def test_isolated_rust_runner_launch_imports_only_the_trusted_control_siblings(self):
+        root = Path(__file__).resolve().parents[2]
+        supervisor_source = inspect.getsource(supervisor)
+        self.assertIn('"/usr/bin/python3", "-B", "-I", "-S", "/control/devlane/rust_matrix_runner.py"',
+                      supervisor_source)
+        self.assertIn('control_root / "kit/devlane", root / "control/devlane", readonly=True',
+                      supervisor_source)
+        self.assertNotIn("/workspace/source/rust_matrix_runner.py", supervisor_source)
+        result = subprocess.run(
+            [sys.executable, "-B", "-I", "-S", str(root / "kit/devlane/rust_matrix_runner.py")],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=10, check=False,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr.decode("utf-8", "replace"))
+        self.assertIn(b"the following arguments are required", result.stderr)
+        self.assertNotIn(b"ModuleNotFoundError", result.stderr)
+
+    def test_deny_policy_and_offline_tool_argv_match_pinned_contracts(self):
+        deny_policy = tomllib.loads(test_e2e.RUST_FIXTURE_SOURCES["deny.toml"].decode("ascii"))
+        advisories = deny_policy["advisories"]
+        self.assertEqual(advisories["yanked"], "deny")
+        self.assertEqual(advisories["unmaintained"], "workspace")
+        self.assertEqual(advisories["ignore"], [])
+        self.assertNotIn("yanked", deny_policy)
+        self.assertNotIn("unmaintained", deny_policy)
+
+        checks = []
+
+        def simple(records, suite, argv, deadline, timeout=1800):
+            checks.append((suite, argv))
+            return _coverage(records, suite)
+
+        def rust_arm(records, scope, manifest, workspace_mode, mode, config, deadline):
+            suffix = "all-features" if mode == "all" else "default"
+            records.append({
+                "kind": "coverage", "stage": "unit", "suite": scope + "-" + suffix,
+                "total": 1, "passed": 1, "failed": 0, "ignored": 0,
+            })
+            return True
+
+        def replay(records, mode, deadline):
+            suffix = "all-features" if mode == "all" else "default"
+            records.append({
+                "kind": "coverage", "stage": "unit", "suite": "fuzz-replay-" + suffix,
+                "total": 1, "passed": 1, "failed": 0, "ignored": 0,
+            })
+            return True
+
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "matrix.jsonl"
+            with patch.object(rust_matrix_runner, "_copy_advisory_database"), \
+                    patch.object(rust_matrix_runner, "_simple_check", side_effect=simple), \
+                    patch.object(rust_matrix_runner, "_rust_test_arm", side_effect=rust_arm), \
+                    patch.object(rust_matrix_runner, "_fuzz_replay", side_effect=replay):
+                result = rust_matrix_runner.run(
+                    rust_matrix_runner.EXPECTED_MATRIX, "fixed-test-map", str(report), time.monotonic() + 60,
+                )
+        self.assertEqual(result, 0)
+
+        deny = next(argv for suite, argv in checks if suite == "deny-root")
+        self.assertEqual(deny[1:], [
+            "--manifest-path", "/workspace/source/Cargo.toml", "--config", "/workspace/source/deny.toml",
+            "--workspace", "--all-features", "--offline", "--locked", "check",
+        ])
+        self.assertEqual(deny[3], "--config")
+        self.assertEqual(deny[5:8], ["--workspace", "--all-features", "--offline"])
+        self.assertEqual(deny[8:], ["--locked", "check"])
+
+        audit = next(argv for suite, argv in checks if suite == "audit-root")
+        self.assertEqual(audit[1:6], ["audit", "--deny", "unsound", "--no-fetch", "--db"])
+        self.assertEqual(audit[6], "/scratch/cargo-home/advisory-dbs/" +
+                         rust_matrix_runner.ADVISORY_DB_DIRECTORY)
+        self.assertEqual(audit[7:], ["--file", "/workspace/source/Cargo.lock"])
+
+        vet = next(argv for suite, argv in checks if suite == "vet-root")
+        self.assertEqual(vet[1:3], ["vet", "check"])
+        self.assertEqual(vet[-2:], ["--locked", "--frozen"])
+
+    def test_advisory_database_copy_matches_cargo_deny_default_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tools = root / "tools"
+            source = tools / "advisory-db" / "crates" / "fixture"
+            source.mkdir(parents=True)
+            (source / "RUSTSEC-2026-0001.md").write_text("source-free advisory", encoding="ascii")
+            cargo_home = root / "cargo-home"
+            cargo_home.mkdir()
+            with patch.object(rust_matrix_runner, "TOOLS_ROOT", str(tools)), \
+                    patch.object(rust_matrix_runner, "_remaining", return_value=30):
+                rust_matrix_runner._copy_advisory_database(30, cargo_home=str(cargo_home))
+            expected = cargo_home / "advisory-dbs" / rust_matrix_runner.ADVISORY_DB_DIRECTORY
+            self.assertEqual((expected / "crates/fixture/RUSTSEC-2026-0001.md").read_text(encoding="ascii"),
+                             "source-free advisory")
+            self.assertFalse((cargo_home / "advisory-db").exists())
+
+    def test_shared_harness_deadline_caps_repeated_phase_timeout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "deadline.json"
+            deadline_budget.create(path, 45, 5, 50)
+            with patch.object(test_e2e, "DEADLINE_FILE", str(path)):
+                self.assertLessEqual(test_e2e._bounded_timeout(3600), 45)
+                self.assertLessEqual(test_e2e._bounded_timeout(2400), 45)
+        source = inspect.getsource(test_e2e._run_variant)
+        self.assertIn('"--deadline-file", DEADLINE_FILE', source)
+
+    def test_prepared_readonly_database_cleanup_never_follows_symlinks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            previous_temp = test_e2e.RUNNER_TEMP
+            try:
+                test_e2e.RUNNER_TEMP = root.resolve()
+                prepared = root / "devlane-e2e-owned"
+                database = prepared / "devlane-tools/advisory-db/crates"
+                database.mkdir(parents=True)
+                (database / "public.md").write_text("synthetic advisory", encoding="ascii")
+                os.chmod(database, 0o555)
+                external = root / "outside"
+                external.mkdir()
+                outside_mode = external.stat().st_mode & 0o777
+                outside_file = external / "must-remain"
+                outside_file.write_text("outside", encoding="ascii")
+                (prepared / "escape").symlink_to(external, target_is_directory=True)
+                test_e2e._remove_owned_prepared_tree(prepared)
+                self.assertFalse(prepared.exists())
+                self.assertTrue(outside_file.exists())
+                self.assertEqual(external.stat().st_mode & 0o777, outside_mode)
+            finally:
+                test_e2e.RUNNER_TEMP = previous_temp
+
+    def test_key_unlink_failure_still_tears_down_and_preserves_original_error(self):
+        for failure_phase in ("start", "decrypt"):
+            with self.subTest(phase=failure_phase), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                scenario = {"profile": "core-node", "name": "unlink-negative",
+                            "files": lambda **_kwargs: {}, "allowed_files": {},
+                            "allowed_tests": {}, "frames": {}}
+                lifecycle = test_e2e._SupervisorLifecycle(root / "devlane-unlink-negative")
+                original_unlink = Path.unlink
+                def refuse_key(path, *args, **kwargs):
+                    if path.name == "synthetic-key.hex":
+                        raise PermissionError("synthetic-unlink-failure")
+                    return original_unlink(path, *args, **kwargs)
+                def run(command, **kwargs):
+                    if failure_phase in command:
+                        raise RuntimeError("original-" + failure_phase + "-failure")
+                    return subprocess.CompletedProcess(command, 0, b"", b"")
+                with patch.object(test_e2e, "RUNNER_TEMP", root), \
+                        patch.object(test_e2e, "RUN_ID", "unlink-negative"), \
+                        patch.object(test_e2e, "_archive", return_value=b"archive"), \
+                        patch.object(test_e2e.bundle, "build_envelope", return_value=b"envelope"), \
+                        patch.object(test_e2e.bundle, "write_private_key"), \
+                        patch.object(test_e2e.bundle, "read_key_file", return_value=b"key"), \
+                        patch.object(test_e2e.fetch, "validate_dispatch"), \
+                        patch.object(test_e2e, "_positive_control"), \
+                        patch.object(test_e2e, "_run", side_effect=run), \
+                        patch.object(Path, "unlink", refuse_key), \
+                        patch.object(test_e2e.host_cleanup, "clean") as clean, \
+                        patch.object(lifecycle, "confirm_teardown") as confirm:
+                    with self.assertRaisesRegex(RuntimeError, "original-" + failure_phase + "-failure"):
+                        test_e2e._run_variant(scenario, b"{}", root / "prepared",
+                                              {name: "" for name in ("node", "npm", "cargo", "rustc")},
+                                              b"k" * 32, "accept", lifecycle)
+                    clean.assert_called_once()
+                    confirm.assert_called_once()
+                    self.assertTrue(lifecycle.start_attempted)
+                    self.assertFalse(lifecycle.cleanup_confirmed)
+
+    def test_prepared_tree_is_preserved_when_supervisor_teardown_is_unconfirmed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            previous_temp, previous_run = test_e2e.RUNNER_TEMP, test_e2e.RUN_ID
+            test_e2e.RUNNER_TEMP = root
+            test_e2e.RUN_ID = "lifecycle-negative"
+            scenario = {
+                "name": "lifecycle-negative", "profile": "core-node", "payload": b"{}",
+                "variants": ("accept",),
+            }
+            prepared = root / "devlane-e2e-lifecycle-negative-lifecycle-negative"
+            marker = prepared / "readonly.db"
+
+            def prepare_fixture(_profile, _projection, destination):
+                destination.mkdir()
+                (destination / marker.name).write_text("source-free database", encoding="ascii")
+                os.chmod(marker, 0o444)
+                os.chmod(destination, 0o555)
+                return {name: "" for name in ("node", "npm", "cargo", "rustc")}
+
+            evidence = []
+
+            def fail_after_start_attempt(*args):
+                lifecycle = args[-1]
+                evidence.append(lifecycle)
+                lifecycle.note_start_attempt()
+                raise RuntimeError("original-execution-failure")
+
+            try:
+                with patch.object(test_e2e, "_prepare", side_effect=prepare_fixture), \
+                        patch.object(test_e2e, "_run_variant", side_effect=fail_after_start_attempt), \
+                        patch.object(test_e2e, "_remove_owned_prepared_tree") as remove_tree:
+                    with self.assertRaisesRegex(RuntimeError, "original-execution-failure"):
+                        test_e2e._run_scenario(scenario)
+                    remove_tree.assert_not_called()
+                self.assertEqual(len(evidence), 1)
+                self.assertTrue(evidence[0].start_attempted)
+                self.assertFalse(evidence[0].cleanup_confirmed)
+                self.assertTrue(prepared.is_dir())
+                self.assertEqual(prepared.stat().st_mode & 0o777, 0o555)
+                self.assertEqual(marker.stat().st_mode & 0o777, 0o444)
+            finally:
+                if prepared.exists():
+                    os.chmod(prepared, 0o700)
+                    os.chmod(marker, 0o600)
+                    marker.unlink()
+                    prepared.rmdir()
+                test_e2e.RUNNER_TEMP, test_e2e.RUN_ID = previous_temp, previous_run
+
+    def test_prepared_rust_tool_verification_refuses_a_symlink_escape(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            prepared = base / "prepared"
+            tools = prepared / "devlane-tools"
+            source = base / "source"
+            tools.mkdir(parents=True)
+            source.mkdir()
+            outside = base / "outside-tool"
+            outside.write_text("outside", encoding="ascii")
+            for name in rust_tooling.TOOLS:
+                (tools / name).symlink_to(outside) if name == "cargo-deny" else (tools / name).write_text("tool")
+                (source / name).write_text("tool")
+            (tools / "advisory-db").mkdir()
+            (tools / "advisory-db-revision").write_text("0" * 40, encoding="ascii")
+            for entry in rust_tooling.TOOLS:
+                (source / entry).write_text("tool")
+            outside_mode = outside.stat().st_mode & 0o777
+            with self.assertRaisesRegex(RuntimeError, "rust-matrix-tool-layout"):
+                test_e2e._verify_prepared_rust_tools(prepared, source)
+            self.assertEqual(outside.stat().st_mode & 0o777, outside_mode)
+
+    def test_public_fixture_contract_covers_the_production_matrix_without_static_locks(self):
+        root = Path(__file__).resolve().parents[2]
+        profile = json.loads((root / "ci/devlane-profiles.json").read_text(encoding="utf-8"))["profiles"]["core-rust"]
+        matrix = rust_matrix_runner.EXPECTED_MATRIX
+        self.assertEqual(profile["rust_matrix"], matrix)
+        self.assertEqual(matrix["toolchain"], "1.99.1")
+        self.assertEqual(matrix["tool_versions"], {
+            "cargo_deny": "0.20.2", "cargo_audit": "0.22.2", "cargo_vet": "0.10.3",
+        })
+        self.assertEqual(set(test_e2e.RUST_LOCKFILES), {
+            "Cargo.lock", "fuzz/Cargo.lock", "runtime/Cargo.lock",
+        })
+        self.assertEqual(len(matrix["coverage_ids"]), 22)
+        self.assertEqual(set(test_e2e.RUST_FIXTURE_TESTS), {
+            "root::Cargo.toml::tests::child_has_no_control_secrets_or_sockets",
+            "runtime::runtime/crates/services/listener/Cargo.toml::tests::listener_fixture_is_reachable",
+            "fuzz::fuzz/Cargo.toml::tests::corpus_fixture_is_present",
+            "listener::runtime/crates/services/listener/Cargo.toml::tests::listener_fixture_is_reachable",
+        })
+        self.assertIn("fuzz/corpus/valid-object.json", test_e2e.RUST_FIXTURE_SOURCES)
+        self.assertIn("fuzz/corpus/valid-array.json", test_e2e.RUST_FIXTURE_SOURCES)
+        self.assertIn("runtime/crates/services/listener/Cargo.toml", test_e2e.RUST_FIXTURE_SOURCES)
+        self.assertIn("supply-chain/audits.toml", test_e2e.RUST_FIXTURE_SOURCES)
+        self.assertIn("supply-chain/config.toml", test_e2e.RUST_FIXTURE_SOURCES)
+        self.assertIn("runtime/supply-chain/audits.toml", test_e2e.RUST_FIXTURE_SOURCES)
+        self.assertIn("runtime/supply-chain/config.toml", test_e2e.RUST_FIXTURE_SOURCES)
+        self.assertNotIn("supply-chain/imports.lock", test_e2e.RUST_FIXTURE_SOURCES)
+        self.assertNotIn("runtime/supply-chain/imports.lock", test_e2e.RUST_FIXTURE_SOURCES)
+        self.assertNotIn("Cargo.lock", test_e2e.RUST_FIXTURE_SOURCES)
+        self.assertNotIn("fuzz/Cargo.lock", test_e2e.RUST_FIXTURE_SOURCES)
+        self.assertNotIn("runtime/Cargo.lock", test_e2e.RUST_FIXTURE_SOURCES)
+        tooling_versions = {name: row[3].rsplit(" ", 1)[-1] for name, row in rust_tooling.TOOLS.items()}
+        self.assertEqual(tooling_versions, {
+            "cargo-deny": "0.20.2", "cargo-audit": "0.22.2", "cargo-vet": "0.10.3",
+        })
+        generator = inspect.getsource(test_e2e._write_rust_fixture)
+        self.assertIn("generate-lockfile", generator)
+        contract = inspect.getsource(test_e2e._validate_rust_fixture)
+        self.assertIn("fetch.validate_projection", contract)
+        self.assertIn("fetch.project_cargo_lock", contract)
+        self.assertIn("bundle.inspect_archive", contract)
+        install = inspect.getsource(test_e2e._run_scenario)
+        self.assertIn("rust_tooling.install", install)
+        self.assertIn("_verify_prepared_rust_tools(prepared, rust_tool_cache)", install)
+        self.assertLess(install.index("rust_tooling.install"), install.index("_run_variant("))
+        main = inspect.getsource(test_e2e.main)
+        self.assertLess(main.index("rust_tooling.fetch_tools"), main.index("_run_scenario(rust_scenario"))
+        prepared_tools = inspect.getsource(test_e2e._verify_prepared_rust_tools)
+        self.assertIn("hashlib.sha256(path.read_bytes())", prepared_tools)
+        self.assertIn('"advisory-db"', prepared_tools)
+        self.assertIn('"advisory-db-revision"', prepared_tools)
+        self.assertIn("advisory-database-binding", prepared_tools)
+        rustfmt = inspect.getsource(test_e2e._verify_rust_toolchain)
+        self.assertIn('"which", "--toolchain", RUST_VERSION, "rustfmt"', rustfmt)
+
     def test_trusted_profile_is_exactly_the_runner_contract_and_has_no_commands(self):
         root = Path(__file__).resolve().parents[2]
         profile_path = root / "ci/devlane-profiles.json"
@@ -207,6 +586,30 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 )
             self.assertEqual(result, 1)
             self.assertIn(b'"status":"fail"', report.read_bytes())
+
+    def test_every_workspace_audit_denies_unsound_without_ignores(self):
+        audit_calls = {}
+        def simple(records, suite, argv, deadline, timeout=1800):
+            if suite.startswith("audit-"):
+                audit_calls[suite] = argv
+            return _coverage(records, suite)
+        def arm(records, scope, manifest, workspace_mode, feature_set, config, deadline):
+            return _coverage(records, scope + ("-all-features" if feature_set == "all" else "-default"))
+        def replay(records, feature_set, deadline):
+            return _coverage(records, "fuzz-replay-" + ("all-features" if feature_set == "all" else "default"))
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(rust_matrix_runner, "_copy_advisory_database"), \
+                    patch.object(rust_matrix_runner, "_simple_check", side_effect=simple), \
+                    patch.object(rust_matrix_runner, "_rust_test_arm", side_effect=arm), \
+                    patch.object(rust_matrix_runner, "_fuzz_replay", side_effect=replay):
+                result = rust_matrix_runner.run(rust_matrix_runner.EXPECTED_MATRIX, "fixed-map",
+                                               str(Path(temporary) / "report.jsonl"), time.monotonic() + 60)
+        self.assertEqual(result, 0)
+        self.assertEqual(set(audit_calls), {"audit-root", "audit-runtime", "audit-fuzz"})
+        for argv in audit_calls.values():
+            self.assertEqual(argv[1:6], ["audit", "--deny", "unsound", "--no-fetch", "--db"])
+            self.assertIn("--file", argv)
+            self.assertFalse(any(arg == "--ignore" or arg.startswith("--ignore=") for arg in argv))
 
     def test_candidate_matrix_mutation_is_rejected_before_execution(self):
         matrix = json.loads(json.dumps(rust_matrix_runner.EXPECTED_MATRIX))

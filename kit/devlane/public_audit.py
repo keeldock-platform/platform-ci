@@ -29,15 +29,20 @@ DECRYPT_ENVIRONMENT = "devlane-decrypt"
 AUDIT_JOB = "devlane-encrypted-audit"
 STEP_NAMES = (
     "Fetch public control and validate dispatch",
+    "Reserve work time for control evidence cache restore",
     "Restore exact source-free control evidence",
     "Verify exact source-free control evidence",
+    "Reserve work time for initial permit cache restore",
     "Restore one-run bundle permit",
     "Claim this bundle for one run before decryption",
+    "Reserve work time for permit cache save",
     "Save one-run bundle permit",
     "Discard local permit copy before persisted verification",
+    "Reserve work time for persisted permit cache restore",
     "Restore and verify persisted one-run permit",
     "Verify permit and emit bound dispatch marker",
     "Fetch ciphertext and sanitized dependency projection",
+    "Reserve work time for pinned Node action",
     "Set up pinned Node toolchain",
     "Install pinned Rust toolchain",
     "Prepare dependencies before the cut",
@@ -160,7 +165,7 @@ def parse_workflow(path):
             block_indent = None
         if indent == 2 and text.endswith(":"):
             job = text[:-1]
-            jobs[job] = {"env": {}, "steps": []}
+            jobs[job] = {"env": {}, "steps": [], "timeout_minutes": None}
             step = section = sub = None
         elif job is None:
             continue
@@ -168,19 +173,26 @@ def parse_workflow(path):
             section = text[:-1] if text.endswith(":") else None
             sub = None
             step = None
+            if text.startswith("timeout-minutes: "):
+                value = text[len("timeout-minutes: "):].strip()
+                jobs[job]["timeout_minutes"] = int(value) if value.isdecimal() else None
             if text.startswith("environment: "):
                 jobs[job]["environment"] = text[len("environment: "):].strip()
         elif section == "env" and indent == 6 and ": " in text:
             key, value = text.split(": ", 1)
             jobs[job]["env"][key] = value
         elif section == "steps" and indent == 6 and text.startswith("- name: "):
-            step = {"name": text[len("- name: "):].strip(), "run": [], "uses": None, "with": {}, "env": {}}
+            step = {"name": text[len("- name: "):].strip(), "run": [], "uses": None,
+                    "with": {}, "env": {}, "timeout_minutes": None}
             jobs[job]["steps"].append(step)
             sub = None
         elif section == "steps" and step is not None and indent == 8:
             sub = None
             if text.startswith("uses: "):
                 step["uses"] = text[len("uses: "):].split()[0]
+            elif text.startswith("timeout-minutes: "):
+                value = text[len("timeout-minutes: "):].strip()
+                step["timeout_minutes"] = int(value) if value.isdecimal() else None
             elif text == "run: |":
                 block_indent = 10
             elif text.startswith("run: "):
@@ -226,6 +238,7 @@ class _Grammar:
             "CI_REPOSITORY": REPOSITORY, "CI_REPOSITORY_ID": str(REPOSITORY_ID),
             "CI_SERVER_URL": "https://github.com", "CI_EVENT_NAME": "workflow_dispatch",
             "CI_SHA": identity.get("control_sha"), "PYTHONDONTWRITEBYTECODE": "1",
+            "CI_WORKSPACE": RUNNER_HOME + "/work/platform-ci/platform-ci",
             "CI_RUN_ID": run_id, "GITHUB_RUN_ID": run_id, "CI_RUN_ATTEMPT": "1", "GITHUB_RUN_ATTEMPT": "1",
         }
         if kind == "encrypted":
@@ -237,7 +250,7 @@ class _Grammar:
                 "RUN_ROOT": TEMP + "/devlane-" + str(run_id),
             })
         else:
-            fixed["CI_WORKSPACE"] = RUNNER_HOME + "/work/platform-ci/platform-ci"
+            fixed["CI_REF"] = "refs/heads/develop"
         if name in fixed:
             return fixed[name] is not None and value == fixed[name]
         if name in ("DEVLANE_DECRYPT_KEY", "GITHUB_TOKEN"):

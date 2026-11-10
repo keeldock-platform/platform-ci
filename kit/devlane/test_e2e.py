@@ -12,13 +12,11 @@ commands, adapters, filter and cleanup; nothing is stubbed):
   inspection of the workload's environment, descriptors and files for key bytes),
   a wrong-key refusal, a failing test mapped to its opaque identity, and a
   cancellation while a profile command is running.
-* synthetic-rust: build script with planted output, a test inspecting its own
-  environment and descriptors.
+* synthetic-rust: actual public root, fuzz and runtime workspaces with Cargo-generated
+  locks, a listener package, replay corpus and the full fixed production matrix.
 * real-node: the pinned Vitest, Vite and TypeScript packages (native bindings
   included) installed online from the reviewed lock, run offline, with a passing
   and a failing real test.
-* real-rust: real crates.io dependencies and dev-dependencies vendored online,
-  built and tested offline.
 * real-browser: the pinned Playwright test runner with an installed Chromium,
   run offline.
 * install-script-canary: a public package whose lock entry declares an install script
@@ -31,6 +29,7 @@ import hashlib
 import io
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -43,10 +42,16 @@ import bundle
 import fetch
 import network_probe
 import host_cleanup
+import owned_tree_cleanup
+import rust_matrix_runner
+import rust_tooling
+import deadline as deadline_budget
+import filter as output_filter
 
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER_TEMP = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir())).resolve()
+DEADLINE_FILE = ""
 RUN_ID = os.environ.get("GITHUB_RUN_ID", "")
 CONTROL_SHA = os.environ.get("CI_SHA", "")
 CONTROL_RUN_ID = RUN_ID
@@ -57,6 +62,7 @@ COMMAND_CANARIES = ("::add-mask::SYNTHETIC_SOURCE_CANARY_7f8c", "::error::SYNTHE
                     chr(35) * 2 + "[group]SYNTHETIC_SOURCE_CANARY_7f8c", "::set-output name=x::SYNTHETIC_SOURCE_CANARY_7f8c")
 BACKGROUND_MARKER = "DEVLANE_E2E_BACKGROUND_MARKER"
 RUST_VERSION = "1.99.1"
+RUST_LOCKFILES = ("Cargo.lock", "fuzz/Cargo.lock", "runtime/Cargo.lock")
 PLAYWRIGHT_VERSION = "1.54.2"
 SYNTHETIC_LOCK = ROOT / "kit/confinement/synthetic_project/package-lock.json"
 
@@ -66,13 +72,25 @@ def _require(condition, code):
         raise RuntimeError(code)
 
 
+def _bounded_timeout(timeout):
+    if DEADLINE_FILE:
+        return min(float(timeout), deadline_budget.remaining(DEADLINE_FILE))
+    return timeout
+
+
+def _process_run(argv, **kwargs):
+    if "timeout" in kwargs:
+        kwargs["timeout"] = _bounded_timeout(kwargs["timeout"])
+    return subprocess.run(argv, **kwargs)
+
+
 def _scan_output(data, code):
     for canary in (SOURCE_CANARY.encode("ascii"), KEY_CANARY, b"::add-mask::", b"::error::", (chr(35) * 2 + "[group]SYNTHETIC").encode("ascii")):
         _require(canary not in data, code)
 
 
 def _run(argv, *, env=None, timeout=900, expected=0, scan=True, cwd=None):
-    result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+    result = _process_run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, env=env, timeout=timeout,
                             close_fds=True, check=False, cwd=cwd)
     _require(result.returncode == expected, "production-path-" + Path(argv[0]).name + "-failed")
@@ -82,7 +100,8 @@ def _run(argv, *, env=None, timeout=900, expected=0, scan=True, cwd=None):
 
 
 def _processes_matching(marker):
-    result = subprocess.run(["pgrep", "-f", marker], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+    result = _process_run(["pgrep", "-f", marker], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          check=False, timeout=5)
     own = {os.getpid(), os.getppid()}
     return [int(item) for item in result.stdout.split() if int(item) not in own]
 
@@ -142,40 +161,384 @@ def _node_projection(source_lock, playwright=()):
     return projection, payload
 
 
-def _generated_lock(manifest_text, *, node):
-    """Resolve a lock on the (networked) hosted runner for packages the reviewed lock lacks."""
+def _generated_npm_lock(manifest_text):
+    """Resolve a package lock on the networked hosted runner for packages the reviewed lock lacks."""
     with tempfile.TemporaryDirectory(prefix="devlane-lock-", dir=str(RUNNER_TEMP)) as temporary:
         directory = Path(temporary)
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": temporary, "LC_ALL": "C"}
-        if node:
-            (directory / "package.json").write_text(manifest_text, encoding="utf-8")
-            _run(["npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"],
-                 env=env, cwd=temporary, timeout=600, scan=False)
-            return json.loads((directory / "package-lock.json").read_text(encoding="utf-8"))
-        (directory / "src").mkdir()
-        (directory / "src/lib.rs").write_text("", encoding="ascii")
-        (directory / "build.rs").write_text("fn main() {}\n", encoding="ascii")
-        (directory / "Cargo.toml").write_text(manifest_text, encoding="utf-8")
-        _run(["cargo", "generate-lockfile"], env=dict(env, CARGO_HOME=str(directory / "cargo-home")),
-             cwd=temporary, timeout=600, scan=False)
-        return (directory / "Cargo.lock").read_bytes()
+        (directory / "package.json").write_text(manifest_text, encoding="utf-8")
+        _run(["npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"],
+             env=env, cwd=temporary, timeout=600, scan=False)
+        return json.loads((directory / "package-lock.json").read_text(encoding="utf-8"))
 
 
-def _rust_projection(lock_bytes):
+def _rust_projection(lock_bytes, fuzz_lock_bytes, runtime_lock_bytes):
     cargo_manifest, cargo_lock, cargo_rows = fetch.project_cargo_lock(lock_bytes)
-    workspace_manifest, workspace_lock, _ = fetch.project_cargo_lock(lock_bytes)
+    fuzz_manifest, fuzz_lock, _ = fetch.project_cargo_lock(fuzz_lock_bytes)
+    runtime_manifest, runtime_lock, _ = fetch.project_cargo_lock(runtime_lock_bytes)
     projection = {
         "schema": 1, "profile": "core-rust", "tools": {"cargo": RUST_VERSION, "rustc": RUST_VERSION},
         "npm": [], "cargo": cargo_rows, "playwright": [], "cargo_manifest": cargo_manifest,
         "cargo_lock": cargo_lock,
         "cargo_workspaces": [
-            {"path": "fuzz/Cargo.lock", "manifest": workspace_manifest, "lock": workspace_lock},
-            {"path": "runtime/Cargo.lock", "manifest": workspace_manifest, "lock": workspace_lock},
+            {"path": "fuzz/Cargo.lock", "manifest": fuzz_manifest, "lock": fuzz_lock},
+            {"path": "runtime/Cargo.lock", "manifest": runtime_manifest, "lock": runtime_lock},
         ],
     }
     payload = bundle.canonical_json(projection)
     fetch.validate_projection(payload, "core-rust")
     return projection, payload
+
+
+RUST_FIXTURE_SOURCES = {
+    "Cargo.toml": (
+        '[package]\nname = "devlane-matrix-root"\nversion = "0.0.0"\nedition = "2021"\nbuild = "build.rs"\n\n'
+        '[workspace]\nmembers = ["."]\nresolver = "2"\n\n'
+        '[features]\nsynthetic-matrix = []\n\n'
+        '[dependencies]\nitoa = "=1.0.15"\n\n[dev-dependencies]\nfastrand = "=2.3.0"\n'
+    ).encode("ascii"),
+    "build.rs": None,
+    "src/lib.rs": None,
+    "deny.toml": (
+        '[graph]\nall-features = true\n\n'
+        '[advisories]\nversion = 2\nyanked = "deny"\nunmaintained = "workspace"\nignore = []\n\n'
+        '[licenses]\nversion = 2\nallow = ["MIT", "Apache-2.0", "Unicode-3.0"]\n'
+        'confidence-threshold = 0.93\nprivate = { ignore = true }\n\n'
+        '[bans]\nmultiple-versions = "warn"\nwildcards = "deny"\nallow-wildcard-paths = true\nhighlight = "all"\nskip = []\n\n'
+        '[sources]\nunknown-registry = "deny"\nunknown-git = "deny"\n'
+        'allow-registry = ["https:' + chr(47) * 2 + 'github.com/rust-lang/crates.io-index"]\nallow-git = []\n'
+    ).encode("ascii"),
+    "supply-chain/config.toml": (
+        '[cargo-vet]\nversion = "0.10"\n\n'
+        '[[exemptions.fastrand]]\nversion = "2.3.0"\ncriteria = "safe-to-deploy"\n\n'
+        '[[exemptions.itoa]]\nversion = "1.0.15"\ncriteria = "safe-to-deploy"\n'
+    ).encode("ascii"),
+    "supply-chain/audits.toml": b'[audits]\n',
+    "fuzz/Cargo.toml": (
+        '[package]\nname = "devlane-matrix-fuzz-replay"\nversion = "0.0.0"\nedition = "2021"\n'
+        '\n[workspace]\n\n[features]\nsynthetic-matrix = []\n'
+    ).encode("ascii"),
+    "fuzz/src/main.rs": None,
+    "fuzz/corpus/valid-object.json": b'{"kind":"object","value":1}\n',
+    "fuzz/corpus/valid-array.json": b'{"kind":"array","items":[]}\n',
+    "runtime/Cargo.toml": (
+        '[workspace]\nmembers = ["crates/services/listener"]\nresolver = "2"\n'
+    ).encode("ascii"),
+    "runtime/crates/services/listener/Cargo.toml": (
+        '[package]\nname = "devlane-matrix-listener"\nversion = "0.0.0"\nedition = "2021"\n'
+        '\n[features]\nsynthetic-matrix = []\n'
+    ).encode("ascii"),
+    "runtime/crates/services/listener/src/lib.rs": None,
+    "runtime/supply-chain/config.toml": b'[cargo-vet]\nversion = "0.10"\n',
+    "runtime/supply-chain/audits.toml": b'[audits]\n',
+}
+
+RUST_FIXTURE_TESTS = {
+    "root::Cargo.toml::tests::child_has_no_control_secrets_or_sockets": "case_0001",
+    "runtime::runtime/crates/services/listener/Cargo.toml::tests::listener_fixture_is_reachable": "case_0002",
+    "fuzz::fuzz/Cargo.toml::tests::corpus_fixture_is_present": "case_0003",
+    "listener::runtime/crates/services/listener/Cargo.toml::tests::listener_fixture_is_reachable": "case_0004",
+}
+
+
+def _rust_fixture_source_map():
+    marker = chr(35)
+    root_library = (
+        'pub fn rendered(value: u32) -> String {\n'
+        '    let mut buffer = itoa::Buffer::new();\n'
+        '    buffer.format(value).to_owned()\n'
+        '}\n\n'
+        + marker + '[cfg(test)]\nmod tests {\n    ' + marker + '[test]\n'
+        '    fn child_has_no_control_secrets_or_sockets() {\n'
+        '        for (name, _) in std::env::vars() {\n'
+        '            assert_ne!(name, "DEVLANE_DECRYPT_KEY");\n'
+        '            assert!(!name.starts_with("GITHUB_"));\n'
+        '            assert!(!name.starts_with("RUNNER_"));\n'
+        '            assert!(!name.starts_with("ACTIONS_"));\n'
+        '        }\n'
+        '        let key_canary = "' + KEY_CANARY.decode("ascii") + '";\n'
+        '        assert!(!std::env::vars().any(|(_, value)| value.contains(key_canary)));\n'
+        '        assert!(!std::env::args().any(|argument| argument.contains(key_canary)));\n'
+        '        assert_eq!(super::rendered(7), "7");\n'
+        '        let _ = fastrand::u8(..);\n'
+        '        assert!(!std::path::Path::new("/ho\\x6de/runner").exists());\n'
+        '        let fds = std::fs::read_dir("/proc/self/fd").expect("proc-fd");\n'
+        '        for entry in fds.flatten() {\n'
+        '            if let Ok(target) = std::fs::read_link(entry.path()) {\n'
+        '                assert!(!target.to_string_lossy().starts_with("socket:["));\n'
+        '            }\n'
+        '        }\n'
+        '        let _private = "' + SOURCE_CANARY + '";\n'
+        '    }\n}\n'
+    ).encode("ascii")
+    listener_library = (
+        marker + '[cfg(test)]\nmod tests {\n    ' + marker + '[test]\n'
+        '    fn listener_fixture_is_reachable() {\n'
+        '        assert_eq!(std::env::var("CI").ok().as_deref(), Some("1"));\n'
+        '    }\n}\n'
+    ).encode("ascii")
+    fuzz_main = (
+        'const CORPUS: [&[u8]; 2] = [\n'
+        '    include_bytes!("../corpus/valid-object.json"),\n'
+        '    include_bytes!("../corpus/valid-array.json"),\n'
+        '];\n\n'
+        'fn replay_corpus() -> usize {\n'
+        '    for seed in CORPUS {\n'
+        '        if !seed.starts_with(b"{") || !seed.ends_with(b"}\\n") {\n'
+        '            std::process::exit(2);\n'
+        '        }\n'
+        '    }\n'
+        '    CORPUS.len()\n'
+        '}\n\n'
+        'fn main() {\n'
+        '    println!("Replayed {} parser corpus seeds.", replay_corpus());\n'
+        '}\n\n'
+        + marker + '[cfg(test)]\nmod tests {\n    ' + marker + '[test]\n'
+        '    fn corpus_fixture_is_present() {\n'
+        '        assert_eq!(super::replay_corpus(), 2);\n'
+        '    }\n}\n'
+    ).encode("ascii")
+    return {
+        "build.rs": _rust_build_script().encode("ascii"),
+        "src/lib.rs": root_library,
+        "fuzz/src/main.rs": fuzz_main,
+        "runtime/crates/services/listener/src/lib.rs": listener_library,
+    }
+
+
+def _write_rust_fixture(root, cargo_path):
+    if not sys.platform.startswith("linux") or os.geteuid() == 0:
+        raise RuntimeError("rust-fixture-linux-runner-required")
+    _verify_rust_toolchain({"cargo": cargo_path, "rustc": _tool_paths("core-rust")["rustc"]})
+    root = Path(root)
+    _require(not root.exists() and not root.is_symlink(), "rust-fixture-output-exists")
+    root.mkdir(mode=0o700, parents=True)
+    files = dict(RUST_FIXTURE_SOURCES)
+    files.update(_rust_fixture_source_map())
+    for relative, payload in files.items():
+        path = root / relative
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    lock_hashes = {}
+    for relative in RUST_LOCKFILES:
+        manifest = "Cargo.toml" if relative == "Cargo.lock" else relative.removesuffix("Cargo.lock") + "Cargo.toml"
+        _run([cargo_path, "generate-lockfile", "--manifest-path", str(root / manifest)],
+             cwd=root, timeout=600, scan=False)
+        lock_path = root / relative
+        _require(lock_path.is_file() and not lock_path.is_symlink(), "rust-fixture-lock-missing")
+        lock_bytes = lock_path.read_bytes()
+        _require(bool(lock_bytes), "rust-fixture-lock-empty")
+        lock_hashes[relative] = hashlib.sha256(lock_bytes).hexdigest()
+        files[relative] = lock_bytes
+    projection, projection_bytes = _rust_projection(
+        files["Cargo.lock"], files["fuzz/Cargo.lock"], files["runtime/Cargo.lock"])
+    snapshot = {
+        "schema": 1,
+        "toolchain": RUST_VERSION,
+        "lockfiles": {path: {"sha256": lock_hashes[path], "size": len(files[path])}
+                      for path in RUST_LOCKFILES},
+        "projection_sha256": hashlib.sha256(projection_bytes).hexdigest(),
+    }
+    (root / ".devlane-projection.json").write_bytes(projection_bytes)
+    (root / ".devlane-lock-snapshot.json").write_bytes(bundle.canonical_json(snapshot) + b"\n")
+    _validate_rust_fixture(root, files, projection, projection_bytes, snapshot)
+    print("rust_matrix_fixture=generated locks=3 suites=22")
+
+
+def _validate_rust_fixture(root, files, projection, projection_bytes, snapshot):
+    root = Path(root)
+    _require(rust_matrix_runner.EXPECTED_MATRIX["toolchain"] == RUST_VERSION, "rust-matrix-toolchain-mismatch")
+    _require(len(rust_matrix_runner.EXPECTED_MATRIX["coverage_ids"]) == 22, "rust-matrix-suite-count")
+    _require([item["path"] for item in projection["cargo_workspaces"]]
+             == ["fuzz/Cargo.lock", "runtime/Cargo.lock"], "rust-matrix-projection-paths")
+    validated = fetch.validate_projection(projection_bytes, "core-rust")
+    _require(validated == projection, "rust-matrix-projection-invalid")
+    _require(set(snapshot["lockfiles"]) == set(RUST_LOCKFILES), "rust-matrix-lock-snapshot-set")
+    for path in RUST_LOCKFILES:
+        payload = files.get(path)
+        _require(type(payload) is bytes and hashlib.sha256(payload).hexdigest() == snapshot["lockfiles"][path]["sha256"],
+                 "rust-matrix-lock-snapshot-mismatch")
+        _require(snapshot["lockfiles"][path]["size"] == len(payload), "rust-matrix-lock-snapshot-size")
+        manifest, lock, dependencies = fetch.project_cargo_lock(payload)
+        row = projection["cargo_workspaces"][0 if path.startswith("fuzz/") else 1] if path != "Cargo.lock" else None
+        if path == "Cargo.lock":
+            _require(manifest == projection["cargo_manifest"] and lock == projection["cargo_lock"],
+                     "rust-matrix-root-projection")
+            _require({item["name"] for item in dependencies} >= {"itoa", "fastrand"},
+                     "rust-matrix-root-dependency-projection")
+        else:
+            _require(manifest == row["manifest"] and lock == row["lock"], "rust-matrix-workspace-projection")
+            _require(not dependencies, "rust-matrix-workspace-dependencies")
+    _require(snapshot["projection_sha256"] == hashlib.sha256(projection_bytes).hexdigest(),
+             "rust-matrix-projection-snapshot")
+    expected_lock_hashes = {path: value["sha256"] for path, value in snapshot["lockfiles"].items()}
+    archive = _archive(files, "core-rust", snapshot["projection_sha256"], {}, RUST_FIXTURE_TESTS, {},
+                      original_lockfiles=expected_lock_hashes)
+    manifest, archive_files, _ = bundle.inspect_archive(archive, {
+        "profile": "core-rust", "fetch_sha256": snapshot["projection_sha256"],
+    })
+    _require(set(manifest["original_lockfiles"]) == set(RUST_LOCKFILES), "rust-matrix-archive-lock-set")
+    _require(all(archive_files[path] == files[path] for path in RUST_LOCKFILES), "rust-matrix-archive-lock-bytes")
+    _require(set(RUST_FIXTURE_TESTS) == {
+        "root::Cargo.toml::tests::child_has_no_control_secrets_or_sockets",
+        "runtime::runtime/crates/services/listener/Cargo.toml::tests::listener_fixture_is_reachable",
+        "fuzz::fuzz/Cargo.toml::tests::corpus_fixture_is_present",
+        "listener::runtime/crates/services/listener/Cargo.toml::tests::listener_fixture_is_reachable",
+    }, "rust-matrix-test-map")
+    required_files = set(RUST_FIXTURE_SOURCES) | set(_rust_fixture_source_map()) | set(RUST_LOCKFILES)
+    _require(required_files.issubset(files) and all(bool(files[path]) for path in required_files),
+             "rust-matrix-fixture-files")
+    for relative in required_files:
+        path = root / relative
+        _require(path.is_file() and not path.is_symlink() and path.read_bytes() == files[relative],
+                 "rust-matrix-fixture-source-binding")
+    _require((root / ".devlane-projection.json").read_bytes() == projection_bytes,
+             "rust-matrix-projection-file-binding")
+    _require(bundle.strict_json((root / ".devlane-lock-snapshot.json").read_bytes(), 64 * 1024) == snapshot,
+             "rust-matrix-lock-snapshot-file-binding")
+    matrix = rust_matrix_runner.EXPECTED_MATRIX
+    _require(matrix["workspaces"] == [
+        {"id": "root", "manifest": "/workspace/source/Cargo.toml", "lock": "/workspace/source/Cargo.lock", "mode": "workspace"},
+        {"id": "runtime", "manifest": "/workspace/source/runtime/Cargo.toml", "lock": "/workspace/source/runtime/Cargo.lock", "mode": "workspace"},
+        {"id": "fuzz", "manifest": "/workspace/source/fuzz/Cargo.toml", "lock": "/workspace/source/fuzz/Cargo.lock", "mode": "package"},
+    ], "rust-matrix-workspace-set")
+    _require(matrix["listener"] == {
+        "id": "listener", "manifest": "/workspace/source/runtime/crates/services/listener/Cargo.toml",
+        "lock": "/workspace/source/runtime/Cargo.lock", "mode": "package",
+    }, "rust-matrix-listener-package")
+    _require(matrix["coverage_ids"] == [
+        "fmt-root", "fmt-runtime", "fmt-fuzz", "deny-root", "deny-runtime", "deny-fuzz",
+        "audit-root", "audit-runtime", "audit-fuzz", "vet-root", "vet-runtime", "vet-fuzz",
+        "root-default", "root-all-features", "runtime-default", "runtime-all-features",
+        "fuzz-default", "fuzz-all-features", "listener-default", "listener-all-features",
+        "fuzz-replay-default", "fuzz-replay-all-features",
+    ], "rust-matrix-suite-set")
+    for path in ("deny.toml", "supply-chain/config.toml", "supply-chain/audits.toml",
+                 "runtime/supply-chain/config.toml", "runtime/supply-chain/audits.toml",
+                 "fuzz/corpus/valid-object.json", "fuzz/corpus/valid-array.json"):
+        _require(path in files and bool(files[path]), "rust-matrix-policy-or-replay-fixture")
+    _require(b'[[exemptions.fastrand]]\nversion = "2.3.0"' in files["supply-chain/config.toml"]
+             and b'[[exemptions.itoa]]\nversion = "1.0.15"' in files["supply-chain/config.toml"],
+             "rust-matrix-fixture-vet-policy")
+    return archive
+
+
+def _load_rust_fixture(root):
+    root = Path(root)
+    projection_bytes = (root / ".devlane-projection.json").read_bytes()
+    snapshot = bundle.strict_json((root / ".devlane-lock-snapshot.json").read_bytes(), 64 * 1024)
+    _require(type(snapshot) is dict and set(snapshot) == {
+        "schema", "toolchain", "lockfiles", "projection_sha256",
+    } and snapshot["schema"] == 1 and snapshot["toolchain"] == RUST_VERSION,
+        "rust-matrix-lock-snapshot-shape")
+    _require(type(snapshot["projection_sha256"]) is str
+             and re.fullmatch(r"[a-f0-9]{64}", snapshot["projection_sha256"]) is not None,
+             "rust-matrix-projection-snapshot-shape")
+    files = {}
+    for relative in set(RUST_FIXTURE_SOURCES) | set(_rust_fixture_source_map()) | set(RUST_LOCKFILES):
+        path = root / relative
+        _require(path.is_file() and not path.is_symlink(), "rust-fixture-source-missing")
+        files[relative] = path.read_bytes()
+    projection = fetch.validate_projection(projection_bytes, "core-rust")
+    _validate_rust_fixture(root, files, projection, projection_bytes, snapshot)
+    return projection, projection_bytes, snapshot, files
+
+
+def _verify_rust_toolchain(paths):
+    for name in ("cargo", "rustc"):
+        result = _process_run([paths[name], "--version"], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                timeout=10, check=False, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+        words = result.stdout.decode("ascii", "strict").split()
+        _require(result.returncode == 0 and len(words) >= 2 and words[1] == RUST_VERSION,
+                 "rust-fixture-toolchain-version")
+    rustup = shutil.which("rustup")
+    _require(bool(rustup), "rustup-unavailable")
+    rustup_env = {
+        "PATH": os.pathsep.join((str(Path(rustup).parent), "/usr/bin", "/bin")),
+        "HOME": os.environ.get("HOME", ""),
+        "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", ""),
+        "CARGO_HOME": os.environ.get("CARGO_HOME", ""),
+        "LC_ALL": "C",
+    }
+    result = _process_run([rustup, "run", RUST_VERSION, "rustfmt", "--version"], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            timeout=10, check=False, env=rustup_env)
+    version = result.stdout.decode("ascii", "strict").strip()
+    _require(result.returncode == 0 and version.startswith("rustfmt "),
+             "rust-fixture-rustfmt-unavailable")
+    result = _process_run([rustup, "show", "home"], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            timeout=10, check=False, env=rustup_env)
+    _require(result.returncode == 0, "rust-fixture-rustup-home")
+    rustup_home = Path(result.stdout.decode("ascii", "strict").strip()).resolve(strict=True)
+    result = _process_run([rustup, "which", "--toolchain", RUST_VERSION, "rustfmt"],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, timeout=10, check=False, env=rustup_env)
+    _require(result.returncode == 0, "rust-fixture-rustfmt-toolchain")
+    rustfmt_path = Path(result.stdout.decode("ascii", "strict").strip()).resolve(strict=True)
+    try:
+        relative = rustfmt_path.relative_to(rustup_home / "toolchains")
+    except ValueError:
+        relative = Path()
+    _require(rustfmt_path.name == "rustfmt" and len(relative.parts) >= 2
+             and (relative.parts[0] == RUST_VERSION or relative.parts[0].startswith(RUST_VERSION + "-"))
+             and relative.parts[1:] == ("bin", "rustfmt"), "rust-fixture-rustfmt-toolchain")
+
+
+def _verify_prepared_rust_tools(prepared, source):
+    tools = Path(prepared) / "devlane-tools"
+    source = Path(source)
+    _require(tools.is_dir() and not tools.is_symlink(), "rust-matrix-tools-missing")
+    expected_entries = set(rust_tooling.TOOLS) | {"advisory-db", "advisory-db-revision"}
+    _require({path.name for path in tools.iterdir()} == expected_entries, "rust-matrix-tools-layout")
+    for name, (_, _, _, version, _) in rust_tooling.TOOLS.items():
+        path = tools / name
+        _require(path.is_file() and not path.is_symlink() and os.access(path, os.X_OK),
+                 "rust-matrix-tool-layout")
+        source_path = source / name
+        _require(source_path.is_file() and not source_path.is_symlink()
+                 and hashlib.sha256(path.read_bytes()).digest()
+                 == hashlib.sha256(source_path.read_bytes()).digest(), "rust-matrix-tool-copy-binding")
+        result = _process_run([str(path), "--version"], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                timeout=10, check=False, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+        _require(result.returncode == 0 and result.stdout.decode("ascii", "strict").strip() == version,
+                 "rust-matrix-tool-version")
+    database = tools / "advisory-db"
+    revision_path = tools / "advisory-db-revision"
+    _require(database.is_dir() and not database.is_symlink() and revision_path.is_file()
+             and not revision_path.is_symlink(), "rust-matrix-advisory-database-missing")
+    revision = revision_path.read_text(encoding="ascii").strip()
+    _require(re.fullmatch(r"[a-f0-9]{40}", revision) is not None, "rust-matrix-advisory-database-revision")
+    _require((database / "crates").is_dir() and any((database / "crates").rglob("*.md")),
+             "rust-matrix-advisory-database-layout")
+    result = _process_run(["git", "-C", str(database), "rev-parse", "--verify", "HEAD"],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            timeout=10, check=False, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+    _require(result.returncode == 0 and result.stdout.decode("ascii", "strict").strip() == revision,
+             "rust-matrix-advisory-database-binding")
+    source_database = source / "advisory-db"
+    source_revision = (source / "advisory-db-revision").read_text(encoding="ascii").strip()
+    _require(source_database.is_dir() and not source_database.is_symlink()
+             and source_revision == revision, "rust-matrix-advisory-database-copy-binding")
+    for database_path in (database, source_database):
+        head = _process_run(["git", "-C", str(database_path), "rev-parse", "--verify", "HEAD"],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=10, check=False, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+        _require(head.returncode == 0 and head.stdout.decode("ascii", "strict").strip() == revision,
+                 "rust-matrix-advisory-database-binding")
+        status = _process_run(
+            ["git", "-C", str(database_path), "status", "--porcelain", "--untracked-files=all"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=10, check=False,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "GIT_OPTIONAL_LOCKS": "0"},
+        )
+        _require(status.returncode == 0 and not status.stdout, "rust-matrix-advisory-database-dirty")
+    for current, directories, filenames in os.walk(tools, followlinks=False):
+        _require(not Path(current).is_symlink(), "rust-matrix-tools-link")
+        _require(all(not (Path(current) / name).is_symlink() for name in directories + filenames),
+                 "rust-matrix-tools-link")
 
 
 """---------------------------------------------------------------- fixtures"""
@@ -330,30 +693,6 @@ def _browser_source(lock):
     }
 
 
-def _rust_test_source(extra_assert=""):
-    marker = chr(35)
-    return (
-        marker + "[cfg(test)]\nmod tests {\n    " + marker + "[test]\n"
-        "    fn child_has_no_control_secrets_or_sockets() {\n"
-        "        for (name, _) in std::env::vars() {\n"
-        "            assert!(name != \"DEVLANE_DECRYPT_KEY\");\n"
-        "            assert!(!name.starts_with(\"GITHUB_\"));\n"
-        "            assert!(!name.starts_with(\"RUNNER_\"));\n"
-        "            assert!(name != \"SYNTHETIC_KEY_CANARY\");\n"
-        "        }\n"
-        "        let key_canary = \"" + KEY_CANARY.decode("ascii") + "\";\n"
-        "        assert!(!std::env::args().any(|argument| argument.contains(key_canary)));\n"
-        "        assert!(!std::path::Path::new(\"/ho\\x6de/runner\").exists());\n"
-        "        let fds = std::fs::read_dir(\"/proc/self/fd\").expect(\"proc-fd\");\n"
-        "        for entry in fds.flatten() {\n"
-        "            if let Ok(target) = std::fs::read_link(entry.path()) {\n"
-        "                assert!(!target.to_string_lossy().starts_with(\"socket:[\"));\n"
-        "            }\n        }\n"
-        + extra_assert +
-        "        let _private = \"" + SOURCE_CANARY + "\";\n    }\n}\n"
-    )
-
-
 def _rust_build_script():
     return (
         "fn main() {\n"
@@ -364,30 +703,17 @@ def _rust_build_script():
     )
 
 
-def _rust_files(manifest, lock, *, real_dependencies=False):
-    extra = ""
-    library = _rust_test_source(extra)
-    if real_dependencies:
-        library = ("pub fn rendered(value: u32) -> String { let mut buffer = itoa::Buffer::new(); buffer.format(value).to_owned() }\n"
-                   + _rust_test_source("        assert_eq!(super::rendered(7), \"7\");\n"
-                                       "        let _ = fastrand::u8(..);\n"))
-    return {
-        "Cargo.toml": manifest.encode("utf-8"),
-        "Cargo.lock": lock,
-        "build.rs": _rust_build_script().encode("ascii"),
-        "src/lib.rs": library.encode("ascii"),
-    }
-
-
-def _archive(files, profile, projection_sha, allowed_files, allowed_tests, frames):
+def _archive(files, profile, projection_sha, allowed_files, allowed_tests, frames, *, original_lockfiles=None):
     inventory = [{"path": name, "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
                  for name, payload in sorted(files.items())]
     lock_name = "package-lock.json" if profile == "core-node" else "Cargo.lock"
+    if original_lockfiles is None:
+        original_lockfiles = {lock_name: hashlib.sha256(files[lock_name]).hexdigest()}
     manifest = {
         "schema": 1, "profile": profile, "profile_revision": 1, "source_revision": CONTROL_SHA,
         "tree_sha256": hashlib.sha256(bundle.canonical_json(inventory)).hexdigest(),
         "files": inventory,
-        "original_lockfiles": {lock_name: hashlib.sha256(files[lock_name]).hexdigest()},
+        "original_lockfiles": original_lockfiles,
         "fetch_sha256": projection_sha,
         "allowed_files": allowed_files, "allowed_tests": allowed_tests, "frames": frames,
         "limits": {"ciphertext_bytes": bundle.MAX_CIPHERTEXT, "expanded_bytes": bundle.MAX_EXPANDED,
@@ -456,7 +782,7 @@ def late_scenarios():
     result = []
     canary_manifest = json.dumps({"name": "synthetic-private-canary", "version": "0.0.0", "private": True,
                                   "devDependencies": {INSTALL_SCRIPT_PACKAGE: INSTALL_SCRIPT_VERSION}})
-    canary_lock = _generated_lock(canary_manifest, node=True)
+    canary_lock = _generated_npm_lock(canary_manifest)
     _require(bool(canary_lock["packages"]["node_modules/" + INSTALL_SCRIPT_PACKAGE].get("hasInstallScript")),
              "install-script-canary-lacks-marker")
     projection, payload = _node_projection(canary_lock)
@@ -467,22 +793,9 @@ def late_scenarios():
         "allowed_tests": {"synthetic canary suite accepted test": "case_0001"}, "frames": {},
         "variants": ("accept",), "after_prepare": _install_script_canary_check,
     })
-    rust_manifest = (
-        '[package]\nname = "devlane-projection"\nversion = "0.0.0"\nedition = "2021"\nbuild = "build.rs"\n\n'
-        '[lib]\npath = "src/lib.rs"\n\n[dependencies]\nitoa = "=1.0.15"\n\n[dev-dependencies]\nfastrand = "=2.3.0"\n'
-    )
-    lock = _generated_lock(rust_manifest, node=False)
-    projection, payload = _rust_projection(lock)
-    result.append({
-        "name": "real-rust", "profile": "core-rust", "projection": projection, "payload": payload,
-        "files": lambda **kw: _rust_files(rust_manifest, lock, real_dependencies=True),
-        "allowed_files": {"src/lib.rs": "file_0001"},
-        "allowed_tests": {"tests::child_has_no_control_secrets_or_sockets": "case_0001"}, "frames": {},
-        "variants": ("accept",),
-    })
     browser_manifest = json.dumps({"name": "synthetic-private-canary", "version": "0.0.0", "private": True,
                                    "devDependencies": {"@playwright/test": PLAYWRIGHT_VERSION}})
-    browser_lock = _generated_lock(browser_manifest, node=True)
+    browser_lock = _generated_npm_lock(browser_manifest)
     projection, payload = _node_projection(browser_lock, playwright=("chromium",))
     result.append({
         "name": "real-browser", "profile": "core-node", "projection": projection, "payload": payload,
@@ -514,6 +827,7 @@ def _prepare(profile, projection_path, prepared_path):
         sys.executable, "-B", str(ROOT / "kit/devlane/prepare.py"),
         "--projection", str(projection_path), "--output", str(prepared_path), "--profile", profile,
         "--owner-uid", str(os.getuid()), "--owner-gid", str(os.getgid()),
+        "--deadline-file", DEADLINE_FILE,
     ]
     for name, path in paths.items():
         command.extend(("--" + name + "-path", path))
@@ -522,8 +836,56 @@ def _prepare(profile, projection_path, prepared_path):
     return paths
 
 
+def _summary_records(summary, scenario):
+    profile_root = bundle.strict_json((ROOT / "ci/devlane-profiles.json").read_bytes())
+    profile = profile_root["profiles"][scenario["profile"]]
+    matrix = profile.get("rust_matrix", {})
+    suites = sorted(matrix.get("coverage_ids", []))
+    _require(scenario["profile"] != "core-rust" or matrix == rust_matrix_runner.EXPECTED_MATRIX,
+             "rust-matrix-summary-profile")
+    files = sorted(set(scenario["allowed_files"].values()))
+    tests = sorted(set(scenario["allowed_tests"].values()))
+    frames = sorted(set(scenario["frames"].values()))
+    stages = list(profile["stages"]) + (["browser"] if frames else [])
+    allowlists = {
+        "files": {identifier: identifier for identifier in files},
+        "tests": {identifier: identifier for identifier in tests},
+        "frames": {identifier: identifier for identifier in frames},
+        "stages": stages,
+        "codes": sorted(set(profile.get("diagnostic_codes", []) + ["DEVLANE_FAILURE"])),
+        "max_lines": {identifier: 10_000_000 for identifier in files},
+        "suites": suites,
+    }
+    output_filter.validate_public_summary(summary, allowlists, frames)
+    records = [bundle.strict_json(line, output_filter.MAX_RECORD_BYTES)
+               for line in summary.splitlines()]
+    if scenario["profile"] == "core-rust":
+        expected = set(rust_matrix_runner.EXPECTED_MATRIX["coverage_ids"])
+        coverage = [record for record in records if record.get("kind") == "coverage"]
+        seen = [record.get("suite") for record in coverage]
+        _require(len(seen) == len(expected) and len(seen) == len(set(seen)) and set(seen) == expected,
+                 "rust-matrix-summary-coverage-set")
+        _require(not any(record.get("kind") == "test"
+                         or (record.get("kind") == "frame" and record.get("status") != "pass")
+                         or (record.get("kind") == "control" and record.get("status") != "pass")
+                         or (record.get("kind") == "diagnostic" and record.get("level") == "error")
+                         for record in records), "rust-matrix-summary-not-all-pass")
+        for row in coverage:
+            counts = [row.get(name) for name in ("total", "passed", "failed", "ignored")]
+            _require(all(type(value) is int and value >= 0 for value in counts)
+                     and counts[0] > 0 and counts[1] + counts[2] + counts[3] == counts[0]
+                     and counts[2] == 0 and counts[3] == 0,
+                     "rust-matrix-summary-counts")
+    return records
+
+
+def _remove_owned_prepared_tree(path):
+    """Restore directory write permission only through owned, no-follow descriptors."""
+    owned_tree_cleanup.remove_owned_tree(path, RUNNER_TEMP, prefix="prepared-cleanup-")
+
+
 def _positive_control(path):
-    value = network_probe.positive_control(timeout=5)
+    value = network_probe.positive_control(timeout=_bounded_timeout(5))
     _require(value == {"connected": True, "target": "public-tls-control"}, "positive-control-failed")
     path.write_bytes(bundle.canonical_json(value) + b"\n")
 
@@ -532,9 +894,50 @@ def _supervisor(*arguments):
     return [sys.executable, "-B", str(ROOT / "kit/devlane/supervisor.py"), *arguments]
 
 
-def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_bytes, variant):
+def _assert_startup_projection_refusal(result):
+    _require(result.returncode == 2 and result.stdout == b"" and result.stderr.strip() ==
+             b"devlane_supervisor_refusal=projection-binding-mismatch",
+             "startup-refusal-wrong-boundary")
+
+
+class _SupervisorLifecycle:
+    """Prepared data stays immutable until this run's supervisor is absent."""
+
+    def __init__(self, root):
+        self.root = root
+        self.start_attempted = False
+        self.cleanup_confirmed = False
+
+    def begin_variant(self, root):
+        self.root = root
+        self.start_attempted = False
+        self.cleanup_confirmed = False
+
+    def note_start_attempt(self):
+        self.start_attempted = True
+        self.cleanup_confirmed = False
+
+    def confirm_teardown(self):
+        _require(not self.root.exists() and not self.root.is_symlink(), "host-cleanup-root-remains")
+        _require(not _processes_matching("supervisor.py"), "supervisor-survived-cleanup")
+        _require(not _processes_matching(BACKGROUND_MARKER), "background-process-survived-cleanup")
+        self.cleanup_confirmed = True
+
+    def permits_prepared_cleanup(self):
+        if self.start_attempted and not self.cleanup_confirmed:
+            return False
+        try:
+            return (not self.root.exists() and not self.root.is_symlink()
+                    and not _processes_matching("supervisor.py")
+                    and not _processes_matching(BACKGROUND_MARKER))
+        except Exception:
+            return False
+
+
+def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_bytes, variant, lifecycle):
     profile = scenario["profile"]
     root = RUNNER_TEMP / ("devlane-" + RUN_ID)
+    lifecycle.begin_variant(root)
     _require(not root.exists() and not root.is_symlink(), "runner-root-already-exists")
     root.mkdir(mode=0o700)
     try:
@@ -548,7 +951,16 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
         files = scenario["files"](**({"failing_test": True} if variant == "failing-test" else
                                      {"hang": True} if variant == "cancel" else {}))
         archive = _archive(files, profile, projection_sha, scenario["allowed_files"],
-                           scenario["allowed_tests"], scenario["frames"])
+                           scenario["allowed_tests"], scenario["frames"],
+                           original_lockfiles=scenario.get("original_lockfiles"))
+        if profile == "core-rust":
+            rust_manifest, rust_files, _ = bundle.inspect_archive(archive, {
+                "profile": "core-rust", "fetch_sha256": projection_sha,
+            })
+            _require(set(rust_manifest["original_lockfiles"]) == set(RUST_LOCKFILES),
+                     "rust-matrix-envelope-lock-set")
+            _require(all(rust_files[path] == files[path] for path in RUST_LOCKFILES),
+                     "rust-matrix-envelope-lock-binding")
         bindings = {
             "format": "kd-public-devlane-aesgcm-v1", "repository_id": fetch.REPOSITORY_ID,
             "control_sha": CONTROL_SHA, "workflow_path": fetch.WORKFLOW_PATH, "profile": profile,
@@ -579,14 +991,15 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
         start = _supervisor("start", "--state-dir", str(state_path), "--context", str(context_path),
                             "--workspace", str(ROOT), "--prepared", str(prepared_path),
                             "--bundle", str(bundle_path), "--projection", str(projection_path),
-                            "--positive-control", str(positive_path))
+                            "--positive-control", str(positive_path), "--deadline-file", DEADLINE_FILE)
         for name in ("node", "npm", "cargo", "rustc"):
             start.extend(("--" + name + "-path", tool_paths[name]))
+        lifecycle.note_start_attempt()
         if variant == "startup-refusal":
-            _run(start, timeout=90, expected=2)
-            host_cleanup.clean(str(root), str(RUNNER_TEMP))
-            _require(not root.exists(), "host-cleanup-root-remains")
-            _require(not _processes_matching("supervisor.py"), "supervisor-survived-startup-refusal")
+            refused = _run(start, timeout=90, expected=2)
+            _assert_startup_projection_refusal(refused)
+            host_cleanup.clean(str(root), str(RUNNER_TEMP), deadline_file=DEADLINE_FILE)
+            lifecycle.confirm_teardown()
             return
         _run(start, timeout=90)
         _run(_supervisor("probe", "--state-dir", str(state_path)), timeout=90)
@@ -602,25 +1015,32 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
             _run(_supervisor("decrypt", "--state-dir", str(state_path)), env=decrypt_env, timeout=180,
                  expected=2 if variant == "wrong-key" else 0)
         finally:
+            decrypt_error = sys.exc_info()[1]
             decrypt_env.pop("DEVLANE_DECRYPT_KEY", None)
             supplied_key = ""
-            key_path.unlink(missing_ok=True)
+            try:
+                key_path.unlink(missing_ok=True)
+            except OSError:
+                if decrypt_error is None:
+                    raise
+                print("key_cleanup=unconfirmed", file=sys.stderr)
         execute = _supervisor("execute", "--state-dir", str(state_path), "--context", str(context_path))
         if variant == "wrong-key":
             """A refused decryption must leave execution refused: exit 2 and no summary at all."""
             refused = _run(execute, expected=2)
             _require(refused.stdout == b"", "summary-after-decrypt-refusal")
         elif variant == "cancel":
+            wait_budget = _bounded_timeout(180)
             process = subprocess.Popen(execute, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE, close_fds=True)
-            deadline = time.monotonic() + 180
-            while time.monotonic() < deadline and process.poll() is None and not _processes_matching(BACKGROUND_MARKER):
-                time.sleep(1)
+                                       stderr=subprocess.PIPE, close_fds=True, start_new_session=True)
+            wait_until = time.monotonic() + wait_budget
+            while time.monotonic() < wait_until and process.poll() is None and not _processes_matching(BACKGROUND_MARKER):
+                time.sleep(min(1, wait_until - time.monotonic()))
             _require(process.poll() is None and bool(_processes_matching(BACKGROUND_MARKER)),
                      "cancel-target-did-not-start")
-            host_cleanup.clean(str(root), str(RUNNER_TEMP))
+            host_cleanup.clean(str(root), str(RUNNER_TEMP), deadline_file=DEADLINE_FILE)
             try:
-                output, errors = process.communicate(timeout=180)
+                output, errors = process.communicate(timeout=_bounded_timeout(180))
             except subprocess.TimeoutExpired:
                 process.kill()
                 raise RuntimeError("cancelled-execute-did-not-end") from None
@@ -629,71 +1049,143 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
         else:
             expected = 1 if variant in ("failing-test", "accept-with-failure") else 0
             result = _run(execute, timeout=60 * 40, expected=expected)
+            _require(result.stdout.endswith(b"\n"), "summary-schema-invalid")
+            records = _summary_records(result.stdout, scenario)
             summary = result.stdout.splitlines()
-            _require(all(line.startswith(b"{") for line in summary), "summary-schema-invalid")
-            allowed = (b"file_0001", b"case_0001", b"case_0002", b"frame_0001", b"DEVLANE_FAILURE")
-            _require(all(any(item in line for item in allowed) for line in summary), "summary-identity-invalid")
             _require(len(summary) <= 100 and len(result.stdout) <= 16 * 1024, "summary-limits")
             if variant in ("failing-test", "accept-with-failure"):
-                wanted = b'"test":"case_0001"' if variant == "failing-test" else b'"test":"case_0002"'
-                _require(any(wanted in line for line in summary), "test-failure-not-mapped")
+                wanted = "case_0001" if variant == "failing-test" else "case_0002"
+                _require(any(record.get("kind") == "test" and record.get("test") == wanted
+                             for record in records), "test-failure-not-mapped")
             if scenario["frames"]:
                 _require(any(b'"frame":"frame_0001"' in line and b'"status":"pass"' in line for line in summary),
                          "browser-frame-not-reported")
             if variant == "accept" and scenario["name"] == "synthetic-node":
                 _require(not any(b'"kind":"control"' in line for line in summary), "unexpected-control-failure")
         os.environ.setdefault("GITHUB_RUN_ID", RUN_ID)
-        host_cleanup.clean(str(root), str(RUNNER_TEMP))
-        _require(not root.exists(), "host-cleanup-root-remains")
+        host_cleanup.clean(str(root), str(RUNNER_TEMP), deadline_file=DEADLINE_FILE)
         """Descendants that outlived their parent must not outlive cleanup."""
         _require(not _processes_matching(BACKGROUND_MARKER), "background-process-survived-cleanup")
+        lifecycle.confirm_teardown()
     finally:
-        (root / "synthetic-key.hex").unlink(missing_ok=True)
-        if root.exists() and not root.is_symlink():
-            os.environ.setdefault("GITHUB_RUN_ID", RUN_ID)
-            host_cleanup.clean(str(root), str(RUNNER_TEMP))
+        previous_error = sys.exc_info()[1]
+        cleanup_error = None
+        try:
+            (root / "synthetic-key.hex").unlink(missing_ok=True)
+        except OSError as error:
+            cleanup_error = error
+        try:
+            if root.exists() or root.is_symlink():
+                if not root.is_symlink():
+                    os.environ.setdefault("GITHUB_RUN_ID", RUN_ID)
+                    host_cleanup.clean(str(root), str(RUNNER_TEMP), deadline_file=DEADLINE_FILE)
+            lifecycle.confirm_teardown()
+        except Exception as error:
+            cleanup_error = cleanup_error or error
+        if cleanup_error is not None:
+            lifecycle.cleanup_confirmed = False
+            if previous_error is None:
+                raise cleanup_error
+            print("host_cleanup=unconfirmed", file=sys.stderr)
 
 
-def _run_scenario(scenario):
+def _run_scenario(scenario, rust_tool_cache=None):
     prepared = RUNNER_TEMP / ("devlane-e2e-" + RUN_ID + "-" + scenario["name"])
     projection_path = RUNNER_TEMP / ("devlane-e2e-projection-" + RUN_ID + "-" + scenario["name"])
+    lifecycle = _SupervisorLifecycle(RUNNER_TEMP / ("devlane-" + RUN_ID))
     try:
         projection_path.write_bytes(scenario["payload"])
         tool_paths = _prepare(scenario["profile"], projection_path, prepared)
+        if scenario["profile"] == "core-rust":
+            _require(rust_tool_cache is not None, "rust-matrix-tool-preparation-missing")
+            rust_tooling.install(str(rust_tool_cache), str(prepared), deadline_file=DEADLINE_FILE)
+            _verify_prepared_rust_tools(prepared, rust_tool_cache)
         if "after_prepare" in scenario:
             scenario["after_prepare"](prepared)
         key_bytes = KEY_CANARY + bytes(range(16))
         for variant in scenario["variants"]:
-            _run_variant(scenario, scenario["payload"], prepared, tool_paths, key_bytes, variant)
+            _run_variant(scenario, scenario["payload"], prepared, tool_paths, key_bytes, variant, lifecycle)
     finally:
-        if prepared.exists() and not prepared.is_symlink():
-            shutil.rmtree(prepared)
-        projection_path.unlink(missing_ok=True)
+        previous_error = sys.exc_info()[1]
+        try:
+            try:
+                if prepared.exists() or prepared.is_symlink():
+                    _require(lifecycle.permits_prepared_cleanup(), "prepared-cleanup-supervisor-unconfirmed")
+                    _remove_owned_prepared_tree(prepared)
+                _require(not prepared.exists() and not prepared.is_symlink(), "prepared-cleanup-tree-remains")
+            except Exception:
+                if previous_error is None:
+                    raise
+            if prepared.exists() or prepared.is_symlink():
+                if previous_error is None:
+                    raise RuntimeError("prepared-cleanup-tree-remains")
+                print("prepared_cleanup=unconfirmed", file=sys.stderr)
+        finally:
+            try:
+                projection_path.unlink(missing_ok=True)
+                if projection_path.exists() or projection_path.is_symlink():
+                    raise RuntimeError("projection-cleanup-remains")
+            except Exception:
+                if previous_error is None:
+                    raise
+                print("projection_cleanup=unconfirmed", file=sys.stderr)
 
 
-def main():
+def _deadline_termination(signum, _frame):
+    raise RuntimeError("harness-work-deadline")
+
+
+def main(argv=None):
+    parser = __import__("argparse").ArgumentParser()
+    parser.add_argument("--generate-rust-fixture", default="")
+    parser.add_argument("--rust-fixture", default="")
+    parser.add_argument("--deadline-file", required=True)
+    args = parser.parse_args(argv)
+    global DEADLINE_FILE
+    DEADLINE_FILE = args.deadline_file
+    deadline_budget.remaining(DEADLINE_FILE)
+    if args.generate_rust_fixture:
+        _require(bool(DEADLINE_FILE), "deadline-file-required")
+        paths = _tool_paths("core-rust")
+        _verify_rust_toolchain(paths)
+        _write_rust_fixture(args.generate_rust_fixture, paths["cargo"])
+        return 0
     _require(sys.platform.startswith("linux") and os.geteuid() != 0, "linux-runner-user-required")
+    _require(bool(DEADLINE_FILE), "deadline-file-required")
+    signal.signal(signal.SIGTERM, _deadline_termination)
     _require(bool(RUN_ID and RUN_ID.isdecimal() and CONTROL_SHA and len(CONTROL_SHA) == 40), "workflow-identity-required")
     _require(shutil.which("sudo") and shutil.which("unshare") and shutil.which("pgrep"), "linux-tools-required")
-    done = []
-    for scenario in scenarios():
-        _run_scenario(scenario)
-        done.append(scenario["name"])
-    """Synthetic fixture for the Rust profile (no network resolution needed)."""
-    cargo_lock = b'version = 3\n\n[[package]]\nname = "devlane-projection"\nversion = "0.0.0"\n'
-    projection, payload = _rust_projection(cargo_lock)
-    synthetic_rust = {
-        "name": "synthetic-rust", "profile": "core-rust", "projection": projection, "payload": payload,
-        "files": lambda **kw: _rust_files(projection["cargo_manifest"], projection["cargo_lock"].encode("utf-8")),
-        "allowed_files": {"src/lib.rs": "file_0001"},
-        "allowed_tests": {"tests::child_has_no_control_secrets_or_sockets": "case_0001"}, "frames": {},
+    fixture_root = args.rust_fixture or os.environ.get("DEVLANE_RUST_FIXTURE", "")
+    _require(bool(fixture_root), "rust-fixture-path-required")
+    projection, projection_bytes, snapshot, rust_files = _load_rust_fixture(fixture_root)
+    tooling_root = RUNNER_TEMP / ("devlane-rust-tools-" + RUN_ID)
+    rust_scenario = {
+        "name": "synthetic-rust", "profile": "core-rust", "projection": projection,
+        "payload": projection_bytes, "files": lambda **kw: rust_files,
+        "allowed_files": {}, "allowed_tests": RUST_FIXTURE_TESTS, "frames": {},
+        "original_lockfiles": {path: value["sha256"] for path, value in snapshot["lockfiles"].items()},
         "variants": ("accept", "wrong-key"),
     }
-    _run_scenario(synthetic_rust)
-    done.append(synthetic_rust["name"])
-    for scenario in late_scenarios():
-        _run_scenario(scenario)
-        done.append(scenario["name"])
+    done = []
+    try:
+        rust_tooling.fetch_tools(str(tooling_root), deadline_file=DEADLINE_FILE)
+        for scenario in scenarios():
+            _run_scenario(scenario)
+            done.append(scenario["name"])
+        _run_scenario(rust_scenario, tooling_root)
+        done.append(rust_scenario["name"])
+        for scenario in late_scenarios():
+            _run_scenario(scenario)
+            done.append(scenario["name"])
+    finally:
+        previous_error = sys.exc_info()[1]
+        try:
+            if tooling_root.exists() and not tooling_root.is_symlink():
+                shutil.rmtree(tooling_root)
+            _require(not tooling_root.exists() and not tooling_root.is_symlink(), "rust-tool-cleanup-remains")
+        except Exception:
+            if previous_error is None:
+                raise
     print("devlane_production_e2e=pass scenarios=" + ",".join(done))
     return 0
 

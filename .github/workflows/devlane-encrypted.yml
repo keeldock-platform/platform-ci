@@ -77,6 +77,7 @@ jobs:
       CI_EVENT_NAME: ${{ github.event_name }}
       CI_RUN_ID: ${{ github.run_id }}
       CI_RUN_ATTEMPT: ${{ github.run_attempt }}
+      CI_WORKSPACE: ${{ github.workspace }}
       CI_CONTROL_RUN_ID: ${{ inputs.control_run_id }}
       DEVLANE_PROFILE: ${{ inputs.profile }}
       DEVLANE_WAVE_ID: ${{ inputs.wave_id }}
@@ -91,34 +92,137 @@ jobs:
       DEVLANE_CACHE_BASELINE_SHA256: ${{ inputs.cache_baseline_sha256 }}
     steps:
       - name: Fetch public control and validate dispatch
-        timeout-minutes: 10
+        timeout-minutes: 180
         run: |
           set -euo pipefail
           umask 077
           RUN_ROOT="$RUNNER_TEMP/devlane-$CI_RUN_ID"
           export RUN_ROOT
           printf 'RUN_ROOT=%s\n' "$RUN_ROOT" >> "$GITHUB_ENV"
-          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" ]]
-          [[ "$CI_REPOSITORY_ID" == "1430960557" ]]
-          [[ "$CI_SERVER_URL" == "https://github.com" ]]
-          [[ "$CI_EVENT_NAME" == "workflow_dispatch" ]]
-          [[ "$CI_REF" == "refs/heads/main" ]]
-          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
-          mkdir -m 700 "$RUN_ROOT"
-          python3 -B -c 'import os,sys,time; fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600); os.write(fd,repr(time.monotonic()).encode("ascii")); os.fsync(fd); os.close(fd)' "$RUN_ROOT/deadline-start"
-          git init -q . 2>/dev/null
-          git config core.autocrlf false 2>/dev/null
-          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
-          git fetch --quiet --no-tags --depth=1 origin "$CI_SHA" 2>/dev/null
-          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
-          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
-          [[ "$actual_sha" == "$CI_SHA" ]]
-          python3 -B kit/devlane/deadline.py create --file "$RUN_ROOT/deadline.json" --budget-seconds 8700 --cleanup-reserve-seconds 2100 --job-seconds 10800 --started-at-file "$RUN_ROOT/deadline-start"
-          python3 -B kit/devlane/deadline.py check --file "$RUN_ROOT/deadline.json"
+          python3 -B - <<'PY'
+          import os
+          import re
+          import signal
+          import subprocess
+          import sys
+          import time
+
+          def refuse(code):
+              print("devlane_bootstrap_refusal=" + code, file=sys.stderr)
+              raise SystemExit(1)
+
+          started_at = time.monotonic()
+          run_root = os.environ["RUN_ROOT"]
+          try:
+              os.mkdir(run_root, 0o700)
+          except OSError:
+              refuse("bootstrap-run-root")
+          start_file = os.path.join(run_root, "deadline-start")
+          try:
+              descriptor = os.open(start_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+              with os.fdopen(descriptor, "w", encoding="ascii") as output:
+                  output.write("%.17g\n" % started_at)
+                  output.flush()
+                  os.fsync(output.fileno())
+          except OSError:
+              refuse("bootstrap-start-marker")
+
+          work_deadline = started_at + 8700
+          reap_seconds = 5
+          child_environment = {
+              "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+              "LC_ALL": "C",
+              "GIT_CONFIG_GLOBAL": "/dev/null",
+              "GIT_CONFIG_NOSYSTEM": "1",
+              "GIT_TERMINAL_PROMPT": "0",
+              "PYTHONDONTWRITEBYTECODE": "1",
+          }
+
+          def terminate_and_reap(process):
+              try:
+                  os.killpg(process.pid, signal.SIGTERM)
+              except ProcessLookupError:
+                  pass
+              try:
+                  process.communicate(timeout=2)
+              except subprocess.TimeoutExpired:
+                  pass
+              try:
+                  os.killpg(process.pid, signal.SIGKILL)
+              except ProcessLookupError:
+                  pass
+              try:
+                  process.communicate(timeout=3)
+              except subprocess.TimeoutExpired:
+                  refuse("bootstrap-reap-unconfirmed")
+
+          def run(argv, *, capture=False):
+              remaining = work_deadline - time.monotonic()
+              if remaining <= reap_seconds:
+                  refuse("bootstrap-work-deadline")
+              timeout = min(540, remaining - reap_seconds)
+              try:
+                  process = subprocess.Popen(
+                      argv, cwd=os.environ["CI_WORKSPACE"], env=child_environment,
+                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL,
+                      close_fds=True, start_new_session=True,
+                  )
+                  remaining = work_deadline - time.monotonic()
+                  if remaining <= reap_seconds:
+                      terminate_and_reap(process)
+                      refuse("bootstrap-work-deadline")
+                  timeout = min(timeout, 540, remaining - reap_seconds)
+                  try:
+                      output, _errors = process.communicate(timeout=timeout)
+                  except subprocess.TimeoutExpired:
+                      terminate_and_reap(process)
+                      refuse("bootstrap-command-timeout")
+              except OSError:
+                  refuse("bootstrap-command-failed")
+              if process.returncode != 0:
+                  refuse("bootstrap-command-failed")
+              return output if capture else b""
+
+          if (os.environ.get("CI_REPOSITORY") != "keeldock-platform/platform-ci"
+                  or os.environ.get("CI_REPOSITORY_ID") != "1430960557"
+                  or os.environ.get("CI_SERVER_URL") != "https://github.com"
+                  or os.environ.get("CI_EVENT_NAME") != "workflow_dispatch"
+                  or os.environ.get("CI_REF") != "refs/heads/main"
+                  or not re.fullmatch(r"[1-9][0-9]{0,18}", os.environ.get("CI_RUN_ID", ""))
+                  or not re.fullmatch(r"[a-f0-9]{40}", os.environ.get("CI_SHA", ""))):
+              refuse("dispatch-identity")
+
+          workspace = os.environ["CI_WORKSPACE"]
+          origin = os.environ["CI_SERVER_URL"].rstrip("/") + "/" + os.environ["CI_REPOSITORY"] + ".git"
+          run(["git", "-C", workspace, "init", "-q"])
+          run(["git", "-C", workspace, "config", "core.autocrlf", "false"])
+          run(["git", "-C", workspace, "remote", "add", "origin", origin])
+          if run(["git", "-C", workspace, "remote", "get-url", "origin"], capture=True).decode("utf-8").strip() != origin:
+              refuse("bootstrap-origin-mismatch")
+          run(["git", "-C", workspace, "fetch", "--quiet", "--no-tags", "--depth=1", "origin", os.environ["CI_SHA"]])
+          run(["git", "-C", workspace, "checkout", "--quiet", "--detach", "FETCH_HEAD"])
+          actual_sha = run(["git", "-C", workspace, "rev-parse", "--verify", "HEAD"], capture=True).decode("ascii").strip()
+          if actual_sha != os.environ["CI_SHA"]:
+              refuse("bootstrap-sha-mismatch")
+          deadline_script = os.path.join(workspace, "kit/devlane/deadline.py")
+          deadline_file = os.path.join(run_root, "deadline.json")
+          run([
+              sys.executable, "-B", deadline_script, "create", "--file", deadline_file,
+              "--budget-seconds", "8700", "--cleanup-reserve-seconds", "2100", "--job-seconds", "10800",
+              "--started-at-file", start_file,
+          ])
+          PY
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             python3 -B -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; import cryptography; assert AESGCM is not None and cryptography.__version__'
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             python3 -B kit/devlane/fetch.py context --output "$RUN_ROOT/context.json"
+      - name: Reserve work time for control evidence cache restore
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/deadline.py guard-action --file "$RUN_ROOT/deadline.json" \
+            --step-timeout-seconds 60 --margin-seconds 60
       - name: Restore exact source-free control evidence
         timeout-minutes: 1
         uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
@@ -131,6 +235,12 @@ jobs:
           set -euo pipefail
           python3 -B kit/devlane/permit.py verify-control \
             --file "$RUNNER_TEMP/devlane-control-evidence/permit.json" --control-sha "$CI_SHA" --run-id "$CI_CONTROL_RUN_ID"
+      - name: Reserve work time for initial permit cache restore
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/deadline.py guard-action --file "$RUN_ROOT/deadline.json" \
+            --step-timeout-seconds 60 --margin-seconds 60
       - name: Restore one-run bundle permit
         timeout-minutes: 1
         uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
@@ -142,6 +252,12 @@ jobs:
           set -euo pipefail
           mkdir -m 700 -p "$RUNNER_TEMP/devlane-bundle-permit"
           python3 -B kit/devlane/permit.py claim --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json"
+      - name: Reserve work time for permit cache save
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/deadline.py guard-action --file "$RUN_ROOT/deadline.json" \
+            --step-timeout-seconds 60 --margin-seconds 60
       - name: Save one-run bundle permit
         timeout-minutes: 1
         uses: actions/cache/save@3edfce9056124e459a23f683a21433670d47daca
@@ -153,6 +269,12 @@ jobs:
           set -euo pipefail
           rm -rf -- "$RUNNER_TEMP/devlane-bundle-permit"
           [[ ! -e "$RUNNER_TEMP/devlane-bundle-permit" ]]
+      - name: Reserve work time for persisted permit cache restore
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/deadline.py guard-action --file "$RUN_ROOT/deadline.json" \
+            --step-timeout-seconds 60 --margin-seconds 60
       - name: Restore and verify persisted one-run permit
         timeout-minutes: 1
         uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
@@ -176,6 +298,13 @@ jobs:
             python3 -B kit/devlane/fetch.py check-projection --file "$RUN_ROOT/projection.json" --profile "$DEVLANE_PROFILE"
           '
           mkdir -m 700 "$RUN_ROOT/workspace"
+      - name: Reserve work time for pinned Node action
+        timeout-minutes: 1
+        if: ${{ inputs.profile == 'core-node' }}
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/deadline.py guard-action --file "$RUN_ROOT/deadline.json" \
+            --step-timeout-seconds 300 --margin-seconds 60
       - name: Set up pinned Node toolchain
         timeout-minutes: 5
         if: ${{ inputs.profile == 'core-node' }}
@@ -189,40 +318,46 @@ jobs:
         if: ${{ inputs.profile == 'core-rust' }}
         run: |
           set -euo pipefail
-          rust_version="$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tools"]["cargo"])' "$RUN_ROOT/projection.json")"
+          rust_version="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tools"]["cargo"])' "$RUN_ROOT/projection.json")"
           [[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             rustup toolchain install "$rust_version" --profile minimal --component rustfmt >/dev/null 2>&1
-          python3 -B kit/devlane/deadline.py check --file "$RUN_ROOT/deadline.json"
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             rustup default "$rust_version" >/dev/null 2>&1
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
-            python3 -B kit/devlane/rust_tooling.py fetch --output "$RUN_ROOT/rust-tooling"
+            python3 -B kit/devlane/rust_tooling.py fetch --output "$RUN_ROOT/rust-tooling" \
+              --deadline-file "$RUN_ROOT/deadline.json"
       - name: Prepare dependencies before the cut
         run: |
           set -euo pipefail
           for tool in unshare mount umount setpriv chroot ip nft shred; do command -v "$tool" >/dev/null 2>&1; done
-          owner_uid="$(id -u)"
-          owner_gid="$(id -g)"
+          owner_uid="$EUID"
+          owner_gid="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- id -g)"
           node_path="$(command -v node || true)"
           npm_path="$(command -v npm || true)"
           cargo_path=""
           rustc_path=""
           if [[ "$DEVLANE_PROFILE" == "core-rust" ]]; then
-            rust_version="$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tools"]["cargo"])' "$RUN_ROOT/projection.json")"
+            rust_version="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tools"]["cargo"])' "$RUN_ROOT/projection.json")"
             [[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-            cargo_path="$(rustup which --toolchain "$rust_version" cargo)"
-            rustc_path="$(rustup which --toolchain "$rust_version" rustc)"
+            cargo_path="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              rustup which --toolchain "$rust_version" cargo)"
+            rustc_path="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              rustup which --toolchain "$rust_version" rustc)"
           fi
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             sudo -n unshare --mount --pid --ipc --fork --mount-proc --kill-child -- \
             python3 -B kit/devlane/prepare.py \
               --projection "$RUN_ROOT/projection.json" --output "$RUN_ROOT/prepared" \
               --profile "$DEVLANE_PROFILE" --owner-uid "$owner_uid" --owner-gid "$owner_gid" \
-              --node-path "$node_path" --npm-path "$npm_path" --cargo-path "$cargo_path" --rustc-path "$rustc_path"
+              --node-path "$node_path" --npm-path "$npm_path" --cargo-path "$cargo_path" --rustc-path "$rustc_path" \
+              --deadline-file "$RUN_ROOT/deadline.json"
           if [[ "$DEVLANE_PROFILE" == "core-rust" ]]; then
             python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
-              python3 -B kit/devlane/rust_tooling.py install --source "$RUN_ROOT/rust-tooling" --prepared "$RUN_ROOT/prepared"
+              python3 -B kit/devlane/rust_tooling.py install --source "$RUN_ROOT/rust-tooling" --prepared "$RUN_ROOT/prepared" \
+                --deadline-file "$RUN_ROOT/deadline.json"
           fi
       - name: Prove public connectivity before the cut
         run: |
@@ -237,10 +372,13 @@ jobs:
           cargo_path=""
           rustc_path=""
           if [[ "$DEVLANE_PROFILE" == "core-rust" ]]; then
-            rust_version="$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tools"]["cargo"])' "$RUN_ROOT/projection.json")"
+            rust_version="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tools"]["cargo"])' "$RUN_ROOT/projection.json")"
             [[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-            cargo_path="$(rustup which --toolchain "$rust_version" cargo)"
-            rustc_path="$(rustup which --toolchain "$rust_version" rustc)"
+            cargo_path="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              rustup which --toolchain "$rust_version" cargo)"
+            rustc_path="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              rustup which --toolchain "$rust_version" rustc)"
           fi
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             python3 -B kit/devlane/supervisor.py start \
@@ -277,7 +415,8 @@ jobs:
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
           set -euo pipefail
-          python3 -B kit/devlane/host_cleanup.py --root "$RUN_ROOT" --runner-temp "$RUNNER_TEMP"
+          python3 -B kit/devlane/host_cleanup.py --root "$RUN_ROOT" --runner-temp "$RUNNER_TEMP" \
+            --deadline-file "$RUN_ROOT/deadline.json"
           printf 'devlane_job=completed public_output=filtered cleanup=confirmed\n'
   devlane-encrypted-audit:
     name: devlane-encrypted-audit
@@ -302,27 +441,132 @@ jobs:
       DEVLANE_CACHE_BASELINE_SHA256: ${{ inputs.cache_baseline_sha256 }}
       GITHUB_RUN_ID: ${{ github.run_id }}
       GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+      CI_WORKSPACE: ${{ github.workspace }}
     steps:
       - name: Fetch public control and validate dispatch
+        timeout-minutes: 10
         run: |
           set -euo pipefail
-          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" ]]
-          [[ "$CI_REPOSITORY_ID" == "1430960557" ]]
-          [[ "$CI_SERVER_URL" == "https://github.com" ]]
-          [[ "$CI_EVENT_NAME" == "workflow_dispatch" ]]
-          [[ "$CI_REF" == "refs/heads/main" ]]
-          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
-          git init -q . 2>/dev/null
-          git config core.autocrlf false 2>/dev/null
-          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
-          git fetch --quiet --no-tags --depth=1 origin "$CI_SHA" 2>/dev/null
-          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
-          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
-          [[ "$actual_sha" == "$CI_SHA" ]]
+          python3 -B - <<'PY'
+          import os
+          import re
+          import signal
+          import subprocess
+          import sys
+          import time
+
+          def refuse(code):
+              print("devlane_audit_bootstrap_refusal=" + code, file=sys.stderr)
+              raise SystemExit(1)
+
+          started_at = time.monotonic()
+          run_id = os.environ.get("GITHUB_RUN_ID", "")
+          attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+          if (os.environ.get("CI_REPOSITORY") != "keeldock-platform/platform-ci"
+                  or os.environ.get("CI_REPOSITORY_ID") != "1430960557"
+                  or os.environ.get("CI_SERVER_URL") != "https://github.com"
+                  or os.environ.get("CI_EVENT_NAME") != "workflow_dispatch"
+                  or os.environ.get("CI_REF") != "refs/heads/main"
+                  or not re.fullmatch(r"[a-f0-9]{40}", os.environ.get("CI_SHA", ""))
+                  or not re.fullmatch(r"[1-9][0-9]{0,18}", run_id)
+                  or not re.fullmatch(r"[1-9][0-9]{0,3}", attempt)):
+              refuse("dispatch-identity")
+
+          runner_temp = os.environ["RUNNER_TEMP"]
+          workspace = os.environ["CI_WORKSPACE"]
+          start_file = os.path.join(runner_temp, "devlane-audit-start-" + run_id + "-" + attempt)
+          deadline_file = os.path.join(runner_temp, "devlane-audit-deadline-" + run_id + "-" + attempt + ".json")
+          try:
+              descriptor = os.open(start_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+              with os.fdopen(descriptor, "w", encoding="ascii") as output:
+                  output.write("%.17g\n" % started_at)
+                  output.flush()
+                  os.fsync(output.fileno())
+          except OSError:
+              refuse("bootstrap-start-marker")
+
+          work_deadline = started_at + 480
+          reap_seconds = 5
+          child_environment = {
+              "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+              "LC_ALL": "C",
+              "GIT_CONFIG_GLOBAL": "/dev/null",
+              "GIT_CONFIG_NOSYSTEM": "1",
+              "GIT_TERMINAL_PROMPT": "0",
+              "PYTHONDONTWRITEBYTECODE": "1",
+          }
+
+          def terminate_and_reap(process):
+              try:
+                  os.killpg(process.pid, signal.SIGTERM)
+              except ProcessLookupError:
+                  pass
+              try:
+                  process.communicate(timeout=2)
+              except subprocess.TimeoutExpired:
+                  pass
+              try:
+                  os.killpg(process.pid, signal.SIGKILL)
+              except ProcessLookupError:
+                  pass
+              try:
+                  process.communicate(timeout=3)
+              except subprocess.TimeoutExpired:
+                  refuse("bootstrap-reap-unconfirmed")
+
+          def run(argv, *, capture=False):
+              remaining = work_deadline - time.monotonic()
+              if remaining <= reap_seconds:
+                  refuse("bootstrap-work-deadline")
+              timeout = min(540, remaining - reap_seconds)
+              try:
+                  process = subprocess.Popen(
+                      argv, cwd=workspace, env=child_environment,
+                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL,
+                      close_fds=True, start_new_session=True,
+                  )
+                  remaining = work_deadline - time.monotonic()
+                  if remaining <= reap_seconds:
+                      terminate_and_reap(process)
+                      refuse("bootstrap-work-deadline")
+                  timeout = min(timeout, 540, remaining - reap_seconds)
+                  try:
+                      output, _errors = process.communicate(timeout=timeout)
+                  except subprocess.TimeoutExpired:
+                      terminate_and_reap(process)
+                      refuse("bootstrap-command-timeout")
+              except OSError:
+                  refuse("bootstrap-command-failed")
+              if process.returncode != 0:
+                  refuse("bootstrap-command-failed")
+              return output if capture else b""
+
+          origin = os.environ["CI_SERVER_URL"].rstrip("/") + "/" + os.environ["CI_REPOSITORY"] + ".git"
+          run(["git", "-C", workspace, "init", "-q"])
+          run(["git", "-C", workspace, "config", "core.autocrlf", "false"])
+          run(["git", "-C", workspace, "remote", "add", "origin", origin])
+          if run(["git", "-C", workspace, "remote", "get-url", "origin"], capture=True).decode("utf-8").strip() != origin:
+              refuse("bootstrap-origin-mismatch")
+          run(["git", "-C", workspace, "fetch", "--quiet", "--no-tags", "--depth=1", "origin", os.environ["CI_SHA"]])
+          run(["git", "-C", workspace, "checkout", "--quiet", "--detach", "FETCH_HEAD"])
+          actual_sha = run(["git", "-C", workspace, "rev-parse", "--verify", "HEAD"], capture=True).decode("ascii").strip()
+          if actual_sha != os.environ["CI_SHA"]:
+              refuse("bootstrap-sha-mismatch")
+          deadline_script = os.path.join(workspace, "kit/devlane/deadline.py")
+          run([
+              sys.executable, "-B", deadline_script, "create", "--file", deadline_file,
+              "--budget-seconds", "480", "--cleanup-reserve-seconds", "120", "--job-seconds", "600",
+              "--started-at-file", start_file,
+          ])
+          PY
       - name: Audit exact two-job graph and public surfaces
         id: audit
+        timeout-minutes: 8
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 -B kit/devlane/public_audit.py
+          python3 -B kit/devlane/deadline.py run \
+            --file "$RUNNER_TEMP/devlane-audit-deadline-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.json" -- \
+            python3 -B kit/devlane/public_audit.py

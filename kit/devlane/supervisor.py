@@ -10,6 +10,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import resource
 import shutil
 import signal
@@ -33,6 +34,7 @@ MAX_SUMMARY = output_filter.MAX_SUMMARY_BYTES
 SOCKET_NAME = "control.sock"
 READY_NAME = "ready.json"
 PID_NAME = "host-pid"
+STARTUP_REFUSAL_NAME = "startup-refusal.json"
 WORKER_UID = 65534
 WORKER_GID = 65534
 PROFILE_FILE = "ci/devlane-profiles.json"
@@ -41,6 +43,7 @@ ACTIVE_CHILDREN_LOCK = threading.Lock()
 CANCEL_REQUESTED = threading.Event()
 SERVICE_LOCK = threading.RLock()
 MOUNT_TARGETS = []
+ACTIVE_DEADLINE_FILE = ""
 
 
 class SupervisorRefusal(ValueError):
@@ -53,7 +56,19 @@ def _refuse(code):
     raise SupervisorRefusal(code)
 
 
-def _run(argv, timeout=10, input_bytes=None, env=None):
+def _bounded_timeout(timeout, *, cleanup=False):
+    if not ACTIVE_DEADLINE_FILE:
+        return timeout
+    try:
+        remaining = (deadline_budget.cleanup_remaining(ACTIVE_DEADLINE_FILE) if cleanup
+                     else deadline_budget.remaining(ACTIVE_DEADLINE_FILE))
+    except deadline_budget.DeadlineRefusal:
+        _refuse("total-deadline-exhausted")
+    return min(timeout, remaining)
+
+
+def _run(argv, timeout=10, input_bytes=None, env=None, *, cleanup=False):
+    timeout = _bounded_timeout(timeout, cleanup=cleanup)
     try:
         result = subprocess.run(
             argv, input=input_bytes, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -415,7 +430,12 @@ def _run_profile_command(root, command, stage, log_path, tools, timeout=1200, de
     environment = _worker_environment(stage, root, tools)
     if CANCEL_REQUESTED.is_set():
         return 130
-    if deadline is not None:
+    if deadline is None:
+        try:
+            timeout = _bounded_timeout(timeout)
+        except SupervisorRefusal:
+            return 124
+    else:
         try:
             timeout = min(timeout, deadline_budget.remaining(deadline))
         except deadline_budget.DeadlineRefusal:
@@ -452,7 +472,12 @@ def _run_profile_command(root, command, stage, log_path, tools, timeout=1200, de
 def _run_control_adapter(root, command, stage, tools, log_name, timeout=60, deadline=None, cpu_seconds=1200):
     if CANCEL_REQUESTED.is_set():
         return 130
-    if deadline is not None:
+    if deadline is None:
+        try:
+            timeout = _bounded_timeout(timeout)
+        except SupervisorRefusal:
+            return 124
+    else:
         try:
             timeout = min(timeout, deadline_budget.remaining(deadline))
         except deadline_budget.DeadlineRefusal:
@@ -679,7 +704,7 @@ def _preflight_tools(profile, projection, tool_paths):
             _refuse("tool-manifest-invalid")
         try:
             version = subprocess.run([paths[name], "--version"], stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL, timeout=10, check=False,
+                                     stderr=subprocess.DEVNULL, timeout=_bounded_timeout(10), check=False,
                                      env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}).stdout.decode("ascii", "strict").strip()
         except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
             _refuse("tool-version-unavailable")
@@ -872,6 +897,7 @@ def _shred_tree(root):
 class Service:
     def __init__(self, state_dir, context_path, workspace, prepared, bundle_path, projection_path,
                  host_net_inode, owner_uid, tool_paths, deadline_file):
+        global ACTIVE_DEADLINE_FILE
         self.state_dir = Path(state_dir)
         self.context = _context_from_file(context_path)
         self.workspace = Path(workspace).resolve(strict=True)
@@ -882,6 +908,7 @@ class Service:
         self.owner_uid = owner_uid
         self.tool_paths = tool_paths
         self.deadline_file = Path(deadline_file).resolve(strict=True)
+        ACTIVE_DEADLINE_FILE = str(self.deadline_file)
         self.deadline = None
         self.root = self.state_dir / "namespace-root"
         self.manifest = None
@@ -929,9 +956,9 @@ class Service:
         self.projection_value = projection_value
         if self.context["profile"] == "core-node":
             node_version = subprocess.run([self.tool_info["paths"]["node"], "--version"], stdout=subprocess.PIPE,
-                                          stderr=subprocess.DEVNULL, timeout=10, check=False)
+                                          stderr=subprocess.DEVNULL, timeout=_bounded_timeout(10), check=False)
             npm_version = subprocess.run([self.tool_info["paths"]["npm"], "--version"], stdout=subprocess.PIPE,
-                                         stderr=subprocess.DEVNULL, timeout=10, check=False)
+                                         stderr=subprocess.DEVNULL, timeout=_bounded_timeout(10), check=False)
             if node_version.returncode != 0 or npm_version.returncode != 0:
                 _refuse("node-toolchain-version")
             if node_version.stdout.strip() != b"v24.22.1" or npm_version.stdout.strip() != b"11.19.1":
@@ -1236,10 +1263,10 @@ class Service:
             if not os.path.ismount(mount):
                 continue
             try:
-                _run(["umount", str(mount)], timeout=8)
+                _run(["umount", str(mount)], timeout=8, cleanup=True)
             except SupervisorRefusal:
                 try:
-                    _run(["umount", "-l", str(mount)], timeout=8)
+                    _run(["umount", "-l", str(mount)], timeout=8, cleanup=True)
                 except SupervisorRefusal:
                     pass
             if os.path.ismount(mount):
@@ -1353,6 +1380,20 @@ def _serve(args):
             workers.append(worker)
             worker.start()
         result = 0
+    except SupervisorRefusal as error:
+        try:
+            refusal_path = Path(args.state_dir) / STARTUP_REFUSAL_NAME
+            payload = json.dumps({"code": error.code}, sort_keys=True, separators=(",", ":")).encode("ascii")
+            descriptor = os.open(refusal_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                 | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            with os.fdopen(descriptor, "wb") as output:
+                os.fchown(output.fileno(), args.owner_uid, -1)
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
+        except OSError:
+            pass
+        result = 2
     except Exception:
         result = 2
     finally:
@@ -1384,11 +1425,15 @@ def _serve(args):
 def _start(args):
     if not sys.platform.startswith("linux"):
         _refuse("linux-runner-required")
+    try:
+        start_deadline = time.monotonic() + min(30, deadline_budget.remaining(args.deadline_file))
+    except deadline_budget.DeadlineRefusal:
+        _refuse("total-deadline-unavailable")
     state_dir = Path(args.state_dir)
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if state_dir.is_symlink() or state_dir.stat().st_uid != os.getuid() or stat.S_IMODE(state_dir.stat().st_mode) & 0o077:
         _refuse("state-directory-permissions")
-    if (state_dir / SOCKET_NAME).exists() or (state_dir / READY_NAME).exists():
+    if any(state_dir.iterdir()):
         _refuse("state-directory-not-empty")
     context = _context_from_file(args.context)
     try:
@@ -1428,6 +1473,11 @@ def _start(args):
         "--cargo-path", tool_paths["cargo"], "--rustc-path", tool_paths["rustc"],
     ]
     try:
+        start_deadline = min(start_deadline,
+                             time.monotonic() + deadline_budget.remaining(args.deadline_file))
+    except deadline_budget.DeadlineRefusal:
+        _refuse("total-deadline-exhausted")
+    try:
         child = subprocess.Popen(
             command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             close_fds=True, start_new_session=True,
@@ -1435,14 +1485,27 @@ def _start(args):
         )
         (state_dir / PID_NAME).write_text(str(child.pid), encoding="ascii")
         os.chmod(state_dir / PID_NAME, 0o600)
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
+        while time.monotonic() < start_deadline:
             if (state_dir / READY_NAME).is_file():
                 print("offline_supervisor=ready")
                 return 0
             if child.poll() is not None:
-                _refuse("supervisor-start-failed")
-            time.sleep(0.1)
+                refusal_path = state_dir / STARTUP_REFUSAL_NAME
+                code = "supervisor-start-failed"
+                try:
+                    refusal = bundle.strict_json(refusal_path.read_bytes(), 1024)
+                    if (type(refusal) is dict and set(refusal) == {"code"}
+                            and type(refusal["code"]) is str
+                            and re.fullmatch(r"[a-z][a-z0-9-]{0,63}", refusal["code"])):
+                        code = refusal["code"]
+                except (OSError, bundle.Refusal):
+                    pass
+                try:
+                    (state_dir / PID_NAME).unlink()
+                except OSError:
+                    pass
+                _refuse(code)
+            time.sleep(min(0.1, max(0, start_deadline - time.monotonic())))
         try:
             child.terminate()
             child.wait(timeout=3)

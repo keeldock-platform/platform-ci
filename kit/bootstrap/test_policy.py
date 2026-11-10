@@ -1791,8 +1791,10 @@ class LaneRegistryTests(unittest.TestCase):
                     self.assertIn(initialize, text)
                     self.assertIn("          export RUN_ROOT\n", text)
                     self.assertIn(persist, text)
-                    self.assertLess(text.index(initialize), text.index('mkdir -m 700 "$RUN_ROOT"'))
-                    self.assertLess(text.index(persist), text.index('mkdir -m 700 "$RUN_ROOT"'))
+                    create_root = "os.mkdir(run_root, 0o700)"
+                    self.assertIn(create_root, text)
+                    self.assertLess(text.index(initialize), text.index(create_root))
+                    self.assertLess(text.index(persist), text.index(create_root))
                 with self.assertRaises(PolicyError):
                     validate_workflow_text(text, "connect", kind)
 

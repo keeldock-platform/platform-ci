@@ -50,6 +50,26 @@ def remaining(path, now=None):
     return seconds
 
 
+def cleanup_remaining(path, now=None):
+    value = _read(path)
+    reap_reserve = min(KILL_REAP_SECONDS, value["cleanup_reserve"])
+    seconds = (value["work_deadline"] + value["cleanup_reserve"] - reap_reserve
+               - (time.monotonic() if now is None else now))
+    if seconds <= 0:
+        raise DeadlineRefusal("total-deadline-exhausted")
+    return seconds
+
+
+def guard_action(path, step_timeout_seconds, margin_seconds=60, now=None):
+    if (type(step_timeout_seconds) is not int or step_timeout_seconds < 1
+            or type(margin_seconds) is not int or margin_seconds < 0):
+        raise DeadlineRefusal("action-budget-invalid")
+    seconds = remaining(path, now=now)
+    if seconds < step_timeout_seconds + margin_seconds:
+        raise DeadlineRefusal("action-work-budget-insufficient")
+    return seconds
+
+
 def _started_at(path):
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     try:
@@ -94,32 +114,36 @@ def create(path, budget_seconds, cleanup_reserve_seconds, job_seconds, now=None,
         os.fsync(output.fileno())
 
 
-def _terminate_group(process):
-    started = time.monotonic()
-    sent_term = False
+def _terminate_group(process, reserve=TERM_GRACE_SECONDS + KILL_REAP_SECONDS):
+    kill_budget = min(KILL_REAP_SECONDS, max(0, reserve))
+    term_budget = max(0, reserve - kill_budget)
     try:
         os.killpg(process.pid, signal.SIGTERM)
-        sent_term = True
     except ProcessLookupError:
         pass
     try:
-        process.wait(timeout=TERM_GRACE_SECONDS)
+        process.wait(timeout=term_budget)
     except subprocess.TimeoutExpired:
         pass
     finally:
-        if sent_term:
-            left = TERM_GRACE_SECONDS - (time.monotonic() - started)
-            if left > 0:
-                time.sleep(left)
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         finally:
-            process.wait(timeout=KILL_REAP_SECONDS)
+            try:
+                process.wait(timeout=kill_budget)
+            except subprocess.TimeoutExpired:
+                pass
 
 
-def run(path, argv):
+def run(path, argv, timeout_cleanup_reserve=None):
+    value = _read(path)
+    if timeout_cleanup_reserve is None:
+        timeout_cleanup_reserve = min(TERM_GRACE_SECONDS + KILL_REAP_SECONDS, value["cleanup_reserve"])
+    if (type(timeout_cleanup_reserve) is not int or timeout_cleanup_reserve < 1
+            or timeout_cleanup_reserve > value["cleanup_reserve"]):
+        raise DeadlineRefusal("deadline-cleanup-reserve-invalid")
     budget = remaining(path)
     try:
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, start_new_session=True)
@@ -128,11 +152,17 @@ def run(path, argv):
     completed = False
     try:
         try:
+            budget = remaining(path)
+        except DeadlineRefusal:
+            _terminate_group(process, timeout_cleanup_reserve)
+            completed = True
+            return 124
+        try:
             code = process.wait(timeout=budget)
             completed = True
             return code
         except subprocess.TimeoutExpired:
-            _terminate_group(process)
+            _terminate_group(process, timeout_cleanup_reserve)
             completed = True
             return 124
     finally:
@@ -143,6 +173,8 @@ def run(path, argv):
 def main(argv=None):
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="operation", required=True)
+    start_parser = commands.add_parser("mark-start")
+    start_parser.add_argument("--file", required=True)
     create_parser = commands.add_parser("create")
     create_parser.add_argument("--file", required=True)
     create_parser.add_argument("--budget-seconds", type=int, required=True)
@@ -152,11 +184,23 @@ def main(argv=None):
     for operation in ("check", "remaining"):
         check_parser = commands.add_parser(operation)
         check_parser.add_argument("--file", required=True)
+    action_parser = commands.add_parser("guard-action")
+    action_parser.add_argument("--file", required=True)
+    action_parser.add_argument("--step-timeout-seconds", type=int, required=True)
+    action_parser.add_argument("--margin-seconds", type=int, default=60)
     run_parser = commands.add_parser("run")
     run_parser.add_argument("--file", required=True)
+    run_parser.add_argument("--timeout-cleanup-reserve-seconds", type=int)
     run_parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     try:
+        if args.operation == "mark-start":
+            descriptor = os.open(args.file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "w", encoding="ascii") as output:
+                output.write("%.17g\n" % time.monotonic())
+                output.flush()
+                os.fsync(output.fileno())
+            return 0
         if args.operation == "create":
             create(args.file, args.budget_seconds, args.cleanup_reserve_seconds,
                    args.job_seconds, started_at_file=args.started_at_file)
@@ -167,10 +211,13 @@ def main(argv=None):
         if args.operation == "remaining":
             print("deadline_remaining_seconds=%d" % int(remaining(args.file)))
             return 0
+        if args.operation == "guard-action":
+            guard_action(args.file, args.step_timeout_seconds, args.margin_seconds)
+            return 0
         command = args.command[1:] if args.command[:1] == ["--"] else args.command
         if not command:
             raise DeadlineRefusal("deadline-command-invalid")
-        return run(args.file, command)
+        return run(args.file, command, timeout_cleanup_reserve=args.timeout_cleanup_reserve_seconds)
     except (DeadlineRefusal, OSError, ValueError, UnicodeError, json.JSONDecodeError) as error:
         print("devlane_deadline_refusal=" + (error.args[0] if isinstance(error, DeadlineRefusal) else "deadline-failed"), file=sys.stderr)
         return 2

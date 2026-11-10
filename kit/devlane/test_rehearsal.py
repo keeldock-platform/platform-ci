@@ -138,6 +138,42 @@ class ProcedureDocumentTests(unittest.TestCase):
     root = Path(__file__).resolve().parents[2]
     text = (root / "docs/devlane-procedure.md").read_text(encoding="utf-8")
 
+    @staticmethod
+    def _integrated_contract_errors(text):
+        errors = []
+        try:
+            dispatch_start = text.index("8. Install the key, dispatch once, reconcile and arm timed revocation")
+            dispatch_end = text.index("\n9. After the coordinator returns successfully", dispatch_start)
+            dispatch = text[dispatch_start:dispatch_end]
+        except ValueError:
+            dispatch = ""
+            errors.append("integrated dispatch section")
+        try:
+            recovery_start = text.index("12. Before reserving any later wave")
+            recovery_end = text.index("\n**Rehearsal wave", recovery_start)
+            recovery = text[recovery_start:recovery_end]
+        except ValueError:
+            recovery = ""
+            errors.append("pending-secret recovery section")
+
+        required_dispatch = (
+            ("kit/devlane/coordinator.py dispatch-wave", "single dispatch operation"),
+            ("--key-file \"$DEVLANE_PRIVATE/key.hex\"", "key-file binding"),
+            ("300-second reconciliation deadline", "timed reconciliation deadline"),
+            ("watcher follows only the ledger-bound run", "ledger-bound watcher"),
+            ("revokes when the decrypt step concludes or the run ends", "decrypt/run revocation"),
+            ("revokes at the deadline if no run becomes visible", "deadline revocation"),
+            ("Failed or ambiguous dispatch responses still reconcile; no second dispatch is issued", "no redispatch"),
+        )
+        errors.extend(label for phrase, label in required_dispatch if phrase not in dispatch)
+        if "DEVLANE_DECRYPT_KEY" not in text or "environment" not in text:
+            errors.append("environment secret binding")
+        if "recover-pending-secrets" not in recovery:
+            errors.append("pending-secret recovery command")
+        if "blocks `reserve-wave` until recovery completes" not in recovery:
+            errors.append("reservation blocked until recovery")
+        return errors
+
     def test_every_documented_tool_invocation_exists_with_its_flags(self):
         import re
         pattern = re.compile(r"python3 -B kit/devlane/([a-z_]+)\.py((?: [a-z-]+)?)((?: --[a-z0-9-]+(?: \S+)?)*)")
@@ -158,29 +194,77 @@ class ProcedureDocumentTests(unittest.TestCase):
             for flag in flags:
                 self.assertIn(flag, help_text, (script, operation, flag))
             seen.add((script, operation))
-        for expected in (("coordinator", "await-decrypt-and-revoke"), ("coordinator", "mark-secret-installing"),
-                         ("coordinator", "mark-secret-installed"), ("coordinator", "reserve-wave"),
-                         ("coordinator", "record-control-evidence"), ("coordinator", "cleanup-terminal"),
-                         ("coordinator", "reconcile-dispatch"), ("rehearsal", "source"), ("rehearsal", "requests"),
-                         ("project", ""), ("bundle", "create")):
+        for expected in (("coordinator", "dispatch-wave"), ("coordinator", "recover-pending-secrets"),
+                         ("coordinator", "reserve-wave"), ("coordinator", "record-control-evidence"),
+                         ("coordinator", "cleanup-terminal"), ("rehearsal", "source"),
+                         ("rehearsal", "requests"), ("project", ""), ("bundle", "create")):
             self.assertIn(expected, seen)
+        for retired in (("coordinator", "await-decrypt-and-revoke"), ("coordinator", "mark-secret-installing"),
+                        ("coordinator", "mark-secret-installed"), ("coordinator", "reconcile-dispatch")):
+            self.assertNotIn(retired, seen)
 
-    def test_the_procedure_states_the_environment_secret_rehearsal_and_timed_revocation(self):
-        for phrase in ("gh secret set DEVLANE_DECRYPT_KEY --env devlane-decrypt", "devlane-decrypt",
-                       "Rehearsal wave (required before the first private wave)", "within_limit=true",
-                       "Duplicate refusal", "terminal_cleanup=complete", "audit disposition `accepted`",
-                       "Claim this bundle for one run before decryption", "record-control-evidence",
-                       "Dependency disclosure", "Records side channel", "Report integrity"):
+    def test_the_procedure_states_the_integrated_dispatch_and_recovery_contract(self):
+        for phrase in ("Install the key, dispatch once, reconcile and arm timed revocation as one coordinator operation",
+                       "DEVLANE_DECRYPT_KEY", "devlane-decrypt", "dispatch-wave", "300-second reconciliation deadline",
+                       "watcher follows only the ledger-bound run", "revokes at the deadline if no run becomes visible",
+                       "Failed or ambiguous dispatch responses still reconcile; no second dispatch is issued",
+                       "Before reserving any later wave, explicitly recover durable secret obligations",
+                       "recover-pending-secrets", "Rehearsal wave (required before the first private wave)",
+                       "within_limit=true", "Duplicate refusal", "terminal_cleanup=complete",
+                       "audit disposition `accepted`", "Claim this bundle for one run before decryption",
+                       "record-control-evidence", "Dependency disclosure", "Records side channel", "Report integrity"):
             self.assertIn(phrase, self.text)
         self.assertNotIn("DEVLANE_DECRYPT_KEY=", self.text)
         self.assertNotIn("--body", self.text)
-        self.assertNotIn("gh secret set DEVLANE_DECRYPT_KEY --repo", self.text)
+        self.assertNotIn("gh secret set", self.text)
+        self.assertEqual(self._integrated_contract_errors(self.text), [])
+
+    def test_contract_rejects_removed_dispatch_key_revocation_and_recovery_obligations(self):
+        dispatch_start = self.text.index("8. Install the key, dispatch once, reconcile and arm timed revocation")
+        dispatch_end = self.text.index("\n9. After the coordinator returns successfully", dispatch_start)
+        dispatch = self.text[dispatch_start:dispatch_end]
+        recovery_start = self.text.index("12. Before reserving any later wave")
+        recovery_end = self.text.index("\n**Rehearsal wave", recovery_start)
+        recovery = self.text[recovery_start:recovery_end]
+
+        self.assertIn("--key-file \"$DEVLANE_PRIVATE/key.hex\"", dispatch)
+        self.assertIn("DEVLANE_DECRYPT_KEY", self.text)
+        self.assertIn("300-second reconciliation deadline", dispatch)
+        self.assertIn("watcher follows only the ledger-bound run", dispatch)
+        self.assertIn("recover-pending-secrets", recovery)
+        self.assertIn("blocks `reserve-wave` until recovery completes", recovery)
+
+        mutations = []
+        for changed_dispatch, label, expected_error in (
+            (dispatch.replace("kit/devlane/coordinator.py dispatch-wave", "kit/devlane/coordinator.py manual-dispatch", 1),
+             "dispatch operation", "single dispatch operation"),
+            (dispatch.replace('--key-file "$DEVLANE_PRIVATE/key.hex"', "", 1), "key-file binding", "key-file binding"),
+            (dispatch.replace("300-second reconciliation deadline", "bounded reconciliation", 1), "timed revocation",
+             "timed reconciliation deadline"),
+            (dispatch.replace("watcher follows only the ledger-bound run", "watcher follows the run", 1), "run binding",
+             "ledger-bound watcher"),
+        ):
+            mutations.append((self.text[:dispatch_start] + changed_dispatch + self.text[dispatch_end:], label, expected_error))
+        mutations.append((self.text.replace("DEVLANE_DECRYPT_KEY", "UNBOUND_DECRYPT_KEY"), "environment secret",
+                          "environment secret binding"))
+        changed_recovery = recovery.replace("recover-pending-secrets", "recover-secrets", 1).replace(
+            "blocks `reserve-wave` until recovery completes", "permits reservation", 1)
+        mutations.append((self.text[:recovery_start] + changed_recovery + self.text[recovery_end:],
+                          "recovery command and gate", "pending-secret recovery command"))
+        for changed, label, expected_error in mutations:
+            with self.subTest(missing=label):
+                self.assertIn(expected_error, self._integrated_contract_errors(changed))
 
     def test_the_synthetic_workflow_names_match_the_coordinator_environment(self):
         encrypted = (self.root / ".github/workflows/devlane-encrypted.yml").read_text(encoding="utf-8")
+        synthetic = (self.root / ".github/workflows/devlane-synthetic.yml").read_text(encoding="utf-8")
         self.assertIn("environment: " + coordinator.DECRYPT_ENVIRONMENT, encrypted)
         self.assertIn(coordinator.SECRET_NAME, encrypted)
         self.assertIn(coordinator.DECRYPT_STEP, encrypted)
+        rust_version = json.loads((self.root / "ci/devlane-profiles.json").read_text(encoding="utf-8"))[
+            "profiles"]["core-rust"]["rust_matrix"]["toolchain"]
+        self.assertEqual(rehearsal.fixtures.RUST_VERSION, rust_version)
+        self.assertIn("rustup toolchain install " + rust_version + " --profile minimal", synthetic)
 
 
 def bundle_request_digest(owner):
