@@ -176,6 +176,46 @@ class PreparationTests(unittest.TestCase):
                 smoke.main(args)
             execute.assert_not_called()
 
+    def test_public_smoke_reports_bounded_filesystem_phase_and_preserves_primary_error(self):
+        args = ["--cargo-path", "unused", "--rustc-path", "unused", "--control-sha", CONTROL_SHA,
+                "--deadline-file", "unused", "--owner-uid", "1001", "--owner-gid", "1001"]
+        with tempfile.TemporaryDirectory() as temporary:
+            def fail_after_phase(*_args):
+                smoke.set_smoke_phase("smoke-projection-envelope")
+                raise OSError(errno.EACCES, "private-path-canary", "private-path-canary")
+
+            with patch.object(smoke.sys, "platform", "linux"), \
+                    patch.object(smoke.os, "geteuid", return_value=0), \
+                    patch.object(smoke.deadline, "remaining"), \
+                    patch.object(smoke.tempfile, "mkdtemp", return_value=temporary), \
+                    patch.object(smoke, "smoke", side_effect=fail_after_phase), \
+                    patch.object(smoke.os.path, "ismount", return_value=False), \
+                    patch.object(smoke.shutil, "rmtree", side_effect=OSError(errno.EIO, "cleanup-path-canary")):
+                with self.assertRaises(OSError) as result:
+                    smoke.main(args)
+            diagnostic = smoke.failure_diagnostic(result.exception)
+            self.assertEqual(diagnostic,
+                             "unexpected-filesystem-smoke-projection-envelope-errno-13-cleanup-unconfirmed")
+            self.assertNotIn("private-path-canary", diagnostic)
+            self.assertNotIn("cleanup-path-canary", diagnostic)
+
+    def test_public_smoke_cleanup_failure_cannot_report_success(self):
+        args = ["--cargo-path", "unused", "--rustc-path", "unused", "--control-sha", CONTROL_SHA,
+                "--deadline-file", "unused", "--owner-uid", "1001", "--owner-gid", "1001"]
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(smoke.sys, "platform", "linux"), \
+                    patch.object(smoke.os, "geteuid", return_value=0), \
+                    patch.object(smoke.deadline, "remaining"), \
+                    patch.object(smoke.tempfile, "mkdtemp", return_value=temporary), \
+                    patch.object(smoke, "smoke"), \
+                    patch.object(smoke.os.path, "ismount", return_value=False), \
+                    patch.object(smoke.shutil, "rmtree", side_effect=OSError(errno.EIO, "cleanup-path-canary")):
+                with self.assertRaises(bundle.Refusal) as result:
+                    smoke.main(args)
+            diagnostic = smoke.failure_diagnostic(result.exception)
+            self.assertEqual(diagnostic, "rust-preparation-smoke-cleanup-cleanup-unconfirmed")
+            self.assertNotIn("cleanup-path-canary", diagnostic)
+
     def test_smoke_preserves_the_preparation_child_file_limit_without_privileged_raise(self):
         def child(*_args, **kwargs):
             kwargs["preexec_fn"]()
