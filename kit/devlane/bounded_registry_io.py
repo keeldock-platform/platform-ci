@@ -1,6 +1,7 @@
 """Streaming byte, deadline and crate-archive limits for the offline resolver."""
 from __future__ import annotations
 
+import errno
 import hashlib
 import gzip
 import os
@@ -127,8 +128,13 @@ def run_bounded_process(argv: list[str], budget: PhaseBudget, *, cwd: str | Path
             stderr=subprocess.DEVNULL if stderr is None else subprocess.PIPE,
             close_fds=True, start_new_session=True,
         )
-    except OSError:
-        _fail("process-start")
+    except OSError as error:
+        category = {
+            errno.EACCES: "permission", errno.ENOENT: "missing-file",
+            errno.EAGAIN: "process-limit", errno.ENOMEM: "memory",
+            errno.EPERM: "policy", errno.ENOEXEC: "format", errno.ETXTBSY: "busy",
+        }.get(error.errno, "os")
+        _fail("process-start-" + category)
     total = 0
     selector = selectors.DefaultSelector()
     streams = []

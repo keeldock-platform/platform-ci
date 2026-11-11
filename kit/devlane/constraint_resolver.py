@@ -1173,6 +1173,9 @@ def run_cargo_fixed_point(envelope: dict[str, Any], *, expected_source_sha: str,
         except bounded_registry_io.Refusal as error:
             reason = error.args[0] if error.args and error.args[0] in {
                 "phase-deadline", "cleanup-deadline", "process-output-limit", "process-start", "cancelled",
+                "process-start-permission", "process-start-missing-file", "process-start-process-limit",
+                "process-start-memory", "process-start-policy", "process-start-format",
+                "process-start-busy", "process-start-os",
             } else "process"
             _fail("resolver-" + Path(executable).name + "-version-" + reason)
         except OSError:

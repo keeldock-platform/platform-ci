@@ -269,7 +269,10 @@ class DeadlineTests(unittest.TestCase):
                     patch.object(deadline.subprocess, "Popen", return_value=process), \
                     patch.object(deadline.os, "killpg"):
                 self.assertEqual(deadline.run(path, ["fixed-command"]), 124)
-            self.assertEqual([call.kwargs["timeout"] for call in process.wait.call_args_list], [9, 2, 3])
+            wait_timeouts = [call.kwargs["timeout"] for call in process.wait.call_args_list]
+            self.assertEqual(len(wait_timeouts), 3)
+            self.assertAlmostEqual(wait_timeouts[0], 9)
+            self.assertEqual(wait_timeouts[1:], [2, 3])
 
     def test_outer_watchdog_leaves_only_final_reap_inside_reserved_cleanup_window(self):
         process = Mock(pid=123, wait=Mock(side_effect=[

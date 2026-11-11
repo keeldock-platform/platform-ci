@@ -1,4 +1,5 @@
 """Source-free regressions for pre-cut registry preparation."""
+import errno
 import os
 from pathlib import Path
 import tempfile
@@ -7,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import bundle
+import bounded_registry_io
 import constraint_resolver
 import project
 import rust_preparation_v2 as worker
@@ -18,6 +20,26 @@ CONTROL_SHA = acceptance.CONTROL_SHA
 
 
 class PreparationTests(unittest.TestCase):
+    def test_process_start_errors_report_only_fixed_categories(self):
+        categories = {
+            errno.EACCES: "permission", errno.ENOENT: "missing-file",
+            errno.EAGAIN: "process-limit", errno.ENOMEM: "memory",
+            errno.EPERM: "policy", errno.ENOEXEC: "format", errno.ETXTBSY: "busy",
+            errno.EIO: "os",
+        }
+        for number, category in categories.items():
+            with self.subTest(number=number), patch.object(
+                bounded_registry_io.subprocess, "Popen",
+                side_effect=OSError(number, "private-path-canary"),
+            ):
+                with self.assertRaisesRegex(
+                    bounded_registry_io.Refusal, "^process-start-" + category + "$",
+                ):
+                    bounded_registry_io.run_bounded_process(
+                        ["fixed-command"], bounded_registry_io.PhaseBudget.start(10),
+                        cwd="/", env={},
+                    )
+
     def request(self):
         return acceptance.OfflineProjectionV2AcceptanceTests()._request()
 
