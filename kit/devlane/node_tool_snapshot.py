@@ -314,7 +314,7 @@ def _copy_directory(source_fd, destination_fd, prefix, allowed_uids, deadline_fi
             _refuse("node-snapshot-source-owner")
         if stat.S_ISDIR(observed.st_mode):
             mode = stat.S_IMODE(observed.st_mode)
-            if mode & 0o022 or not mode & stat.S_IRUSR or not mode & stat.S_IXUSR or not mode & stat.S_IROTH or not mode & stat.S_IXOTH:
+            if mode & 0o022 or not mode & stat.S_IRUSR or not mode & stat.S_IXUSR:
                 _refuse("node-snapshot-source-permissions")
             child_source = child_target = None
             try:
@@ -343,7 +343,7 @@ def _copy_directory(source_fd, destination_fd, prefix, allowed_uids, deadline_fi
                 os.close(child_target)
         elif stat.S_ISREG(observed.st_mode):
             mode = stat.S_IMODE(observed.st_mode)
-            if mode & (0o022 | stat.S_ISUID | stat.S_ISGID) or not mode & stat.S_IRUSR or not mode & stat.S_IROTH:
+            if mode & (0o022 | stat.S_ISUID | stat.S_ISGID) or not mode & stat.S_IRUSR:
                 _refuse("node-snapshot-source-permissions")
             source_file = target_file = None
             digest = hashlib.sha256()

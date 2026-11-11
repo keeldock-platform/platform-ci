@@ -92,7 +92,23 @@ def _node_refuse(code):
     raise bundle.Refusal(code)
 
 
-def _node_directory(path, owner_uids, *, worker_access=False):
+_NODE_DIRECTORY_WRITE_CODES = {
+    "source-anchor": "node-toolchain-source-anchor-write-mode",
+    "source-cache-root": "node-toolchain-source-cache-root-write-mode",
+    "source-node-layout": "node-toolchain-source-node-layout-write-mode",
+    "source-npm-layout": "node-toolchain-source-npm-layout-write-mode",
+    "source-npm-tree": "node-toolchain-source-npm-tree-write-mode",
+}
+_NODE_FILE_WRITE_CODES = {
+    "source-node-file": "node-toolchain-source-node-file-write-mode",
+    "source-npm-file": "node-toolchain-source-npm-file-write-mode",
+}
+
+
+def _node_directory(path, owner_uids, *, role):
+    write_code = _NODE_DIRECTORY_WRITE_CODES.get(role)
+    if write_code is None:
+        _node_refuse("node-tool-layout")
     try:
         metadata = os.lstat(path)
     except OSError:
@@ -103,14 +119,15 @@ def _node_directory(path, owner_uids, *, worker_access=False):
         _node_refuse("node-toolchain-owner")
     mode = stat.S_IMODE(metadata.st_mode)
     if mode & 0o022:
-        _node_refuse("node-toolchain-directory-write-mode")
+        _node_refuse(write_code)
     if not mode & stat.S_IRUSR or not mode & stat.S_IXUSR:
         _node_refuse("node-toolchain-directory-control-access")
-    if worker_access and (not mode & stat.S_IROTH or not mode & stat.S_IXOTH):
-        _node_refuse("node-toolchain-directory-worker-access")
 
 
-def _node_regular_file(path, owner_uids, *, executable):
+def _node_regular_file(path, owner_uids, *, executable, role):
+    write_code = _NODE_FILE_WRITE_CODES.get(role)
+    if write_code is None:
+        _node_refuse("node-tool-layout")
     try:
         metadata = os.lstat(path)
     except OSError:
@@ -121,13 +138,11 @@ def _node_regular_file(path, owner_uids, *, executable):
         _node_refuse("node-toolchain-owner")
     mode = stat.S_IMODE(metadata.st_mode)
     if mode & (0o022 | stat.S_ISUID | stat.S_ISGID):
-        _node_refuse("node-toolchain-file-write-mode")
+        _node_refuse(write_code)
     if not mode & stat.S_IRUSR:
         _node_refuse("node-toolchain-file-control-access")
-    if executable and (not mode & stat.S_IXUSR or not mode & stat.S_IXOTH):
+    if executable and not mode & stat.S_IXUSR:
         _node_refuse("node-toolchain-executable")
-    if not executable and not mode & stat.S_IROTH:
-        _node_refuse("node-toolchain-file-worker-access")
 
 
 def _validate_npm_tree(root, owner_uids, deadline_file=None):
@@ -163,10 +178,10 @@ def _validate_npm_tree(root, owner_uids, deadline_file=None):
                     except OSError:
                         _node_refuse("node-toolchain-missing")
                     if stat.S_ISDIR(metadata.st_mode):
-                        _node_directory(path, owner_uids, worker_access=True)
+                        _node_directory(path, owner_uids, role="source-npm-tree")
                         pending.append(path)
                     elif stat.S_ISREG(metadata.st_mode):
-                        _node_regular_file(path, owner_uids, executable=False)
+                        _node_regular_file(path, owner_uids, executable=False, role="source-npm-file")
                     elif stat.S_ISLNK(metadata.st_mode):
                         if metadata.st_uid not in owner_uids:
                             _node_refuse("node-toolchain-owner")
@@ -191,7 +206,7 @@ def _validate_npm_tree(root, owner_uids, deadline_file=None):
 
 def validate_node_toolchain(paths, owner_uid, *, tool_cache_root=None, node_root=None, system_anchors=None,
                             deadline_file=None):
-    """Bind Node/npm to a pinned tree owned only by root or the invoking control runner."""
+    """Validate the trusted source tree; worker access is enforced on its sealed snapshot."""
     cache_root = Path(tool_cache_root) if tool_cache_root is not None else NODE_TOOL_CACHE_ROOT
     root = Path(node_root) if node_root is not None else NODE_TOOL_ROOT
     anchors = tuple(system_anchors) if system_anchors is not None else NODE_TOOL_SYSTEM_ANCHORS
@@ -207,27 +222,30 @@ def validate_node_toolchain(paths, owner_uid, *, tool_cache_root=None, node_root
         anchor = Path(anchor)
         if index and anchor.parent != Path(anchors[index - 1][0]):
             _node_refuse("node-tool-layout")
-        _node_directory(anchor, frozenset((anchor_uid,)))
+        _node_directory(anchor, frozenset((anchor_uid,)), role="source-anchor")
     if cache_root.parent != Path(anchors[-1][0]):
         _node_refuse("node-tool-layout")
-    _node_directory(cache_root, owner_uids)
+    _node_directory(cache_root, owner_uids, role="source-cache-root")
 
     relative_directories = (
-        Path("node"), Path("node") / NODE_VERSION, Path("node") / NODE_VERSION / "x64",
-        Path("node") / NODE_VERSION / "x64/bin", Path("node") / NODE_VERSION / "x64/lib",
-        Path("node") / NODE_VERSION / "x64/lib/node_modules",
-        Path("node") / NODE_VERSION / "x64/lib/node_modules/npm",
-        Path("node") / NODE_VERSION / "x64/lib/node_modules/npm/bin",
+        (Path("node"), "source-node-layout"),
+        (Path("node") / NODE_VERSION, "source-node-layout"),
+        (Path("node") / NODE_VERSION / "x64", "source-node-layout"),
+        (Path("node") / NODE_VERSION / "x64/bin", "source-node-layout"),
+        (Path("node") / NODE_VERSION / "x64/lib", "source-node-layout"),
+        (Path("node") / NODE_VERSION / "x64/lib/node_modules", "source-node-layout"),
+        (Path("node") / NODE_VERSION / "x64/lib/node_modules/npm", "source-npm-layout"),
+        (Path("node") / NODE_VERSION / "x64/lib/node_modules/npm/bin", "source-npm-layout"),
     )
-    for relative in relative_directories:
-        _node_directory(cache_root / relative, owner_uids, worker_access=True)
+    for relative, role in relative_directories:
+        _node_directory(cache_root / relative, owner_uids, role=role)
 
     node = root / "bin/node"
     npm_launcher = root / "bin/npm"
     npm_cli = root / "lib/node_modules/npm/bin/npm-cli.js"
     if paths.get("node") != str(node) or paths.get("npm") != str(npm_launcher):
         _node_refuse("node-tool-layout")
-    _node_regular_file(node, owner_uids, executable=True)
+    _node_regular_file(node, owner_uids, executable=True, role="source-node-file")
     try:
         launcher_metadata = os.lstat(npm_launcher)
         launcher_target = os.readlink(npm_launcher)
@@ -238,7 +256,7 @@ def validate_node_toolchain(paths, owner_uid, *, tool_cache_root=None, node_root
         _node_refuse("node-tool-layout")
     if launcher_metadata.st_uid not in owner_uids:
         _node_refuse("node-toolchain-owner")
-    _node_regular_file(npm_cli, owner_uids, executable=False)
+    _node_regular_file(npm_cli, owner_uids, executable=False, role="source-npm-file")
     _validate_npm_tree(root / "lib/node_modules/npm", owner_uids, deadline_file=deadline_file)
     return {"node": str(node), "npm": str(npm_launcher), "npm_cli": str(npm_cli), "root": str(root)}
 

@@ -1463,7 +1463,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                     snapshot_id, str(deadline_path), snapshot_base=snapshot_base, owner_uid=os.getuid(),
                 )
 
-    def test_readonly_node_snapshot_validates_versions_and_mount_source_end_to_end(self):
+    def test_control_only_node_source_normalizes_snapshot_before_versions_and_mount(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
             root = Path(temporary).resolve()
             fixture = self._write_node_toolchain_fixture(root / "node-fixture")
@@ -1474,11 +1474,12 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 if member.is_symlink():
                     continue
                 if member.is_dir():
-                    member.chmod(0o555)
+                    member.chmod(0o700)
                 else:
-                    current_mode = stat.S_IMODE(member.stat().st_mode)
-                    member.chmod(0o555 if current_mode & 0o111 else 0o444)
-            fixture["node_root"].chmod(0o555)
+                    member.chmod(0o700 if member in (fixture["node"], fixture["npm_cli"]) else 0o600)
+            fixture["node_root"].chmod(0o700)
+            fixture["anchor"].chmod(0o750)
+            fixture["cache"].chmod(0o750)
 
             sealed_cache = root / "sealed-tool-cache"
             snapshot_base = sealed_cache / "node" / "24.22.1"
@@ -1520,11 +1521,6 @@ class RustMatrixRunnerTests(unittest.TestCase):
                     validated = node_tool_snapshot.validate_snapshot(
                         snapshot_id, str(deadline_path), snapshot_base=snapshot_base, owner_uid=os.getuid(),
                     )
-                    snapshot_validation = supervisor.node_tool_prepare.validate_node_toolchain(
-                        {"node": validated["node"], "npm": validated["npm"]}, os.getuid(),
-                        tool_cache_root=sealed_cache, node_root=Path(validated["root"]),
-                        system_anchors=((root, os.getuid()),), deadline_file=str(deadline_path),
-                    )
                     prepared_results = supervisor.node_tool_prepare.run_node_versions(
                         validated, supervisor.node_tool_prepare._prepare_node_version_process,
                     )
@@ -1546,8 +1542,17 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 npm_cli = snapshot_root / "lib/node_modules/npm/bin/npm-cli.js"
                 npm_shared = snapshot_root / "lib/node_modules/npm/node_modules/shared.js"
                 npm_link = snapshot_root / "bin/npm"
+                self.assertEqual((stat.S_IMODE(fixture["anchor"].stat().st_mode),
+                                  stat.S_IMODE(fixture["cache"].stat().st_mode),
+                                  stat.S_IMODE(fixture["node_root"].stat().st_mode),
+                                  stat.S_IMODE(fixture["npm_root"].stat().st_mode),
+                                  stat.S_IMODE((fixture["npm_root"] / "node_modules").stat().st_mode),
+                                  stat.S_IMODE(fixture["node"].stat().st_mode),
+                                  stat.S_IMODE(fixture["npm_cli"].stat().st_mode),
+                                  stat.S_IMODE((fixture["npm_root"] / "node_modules/shared.js").stat().st_mode)),
+                                 (0o750, 0o750, 0o700, 0o700, 0o700, 0o700, 0o700, 0o600))
                 self.assertEqual(source_validation["root"], str(fixture["node_root"]))
-                self.assertEqual(snapshot_validation["root"], str(snapshot_root))
+                self.assertEqual(validated["root"], str(snapshot_root))
                 self.assertEqual((stat.S_IMODE(snapshot_root.stat().st_mode),
                                   stat.S_IMODE(node.stat().st_mode),
                                   stat.S_IMODE(npm_cli.stat().st_mode),
@@ -2273,10 +2278,13 @@ class RustMatrixRunnerTests(unittest.TestCase):
 
     def test_node_toolchain_rejects_untrusted_owners_permissions_and_layouts_before_execution(self):
         cases = (
-            ("world-writable-cache", "node-toolchain-directory-write-mode"),
-            ("world-writable-bin", "node-toolchain-directory-write-mode"),
-            ("world-writable-node", "node-toolchain-file-write-mode"),
-            ("world-writable-npm-parent", "node-toolchain-directory-write-mode"),
+            ("world-writable-cache", "node-toolchain-source-cache-root-write-mode"),
+            ("world-writable-bin", "node-toolchain-source-node-layout-write-mode"),
+            ("world-writable-node", "node-toolchain-source-node-file-write-mode"),
+            ("world-writable-npm-parent", "node-toolchain-source-npm-layout-write-mode"),
+            ("group-writable-anchor", "node-toolchain-source-anchor-write-mode"),
+            ("group-writable-npm-subtree", "node-toolchain-source-npm-tree-write-mode"),
+            ("group-writable-npm-file", "node-toolchain-source-npm-file-write-mode"),
             ("bad-owner-cache", "node-toolchain-owner"),
             ("bad-owner-bin", "node-toolchain-owner"),
             ("bad-owner-node", "node-toolchain-owner"),
@@ -2288,16 +2296,13 @@ class RustMatrixRunnerTests(unittest.TestCase):
             ("owner-inaccessible-node", "node-toolchain-file-control-access"),
             ("owner-inaccessible-npm-directory", "node-toolchain-directory-control-access"),
             ("non-executable-node", "node-toolchain-executable"),
-            ("owner-only-node", "node-toolchain-executable"),
-            ("owner-only-npm-cli", "node-toolchain-file-worker-access"),
-            ("owner-only-npm-dependency-dir", "node-toolchain-directory-worker-access"),
             ("symlinked-node", "node-tool-layout"),
             ("alternate-node-name", "node-tool-layout"),
             ("npm-escape-link", "node-tool-layout"),
             ("npm-nested-escape-link", "node-tool-layout"),
-            ("world-writable-npm-dependency-dir", "node-toolchain-directory-write-mode"),
-            ("world-writable-npm-dependency-file", "node-toolchain-file-write-mode"),
-            ("npm-cli-writable", "node-toolchain-file-write-mode"),
+            ("world-writable-npm-dependency-dir", "node-toolchain-source-npm-tree-write-mode"),
+            ("world-writable-npm-dependency-file", "node-toolchain-source-npm-file-write-mode"),
+            ("npm-cli-writable", "node-toolchain-source-npm-file-write-mode"),
         )
         for label, expected_code in cases:
             with self.subTest(case=label), tempfile.TemporaryDirectory() as temporary:
@@ -2308,6 +2313,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 snapshot_base = root / "snapshot-base"
                 paths = dict(fixture["paths"])
                 owner_target = None
+                foreign_group_target = None
                 if label == "world-writable-cache":
                     fixture["cache"].chmod(0o777)
                 elif label == "world-writable-bin":
@@ -2316,6 +2322,15 @@ class RustMatrixRunnerTests(unittest.TestCase):
                     fixture["node"].chmod(0o777)
                 elif label == "world-writable-npm-parent":
                     (fixture["node_root"] / "lib/node_modules/npm/bin").chmod(0o777)
+                elif label == "group-writable-anchor":
+                    fixture["anchor"].chmod(0o775)
+                    foreign_group_target = fixture["anchor"]
+                elif label == "group-writable-npm-subtree":
+                    (fixture["npm_root"] / "node_modules").chmod(0o775)
+                    foreign_group_target = fixture["npm_root"] / "node_modules"
+                elif label == "group-writable-npm-file":
+                    (fixture["npm_root"] / "node_modules/shared.js").chmod(0o664)
+                    foreign_group_target = fixture["npm_root"] / "node_modules/shared.js"
                 elif label == "bad-owner-cache":
                     owner_target = fixture["cache"]
                 elif label == "bad-owner-bin":
@@ -2338,12 +2353,6 @@ class RustMatrixRunnerTests(unittest.TestCase):
                     (fixture["npm_root"] / "node_modules").chmod(0o300)
                 elif label == "non-executable-node":
                     fixture["node"].chmod(0o644)
-                elif label == "owner-only-node":
-                    fixture["node"].chmod(0o700)
-                elif label == "owner-only-npm-cli":
-                    fixture["npm_cli"].chmod(0o600)
-                elif label == "owner-only-npm-dependency-dir":
-                    (fixture["npm_root"] / "node_modules").chmod(0o700)
                 elif label == "symlinked-node":
                     real_node = fixture["node_root"] / "bin/node-real"
                     fixture["node"].rename(real_node)
@@ -2376,7 +2385,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                     fixture["npm_cli"].chmod(0o666)
 
                 with self._node_fixture_policy(fixture):
-                    if owner_target is None:
+                    if owner_target is None and foreign_group_target is None:
                         with patch.object(supervisor.subprocess, "run",
                                           side_effect=AssertionError("version command ran before trust refusal")):
                             with self.assertRaises(supervisor.bundle.Refusal) as caught:
@@ -2389,14 +2398,20 @@ class RustMatrixRunnerTests(unittest.TestCase):
                     else:
                         original_lstat = os.lstat
 
-                        def lstat_with_untrusted_owner(path, *args, **kwargs):
+                        def lstat_with_untrusted_metadata(path, *args, **kwargs):
                             metadata = original_lstat(path, *args, **kwargs)
+                            values = {"st_mode": metadata.st_mode, "st_uid": metadata.st_uid,
+                                      "st_gid": metadata.st_gid}
                             if Path(path) == owner_target:
-                                return SimpleNamespace(st_mode=metadata.st_mode, st_uid=os.getuid() + 1)
+                                values["st_uid"] = os.getuid() + 1
+                            if Path(path) == foreign_group_target:
+                                values["st_gid"] = os.getgid() + 1
+                            if values["st_uid"] != metadata.st_uid or values["st_gid"] != metadata.st_gid:
+                                return SimpleNamespace(**values)
                             return metadata
 
                         with patch.object(supervisor.node_tool_prepare.os, "lstat",
-                                          side_effect=lstat_with_untrusted_owner), \
+                                          side_effect=lstat_with_untrusted_metadata), \
                                 patch.object(supervisor.subprocess, "run",
                                              side_effect=AssertionError("version command ran before owner refusal")):
                             with self.assertRaises(supervisor.bundle.Refusal) as caught:
