@@ -15,6 +15,7 @@ import bundle
 import constraint_resolver
 import deadline
 import project
+import rust_preparation_v2
 
 
 def run(argv, root, stage, deadline_file, environment):
@@ -37,7 +38,9 @@ def run(argv, root, stage, deadline_file, environment):
             child.wait(timeout=min(5, deadline.cleanup_remaining(deadline_file)))
             raise bundle.Refusal("rust-preparation-smoke-timeout")
     if result != 0 or log.stat().st_size > 4 * 1024 * 1024:
-        raise bundle.Refusal("rust-preparation-smoke-" + stage)
+        with log.open("rb") as source:
+            code = rust_preparation_v2.diagnostic_code(source.read(1024 * 1024 + 1))
+        raise bundle.Refusal("rust-preparation-smoke-" + stage + ("-" + code if code else ""))
 
 
 def smoke(args, root):
@@ -134,6 +137,7 @@ if __name__ == "__main__":
     except bundle.Refusal as error:
         print("rust_preparation_v2_public_smoke=refused code=" + str(error))
         raise SystemExit(2)
-    except Exception:
-        print("rust_preparation_v2_public_smoke=refused code=unexpected")
+    except Exception as error:
+        print("rust_preparation_v2_public_smoke=refused code=unexpected-" +
+              rust_preparation_v2.failure_code(error))
         raise SystemExit(2)

@@ -22,6 +22,7 @@ import fetch
 import deadline as deadline_budget
 import diagnostic_contract
 import node_vendor_source
+import rust_preparation_v2
 import node_tool_snapshot
 import owned_tree_cleanup
 
@@ -603,9 +604,19 @@ def _run_rust_v2_worker(root, projection, output_root, owner_uid, owner_gid):
                "/usr/bin/python3", "-B", "-I", "/control/devlane/rust_preparation_v2.py",
                "--control-sha", projection["manifest_constraints"]["candidate"]["control_sha"]]
     _set_preparation_stage("prepare-cargo-vendor")
-    run(command, timeout=3600, log=work / "prepare-rust-v2.log", cwd="/",
-        environment={"PATH": "/tools/rust/bin:/usr/bin:/bin", "HOME": "/devlane-home",
-                     "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1"})
+    try:
+        run(command, timeout=3600, log=work / "prepare-rust-v2.log", cwd="/",
+            environment={"PATH": "/tools/rust/bin:/usr/bin:/bin", "HOME": "/devlane-home",
+                         "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1"})
+    except bundle.Refusal:
+        try:
+            code = rust_preparation_v2.diagnostic_code(
+                rust_preparation_v2.read_input(work / "prepare-rust-v2.log"))
+        except (OSError, bundle.Refusal):
+            code = None
+        if code is not None:
+            print("rust_preparation_worker_refusal=code=" + code)
+        raise
     _publish_prepared_output(work / "prepared", output_root, owner_uid, owner_gid)
 
 

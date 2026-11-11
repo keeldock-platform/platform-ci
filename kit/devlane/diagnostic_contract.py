@@ -93,6 +93,7 @@ PREPARATION_PARENT_CATEGORIES = frozenset((
 ))
 
 ACCEPTANCE_FAILURE_STAGES = frozenset((
+    "rust-v2-preparation-tests", "rust-v2-lock-tests", "rust-v2-source-tests", "rust-v2-public-runtime",
     "crypto-dependency-probe", "acceptance-unit-tests", "coordinator-contract-tests",
     "rust-matrix-runner-tests", "rust-report-tests", "node-adapter-tests", "audit-contract-tests",
     "rehearsal-tests", "production-path-e2e",

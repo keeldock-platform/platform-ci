@@ -97,6 +97,23 @@ class PreparationTests(unittest.TestCase):
             self.assertIn((smoke.resource.RLIMIT_FSIZE, (4 * 1024 * 1024, 256 * 1024 * 1024)),
                           [call.args for call in limits.call_args_list])
 
+    def test_worker_failure_reports_codes_without_raw_exception_values(self):
+        self.assertEqual(worker.failure_code(worker.constraint_resolver.Refusal("resolver-toolchain-file")),
+                         "resolver-toolchain-file")
+        self.assertEqual(worker.failure_code(ValueError("private-canary")), "unexpected-value")
+        self.assertEqual(worker.failure_code(bundle.Refusal("private-canary\nsecond-line")), "unclassified")
+
+    def test_diagnostics_prefer_worker_refusal_over_generic_parent_failure(self):
+        payload = (b"rust_preparation_worker_refusal=code=resolver-toolchain-file\n"
+                   b"dependency_preparation_refusal=stage=prepare-cargo-vendor code=preparation-tool-failed cleanup=confirmed\n")
+        self.assertEqual(worker.diagnostic_code(payload), "resolver-toolchain-file")
+        for invalid in (b"rust_preparation_worker_refusal=code=bad value\n", b"x" * (1024 * 1024 + 1),
+                        b"\x1b[31mrust_preparation_worker_refusal=code=bad\n"):
+            self.assertIsNone(worker.diagnostic_code(invalid))
+        self.assertEqual(worker.diagnostic_code(
+            b"dependency_preparation_exception=stage=prepare-root-mounts class=subprocess-error cleanup=confirmed\n"),
+            "exception-prepare-root-mounts-subprocess-error")
+
 
 if __name__ == "__main__":
     unittest.main()

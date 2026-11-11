@@ -214,6 +214,9 @@ jobs:
             local stage="$1"; shift
             local out="$RUNNER_TEMP/devlane-acceptance.log"
             if "$@" >"$out" 2>&1; then rm -f -- "$out"; return 0; fi
+            if [[ "$stage" == "rust-v2-public-runtime" ]]; then
+              LC_ALL=C grep -aE '^rust_preparation_v2_public_smoke=refused code=[a-z][a-z0-9-]{0,199}$' "$out" | head -n 1 || true
+            fi
             rm -f -- "$out"
             if [[ "$stage" == "production-path-e2e" ]]; then
               local report="$RUNNER_TEMP/devlane-acceptance-diagnostic-output"

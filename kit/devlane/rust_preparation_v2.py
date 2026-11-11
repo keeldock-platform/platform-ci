@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 
@@ -20,6 +21,38 @@ CONFIG = ('[source.crates-io]\nreplace-with = "prepared-registry"\n'
           '[source.prepared-registry]\nlocal-registry = "/prepared/cargo-local-registry"\n'
           '[net]\noffline = true\nretry = 0\n')
 MAX_INPUT = 4 * 1024 * 1024
+
+
+def failure_code(error):
+    known = (bundle.Refusal, constraint_resolver.Refusal,
+             bounded_registry_io.Refusal, deadline.DeadlineRefusal)
+    if type(error) in known and len(error.args) == 1:
+        code = error.args[0]
+        if type(code) is str and re.fullmatch(r"[a-z][a-z0-9-]{0,79}", code):
+            return code
+    categories = {TypeError: "unexpected-type", PermissionError: "file-permission",
+                  FileNotFoundError: "file-missing", ImportError: "runtime-import",
+                  OSError: "filesystem", ValueError: "unexpected-value"}
+    return categories.get(type(error), "unclassified")
+
+
+def diagnostic_code(payload):
+    if type(payload) is not bytes or len(payload) > 1024 * 1024:
+        return None
+    fallback = None
+    for line in payload.splitlines():
+        match = re.fullmatch(rb"rust_preparation_worker_refusal=code=([a-z][a-z0-9-]{0,79})", line)
+        if match:
+            return match[1].decode("ascii")
+        match = re.fullmatch(
+            rb"dependency_preparation_refusal=stage=[a-z][a-z0-9-]{0,79} code=([a-z][a-z0-9-]{0,79}) cleanup=(?:confirmed|unconfirmed|not-needed)", line)
+        if match:
+            fallback = match[1].decode("ascii")
+        match = re.fullmatch(
+            rb"dependency_preparation_exception=stage=([a-z][a-z0-9-]{0,47}) class=([a-z][a-z0-9-]{0,47}) cleanup=(?:confirmed|unconfirmed|not-needed)", line)
+        if match:
+            fallback = "exception-" + match[1].decode("ascii") + "-" + match[2].decode("ascii")
+    return fallback
 
 
 def read_input(path):
@@ -97,6 +130,6 @@ def main(argv=None):
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except Exception:
-
+    except Exception as error:
+        print("rust_preparation_worker_refusal=code=" + failure_code(error))
         raise SystemExit(2)
