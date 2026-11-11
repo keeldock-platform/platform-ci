@@ -15,6 +15,8 @@ import resource
 import shutil
 import signal
 import socket
+import struct
+from pathlib import PurePosixPath
 import stat
 import subprocess
 import sys
@@ -27,6 +29,9 @@ import bounded_registry_io
 import deadline as deadline_budget
 import fetch
 import rust_lock_generation
+import semver_cargo_wrapper
+import semver_offline_cache
+import temp_project_checkpoints
 import filter as output_filter
 import network_probe
 import prepare as node_tool_prepare
@@ -41,6 +46,11 @@ PID_NAME = "host-pid"
 STARTUP_REFUSAL_NAME = "startup-refusal.json"
 WORKER_UID = 65534
 WORKER_GID = 65534
+SEMVER_TARGET_ROOT = "/scratch/semver-target"
+SEMVER_PROJECT_ROOT = SEMVER_TARGET_ROOT + "/semver-checks"
+SEMVER_CHECKPOINT_REPORT = "semver-checkpoints.json"
+MAX_CGROUP_ROSTER_BYTES = 16 * 1024
+MAX_CGROUP_ROSTER_PIDS = 1024
 PROFILE_FILE = "ci/devlane-profiles.json"
 ACTIVE_CHILDREN = set()
 ACTIVE_CHILDREN_LOCK = threading.Lock()
@@ -50,6 +60,22 @@ MOUNT_TARGETS = []
 ACTIVE_DEADLINE_FILE = ""
 
 REFUSAL_CODES = frozenset((
+    'matrix-semver-checkpoint-cgroup',
+    'matrix-semver-checkpoint-cgroup-not-quiescent',
+    'matrix-semver-checkpoint-command',
+    'matrix-semver-checkpoint-contract',
+    'matrix-semver-checkpoint-incomplete',
+    'matrix-semver-checkpoint-lock-outside-closure',
+    'matrix-semver-checkpoint-missing',
+    'matrix-semver-checkpoint-order',
+    'matrix-semver-checkpoint-peer',
+    'matrix-semver-checkpoint-project-count',
+    'matrix-semver-checkpoint-record-exists',
+    'matrix-semver-checkpoint-record-size',
+    'matrix-semver-checkpoint-record-write',
+    'matrix-semver-checkpoint-request',
+    'matrix-semver-checkpoint-snapshot',
+
     "allowlisted-file-too-large", "allowlisted-file-unavailable", "browser-profile-command",
     "bundle-binding-mismatch", "cargo-lock-binding-missing", "cargo-lock-projection-invalid",
     "offline-lock-generation-failed", "cargo-projection-mismatch", "cargo-vendor-missing", "cargo-workspace-count-mismatch",
@@ -1171,6 +1197,9 @@ class Service:
         self.baseline_staged = False
         self.semver_temporary_project_ready = False
         self.execution_done = False
+        self.semver_active = None
+        self.semver_active_lock = threading.Lock()
+        self.semver_checkpoint_record = None
         self.summary = None
         self.outcomes = []
         self.mounts = []
@@ -1461,10 +1490,6 @@ class Service:
             if self.manifest["schema"] == 2:
                 if not self.baseline_staged:
                     _refuse("execution-order")
-                temporary_project = self.root / "workspace/semver-temporary-project"
-                if (not self.semver_temporary_project_ready or temporary_project.is_symlink()
-                        or not temporary_project.is_dir()):
-                    _refuse("semver-temporary-input-missing")
             if commands != [] or stages != ["format", "deny", "audit", "vet", "unit"]:
                 _refuse("profile-command-set")
             output = self.root / "scratch/reports/rust-matrix.jsonl"
@@ -1572,6 +1597,332 @@ class Service:
         }
         return {"ok": True, "status": status, "summary": base64.b64encode(self.summary).decode("ascii"),
                 "catalogs": catalogs}
+
+    def _semver_proc_bytes(self, pid, name, maximum):
+        if type(pid) is not int or pid <= 1 or name not in {"status", "cmdline", "cgroup"}:
+            _refuse("matrix-semver-checkpoint-peer")
+        descriptor = None
+        try:
+            path = "/proc/%d/%s" % (pid, name)
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                                 | getattr(os, "O_CLOEXEC", 0))
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                _refuse("matrix-semver-checkpoint-peer")
+            data = bytearray()
+            deadline = time.monotonic() + 5.0
+            while True:
+                if time.monotonic() >= deadline:
+                    _refuse("matrix-semver-checkpoint-peer")
+                try:
+                    deadline_budget.remaining(self.deadline_file)
+                except deadline_budget.DeadlineRefusal:
+                    _refuse("matrix-semver-checkpoint-peer")
+                chunk = os.read(descriptor, min(4096, maximum + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > maximum:
+                    _refuse("matrix-semver-checkpoint-peer")
+            after = os.fstat(descriptor)
+            if (after.st_dev != metadata.st_dev or after.st_ino != metadata.st_ino
+                    or after.st_nlink != 1):
+                _refuse("matrix-semver-checkpoint-peer")
+            return bytes(data)
+        except SupervisorRefusal:
+            raise
+        except OSError:
+            _refuse("matrix-semver-checkpoint-peer")
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def _semver_read_cgroup_roster(self, path, maximum=MAX_CGROUP_ROSTER_BYTES):
+        descriptor = None
+        try:
+            path = Path(path)
+            before = path.lstat()
+            if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                    or before.st_size > maximum):
+                _refuse("matrix-semver-checkpoint-cgroup")
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            nonblock = getattr(os, "O_NONBLOCK", 0)
+            if not nofollow or not nonblock:
+                _refuse("matrix-semver-checkpoint-cgroup")
+            descriptor = os.open(str(path), os.O_RDONLY | nofollow | nonblock
+                                 | getattr(os, "O_CLOEXEC", 0))
+            opened = os.fstat(descriptor)
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                    or opened.st_dev != before.st_dev or opened.st_ino != before.st_ino
+                    or opened.st_size != before.st_size or opened.st_size > maximum):
+                _refuse("matrix-semver-checkpoint-cgroup")
+            deadline = time.monotonic() + 5.0
+            data = bytearray()
+            while True:
+                if time.monotonic() >= deadline:
+                    _refuse("matrix-semver-checkpoint-cgroup")
+                try:
+                    deadline_budget.remaining(self.deadline_file)
+                except deadline_budget.DeadlineRefusal:
+                    _refuse("matrix-semver-checkpoint-cgroup")
+                chunk = os.read(descriptor, min(4096, maximum + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > maximum:
+                    _refuse("matrix-semver-checkpoint-cgroup")
+            after = os.fstat(descriptor)
+            after_path = path.lstat()
+            if (not stat.S_ISREG(after_path.st_mode) or after_path.st_nlink != 1
+                    or after.st_dev != opened.st_dev or after.st_ino != opened.st_ino
+                    or after.st_nlink != 1 or after.st_mtime_ns != opened.st_mtime_ns
+                    or after.st_ctime_ns != opened.st_ctime_ns
+                    or after_path.st_dev != opened.st_dev or after_path.st_ino != opened.st_ino):
+                _refuse("matrix-semver-checkpoint-cgroup")
+            text = bytes(data).decode("ascii", "strict")
+            if not text.endswith("\n"):
+                _refuse("matrix-semver-checkpoint-cgroup")
+            rows = text[:-1].split("\n")
+            if not rows or len(rows) > MAX_CGROUP_ROSTER_PIDS:
+                _refuse("matrix-semver-checkpoint-cgroup")
+            pids = []
+            for row in rows:
+                if re.fullmatch(r"[1-9][0-9]{0,9}", row) is None:
+                    _refuse("matrix-semver-checkpoint-cgroup")
+                pid = int(row)
+                if pid > 2 ** 31 - 1:
+                    _refuse("matrix-semver-checkpoint-cgroup")
+                pids.append(pid)
+            if len(set(pids)) != len(pids):
+                _refuse("matrix-semver-checkpoint-cgroup")
+            return frozenset(pids)
+        except SupervisorRefusal:
+            raise
+        except (OSError, UnicodeError, ValueError, OverflowError):
+            _refuse("matrix-semver-checkpoint-cgroup")
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def _semver_checkpoint_peer(self, peer_pid, request, active):
+            status = self._semver_proc_bytes(peer_pid, "status", 64 * 1024).decode("ascii", "strict")
+            parent = None
+            effective_uid = None
+            for line in status.splitlines()[:64]:
+                if line.startswith("PPid:"):
+                    value = line[5:].strip()
+                    parent = int(value) if value.isascii() and value.isdecimal() else None
+                elif line.startswith("Uid:"):
+                    fields = line[4:].split()
+                    if len(fields) >= 2 and fields[1].isascii() and fields[1].isdecimal():
+                        effective_uid = int(fields[1])
+            if parent != active["pid"] or effective_uid != WORKER_UID:
+                _refuse("matrix-semver-checkpoint-peer")
+            arguments = self._semver_proc_bytes(peer_pid, "cmdline", 16 * 1024).split(b"\x00")
+            if arguments and arguments[-1] == b"":
+                arguments.pop()
+            try:
+                words = [item.decode("utf-8", "strict") for item in arguments]
+            except UnicodeDecodeError:
+                _refuse("matrix-semver-checkpoint-peer")
+            if (len(words) < 7 or words[1:5] != [
+                    "-B", "-I", "-S", "/control/devlane/semver_cargo_wrapper.py"]):
+                _refuse("matrix-semver-checkpoint-peer")
+            cargo_arguments = words[5:]
+            try:
+                parsed = semver_cargo_wrapper._parse_cargo_arguments(cargo_arguments)
+            except semver_cargo_wrapper.WrapperRefusal:
+                _refuse("matrix-semver-checkpoint-command")
+            if (parsed["operation"] != request["operation"]
+                    or parsed["manifest"] != request["manifest"]
+                    or parsed["project_kind"] not in {"local", "registry"}):
+                _refuse("matrix-semver-checkpoint-command")
+            allowed_events = {
+                "local": {
+                    "update": {"before-update", "after-update"},
+                    "metadata": {"after-metadata"},
+                    "doc": {"after-doc"},
+                },
+                "registry": {
+                    "metadata": {"before-metadata", "after-metadata"},
+                    "doc": {"after-doc"},
+                },
+            }
+            if request["event"] not in allowed_events[parsed["project_kind"]].get(
+                    parsed["operation"], set()):
+                _refuse("matrix-semver-checkpoint-order")
+            cgroup_text = self._semver_proc_bytes(peer_pid, "cgroup", 16 * 1024).decode("ascii", "strict")
+            if not any(row.endswith("::/" + active["job"].path.name)
+                       for row in cgroup_text.splitlines()):
+                _refuse("matrix-semver-checkpoint-peer")
+            pids = self._semver_read_cgroup_roster(active["job"].path / "cgroup.procs")
+            if pids != frozenset({active["pid"], peer_pid}):
+                _refuse("matrix-semver-checkpoint-cgroup-not-quiescent")
+            return parsed
+
+    def _semver_checkpoint_snapshot(self, virtual_root, active):
+            root = self.root / virtual_root.lstrip("/")
+            try:
+                root = semver_offline_cache._require_canonical_directory(
+                    root, "matrix-semver-checkpoint-project",
+                )
+                budget = bounded_registry_io.PhaseBudget.from_outer_deadlines(
+                    active["work_deadline"], active["cleanup_deadline"],
+                    cancelled=CANCEL_REQUESTED.is_set,
+                )
+                manifest_bytes = semver_offline_cache._read_file(
+                    root / "Cargo.toml", semver_offline_cache.MAX_FILE_BYTES,
+                )
+                map_without_lock, count_without_lock, bytes_without_lock = (
+                    semver_offline_cache.source_map_digest(
+                        root, budget, omit_root_cargo_lock=True,
+                        allow_missing_root_cargo_lock=True,
+                        root_relative_keys=True,
+                    )
+                )
+                project_map, project_count, project_bytes = semver_offline_cache.source_map_digest(
+                    root, budget,
+                )
+                lock_path = root / "Cargo.lock"
+                try:
+                    lock_path.lstat()
+                except FileNotFoundError:
+                    lock_sha = None
+                    lock_size = None
+                    rows = None
+                else:
+                    lock_bytes = semver_offline_cache._read_file(
+                        lock_path, semver_offline_cache.MAX_FILE_BYTES,
+                    )
+                    lock_sha = hashlib.sha256(lock_bytes).hexdigest()
+                    lock_size = len(lock_bytes)
+                    rows = constraint_resolver.lock_package_rows(lock_bytes)
+                    available = {
+                        (row["name"], row["version"]): row["checksum"]
+                        for row in active["registry_package_rows"]
+                    }
+                    if any(
+                            available.get((row["name"], row["version"])) != row["checksum"]
+                            for row in rows):
+                        _refuse("matrix-semver-checkpoint-lock-outside-closure")
+                return {
+                    "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+                    "project_map_without_lock_sha256": map_without_lock,
+                    "project_file_count_without_lock": count_without_lock,
+                    "project_tree_bytes_without_lock": bytes_without_lock,
+                    "project_map_sha256": project_map,
+                    "project_file_count": project_count,
+                    "project_tree_bytes": project_bytes,
+                    "lock_sha256": lock_sha,
+                    "lock_size": lock_size,
+                }
+            except (OSError, bounded_registry_io.Refusal, semver_offline_cache.Refusal,
+                    constraint_resolver.Refusal):
+                _refuse("matrix-semver-checkpoint-snapshot")
+
+    def _semver_checkpoint(self, request, peer_pid):
+            if (type(request) is not dict or set(request) != {
+                    "op", "event", "operation", "manifest"} or request.get("op") != "semver-checkpoint"
+                    or type(request.get("event")) is not str
+                    or type(request.get("operation")) is not str
+                    or type(request.get("manifest")) is not str
+                    or len(request["manifest"]) > 4096):
+                _refuse("matrix-semver-checkpoint-request")
+            with self.semver_active_lock:
+                active = self.semver_active
+                if active is None or CANCEL_REQUESTED.is_set():
+                    _refuse("matrix-semver-checkpoint-order")
+                parsed = self._semver_checkpoint_peer(peer_pid, request, active)
+                project_root = str(PurePosixPath(request["manifest"]).parent)
+                snapshot = self._semver_checkpoint_snapshot(project_root, active)
+                tracker = active["trackers"].get(project_root)
+                new_tracker = tracker is None
+                if new_tracker:
+                    if len(active["trackers"]) >= 4096:
+                        _refuse("matrix-semver-checkpoint-project-count")
+                    binding = active["checkpoint_binding"]
+                    tracker = temp_project_checkpoints.CheckpointTracker(
+                        binding, parsed["project_kind"],
+                    )
+                try:
+                    record = tracker.observe(
+                        request["event"], operation=request["operation"],
+                        project_root=project_root, **snapshot,
+                    )
+                except temp_project_checkpoints.CheckpointRefusal:
+                    _refuse("matrix-semver-checkpoint-contract")
+                if new_tracker:
+                    active["trackers"][project_root] = tracker
+                active["events"].append(record)
+            return {"ok": True}
+
+    def _write_semver_checkpoint_record(self, active, *, require_complete):
+            trackers = active["trackers"]
+            if require_complete and not trackers:
+                _refuse("matrix-semver-checkpoint-missing")
+            if not trackers:
+                return
+            projects = []
+            for tracker in trackers.values():
+                try:
+                    projects.append(tracker.finish())
+                except temp_project_checkpoints.CheckpointRefusal:
+                    if require_complete:
+                        _refuse("matrix-semver-checkpoint-incomplete")
+                    return
+            projects.sort(key=lambda item: (
+                item["project_kind"], item["temporary_manifest_sha256"],
+                item["temporary_project_map_sha256"], item["temporary_lock_sha256"],
+            ))
+            record = {
+                "schema": "keeldock.semver-project-checkpoints.v2",
+                "status": "complete",
+                "source_commit": active["checkpoint_binding"]["source_commit"],
+                "control_sha": active["checkpoint_binding"]["control_sha"],
+                "manifest_projection_sha256": active["checkpoint_binding"]["manifest_projection_sha256"],
+                "candidate_git_tree_map_sha256": active["checkpoint_binding"]["candidate_git_tree_map_sha256"],
+                "candidate_transfer_map_sha256": active["checkpoint_binding"]["candidate_transfer_map_sha256"],
+                "baseline_source_map_sha256": active["checkpoint_binding"]["baseline_source_map_sha256"],
+                "semver_tool_binary_sha256": active["checkpoint_binding"]["semver_tool_binary_sha256"],
+                "candidate_selected_map_after_ephemeral_lock_overlay":
+                    active["candidate_selected_map_after_ephemeral_lock_overlay"],
+                "generated_lock_status": active["generated_lock_status"],
+                "generated_lock_sha256": active["generated_lock_sha256"],
+                "rust_tool_hashes": active["rust_tool_hashes"],
+                "rust_tool_provenance_status": active["rust_tool_provenance_status"],
+                "registry_tree_sha256": active["registry_tree_sha256"],
+                "project_count": len(projects),
+                "projects": projects,
+                "raw_source_retained": False,
+            }
+            payload = bundle.canonical_json(record)
+            if len(payload) > 4 * 1024 * 1024:
+                _refuse("matrix-semver-checkpoint-record-size")
+            report = self.root / "scratch/reports" / SEMVER_CHECKPOINT_REPORT
+            try:
+                descriptor = os.open(
+                    str(report), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0), 0o440,
+                )
+                try:
+                    os.fchown(descriptor, 0, 0)
+                    os.fchmod(descriptor, 0o440)
+                    view = memoryview(payload)
+                    while view:
+                        written = os.write(descriptor, view)
+                        if written <= 0:
+                            _refuse("matrix-semver-checkpoint-record-write")
+                        view = view[written:]
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            except FileExistsError:
+                _refuse("matrix-semver-checkpoint-record-exists")
+            except SupervisorRefusal:
+                raise
+            except OSError:
+                _refuse("matrix-semver-checkpoint-record-write")
+            self.semver_checkpoint_record = record
 
     def _summary(self):
         if not self.execution_done or self.summary is None:

@@ -1,0 +1,62 @@
+{
+  "schema": "keeldock.pr1-semver-stage-pins.v1",
+  "tool": {
+    "name": "cargo-semver-checks",
+    "version": "0.51.0",
+    "release_tag": "v0.51.0",
+    "release_commit": "260fad71517e8b320c5c1ad1f367900ab37362a1",
+    "asset_sha256": "cacadafaa5cd27ae6d05a74a103266917ebab4c5e43c898360e177d4fbf06a65",
+    "target": "x86_64-unknown-linux-gnu",
+    "version_output": "cargo 0.51.0"
+  },
+  "baseline": {
+    "identity": "staged baseline runtime",
+    "runtime_root": "/workspace/semver-baseline/runtime",
+    "version": "0.1.0",
+    "runtime_file_count": 59,
+    "runtime_map_sha256": "e0a6b6b1c822658b2d55555c2e790193d0fff402632d7df8c22e2d031e5cb1f3",
+    "runtime_manifest_sha256": "7bbd52ff34a5db106b792b6764e0a032d99e935723227970514568fba48778dc",
+    "runtime_lock_sha256": "d2196578c97f4fd7435bdc6b581f8b59f6020025e003bab91b697aa3a74a3cf7",
+    "source_revision": "bb1258247ebbbcfec7f112c67dd15902a0f4d4d1",
+    "runtime_bytes": 253657
+  },
+  "candidate": {
+    "identity": "authenticated candidate transfer",
+    "source_revision": "9d6cc9e68694e17857d7702e83654131804a1bda",
+    "source_tree": "958e13e531d1b2601f241a91a9f80a44ac04d889",
+    "full_git_tree_map_sha256_before_transfer": "d6ef344e2129babea26ac39c04bacf7eb4cbd3d770acb8416b2fe11a1c334eab",
+    "selected_transfer_map_sha256_before_offline_lock_generation": "ca99e9c82c8ea07bc4a1d73d881da673dc5f71194c0db4c61c179da5d248b6b3",
+    "selected_transfer_file_count_before_offline_lock_generation": 2636,
+    "selected_transfer_bytes_before_offline_lock_generation": 16619832,
+    "excluded_paths": [
+      ".npmrc"
+    ],
+    "runtime_root": "/workspace/source/runtime",
+    "version": "0.2.0",
+    "runtime_semantic_file_count_excluding_cargo_lock": 1260,
+    "runtime_semantic_map_sha256_excluding_cargo_lock": "6242bb393a8b4b70c76efd9eaae4ad3f7b1ba831b380868a3dd5da3b79ad6f73",
+    "runtime_manifest_sha256": "6696df8536d6b4c3ea8ae8ccf7e812cf516833f10302bcf277f3ff4e69aa7d20",
+    "runtime_lock_sha256_at_frozen_capture_provisional_observation_only": "c27ae91fdf892945084cbb063197ee0c22ff40b0cfaeb67ba069e3f581379c5a",
+    "full_git_file_count_before_transfer": 2637,
+    "selected_manifest_sha256": {
+      "Cargo.toml": "98202cdbb1ce4a75cba138acaf6911de65430ba183640b0a45155ab7f8d5530a",
+      "fuzz/Cargo.toml": "053fb43372e34b20cfeb9bdc9f7f63e2c8fadfd5f8dbd10af9f0f76e75d797d0",
+      "runtime/Cargo.toml": "6696df8536d6b4c3ea8ae8ccf7e812cf516833f10302bcf277f3ff4e69aa7d20"
+    }
+  },
+  "offline_cache": {
+    "schema": "keeldock.rust-v2-semver-execution-inputs.v1",
+    "helper_sha256": "d2eccd210ef2f466e927daa3b5b9b1fccddb23c1a5b2387714464cbe58389b14",
+    "wrapper_sha256": "63ba0974db2388b3462f7dddded28fa7f89e5a60575a88ae68d8de9b17712336",
+    "support_modules": {
+      "bounded_registry_io.py": "4ba0d03215642857306056f8a52e051a67056642fca1b42c15921abddba584d5",
+      "cargo_projection.py": "ea0557e6a1d72dacbaa2449449d8ce994f579d8b42bb6263e25643a6da447328",
+      "constraint_resolver.py": "d66ea2eef15d91aa4eb4e97d443efaed3c760f4820c0877e554f349e87452e73",
+      "registry_prefetch.py": "585c02674ca6532b09a4ad426217c34f7a8279412d947b28fb33ebfe8525a45a",
+      "rust_lock_generation.py": "86b999e05b6c24e320591f9a1e2853dcdd7e68615936b42707669c866fa9d3b5",
+      "rust_preparation_v2.py": "f38b3049d0cfbf852406a3dc807341a8bba482e3a2f25530fa390a6182e86422",
+      "temp_project_checkpoints.py": "93e47b3867f6c5e4c7051f5705fc4acea765438c88c73ba272941f6ea11db299"
+    },
+    "replay_mode": "verified-final-payload-only"
+  }
+}
