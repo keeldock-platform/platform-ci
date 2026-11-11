@@ -579,6 +579,50 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 self.assertNotIn("private-path", parsed[1])
                 self.assertNotIn("private-canary", parsed[1])
 
+    def test_node_snapshot_manifest_refusal_sites_are_closed_and_publicly_reportable(self):
+        source = Path(node_tool_snapshot.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        sites = {
+            node.args[0].value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name) and node.func.id == "_manifest_invalid"
+            and node.args and isinstance(node.args[0], ast.Constant)
+        }
+        expected_sites = node_tool_snapshot.MANIFEST_INVALID_SITES - {"unlisted-site"}
+        self.assertEqual(sites, expected_sites)
+        self.assertFalse(public_audit.REFUSAL_LINE.fullmatch(
+            "devlane_supervisor_refusal=node-snapshot-manifest-invalid:private-site",
+        ))
+        for site in node_tool_snapshot.MANIFEST_INVALID_SITES:
+            code = "node-snapshot-manifest-invalid:" + site
+            line = ("dependency_preparation_refusal=stage=prepare-node-toolchain-snapshot "
+                    "code=" + code + " cleanup=not-needed\n").encode("ascii")
+            self.assertEqual(
+                diagnostic_contract.parse_preparation_result(2, b"", line),
+                ("prepare-node-toolchain-snapshot", code, "not-needed"),
+            )
+            public_line = (
+                "devlane_production_e2e=refused stage=prepare-node-toolchain-snapshot "
+                "exception=" + code
+            )
+            self.assertTrue(diagnostic_contract.public_preparation_diagnostic(public_line))
+            self.assertTrue(public_audit.REFUSAL_LINE.fullmatch(
+                "devlane_supervisor_refusal=" + code,
+            ))
+            with patch.object(test_e2e, "_process_run", return_value=subprocess.CompletedProcess(
+                    ["prepare.py"], 2, b"", line)):
+                with self.assertRaises(test_e2e.PreparationRefusalMismatch) as caught:
+                    test_e2e._run_preparation(["prepare.py"])
+            self.assertEqual(caught.exception.category, code)
+            state = test_e2e._DiagnosticState()
+            state.capture("scenario-dependency-prepare", caught.exception)
+            self.assertEqual(
+                state.refusal_line(caught.exception),
+                "devlane_production_e2e=refused stage=prepare-node-toolchain-snapshot "
+                "exception=" + code,
+            )
+
     def test_preparation_diagnostic_allowlists_cover_the_actual_validator_call_graph(self):
         root = Path(__file__).resolve().parents[2] / "kit/devlane"
         preparation = supervisor.node_tool_prepare
@@ -866,7 +910,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 state = test_e2e._DiagnosticState()
                 state.capture("variant-startup-refusal-check", caught.exception)
                 line = state.refusal_line(caught.exception)
-                self.assertRegex(line, r"stage=variant-startup-refusal-check exception=[a-z0-9-]{1,48}$")
+                self.assertRegex(line, r"stage=variant-startup-refusal-check exception=[a-z0-9-]{1,48}(?::[a-z0-9-]{1,48})?$")
                 for marker in ("private-path", "private-canary", "KEYCANARY-73A10X", "unknown-private-code"):
                     self.assertNotIn(marker, line)
 
@@ -924,7 +968,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 state = test_e2e._DiagnosticState()
                 state.capture("variant-supervisor-start-check", caught.exception)
                 line = state.refusal_line(caught.exception)
-                self.assertRegex(line, r"stage=variant-supervisor-start-check exception=[a-z0-9-]{1,48}$")
+                self.assertRegex(line, r"stage=variant-supervisor-start-check exception=[a-z0-9-]{1,48}(?::[a-z0-9-]{1,48})?$")
                 for marker in ("private path", "private diagnostic", "KEYCANARY-73A10X", "unknown-private-code"):
                     self.assertNotIn(marker, line)
 
@@ -1789,6 +1833,40 @@ class RustMatrixRunnerTests(unittest.TestCase):
             self.assertTrue(caught.exception.cleanup_confirmed)
             self.assertEqual(list(snapshot_base.iterdir()), [])
 
+    def test_node_snapshot_sorts_real_node_header_directory_and_sibling_rows(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
+            root = Path(temporary).resolve()
+            fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+            header_dir = fixture["node_root"] / "include/node/uv"
+            header_dir.mkdir(parents=True)
+            (header_dir / "aix.h").write_bytes(b"real-shaped libuv header\n")
+            (fixture["node_root"] / "include/node/uv.h").write_bytes(b"real-shaped libuv API\n")
+            deadline_path = root / "deadline.json"
+            deadline_budget.create(deadline_path, 120, 10, 130)
+            snapshot_base = root / "snapshots"
+            snapshot_id = "test-real-node-row-order"
+
+            with self._node_fixture_policy(fixture):
+                snapshot = node_tool_snapshot.create_snapshot(
+                    fixture["paths"], snapshot_id, os.getuid(), str(deadline_path),
+                    snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
+                    source_node_root=fixture["node_root"],
+                    source_anchors=((fixture["anchor"], os.getuid()),),
+                )
+            try:
+                manifest = json.loads(
+                    (Path(snapshot["root"]) / node_tool_snapshot.MANIFEST_NAME).read_text(encoding="utf-8"),
+                )
+                paths = [row["path"] for row in manifest["entries"]]
+                self.assertEqual(paths, sorted(paths))
+                self.assertLess(paths.index("include/node/uv.h"),
+                                paths.index("include/node/uv/aix.h"))
+            finally:
+                node_tool_snapshot.remove_snapshot(
+                    snapshot_id, str(deadline_path), snapshot_base=snapshot_base,
+                    owner_uid=os.getuid(),
+                )
+
     def test_fifo_replacements_during_copy_and_second_source_verification_are_bounded(self):
         for kind, trigger_count in (("copy", 1), ("source-verification", 2)):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory(dir="/tmp") as temporary:
@@ -1820,7 +1898,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                     kind, fixture, deadline_path, snapshot_base,
                     "test-fifo-read-" + kind, parent, 1,
                 )
-                expected_code = "node-snapshot-manifest-invalid" if kind == "manifest" \
+                expected_code = "node-snapshot-manifest-invalid:manifest-metadata" if kind == "manifest" \
                     else "node-snapshot-content-changed"
                 self.assertEqual(result, ("refused", expected_code, 1, True, True))
 

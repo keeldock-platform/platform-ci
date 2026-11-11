@@ -1242,7 +1242,10 @@ def _assert_supervisor_result(result, expected_returncode, expected_stdout, expe
     if result.returncode == 2 and not stdout:
         if stderr.startswith(b"usage: ") or b"error: the following arguments are required" in stderr:
             raise StartupRefusalMismatch("startup-parser-refusal")
-        refusal = re.fullmatch(rb"devlane_supervisor_refusal=([a-z][a-z0-9-]{0,63})\n", stderr)
+        refusal = re.fullmatch(
+            rb"devlane_supervisor_refusal=([a-z][a-z0-9-]{0,63}(?::[a-z0-9-]{1,48})?)\n",
+            stderr,
+        )
         if refusal is not None:
             code = refusal.group(1).decode("ascii")
             raise StartupRefusalMismatch(code if code in SUPERVISOR_REFUSAL_CODES else "startup-refusal-unlisted")

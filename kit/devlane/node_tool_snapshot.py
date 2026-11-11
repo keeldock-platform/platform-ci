@@ -19,6 +19,11 @@ SHARED_TOOLCHAIN_ANCHOR = Path("/opt")
 PROTECTED_SNAPSHOT_BASE = Path("/run/platform-ci-devlane/node-tools")
 DEFAULT_SNAPSHOT_BASE = PROTECTED_SNAPSHOT_BASE
 MANIFEST_NAME = ".devlane-node-snapshot.json"
+MANIFEST_INVALID_SITES = frozenset((
+    "link-row-path", "source-row-kind", "manifest-open", "manifest-metadata",
+    "manifest-race", "manifest-missing", "manifest-shape", "manifest-digest",
+    "unlisted-site",
+))
 MAX_ENTRIES = 100_000
 MAX_BYTES = bundle.MAX_EXPANDED
 MAX_MANIFEST_BYTES = 32 * 1024 * 1024
@@ -43,6 +48,13 @@ class SnapshotRefusal(ValueError):
 
 def _refuse(code):
     raise SnapshotRefusal(code)
+
+
+def _manifest_invalid(site):
+    """Refuse a malformed manifest with one fixed, reportable validation site."""
+    if site not in MANIFEST_INVALID_SITES:
+        site = "unlisted-site"
+    _refuse("node-snapshot-manifest-invalid:" + site)
 
 
 def valid_snapshot_id(value):
@@ -291,7 +303,7 @@ def _verify_link_graph(root_fd, rows, control_uid, deadline_file, *, cleanup=Fal
             _time_check(deadline_file, cleanup=cleanup)
         relative = row.get("path")
         if type(relative) is not str or relative in entries:
-            _refuse("node-snapshot-manifest-invalid")
+            _manifest_invalid("link-row-path")
         entries[relative] = row
         if row.get("kind") == "symlink":
             links.append(relative)
@@ -541,7 +553,7 @@ def _verify_source_directory(source_fd, prefix, allowed_uids, deadline_file, exp
                     or not _safe_relative_link(relative, target)):
                 _refuse("node-snapshot-source-changed")
         else:
-            _refuse("node-snapshot-manifest-invalid")
+            _manifest_invalid("source-row-kind")
     after = _secure_directory(source_fd, allowed_uids)
     if _metadata_token(before) != _metadata_token(after):
         _refuse("node-snapshot-source-changed")
@@ -727,8 +739,7 @@ def _snapshot_source(root, runner_uid, deadline_file, *, control_uid, snapshot_b
                                      {"bytes": 0}, source_tokens, expected_children)
             if test_checkpoint is not None:
                 test_checkpoint("after-source-verify")
-            if rows != sorted(rows, key=lambda row: row["path"]):
-                _refuse("node-snapshot-manifest-invalid")
+            rows.sort(key=lambda row: row["path"])
             manifest_core = {
                 "schema": 1, "snapshot_id": snapshot_id, "preparation": PREPARATION_ID,
                 "node_version": "24.22.1", "npm_version": "11.19.1",
@@ -869,13 +880,13 @@ def _read_regular_at(directory_fd, name, max_bytes, expected_uid, deadline_file,
     try:
         fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | _O_NOFOLLOW, dir_fd=directory_fd)
     except OSError:
-        _refuse("node-snapshot-manifest-invalid")
+        _manifest_invalid("manifest-open")
     try:
         metadata = os.fstat(fd)
         if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != expected_uid
                 or metadata.st_nlink != 1 or metadata.st_size < 0 or metadata.st_size > max_bytes
                 or expected_mode is not None and stat.S_IMODE(metadata.st_mode) != expected_mode):
-            _refuse("node-snapshot-manifest-invalid")
+            _manifest_invalid("manifest-metadata")
         chunks = []
         total = 0
         while True:
@@ -888,7 +899,7 @@ def _read_regular_at(directory_fd, name, max_bytes, expected_uid, deadline_file,
             if total > max_bytes:
                 _refuse("node-snapshot-limit")
         if total != metadata.st_size or _metadata_token(metadata) != _metadata_token(os.fstat(fd)):
-            _refuse("node-snapshot-manifest-invalid")
+            _manifest_invalid("manifest-race")
         return b"".join(chunks)
     finally:
         os.close(fd)
@@ -901,7 +912,7 @@ def _snapshot_entries(root_fd, prefix, deadline_file, rows, totals, control_uid,
     )
     if not prefix:
         if MANIFEST_NAME not in names:
-            _refuse("node-snapshot-manifest-invalid")
+            _manifest_invalid("manifest-missing")
         names.remove(MANIFEST_NAME)
     for index, name in enumerate(names):
         if index % 128 == 0:
@@ -1002,10 +1013,10 @@ def validate_snapshot(snapshot_id, deadline_file, *, snapshot_base=None, control
                     or type(manifest["runner_uid"]) is not int or not 1 <= manifest["runner_uid"] <= 60000
                     or owner_uid is not None and manifest["runner_uid"] != owner_uid
                     or type(manifest["entries"]) is not list or len(manifest["entries"]) + 1 > MAX_ENTRIES):
-                _refuse("node-snapshot-manifest-invalid")
+                _manifest_invalid("manifest-shape")
             core = {key: manifest[key] for key in keys if key != "content_sha256"}
             if manifest["content_sha256"] != _entry_digest(core):
-                _refuse("node-snapshot-manifest-invalid")
+                _manifest_invalid("manifest-digest")
             rows = []
             totals = {"entries": 0, "bytes": 0, "manifest_rows_bytes": 0}
             _snapshot_entries(root_fd, "", deadline_file, rows, totals, control_uid, cleanup=cleanup)

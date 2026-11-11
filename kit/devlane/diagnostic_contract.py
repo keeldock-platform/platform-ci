@@ -32,6 +32,15 @@ PREPARATION_REFUSAL_CODES = frozenset((
     "node-snapshot-content-changed", "node-snapshot-content-invalid", "node-snapshot-copy-failed",
     "node-snapshot-deadline", "node-snapshot-exists", "node-snapshot-id", "node-snapshot-layout",
     "node-snapshot-limit", "node-snapshot-link-invalid", "node-snapshot-manifest-invalid",
+    "node-snapshot-manifest-invalid:link-row-path",
+    "node-snapshot-manifest-invalid:source-row-kind",
+    "node-snapshot-manifest-invalid:manifest-open",
+    "node-snapshot-manifest-invalid:manifest-metadata",
+    "node-snapshot-manifest-invalid:manifest-race",
+    "node-snapshot-manifest-invalid:manifest-missing",
+    "node-snapshot-manifest-invalid:manifest-shape",
+    "node-snapshot-manifest-invalid:manifest-digest",
+    "node-snapshot-manifest-invalid:unlisted-site",
     "node-snapshot-missing", "node-snapshot-seal-invalid", "node-snapshot-source-changed",
     "node-snapshot-source-layout", "node-snapshot-source-owner", "node-snapshot-source-permissions",
     "node-snapshot-source-read", "node-tool-layout", "node-toolchain-executable", "node-toolchain-missing",
@@ -121,7 +130,7 @@ PREPARATION_E2E_CATEGORIES = frozenset(
 
 _REFUSAL_RESULT = re.compile(
     rb"dependency_preparation_refusal=stage=([a-z0-9-]{1,48}) "
-    rb"code=([a-z0-9-]{1,48}) cleanup=(not-needed|confirmed|unconfirmed)\n\Z"
+    rb"code=([a-z0-9-]{1,48}(?::[a-z0-9-]{1,48})?) cleanup=(not-needed|confirmed|unconfirmed)\n\Z"
 )
 _EXCEPTION_RESULT = re.compile(
     rb"dependency_preparation_exception=stage=([a-z0-9-]{1,48}) "
@@ -129,7 +138,7 @@ _EXCEPTION_RESULT = re.compile(
 )
 _E2E_REFUSAL = re.compile(
     r"devlane_production_e2e=refused stage=([a-z0-9-]{1,48}) "
-    r"exception=([a-z0-9-]{1,48})"
+    r"exception=([a-z0-9-]{1,48}(?::[a-z0-9-]{1,48})?)"
     r"(?: reason=([a-z0-9-]{1,48})(?: version=\"([A-Za-z0-9._+-][A-Za-z0-9 ._+-]{0,31})\")?)?"
     r"(?: cleanup=(unconfirmed))?\Z"
 )

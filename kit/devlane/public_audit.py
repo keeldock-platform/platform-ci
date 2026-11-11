@@ -93,7 +93,9 @@ PUBLIC_CODES = frozenset({
 })
 REFUSAL_LINE = re.compile(
     r"(?:devlane_refusal|devlane_supervisor_refusal|dependency_preparation_refusal|network_probe_refusal)"
-    r"=[a-z0-9-]{1,64}\Z"
+    r"=(?:[a-z0-9-]{1,64}|node-snapshot-manifest-invalid:"
+    r"(?:link-row-path|source-row-kind|manifest-open|manifest-metadata|manifest-race|"
+    r"manifest-missing|manifest-shape|manifest-digest|unlisted-site))\Z"
 )
 def cache_line_patterns(key):
     """Output lines of the pinned cache actions, bound to the one key the step may use."""
