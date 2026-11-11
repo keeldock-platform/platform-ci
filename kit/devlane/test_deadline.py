@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import deadline
+import acceptance_diagnostics
 import fetch
 import host_cleanup
 import network_probe
@@ -396,7 +397,8 @@ class DeadlineTests(unittest.TestCase):
                                   "rust-matrix-runner-tests", "rust-report-tests", "node-adapter-tests",
                                   "audit-contract-tests", "rehearsal-tests", "production-path-e2e")))
         self.assertIn('test_e2e.py --deadline-file "$RUNNER_TEMP/devlane-deadline.json"', workflow)
-        self.assertIn('--report-diagnostic-file "$RUNNER_TEMP/devlane-acceptance-diagnostic-$GITHUB_RUN_ID"', workflow)
+        self.assertIn('acceptance_diagnostics.py --stage "$stage" --file "$out"', workflow)
+        self.assertNotIn("--report-diagnostic-file", workflow)
         self.assertIn('bounded() { python3 -B kit/devlane/deadline.py run', workflow)
         self.assertIn("--timeout-cleanup-reserve-seconds 300", workflow)
         harness = (WORKFLOW_ROOT / "kit/devlane/test_e2e.py").read_text(encoding="utf-8")
@@ -532,7 +534,8 @@ class DeadlineTests(unittest.TestCase):
             ("devlane-synthetic.yml", "devlane-synthetic", "test_acceptance.py"): 1,
             ("devlane-synthetic.yml", "devlane-synthetic", "test_audit_contracts.py"): 1,
             ("devlane-synthetic.yml", "devlane-synthetic", "test_coordinator.py"): 1,
-            ("devlane-synthetic.yml", "devlane-synthetic", "test_e2e.py"): 3,
+            ("devlane-synthetic.yml", "devlane-synthetic", "test_e2e.py"): 2,
+            ("devlane-synthetic.yml", "devlane-synthetic", "acceptance_diagnostics.py"): 1,
             ("devlane-synthetic.yml", "devlane-synthetic", "test_linux_runtime.py"): 1,
             ("devlane-synthetic.yml", "devlane-synthetic", "test_rehearsal.py"): 1,
             ("devlane-synthetic.yml", "devlane-synthetic", "test_rust_report.py"): 1,
@@ -601,6 +604,20 @@ class DeadlineTests(unittest.TestCase):
                                          side_effect=deadline.DeadlineRefusal("total-deadline-exhausted")):
                         with self.assertRaisesRegex(deadline.DeadlineRefusal, "total-deadline-exhausted"):
                             test_e2e.main(arguments)
+                elif script == "acceptance_diagnostics.py":
+                    safe_arguments = [value for value in arguments if value not in ("||", "true")]
+                    with tempfile.TemporaryDirectory() as temporary:
+                        log_path = Path(temporary) / "stage-output.log"
+                        log_path.write_text("source-free failure detail\n", encoding="utf-8")
+                        safe_arguments = [value.replace("$stage", "production-path-e2e").replace(
+                            "$out", str(log_path)) for value in safe_arguments]
+                        output = io.StringIO()
+                        with contextlib.redirect_stdout(output):
+                            self.assertEqual(acceptance_diagnostics.main(safe_arguments), 0)
+                        self.assertIn(
+                            "devlane_acceptance_detail stage=production-path-e2e index=1 "
+                            "text=source-free failure detail", output.getvalue(),
+                        )
                 elif script == "rust_preparation_smoke.py":
                     safe_arguments = [value.replace("$(id -u)", "1001").replace("$(id -g)", "1001")
                                       for value in arguments]

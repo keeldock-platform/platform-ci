@@ -2728,6 +2728,40 @@ class RustMatrixRunnerTests(unittest.TestCase):
                          frozenset((0, os.getuid())))
         self.assertNotIn(preparation.UID, preparation._trusted_toolchain_owner_uids(os.getuid()))
 
+    def test_e2e_node_prepare_uses_current_prepare_cli_without_legacy_node_flags(self):
+        preparation = supervisor.node_tool_prepare
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prepared = root / "prepared"
+            captured = {}
+            paths = {
+                "cargo": "/toolchain/bin/cargo", "rustc": "/toolchain/bin/rustc",
+            }
+
+            def prepare(command):
+                captured["command"] = list(command)
+                prepared.mkdir()
+
+            with patch.object(test_e2e, "_tool_paths", return_value=dict(paths)), \
+                    patch.object(test_e2e, "_run_preparation", side_effect=prepare), \
+                    patch.object(test_e2e, "DEADLINE_FILE", str(root / "deadline.json")), \
+                    patch.object(test_e2e, "CONTROL_SHA", "a" * 40):
+                resolved = test_e2e._prepare(
+                    "core-node", root / "projection.json", prepared,
+                )
+
+            command = captured["command"]
+            script = str(Path(test_e2e.ROOT) / "kit/devlane/prepare.py")
+            arguments = command[command.index(script) + 1:]
+            parsed = preparation._argument_parser().parse_args(arguments)
+            self.assertEqual(parsed.profile, "core-node")
+            self.assertEqual(parsed.cargo_path, paths["cargo"])
+            self.assertEqual(parsed.rustc_path, paths["rustc"])
+            self.assertTrue(parsed.node_snapshot_id)
+            self.assertNotIn("--node-path", arguments)
+            self.assertNotIn("--npm-path", arguments)
+            self.assertEqual(resolved["cargo"], paths["cargo"])
+
     def test_prepare_main_reports_exact_owner_and_exception_categories_without_reflection(self):
         preparation = supervisor.node_tool_prepare
         for failure_kind in ("foreign-owner", "version-permission"):

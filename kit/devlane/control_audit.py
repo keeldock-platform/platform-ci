@@ -18,6 +18,7 @@ REPOSITORY_ID = 1430960557
 WORKFLOW_PATH = ".github/workflows/public-policy.yml"
 CONTROL_RUNNERS = ("ubuntu-24.04", "macos-15", "windows-2025")
 RUN_JOB = "control-audit"
+SYNTHETIC_JOB = "devlane-synthetic / devlane-synthetic"
 MAX_MACOS_CAPACITY_NOTICES = 64
 CONTROL_JOB_NAMES = frozenset(
     ["policy-" + runner for runner in CONTROL_RUNNERS]
@@ -27,7 +28,7 @@ CONTROL_JOB_NAMES = frozenset(
     + ["windows-handoff-synthetic / handoff-unit-" + runner for runner in ("ubuntu-24.04", "windows-2025")]
     + ["development-feedback-smoke / feedback-smoke-producer " + runner for runner in CONTROL_RUNNERS]
     + ["development-feedback-smoke / feedback-smoke-audit"]
-    + ["devlane-synthetic / devlane-synthetic", RUN_JOB]
+    + [SYNTHETIC_JOB, RUN_JOB]
 )
 assert len(CONTROL_JOB_NAMES) == 18
 DECIMAL = re.compile(r"[1-9][0-9]{0,18}\Z")
@@ -111,6 +112,7 @@ def _validate_child_steps(name, job, *, require_main=True):
     steps = _step_rows(job)
     if [step.get("name") for step in steps] != list(CONTROL_STEP_NAMES[name]):
         _refuse()
+    acceptance_failure = name == SYNTHETIC_JOB and job.get("conclusion") == "failure"
     for step in steps:
         skipped_feedback_upload = (
             name.startswith("development-feedback-smoke / feedback-smoke-producer ")
@@ -121,6 +123,10 @@ def _validate_child_steps(name, job, *, require_main=True):
             name == RUN_JOB and step.get("name") == "Save exact source-free control evidence" and not require_main
         )
         expected = "skipped" if skipped_feedback_upload or skipped_control_cache else "success"
+        if acceptance_failure and step.get("name") == "Run full source-free production-path acceptance":
+            expected = "failure"
+        elif acceptance_failure and step.get("name") == "Probe the loopback-only Linux network boundary":
+            expected = "skipped"
         if step.get("status") != "completed" or step.get("conclusion") != expected:
             _refuse()
 
@@ -199,6 +205,9 @@ def validate_jobs(jobs, identity):
                     _refuse()
             elif steps[2].get("status") != "completed" or steps[2].get("conclusion") != "skipped":
                 _refuse()
+        elif (name == SYNTHETIC_JOB and job.get("status") == "completed"
+              and job.get("conclusion") == "failure"):
+            pass
         elif job.get("status") != "completed" or job.get("conclusion") != "success":
             _refuse()
         url = job.get("check_run_url")
@@ -388,11 +397,13 @@ def validate_control_annotations(job_name, control_sha, count, annotations):
         _refuse()
 
 
-def validate_synthetic_log(log, identity):
+def validate_synthetic_log(log, identity, *, failed_acceptance=False):
     try:
         public_audit.validate_job_log_surface(
-            log, "devlane-synthetic", {"run_id": identity["run_id"], "control_sha": identity["control_sha"]},
-            completed=True, workflow="synthetic")
+            log, "devlane-synthetic", {
+                "run_id": identity["run_id"], "control_sha": identity["control_sha"], "ref": identity["ref"],
+            },
+            completed=True, workflow="synthetic", failed_acceptance=failed_acceptance)
     except public_audit.AuditRefusal:
         _refuse()
 
@@ -407,7 +418,11 @@ def run_audit(api, identity):
         _refuse()
     jobs = validate_jobs(value["jobs"], identity)
     """Hosted-output assertion: the real synthetic job log must satisfy the same closed contract the encrypted-lane auditor applies, so any drift in what GitHub actually prints (scaffolding, cache action, setup action, env blocks) fails the control, never a private run."""
-    validate_synthetic_log(api.log_text(jobs["devlane-synthetic / devlane-synthetic"]["id"]), identity)
+    synthetic_job = jobs[SYNTHETIC_JOB]
+    validate_synthetic_log(
+        api.log_text(synthetic_job["id"]), identity,
+        failed_acceptance=synthetic_job["conclusion"] == "failure",
+    )
     for runner in CONTROL_RUNNERS:
         name = "policy-" + runner
         log = api.log_text(jobs[name]["id"])

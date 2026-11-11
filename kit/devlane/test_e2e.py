@@ -1050,7 +1050,7 @@ def late_scenarios():
 
 def _tool_paths(profile):
     paths = _phase_call("tool-path-discovery", lambda: {
-        name: shutil.which(name) or "" for name in ("node", "npm", "cargo", "rustc")
+        name: shutil.which(name) or "" for name in ("cargo", "rustc")
     })
     if profile == "core-rust":
         rustup = _phase_call("rust-tool-path-resolution", shutil.which, "rustup")
@@ -1086,7 +1086,8 @@ def _prepare(profile, projection_path, prepared_path):
                 (str(Path(prepared_path).absolute()) + str(os.getpid())).encode("utf-8")
             ).hexdigest()[:24]
         command.extend(("--node-snapshot-id", snapshot_id))
-    for name, path in paths.items():
+    for name in ("cargo", "rustc"):
+        path = paths[name]
         command.extend(("--" + name + "-path", path))
     try:
         _run_preparation(command)

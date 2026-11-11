@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 import public_audit as audit
 import control_audit
+import acceptance_diagnostics
+import diagnostic_contract
 
 
 SHA = "a" * 40
@@ -50,7 +52,7 @@ def _env_value(name, identity=IDENTITY, kind="encrypted"):
         "CI_WORKSPACE": RUNNER_HOME + "/work/platform-ci/platform-ci",
     }
     if kind == "synthetic":
-        values["CI_REF"] = "refs/heads/develop"
+        values["CI_REF"] = identity.get("ref", "refs/heads/develop")
     return values[name]
 
 
@@ -399,10 +401,34 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 audit.validate_check_output(changed, job, IDENTITY, completed=True)
 
     def test_synthetic_job_log_satisfies_the_same_closed_contract_in_the_control(self):
-        identity = {"run_id": "12345", "control_sha": SHA}
-        log = _render_log("devlane-synthetic", dict(IDENTITY), kind="synthetic",
+        identity = {"run_id": "12345", "control_sha": SHA, "ref": "refs/heads/devlane/d211-1110"}
+        log_identity = dict(IDENTITY)
+        log_identity["ref"] = identity["ref"]
+        log = _render_log("devlane-synthetic", log_identity, kind="synthetic",
                           skip=("Install fixed Rust acceptance toolchain",))
         control_audit.validate_synthetic_log(log, identity)
+        workflow_group = (chr(35) * 2 + "[group]KEYCANARY-73A10X\n").encode("ascii")
+        failure_lines = acceptance_diagnostics.failure_tail(
+            "production-path-e2e", b"\x1b[31mFAILED::error::SYNTHETIC_SOURCE_CANARY_7f8c\n" + workflow_group,
+        )
+        failure = "devlane_acceptance=refused stage=production-path-e2e\n" + "\n".join(failure_lines)
+        before, after = log.rsplit(b"devlane_acceptance=pass", 1)
+        refused = before + failure.encode("ascii") + after.replace(
+            b"2026-11-10T12:00:00.1234567Z devlane_linux_probe=pass\n", b"",
+        )
+        with self.assertRaises(control_audit.ControlAuditRefusal):
+            control_audit.validate_synthetic_log(refused, identity)
+        control_audit.validate_synthetic_log(refused, identity, failed_acceptance=True)
+        wrong_stage = refused.replace(
+            b"devlane_acceptance_detail stage=production-path-e2e",
+            b"devlane_acceptance_detail stage=rust-v2-public-runtime", 1,
+        )
+        with self.assertRaises(control_audit.ControlAuditRefusal):
+            control_audit.validate_synthetic_log(wrong_stage, identity, failed_acceptance=True)
+        with self.assertRaises(control_audit.ControlAuditRefusal):
+            control_audit.validate_synthetic_log(
+                log, {**identity, "ref": "refs/heads/main"},
+            )
         for label, payload in {
             "canary": log + b"2026-11-10T12:00:00.1234567Z PRIVATE_SOURCE_CANARY\n",
             "noisy test output": log.replace(b"devlane_acceptance=pass", b"Ran 31 tests in 1.2s\nOK\ndevlane_acceptance=pass"),
@@ -411,6 +437,35 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         }.items():
             with self.subTest(label), self.assertRaises(control_audit.ControlAuditRefusal):
                 control_audit.validate_synthetic_log(payload, identity)
+
+    def test_source_free_failure_tail_is_bounded_redacted_and_workflow_safe(self):
+        workflow_group = (chr(35) * 2 + "[group]KEYCANARY-73A10X\n").encode("ascii")
+        payload = (b"earliest\n" + b"ordinary diagnostic\n" * 205
+                   + b"\x1b[31m::error::SYNTHETIC_SOURCE_CANARY_7f8c\x1b[0m\n"
+                   + workflow_group + b"x" * 400 + b"\n")
+        details = acceptance_diagnostics.failure_tail("production-path-e2e", payload)
+        self.assertLessEqual(len(details), 202)
+        joined = "\n".join(details)
+        self.assertIn("earlier lines omitted", joined)
+        self.assertIn("[synthetic-canary-redacted]", joined)
+        self.assertNotIn("SYNTHETIC_SOURCE_CANARY_7f8c", joined)
+        self.assertNotIn("KEYCANARY-73A10X", joined)
+        self.assertNotIn("::", joined)
+        self.assertNotIn(chr(35) * 2 + "[", joined)
+        self.assertNotIn("\x1b", joined)
+        canary_tail = acceptance_diagnostics.failure_tail(
+            "production-path-e2e",
+            b"PRIVATE_SOURCE_CANARY SYNTHETIC_KEY_CANARY PRIVATE_KEY_CANARY "
+            + b"KEYCANARY-73A10X" + bytes(range(16)),
+        )
+        canary_text = "\n".join(canary_tail)
+        for marker in ("PRIVATE_SOURCE_CANARY", "SYNTHETIC_KEY_CANARY", "PRIVATE_KEY_CANARY", "KEYCANARY"):
+            self.assertNotIn(marker, canary_text)
+        self.assertTrue(all(diagnostic_contract.public_acceptance_detail(line) for line in details))
+        self.assertTrue(all(diagnostic_contract.public_acceptance_detail(line) for line in canary_tail))
+        self.assertTrue(all(len(line) <= diagnostic_contract.MAX_ACCEPTANCE_DETAIL_BYTES for line in details))
+        with self.assertRaises(ValueError):
+            acceptance_diagnostics.failure_tail("private-stage", b"detail")
 
     def test_preparation_refusal_diagnostics_are_allowlisted_and_never_count_as_acceptance(self):
         root = Path(__file__).resolve().parents[2]
@@ -425,15 +480,27 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         self.assertTrue(grammar.step_output_ok(
             "Run full source-free production-path acceptance", line, {},
         ))
+        refusal_counts = {}
         self.assertTrue(grammar.step_output_ok(
             "Run full source-free production-path acceptance",
-            "devlane_acceptance=refused stage=production-path-e2e", {},
+            "devlane_acceptance=refused stage=production-path-e2e", refusal_counts,
+        ))
+        detail = "devlane_acceptance_detail stage=production-path-e2e index=1 text=ModuleNotFoundError: test fixture import failed"
+        self.assertTrue(grammar.step_output_ok(
+            "Run full source-free production-path acceptance", detail, refusal_counts,
+        ))
+        self.assertFalse(grammar.step_output_ok(
+            "Run full source-free production-path acceptance",
+            detail.replace("production-path-e2e", "rust-v2-public-runtime"), refusal_counts,
         ))
         for invalid in (
             line.replace("node-toolchain-owner", "private-path"),
             line.replace("prepare-node-toolchain-validation", "private-path"),
             line + " cleanup=confirmed",
             line.replace("node-toolchain-owner", "node-toolchain-owner") + " KEYCANARY-73A10X",
+            detail.replace("production-path-e2e", "private-stage"),
+            detail.replace("ModuleNotFoundError", "::error::"),
+            detail + " KEYCANARY-73A10X",
         ):
             with self.subTest(invalid=invalid):
                 self.assertFalse(grammar.step_output_ok(
@@ -442,16 +509,23 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         self.assertFalse(grammar.step_output_ok(
             "Set up pinned Node toolchain", line, {},
         ))
+        encrypted = audit._Grammar(
+            Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml",
+            audit.RUN_JOB, IDENTITY, "encrypted",
+        )
+        self.assertFalse(encrypted.step_output_ok("Prepare dependencies before the cut", detail, {}))
 
         synthetic = _render_log(
-            "devlane-synthetic", dict(IDENTITY), kind="synthetic",
+            "devlane-synthetic", {**IDENTITY, "ref": "refs/heads/devlane/d211-1110"}, kind="synthetic",
             skip=("Install fixed Rust acceptance toolchain",),
         )
         refused = synthetic.replace(
             b"devlane_acceptance=pass", line.encode("ascii"), 1,
         )
         with self.assertRaises(control_audit.ControlAuditRefusal):
-            control_audit.validate_synthetic_log(refused, {"run_id": "12345", "control_sha": SHA})
+            control_audit.validate_synthetic_log(
+                refused, {"run_id": "12345", "control_sha": SHA, "ref": "refs/heads/devlane/d211-1110"},
+            )
 
     def test_reviewed_step_name_lists_match_the_workflow_files(self):
         root = Path(__file__).resolve().parents[2]
@@ -545,6 +619,24 @@ class ControlAuditorMutationTests(unittest.TestCase):
             control_audit.validate_jobs(changed, self.identity)
         changed = copy.deepcopy(jobs)
         changed[-1]["steps"][-2]["status"] = "in_progress"
+        with self.assertRaises(control_audit.ControlAuditRefusal):
+            control_audit.validate_jobs(changed, self.identity)
+
+    def test_control_graph_accepts_only_the_diagnosed_synthetic_acceptance_failure(self):
+        jobs = _control_jobs()
+        synthetic = next(job for job in jobs if job["name"] == control_audit.SYNTHETIC_JOB)
+        synthetic["conclusion"] = "failure"
+        steps = {step["name"]: step for step in synthetic["steps"]}
+        steps["Run full source-free production-path acceptance"]["conclusion"] = "failure"
+        steps["Probe the loopback-only Linux network boundary"]["conclusion"] = "skipped"
+        result = control_audit.validate_jobs(jobs, self.identity)
+        self.assertEqual(result[control_audit.SYNTHETIC_JOB]["conclusion"], "failure")
+
+        changed = copy.deepcopy(jobs)
+        changed_synthetic = next(job for job in changed if job["name"] == control_audit.SYNTHETIC_JOB)
+        changed_steps = {step["name"]: step for step in changed_synthetic["steps"]}
+        changed_steps["Run full source-free production-path acceptance"]["conclusion"] = "success"
+        changed_steps["Probe the loopback-only Linux network boundary"]["conclusion"] = "failure"
         with self.assertRaises(control_audit.ControlAuditRefusal):
             control_audit.validate_jobs(changed, self.identity)
 

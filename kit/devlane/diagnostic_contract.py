@@ -120,6 +120,15 @@ _E2E_REFUSAL = re.compile(
 )
 MAX_PREPARATION_OUTPUT_BYTES = 512
 MAX_PUBLIC_DIAGNOSTIC_BYTES = 192
+MAX_ACCEPTANCE_DETAIL_BYTES = 384
+_ACCEPTANCE_DETAIL = re.compile(
+    r"devlane_acceptance_detail stage=([a-z0-9-]{1,64}) index=(0|[1-9][0-9]{0,2}) text=([ -~]{1,256})\Z"
+)
+_SYNTHETIC_CANARIES = (
+    "SYNTHETIC_SOURCE_CANARY", "PRIVATE_SOURCE_CANARY", "SYNTHETIC_KEY_CANARY",
+    "PRIVATE_KEY_CANARY", "KEYCANARY",
+)
+_WORKFLOW_GROUP_MARKER = chr(35) * 2 + "["
 
 
 def parse_preparation_result(returncode, stdout, stderr):
@@ -165,3 +174,24 @@ def public_preparation_diagnostic(line):
     stage, category, cleanup = match.groups()
     return (stage in PREPARATION_PUBLIC_PHASES and category in PREPARATION_E2E_CATEGORIES
             and (cleanup is None or cleanup == "unconfirmed"))
+
+
+def public_acceptance_detail(line):
+    """Accept one short, neutralized output line from a source-free control stage."""
+    return acceptance_detail_stage(line) is not None
+
+
+def acceptance_detail_stage(line):
+    """Return the accepted source-free failure stage carried by one detail line."""
+    if type(line) is not str or len(line.encode("ascii", "ignore")) > MAX_ACCEPTANCE_DETAIL_BYTES:
+        return None
+    match = _ACCEPTANCE_DETAIL.fullmatch(line)
+    if match is None:
+        return None
+    stage, _index, text = match.groups()
+    if (stage not in ACCEPTANCE_FAILURE_STAGES
+            or "::" in text or _WORKFLOW_GROUP_MARKER in text
+            or any(canary in text for canary in _SYNTHETIC_CANARIES)
+            or "\x1b" in text or not all(ord(character) >= 32 for character in text)):
+        return None
+    return stage

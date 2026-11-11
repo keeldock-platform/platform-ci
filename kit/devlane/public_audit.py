@@ -252,7 +252,7 @@ class _Grammar:
                 "RUN_ROOT": TEMP + "/devlane-" + str(run_id),
             })
         else:
-            fixed["CI_REF"] = "refs/heads/develop"
+            fixed["CI_REF"] = identity.get("ref")
         if name in fixed:
             return fixed[name] is not None and value == fixed[name]
         if name in ("DEVLANE_DECRYPT_KEY", "GITHUB_TOKEN"):
@@ -336,7 +336,19 @@ class _Grammar:
         if step_name == "Run full source-free production-path acceptance":
             if line.startswith("devlane_acceptance=refused stage="):
                 stage = line.removeprefix("devlane_acceptance=refused stage=")
-                return stage in diagnostic_contract.ACCEPTANCE_FAILURE_STAGES
+                if stage not in diagnostic_contract.ACCEPTANCE_FAILURE_STAGES:
+                    return False
+                public_counts["acceptance_refused"] = public_counts.get("acceptance_refused", 0) + 1
+                public_counts["acceptance_refusal_stage"] = stage
+                return public_counts["acceptance_refused"] == 1
+            if self.kind == "synthetic":
+                detail_stage = diagnostic_contract.acceptance_detail_stage(line)
+                if (detail_stage is not None
+                        and detail_stage == public_counts.get("acceptance_refusal_stage")):
+                    public_counts["acceptance_detail_count"] = public_counts.get("acceptance_detail_count", 0) + 1
+                    return True
+                if line.startswith("devlane_acceptance_detail "):
+                    return False
             return diagnostic_contract.public_preparation_diagnostic(line)
         if step_name == "Fetch ciphertext and sanitized dependency projection":
             if GITHUB_ASSET_LINE.fullmatch(line) or line == "fetch_projection_valid=true":
@@ -407,7 +419,7 @@ def validate_summary_records(record_lines, profile):
         _refuse()
 
 
-def validate_job_log_surface(log, job_name, identity, *, completed=True, workflow=None):
+def validate_job_log_surface(log, job_name, identity, *, completed=True, workflow=None, failed_acceptance=False):
     """Closed contract for an encrypted-lane job log.
 
     Every line must be (a) text of the reviewed workflow, (b) exact hosted-runner scaffolding for
@@ -416,6 +428,9 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
     record. The records, taken together, must form one valid canonical summary. Anything else,
     including plausible-looking paths or free text, refuses.
     """
+    if (type(failed_acceptance) is not bool
+            or (failed_acceptance and (workflow != "synthetic" or job_name != "devlane-synthetic"))):
+        _refuse()
     if type(log) is not bytes or len(log) > MAX_LOG_BYTES or b"\x00" in log or b"\x1b" in log:
         _refuse()
     try:
@@ -580,9 +595,16 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         if completed and counts.get(audit_line) != 1 or counts.get(audit_line, 0) > 1:
             _refuse()
     else:
-        required = ("devlane_acceptance=pass", "devlane_linux_probe=pass", "devlane_cache_permit=claimed",
-                    "devlane_cache_permit=restored-and-single-use")
-        if records or any(counts.get(line) != 1 for line in required):
+        cache_markers = ("devlane_cache_permit=claimed", "devlane_cache_permit=restored-and-single-use")
+        outcome_count = counts.get("devlane_acceptance=pass", 0) + counts.get("acceptance_refused", 0)
+        if records or outcome_count != 1 or any(counts.get(line) != 1 for line in cache_markers):
+            _refuse()
+        if failed_acceptance:
+            if (counts.get("acceptance_refused") != 1 or counts.get("devlane_acceptance=pass")
+                    or counts.get("devlane_linux_probe=pass") or not counts.get("acceptance_detail_count")):
+                _refuse()
+        elif (counts.get("devlane_acceptance=pass") != 1 or counts.get("acceptance_refused")
+              or counts.get("devlane_linux_probe=pass") != 1):
             _refuse()
     return {"records": [record.encode("ascii") for record in records]}
 
