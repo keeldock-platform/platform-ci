@@ -11,6 +11,7 @@ import bundle
 import bounded_registry_io
 import constraint_resolver
 import project
+import prepare as preparation
 import rust_preparation_v2 as worker
 import rust_preparation_smoke as smoke
 import test_acceptance as acceptance
@@ -20,6 +21,22 @@ CONTROL_SHA = acceptance.CONTROL_SHA
 
 
 class PreparationTests(unittest.TestCase):
+    def test_worker_device_permissions_are_independent_of_setup_umask(self):
+        expected = {"null": 0o666, "zero": 0o666, "random": 0o444, "urandom": 0o444}
+        for mask in (0o022, 0o077):
+            with self.subTest(mask=mask), tempfile.TemporaryDirectory() as temporary:
+                def create_public_mode_fixture(path, mode, device):
+                    os.mkfifo(path, mode & 0o777)
+                previous = os.umask(mask)
+                try:
+                    with patch.object(preparation.os, "mknod", side_effect=create_public_mode_fixture) as create:
+                        preparation._make_worker_devices(Path(temporary))
+                    self.assertEqual(create.call_count, 4)
+                finally:
+                    os.umask(previous)
+                self.assertEqual({name: (Path(temporary) / name).stat().st_mode & 0o777
+                                  for name in expected}, expected)
+
     def test_execution_preflight_distinguishes_permission_boundaries(self):
         with tempfile.TemporaryDirectory() as temporary, \
                 patch.object(os, "ST_NOEXEC", 8, create=True):

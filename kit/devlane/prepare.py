@@ -530,6 +530,14 @@ def _write_resolver(root):
             (root / "etc" / name).write_bytes(payload)
 
 
+def _make_worker_devices(dev):
+    for name, mode, major, minor in (("null", 0o666, 1, 3), ("zero", 0o666, 1, 5),
+                                     ("random", 0o444, 1, 8), ("urandom", 0o444, 1, 9)):
+        path = Path(dev) / name
+        os.mknod(str(path), stat.S_IFCHR | mode, os.makedev(major, minor))
+        os.chmod(path, mode)
+
+
 def _prepare_root(root, tool_roots):
     _set_preparation_stage("prepare-root-mounts")
     root = Path(root)
@@ -556,9 +564,7 @@ def _prepare_root(root, tool_roots):
         _mount("/etc/ssl/certs", cert_target)
     dev = root / "dev"
     _mount_fs(["mount", "-t", "tmpfs", "-o", "size=64m,mode=0755", "tmpfs", str(dev)], dev)
-    for name, mode, major, minor in (("null", 0o666, 1, 3), ("zero", 0o666, 1, 5),
-                                     ("random", 0o444, 1, 8), ("urandom", 0o444, 1, 9)):
-        os.mknod(str(dev / name), stat.S_IFCHR | mode, os.makedev(major, minor))
+    _make_worker_devices(dev)
     _mount_fs(["mount", "-t", "proc", "-o", "hidepid=2,subset=pid", "proc", str(root / "proc")], root / "proc")
     (root / "devlane-home").mkdir(mode=0o700, parents=True)
     os.chown(str(root / "devlane-home"), UID, GID)
