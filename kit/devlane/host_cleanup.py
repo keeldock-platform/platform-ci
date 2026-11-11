@@ -14,10 +14,11 @@ import isolated_cleanup
 import owned_tree_cleanup
 import deadline as deadline_budget
 import node_tool_snapshot
+import node_vendor_source
 
 
-"""The client must always be able to finish its bounded recovery path before this deadline."""
-HOST_DEADLINE_SECONDS = isolated_cleanup.CLEANUP_BUDGET_SECONDS + 30
+"""The 14-minute child cap leaves one minute inside the workflow's 15-minute cleanup watchdog."""
+HOST_DEADLINE_SECONDS = 840
 PROC_ROOT = Path("/proc")
 
 
@@ -93,7 +94,36 @@ def clean_node_snapshot(snapshot_id, deadline_file):
         timeout=_cleanup_timeout(deadline_file, HOST_DEADLINE_SECONDS), check=False,
         env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1"},
     )
-    if result.returncode != 0 or result.stdout != b"node_snapshot_cleanup=confirmed\n":
+    if result.returncode != 0 or result.stdout != (
+            b"node_snapshot_cleanup=confirmed\nnode_vendor_cleanup=confirmed\n"):
+        _fail()
+    return True
+
+
+def clean_node_vendor_source(snapshot_id, *, control_uid=0):
+    if not node_tool_snapshot.valid_snapshot_id(snapshot_id):
+        _fail()
+    base = node_vendor_source.PROTECTED_BASE
+    area = base / snapshot_id
+    try:
+        base_metadata = os.lstat(base)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        _fail()
+    if (not stat.S_ISDIR(base_metadata.st_mode) or stat.S_ISLNK(base_metadata.st_mode)
+            or base_metadata.st_uid != control_uid or stat.S_IMODE(base_metadata.st_mode) & 0o022):
+        _fail()
+    try:
+        metadata = os.stat(area, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        _fail()
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != control_uid:
+        _fail()
+    owned_tree_cleanup.remove_owned_tree(area, base, prefix="node-vendor-cleanup-")
+    if area.exists() or area.is_symlink():
         _fail()
     return True
 
@@ -188,7 +218,9 @@ def main(argv=None):
             node_tool_snapshot.remove_snapshot(
                 args.node_snapshot_id, args.deadline_file, owner_uid=args.owner_uid,
             )
+            clean_node_vendor_source(args.node_snapshot_id)
             print("node_snapshot_cleanup=confirmed")
+            print("node_vendor_cleanup=confirmed")
             return 0
         if not args.root or not args.runner_temp:
             _fail()

@@ -23,10 +23,14 @@ import filter as public_filter
 import host_cleanup
 import isolated_cleanup
 import network_probe
+import node_tool_snapshot
 import permit
 import prepare
+import project
 import supervisor
 import test_e2e
+import test_node_vendor_source
+import test_node_vendor_source_r2
 
 
 CONTROL_SHA = "a" * 40
@@ -221,6 +225,512 @@ class EnvelopeAcceptanceTests(unittest.TestCase):
         too_large = b"x" * (bundle.MAX_FILE + 1)
         with self.assertRaises(bundle.Refusal):
             bundle.inspect_archive(_sealed_archive([("src/large.ts", too_large, "file")]), BINDINGS)
+
+
+class SourceSelectionAcceptanceTests(unittest.TestCase):
+    revision = "1" * 40
+    lock_oid = "2" * 40
+    forbidden_oid = "3" * 40
+
+    def _build(self, forbidden_path=".npmrc", selected=None):
+        selected = ["Cargo.lock"] if selected is None else selected
+        tree = (
+            ("100644 blob " + self.forbidden_oid + "\t" + forbidden_path + "\0"
+             + "100644 blob " + self.lock_oid + "\tCargo.lock\0").encode("utf-8")
+        )
+
+        def git(argv, **_kwargs):
+            result = type("Result", (), {"returncode": 0})()
+            result.stdout = ((self.revision + "\n").encode("ascii")
+                             if "rev-parse" in argv else tree)
+            return result
+
+        def read_blob(_repository, oid):
+            self.assertEqual(oid, self.lock_oid, "excluded source blob must never be read")
+            return b"version = 4\n"
+
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(bundle.subprocess, "run", side_effect=git), \
+                patch.object(bundle, "_git_blob", side_effect=read_blob):
+            return bundle.build_source_archive(
+                temporary, self.revision, "core-node", FETCH_SHA, selected,
+                {"Cargo.lock": "file_0001"}, {"suite::case": "case_0001"}, {},
+            )
+
+    def test_excluded_forbidden_source_path_does_not_block_selected_archive(self):
+        archive = self._build()
+        manifest, files, _directories = bundle.inspect_archive(archive, BINDINGS)
+        self.assertEqual([row["path"] for row in manifest["files"]], ["Cargo.lock"])
+        self.assertEqual(files, {"Cargo.lock": b"version = 4\n"})
+
+    def test_selected_forbidden_source_paths_still_refuse_before_blob_reads(self):
+        for name in (".npmrc", ".env", "nested/credentials"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary, \
+                    patch.object(bundle.subprocess, "run", side_effect=self._git_metadata) as run_git, \
+                    patch.object(bundle, "_git_blob") as read_blob:
+                with self.assertRaisesRegex(bundle.Refusal, "archive-excluded-path"):
+                    bundle.build_source_archive(
+                        temporary, self.revision, "core-node", FETCH_SHA,
+                        ["Cargo.lock", name], {"Cargo.lock": "file_0001"},
+                        {"suite::case": "case_0001"}, {},
+                    )
+                self.assertEqual(run_git.call_count, 2, "only immutable Git metadata is inspected")
+                read_blob.assert_not_called()
+
+    def _git_metadata(self, argv, **_kwargs):
+        tree = ("100644 blob " + self.forbidden_oid + "\t.npmrc\0"
+                + "100644 blob " + self.lock_oid + "\tCargo.lock\0").encode("utf-8")
+        result = type("Result", (), {"returncode": 0})()
+        result.stdout = ((self.revision + "\n").encode("ascii")
+                         if "rev-parse" in argv else tree)
+        return result
+
+    def test_unselected_forbidden_source_paths_are_not_read_or_rejected(self):
+        for name in (".npmrc", ".env", "nested/credentials", "node_modules/hidden.js"):
+            with self.subTest(name=name):
+                archive = self._build(name)
+                manifest, files, _directories = bundle.inspect_archive(archive, BINDINGS)
+                self.assertEqual([row["path"] for row in manifest["files"]], ["Cargo.lock"])
+                self.assertEqual(files["Cargo.lock"], b"version = 4\n")
+
+
+class AuthenticatedSourceSetAcceptanceTests(unittest.TestCase):
+    def test_current_source_set_binds_full_and_selected_maps_with_one_scoped_exclusion(self):
+        source_sets = bundle._expected_core_rust_source_sets()
+        self.assertEqual(source_sets["domain"], "keeldock" + "-core/core-rust-candidate-baseline/v1")
+        candidate = source_sets["candidate"]
+        self.assertEqual(candidate["source_revision"], "9d6cc9e68694e17857d7702e83654131804a1bda")
+        self.assertEqual(candidate["tree_oid"], "958e13e531d1b2601f241a91a9f80a44ac04d889")
+        self.assertEqual(candidate["full_map_sha256"],
+                         "d6ef344e2129babea26ac39c04bacf7eb4cbd3d770acb8416b2fe11a1c334eab")
+        self.assertEqual(candidate["selected_map_sha256"],
+                         "ca99e9c82c8ea07bc4a1d73d881da673dc5f71194c0db4c61c179da5d248b6b3")
+        self.assertEqual(candidate["selected_file_count"], 2636)
+        self.assertEqual(candidate["selected_bytes"], 16619832)
+        self.assertEqual(source_sets["exclusions"], [
+            {"path": ".npmrc", "status": "untransferred-unscanned"},
+        ])
+        baseline = source_sets["baseline_runtime"]
+        self.assertEqual(baseline["source_revision"], "bb1258247ebbbcfec7f112c67dd15902a0f4d4d1")
+        self.assertEqual(baseline["map_sha256"],
+                         "e0a6b6b1c822658b2d55555c2e790193d0fff402632d7df8c22e2d031e5cb1f3")
+        self.assertEqual((baseline["file_count"], baseline["bytes"]), (59, 253657))
+
+    def _crosslink_fixture(self, top_revision=None):
+        candidate = {
+            "Cargo.toml": b"x", "Cargo.lock": b"x",
+            "runtime/Cargo.toml": b"x", "runtime/Cargo.lock": b"x",
+            "fuzz/Cargo.toml": b"x", "fuzz/Cargo.lock": b"x",
+        }
+        baseline = {"Cargo.toml": b"y", "Cargo.lock": b"z"}
+        candidate_hashes = {name: hashlib.sha256(data).hexdigest() for name, data in candidate.items()}
+        baseline_hashes = {name: hashlib.sha256(data).hexdigest() for name, data in baseline.items()}
+        source_revision = "1" * 40
+        patch_values = {
+            "CORE_RUST_SOURCE_REVISION": source_revision,
+            "CORE_RUST_SOURCE_TREE": "2" * 40,
+            "CORE_RUST_FULL_MAP_SHA256": "a" * 64,
+            "CORE_RUST_SELECTED_MAP_SHA256": bundle.r4_source_map_sha256(candidate_hashes),
+            "CORE_RUST_SELECTED_FILE_COUNT": len(candidate),
+            "CORE_RUST_SELECTED_TOTAL_BYTES": sum(map(len, candidate.values())),
+            "CORE_RUST_SELECTED_MANIFEST_SHA256": {
+                name: candidate_hashes[name]
+                for name in ("Cargo.toml", "runtime/Cargo.toml", "fuzz/Cargo.toml")
+            },
+            "CORE_RUST_BASELINE_REVISION": "4" * 40,
+            "CORE_RUST_BASELINE_MAP_SHA256": bundle.r4_source_map_sha256(baseline_hashes),
+            "CORE_RUST_BASELINE_FILE_COUNT": len(baseline),
+            "CORE_RUST_BASELINE_TOTAL_BYTES": sum(map(len, baseline.values())),
+            "CORE_RUST_BASELINE_RUNTIME_MANIFEST_SHA256": baseline_hashes["Cargo.toml"],
+            "CORE_RUST_BASELINE_RUNTIME_LOCK_SHA256": baseline_hashes["Cargo.lock"],
+        }
+        content = dict(candidate)
+        content.update({bundle.BASELINE_NAMESPACE + "/" + name: data for name, data in baseline.items()})
+        inventory = {name: (len(data), hashlib.sha256(data).hexdigest()) for name, data in content.items()}
+        files = [
+            {"path": name, "size": size, "sha256": digest}
+            for name, (size, digest) in sorted(inventory.items())
+        ]
+        value = {
+            "schema": 2, "profile": "core-rust", "profile_revision": 1,
+            "source_revision": top_revision or source_revision,
+            "tree_sha256": hashlib.sha256(bundle.canonical_json(files)).hexdigest(),
+            "files": files,
+            "original_lockfiles": {
+                name: candidate_hashes[name]
+                for name in ("Cargo.lock", "runtime/Cargo.lock", "fuzz/Cargo.lock")
+            },
+            "fetch_sha256": FETCH_SHA,
+            "allowed_files": {"Cargo.lock": "file_0001"},
+            "allowed_tests": {
+                "root::Cargo.toml::case": "case_0001",
+                "runtime::runtime/Cargo.toml::case": "case_0002",
+                "listener::runtime/crates/services/listener/Cargo.toml::case": "case_0003",
+            },
+            "frames": {},
+            "limits": {
+                "ciphertext_bytes": bundle.MAX_CIPHERTEXT,
+                "expanded_bytes": bundle.MAX_EXPANDED,
+                "files": bundle.MAX_FILES,
+                "file_bytes": bundle.MAX_FILE,
+            },
+        }
+        with patch.multiple(bundle, **patch_values):
+            value["source_sets"] = bundle._expected_core_rust_source_sets()
+            return value, inventory, patch_values
+
+    def test_v2_manifest_top_level_source_revision_matches_candidate_source_set(self):
+        value, inventory, patch_values = self._crosslink_fixture()
+        with patch.multiple(bundle, **patch_values):
+            parsed = bundle._manifest(
+                bundle.canonical_json(value),
+                {"profile": "core-rust", "fetch_sha256": FETCH_SHA}, inventory,
+            )
+        self.assertEqual(parsed["source_revision"], parsed["source_sets"]["candidate"]["source_revision"])
+
+    def test_v2_manifest_refuses_candidate_source_revision_attribution_mismatch(self):
+        value, inventory, patch_values = self._crosslink_fixture("3" * 40)
+        with patch.multiple(bundle, **patch_values):
+            with self.assertRaisesRegex(bundle.Refusal, "inner-source-revision-mismatch"):
+                bundle._manifest(
+                    bundle.canonical_json(value),
+                    {"profile": "core-rust", "fetch_sha256": FETCH_SHA}, inventory,
+                )
+
+    def test_v2_manifest_still_refuses_malformed_top_level_source_revision(self):
+        value, inventory, patch_values = self._crosslink_fixture("invalid")
+        with patch.multiple(bundle, **patch_values):
+            with self.assertRaisesRegex(bundle.Refusal, "inner-source-revision$"):
+                bundle._manifest(
+                    bundle.canonical_json(value),
+                    {"profile": "core-rust", "fetch_sha256": FETCH_SHA}, inventory,
+                )
+
+    def test_v2_bundle_binds_candidate_and_baseline_only_after_encrypted_transfer(self):
+        candidate = {
+            "Cargo.toml": b"[workspace]\n",
+            "Cargo.lock": b"version = 3\n",
+            "runtime/Cargo.toml": b"[workspace]\n",
+            "runtime/Cargo.lock": b"version = 3\n",
+            "fuzz/Cargo.toml": b"[package]\n",
+            "fuzz/Cargo.lock": b"version = 3\n",
+        }
+        baseline = {
+            "Cargo.toml": b"[package]\nname = 'baseline'\n",
+            "Cargo.lock": b"version = 3\n",
+            "src/lib.rs": b"pub fn baseline() {}\n",
+        }
+        candidate_map = {name: hashlib.sha256(payload).hexdigest() for name, payload in candidate.items()}
+        baseline_map = {name: hashlib.sha256(payload).hexdigest() for name, payload in baseline.items()}
+        candidate_digest = bundle.r4_source_map_sha256(candidate_map)
+        baseline_digest = bundle.r4_source_map_sha256(baseline_map)
+        candidate_bytes = sum(map(len, candidate.values()))
+        baseline_bytes = sum(map(len, baseline.values()))
+        revision = "1" * 40
+        tree_oid = "2" * 40
+        blob_oids = {name: ("%040x" % (index + 3)) for index, name in enumerate(candidate)}
+        metadata_rows = [
+            ("100644", "blob", blob_oids[name], name) for name in candidate
+        ] + [("100644", "blob", "9" * 40, ".npmrc")]
+        tree_bytes = b"".join(
+            (mode + " " + kind + " " + oid + "\t" + name + "\0").encode("utf-8")
+            for mode, kind, oid, name in metadata_rows
+        )
+        payload_by_oid = {blob_oids[name]: payload for name, payload in candidate.items()}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repo"
+            repository.mkdir()
+            baseline_root = root / "baseline"
+            for name, payload in baseline.items():
+                target = baseline_root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(payload)
+
+            def git(argv, **_kwargs):
+                result = type("Result", (), {"returncode": 0})()
+                if any(type(item) is str and item.endswith("^{tree}") for item in argv):
+                    result.stdout = (tree_oid + "\n").encode("ascii")
+                elif "rev-parse" in argv:
+                    result.stdout = (revision + "\n").encode("ascii")
+                else:
+                    result.stdout = tree_bytes
+                return result
+
+            def read_blob(_repository, oid):
+                self.assertNotEqual(oid, "9" * 40, "excluded .npmrc blob must never be read")
+                return payload_by_oid[oid]
+
+            patch_values = {
+                "CORE_RUST_SOURCE_REVISION": revision,
+                "CORE_RUST_SOURCE_TREE": tree_oid,
+                "CORE_RUST_FULL_MAP_SHA256": "a" * 64,
+                "CORE_RUST_SELECTED_MAP_SHA256": candidate_digest,
+                "CORE_RUST_SELECTED_FILE_COUNT": len(candidate),
+                "CORE_RUST_SELECTED_TOTAL_BYTES": candidate_bytes,
+                "CORE_RUST_SELECTED_MANIFEST_SHA256": {
+                    name: candidate_map[name] for name in ("Cargo.toml", "runtime/Cargo.toml", "fuzz/Cargo.toml")
+                },
+                "CORE_RUST_BASELINE_REVISION": "4" * 40,
+                "CORE_RUST_BASELINE_MAP_SHA256": baseline_digest,
+                "CORE_RUST_BASELINE_FILE_COUNT": len(baseline),
+                "CORE_RUST_BASELINE_TOTAL_BYTES": baseline_bytes,
+                "CORE_RUST_BASELINE_RUNTIME_MANIFEST_SHA256": baseline_map["Cargo.toml"],
+                "CORE_RUST_BASELINE_RUNTIME_LOCK_SHA256": baseline_map["Cargo.lock"],
+            }
+            with patch.multiple(bundle, **patch_values), \
+                    patch.object(bundle.subprocess, "run", side_effect=git), \
+                    patch.object(bundle, "_git_blob", side_effect=read_blob):
+                source_sets = bundle._expected_core_rust_source_sets()
+                archive_bytes = bundle.build_source_archive(
+                    repository, revision, "core-rust", FETCH_SHA, list(candidate),
+                    {"Cargo.lock": "file_0001"},
+                    {"root::Cargo.toml::case": "case_0001",
+                     "runtime::runtime/Cargo.toml::case": "case_0002",
+                     "listener::runtime/crates/services/listener/Cargo.toml::case": "case_0003"},
+                    {}, baseline_runtime_root=baseline_root, source_sets=source_sets,
+                )
+                expected = dict(BINDINGS, profile="core-rust")
+                manifest, contents, _directories = bundle.inspect_archive(archive_bytes, expected)
+
+        self.assertEqual(manifest["schema"], 2)
+        self.assertEqual(manifest["source_sets"], source_sets)
+        self.assertNotIn(".npmrc", contents)
+        self.assertEqual(contents[".devlane/baseline-runtime/Cargo.lock"], baseline["Cargo.lock"])
+        self.assertEqual(contents["Cargo.lock"], candidate["Cargo.lock"])
+
+    def test_v2_manifest_rejects_candidate_or_baseline_map_drift(self):
+        inventory = {
+            "Cargo.toml": (1, "a" * 64),
+            "Cargo.lock": (1, "a" * 64),
+            ".devlane/baseline-runtime/Cargo.toml": (1, "b" * 64),
+            ".devlane/baseline-runtime/Cargo.lock": (1, "b" * 64),
+        }
+        with patch.multiple(
+                bundle,
+                CORE_RUST_SELECTED_FILE_COUNT=2,
+                CORE_RUST_SELECTED_TOTAL_BYTES=2,
+                CORE_RUST_SELECTED_MAP_SHA256=bundle.r4_source_map_sha256({
+                    "Cargo.toml": "a" * 64, "Cargo.lock": "a" * 64}),
+                CORE_RUST_SELECTED_MANIFEST_SHA256={"Cargo.toml": "a" * 64},
+                CORE_RUST_BASELINE_FILE_COUNT=2,
+                CORE_RUST_BASELINE_TOTAL_BYTES=2,
+                CORE_RUST_BASELINE_MAP_SHA256=bundle.r4_source_map_sha256({
+                    "Cargo.toml": "b" * 64, "Cargo.lock": "b" * 64}),
+                CORE_RUST_BASELINE_RUNTIME_MANIFEST_SHA256="b" * 64,
+                CORE_RUST_BASELINE_RUNTIME_LOCK_SHA256="b" * 64):
+            source_sets = bundle._expected_core_rust_source_sets()
+            bundle._validate_core_rust_source_sets(source_sets, inventory)
+            changed = dict(source_sets)
+            changed["candidate"] = dict(source_sets["candidate"], selected_map_sha256="c" * 64)
+            with self.assertRaisesRegex(bundle.Refusal, "source-sets-candidate-binding"):
+                bundle._validate_core_rust_source_sets(changed, inventory)
+
+
+class NodeVendorIntegrationAcceptanceTests(unittest.TestCase):
+    def test_official_source_flows_through_the_existing_snapshot_and_exact_node(self):
+        self.assertEqual(node_tool_snapshot.PREPARATION_ID,
+                         "nodejs-dist-v24.22.1-linux-x64-sha256")
+        validated = {"node": "/sealed/node/bin/node", "npm_cli": "/sealed/node/npm-cli.js"}
+        self.assertEqual(prepare.node_version_commands(validated), {
+            "node": [validated["node"], "--version"],
+            "npm": [validated["node"], validated["npm_cli"], "--version"],
+        })
+        prepare_source = inspect.getsource(prepare.main)
+        self.assertIn("node_vendor_source.acquire_node_source", prepare_source)
+        self.assertIn("node_tool_snapshot.create_snapshot", prepare_source)
+        workflow = (Path(__file__).resolve().parents[2]
+                    / ".github/workflows/devlane-encrypted.yml").read_text(encoding="utf-8")
+        prepare_step = workflow.split("- name: Prepare dependencies before the cut", 1)[1].split(
+            "- name:", 1,
+        )[0]
+        self.assertNotIn("actions/setup-node@", workflow)
+        self.assertNotIn("/opt/hostedtoolcache", workflow + prepare_source)
+        self.assertNotIn("command -v node", prepare_step)
+        self.assertNotIn("command -v npm", prepare_step)
+        self.assertIn('--deadline-file "$RUN_ROOT/deadline.json"', prepare_step)
+        self.assertIn("node_vendor_source.PROTECTED_BASE", inspect.getsource(host_cleanup.clean_node_vendor_source))
+
+    def test_owned_vendor_cleanup_unlinks_symlink_without_touching_external_tree(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            base = root / "node-vendor"
+            area = base / "test-cleanup"
+            outside = root / "outside"
+            outside.mkdir()
+            marker = outside / "marker"
+            marker.write_text("preserved", encoding="ascii")
+            (area / "cache").mkdir(parents=True)
+            (area / "cache" / "escape").symlink_to(outside, target_is_directory=True)
+            (area / "cache" / "data").write_text("fixture", encoding="ascii")
+            with patch.object(host_cleanup.node_vendor_source, "PROTECTED_BASE", base):
+                self.assertTrue(host_cleanup.clean_node_vendor_source("test-cleanup", control_uid=os.getuid()))
+            self.assertFalse(area.exists())
+            self.assertEqual(marker.read_text(encoding="ascii"), "preserved")
+
+
+class OfflineProjectionV2AcceptanceTests(unittest.TestCase):
+    def _constraint_envelope(self, source_commit, package, requirement, ident, *, empty=False):
+        envelope = {
+            "schema": 2,
+            "profile": "core-rust",
+            "source_commit": source_commit,
+            "control_sha": CONTROL_SHA,
+            "toolchain": "1.99.1",
+            "target_set": ["x86_64-unknown-linux-gnu"],
+            "resolution_mode": "external-all-features-all-targets-v2",
+            "resolver_version": "3" if empty else "2",
+            "constraints": [] if empty else [{"id": ident, "package": package, "version_req": requirement}],
+        }
+        digest_input = {key: envelope[key] for key in (
+            "schema", "profile", "toolchain", "target_set", "resolution_mode", "resolver_version",
+        )}
+        digest_input["constraints"] = [] if empty else [{"package": package, "version_req": requirement}]
+        envelope["manifest_projection_sha256"] = hashlib.sha256(bundle.canonical_json(digest_input)).hexdigest()
+        return envelope
+
+    def _request(self):
+        return {
+            "schema": 2,
+            "profile": "core-rust",
+            "control_sha": CONTROL_SHA,
+            "tools": {"cargo": "1.99.1", "rustc": "1.99.1"},
+            "source_sets": bundle._expected_core_rust_source_sets(),
+            "manifest_constraints": {
+                "candidate": self._constraint_envelope(
+                    bundle.CORE_RUST_SOURCE_REVISION, "serde", "^1.0", "d000001"),
+                "baseline_runtime": self._constraint_envelope(
+                    bundle.CORE_RUST_BASELINE_REVISION, "tokio", "^1.0", "d000002", empty=True),
+            },
+        }
+
+    def test_projection_producer_binds_sanitized_candidate_and_baseline_constraints(self):
+        payload = project.build_projection(self._request())
+        value = fetch.validate_projection(payload, "core-rust", expected_control_sha=CONTROL_SHA)
+        self.assertEqual(value["schema"], 2)
+        self.assertEqual(set(value), {
+            "schema", "profile", "tools", "source_sets", "manifest_constraints", "manifest_projection_sha256",
+        })
+        self.assertEqual(value["source_sets"]["candidate"]["selected_file_count"],
+                         bundle.CORE_RUST_SELECTED_FILE_COUNT)
+        self.assertEqual(value["source_sets"]["baseline_runtime"]["file_count"],
+                         bundle.CORE_RUST_BASELINE_FILE_COUNT)
+
+    def test_projection_requires_both_external_scopes_and_exact_control_binding(self):
+        request = self._request()
+        del request["manifest_constraints"]["baseline_runtime"]
+        with self.assertRaisesRegex(bundle.Refusal, "projection-constraint-scopes"):
+            project.build_projection(request)
+        payload = project.build_projection(self._request())
+        with self.assertRaisesRegex(fetch.Refusal, "projection-constraint-binding"):
+            fetch.validate_projection(payload, "core-rust", expected_control_sha="c" * 40)
+
+    def test_projection_refuses_private_package_namespace_and_missing_constraints(self):
+        request = self._request()
+        request["manifest_constraints"]["candidate"] = self._constraint_envelope(
+            bundle.CORE_RUST_SOURCE_REVISION, "keeldock" + "-private", "^1", "d000001")
+        with self.assertRaisesRegex(bundle.Refusal, "projection-constraint-row"):
+            project.build_projection(request)
+        request = self._request()
+        request["manifest_constraints"]["candidate"] = self._constraint_envelope(
+            bundle.CORE_RUST_SOURCE_REVISION, "serde", "^1", "d000001", empty=True)
+        with self.assertRaisesRegex(fetch.Refusal, "projection-constraint-count"):
+            project.build_projection(request)
+
+    def test_pinned_baseline_rejects_added_external_constraints(self):
+        request = self._request()
+        request["manifest_constraints"]["baseline_runtime"] = self._constraint_envelope(
+            bundle.CORE_RUST_BASELINE_REVISION, "serde", "^1", "d000002")
+        with self.assertRaisesRegex(fetch.Refusal, "projection-baseline-constraints"):
+            project.build_projection(request)
+
+    def test_projection_input_cannot_supply_plaintext_baseline_paths(self):
+        request = self._request()
+        request["baseline_source_root"] = chr(47) + "private/baseline"
+        with self.assertRaisesRegex(bundle.Refusal, "projection-request-shape"):
+            project.build_projection(request)
+
+
+class PostCutBaselineStagingAcceptanceTests(unittest.TestCase):
+    def _baseline_binding(self, files):
+        hashes = {name: hashlib.sha256(payload).hexdigest() for name, payload in files.items()}
+        return {
+            "source_revision": bundle.CORE_RUST_BASELINE_REVISION,
+            "map_sha256": bundle.r4_source_map_sha256(hashes),
+            "file_count": len(files),
+            "bytes": sum(map(len, files.values())),
+            "namespace": bundle.BASELINE_NAMESPACE,
+            "runtime_manifest_sha256": hashes["Cargo.toml"],
+            "runtime_lock_sha256": hashes["Cargo.lock"],
+        }
+
+    def _make_input(self, source_root, files):
+        baseline = source_root / ".devlane/baseline-runtime"
+        for name, payload in files.items():
+            target = baseline / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payload)
+        return baseline
+
+    def test_authenticated_baseline_moves_to_root_owned_readonly_mount_after_cut(self):
+        files = {"Cargo.toml": b"[package]\n", "Cargo.lock": b"version = 3\n"}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_root = root / "workspace/source"
+            source_root.mkdir(parents=True)
+            namespace_root = root
+            self._make_input(source_root, files)
+            mounts = []
+            source_sets = {"baseline_runtime": self._baseline_binding(files)}
+            try:
+                with patch.object(supervisor.os, "chown"), \
+                        patch.object(supervisor, "_mount_bind", side_effect=lambda source, target, readonly: mounts.append(
+                            (Path(source), Path(target), readonly))):
+                    mountpoint = supervisor._stage_baseline_runtime_after_cut(
+                        source_root, namespace_root, source_sets,
+                    )
+                self.assertEqual(mountpoint, root / "workspace/semver-baseline/runtime")
+                self.assertEqual(len(mounts), 1)
+                self.assertTrue(mounts[0][2], "baseline mount must be read-only")
+                staged = root / "workspace/.devlane-baseline-input/runtime"
+                self.assertEqual((staged / "Cargo.lock").read_bytes(), files["Cargo.lock"])
+                self.assertEqual((staged / "Cargo.lock").stat().st_mode & 0o777, 0o444)
+                self.assertEqual(staged.stat().st_mode & 0o777, 0o555)
+                self.assertFalse((source_root / ".devlane").exists())
+                decrypt_source = inspect.getsource(supervisor.Service._decrypt)
+                self.assertLess(decrypt_source.index("self._verify_network_cut()"),
+                                decrypt_source.index("_stage_baseline_runtime_after_cut("))
+                self.assertLess(decrypt_source.index("self._verify_projection_bindings()"),
+                                decrypt_source.index("_stage_baseline_runtime_after_cut("))
+            finally:
+                for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+                    if path.is_dir() and not path.is_symlink():
+                        path.chmod(0o700)
+                    elif path.exists() and not path.is_symlink():
+                        path.chmod(0o600)
+
+    def test_symlinked_baseline_is_refused_without_touching_external_canary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_root = root / "workspace/source"
+            source_root.mkdir(parents=True)
+            source_parent = source_root / ".devlane"
+            source_parent.mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            canary = outside / "canary.txt"
+            canary.write_text("external-canary", encoding="ascii")
+            (source_parent / "baseline-runtime").symlink_to(outside, target_is_directory=True)
+            with patch.object(supervisor, "_mount_bind") as mount_bind:
+                with self.assertRaisesRegex(supervisor.SupervisorRefusal, "prepared-input-invalid"):
+                    supervisor._stage_baseline_runtime_after_cut(
+                        source_root, root, {"baseline_runtime": self._baseline_binding({
+                            "Cargo.toml": b"x", "Cargo.lock": b"y",
+                        })},
+                    )
+                mount_bind.assert_not_called()
+            self.assertEqual(canary.read_text(encoding="ascii"), "external-canary")
 
 
 class OneRunPermitAcceptanceTests(unittest.TestCase):
@@ -880,6 +1390,12 @@ class InstallScriptSuppressionTests(unittest.TestCase):
             self.assertTrue(outcome["none"], "control experiment: without suppression the script must run")
             self.assertEqual({key: value for key, value in outcome.items() if key != "none"},
                              {"npmrc": False, "environment": False, "flag": False})
+
+
+def load_tests(loader, standard_tests, _pattern):
+    standard_tests.addTests(loader.loadTestsFromModule(test_node_vendor_source))
+    standard_tests.addTests(loader.loadTestsFromModule(test_node_vendor_source_r2))
+    return standard_tests
 
 
 if __name__ == "__main__":

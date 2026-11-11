@@ -476,7 +476,6 @@ class DeadlineTests(unittest.TestCase):
                     "Restore one-run bundle permit": 1,
                     "Save one-run bundle permit": 1,
                     "Restore and verify persisted one-run permit": 1,
-                    "Set up pinned Node toolchain": 5,
                 },
             },
             ("devlane-encrypted.yml", "devlane-encrypted-audit"): {
@@ -529,7 +528,7 @@ class DeadlineTests(unittest.TestCase):
             ("devlane-synthetic.yml", "devlane-synthetic", "test_rehearsal.py"): 1,
             ("devlane-synthetic.yml", "devlane-synthetic", "test_rust_report.py"): 1,
             ("devlane-synthetic.yml", "devlane-synthetic", "test_rust_test_runner.py"): 1,
-            ("devlane-encrypted.yml", "devlane-encrypted-run", "deadline.py"): 26,
+            ("devlane-encrypted.yml", "devlane-encrypted-run", "deadline.py"): 25,
             ("devlane-encrypted.yml", "devlane-encrypted-audit", "deadline.py"): 1,
             ("devlane-encrypted.yml", "devlane-encrypted-run", "fetch.py"): 4,
             ("devlane-encrypted.yml", "devlane-encrypted-run", "host_cleanup.py"): 1,

@@ -18,6 +18,7 @@ try:
 except ImportError:
     tomllib = None
 
+import bundle
 from bundle import Refusal, strict_json
 
 
@@ -267,8 +268,106 @@ def _validate_npm_dependency_map(value, code):
             _fail(code)
 
 
-def validate_projection(payload, expected_profile):
+def _validate_constraint_envelope(value, *, expected_source_sha, expected_control_sha,
+                                  allow_empty=False):
+    fields = {"schema", "profile", "source_commit", "control_sha", "manifest_projection_sha256",
+              "toolchain", "target_set", "resolution_mode", "resolver_version", "constraints"}
+    if type(value) is not dict or set(value) != fields:
+        _fail("projection-constraint-shape")
+    if (value["schema"] != 2 or value["profile"] != "core-rust"
+            or value["source_commit"] != expected_source_sha
+            or value["control_sha"] != expected_control_sha
+            or value["toolchain"] != "1.99.1"
+            or value["target_set"] != ["x86_64-unknown-linux-gnu"]
+            or value["resolution_mode"] != "external-all-features-all-targets-v2"
+            or value["resolver_version"] not in ("1", "2", "3")):
+        _fail("projection-constraint-binding")
+    if (type(value["manifest_projection_sha256"]) is not str
+            or not SHA256.fullmatch(value["manifest_projection_sha256"])):
+        _fail("projection-constraint-digest")
+    rows = value["constraints"]
+    if type(rows) is not list or (not rows and not allow_empty) or len(rows) > 20_000:
+        _fail("projection-constraint-count")
+    ids = set()
+    pairs = set()
+    ordered = []
+    for row in rows:
+        if type(row) is not dict or set(row) != {"id", "package", "version_req"}:
+            _fail("projection-constraint-row")
+        ident, package, requirement = row["id"], row["package"], row["version_req"]
+        if (type(ident) is not str or not re.fullmatch(r"d[0-9]{6}", ident) or ident in ids
+                or type(package) is not str or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", package)
+                or package.startswith("keeldock" + "-")
+                or type(requirement) is not str
+                or not re.fullmatch(r"[=<>~^*0-9A-Za-z._,+| -]{1,128}", requirement)):
+            _fail("projection-constraint-row")
+        key = (package, requirement)
+        if key in pairs or ordered and key < ordered[-1]:
+            _fail("projection-constraint-order")
+        ids.add(ident)
+        pairs.add(key)
+        ordered.append(key)
+    digest_body = {
+        "schema": value["schema"], "profile": value["profile"], "toolchain": value["toolchain"],
+        "target_set": value["target_set"], "resolution_mode": value["resolution_mode"],
+        "resolver_version": value["resolver_version"],
+        "constraints": [{"package": row["package"], "version_req": row["version_req"]} for row in rows],
+    }
+    if hashlib.sha256(bundle.canonical_json(digest_body)).hexdigest() != value["manifest_projection_sha256"]:
+        _fail("projection-constraint-digest")
+    if len(bundle.canonical_json(value)) > 4 * 1024 * 1024:
+        _fail("projection-constraint-size")
+    return value
+
+
+def _validate_core_rust_v2_projection(value, expected_control_sha):
+    fields = {"schema", "profile", "tools", "source_sets", "manifest_constraints",
+              "manifest_projection_sha256"}
+    if type(value) is not dict or set(value) != fields:
+        _fail("projection-shape")
+    if (value.get("schema") != 2 or value.get("profile") != "core-rust"
+            or type(expected_control_sha) is not str
+            or not re.fullmatch(r"[a-f0-9]{40}", expected_control_sha)):
+        _fail("projection-binding")
+    if value["tools"] != {"cargo": "1.99.1", "rustc": "1.99.1"}:
+        _fail("projection-tool-version")
+    source_sets = value["source_sets"]
+    if type(source_sets) is not dict or source_sets != bundle._expected_core_rust_source_sets():
+        _fail("projection-source-identity")
+    constraints = value["manifest_constraints"]
+    if type(constraints) is not dict or set(constraints) != {"candidate", "baseline_runtime"}:
+        _fail("projection-constraint-scopes")
+    candidate = _validate_constraint_envelope(
+        constraints["candidate"], expected_source_sha=bundle.CORE_RUST_SOURCE_REVISION,
+        expected_control_sha=expected_control_sha,
+    )
+    baseline = _validate_constraint_envelope(
+        constraints["baseline_runtime"], expected_source_sha=bundle.CORE_RUST_BASELINE_REVISION,
+        expected_control_sha=expected_control_sha, allow_empty=True,
+    )
+
+    if baseline["constraints"] != [] or baseline["resolver_version"] != "3":
+        _fail("projection-baseline-constraints")
+    digest_input = {
+        "schema": 2,
+        "profile": "core-rust",
+        "tools": value["tools"],
+        "source_sets": source_sets,
+        "manifest_constraints": {
+            "candidate": candidate["manifest_projection_sha256"],
+            "baseline_runtime": baseline["manifest_projection_sha256"],
+        },
+    }
+    digest = hashlib.sha256(bundle.canonical_json(digest_input)).hexdigest()
+    if value["manifest_projection_sha256"] != digest:
+        _fail("projection-manifest-digest")
+    return value
+
+
+def validate_projection(payload, expected_profile, expected_control_sha=None):
     value = strict_json(payload, MAX_PROJECTION)
+    if expected_profile == "core-rust" and type(value) is dict and value.get("schema") == 2:
+        return _validate_core_rust_v2_projection(value, expected_control_sha)
     required = {"schema", "profile", "npm", "cargo", "playwright", "tools", "cargo_workspaces"}
     if expected_profile == "core-node":
         required |= {"npm_package", "npm_lock"}
@@ -591,6 +690,7 @@ def main(argv=None):
     projection = sub.add_parser("check-projection")
     projection.add_argument("--file", required=True)
     projection.add_argument("--profile", required=True)
+    projection.add_argument("--control-sha")
     npm_lock = sub.add_parser("check-npm-lock")
     npm_lock.add_argument("--file", required=True)
     context = sub.add_parser("context")
@@ -601,7 +701,7 @@ def main(argv=None):
             size = download_release_asset(args.asset_id, args.size, args.sha256, args.output, args.maximum)
             print("public_asset_verified=true bytes=" + str(size))
         elif args.operation == "check-projection":
-            validate_projection(Path(args.file).read_bytes(), args.profile)
+            validate_projection(Path(args.file).read_bytes(), args.profile, expected_control_sha=args.control_sha)
             print("fetch_projection_valid=true")
         elif args.operation == "check-npm-lock":
             validate_npm_package_lock(Path(args.file).read_bytes())

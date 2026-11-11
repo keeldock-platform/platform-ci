@@ -23,8 +23,10 @@ import time
 from pathlib import Path
 
 import bundle
+import bounded_registry_io
 import deadline as deadline_budget
 import fetch
+import rust_lock_generation
 import filter as output_filter
 import network_probe
 import prepare as node_tool_prepare
@@ -50,7 +52,7 @@ ACTIVE_DEADLINE_FILE = ""
 REFUSAL_CODES = frozenset((
     "allowlisted-file-too-large", "allowlisted-file-unavailable", "browser-profile-command",
     "bundle-binding-mismatch", "cargo-lock-binding-missing", "cargo-lock-projection-invalid",
-    "cargo-projection-mismatch", "cargo-vendor-missing", "cargo-workspace-count-mismatch",
+    "offline-lock-generation-failed", "cargo-projection-mismatch", "cargo-vendor-missing", "cargo-workspace-count-mismatch",
     "cargo-workspace-lock-set", "cargo-workspace-projection-invalid", "cargo-workspace-projection-mismatch",
     "cleanup-incomplete", "cleanup-process-remains", "cleanup-receipt-invalid", "cleanup-root-invalid",
     "control-operation-invalid", "control-protocol-size", "control-protocol-truncated",
@@ -83,6 +85,7 @@ REFUSAL_CODES = frozenset((
     "rust-matrix-report-unavailable", "rust-matrix-status-mismatch", "rust-tool-layout",
     "rust-toolchain-missing", "rust-toolchain-path", "state-directory-not-empty",
     "state-directory-permissions", "summary-catalog-invalid", "summary-not-ready",
+    "semver-temporary-input-missing", "source-set-projection-mismatch",
     "summary-response-invalid", "supervisor-failed", "supervisor-operation-failed",
     "supervisor-start-failed", "supervisor-start-timeout", "supervisor-unavailable", "swap-enabled",
     "swap-state-unavailable", "tool-manifest-invalid", "tool-path-invalid", "tool-version-mismatch",
@@ -421,7 +424,9 @@ def _bound_projection(context, path):
             or hashlib.sha256(payload).hexdigest() != context["projection_sha256"]):
         _refuse("projection-binding-mismatch")
     try:
-        value = fetch.validate_projection(payload, context["profile"])
+        value = fetch.validate_projection(
+            payload, context["profile"], expected_control_sha=context["control_sha"],
+        )
     except (fetch.Refusal, TypeError, KeyError, RecursionError):
         _refuse("projection-invalid")
     return payload, value
@@ -728,6 +733,78 @@ def _chown_tree(root, uid=WORKER_UID, gid=WORKER_GID):
             os.chown(path, uid, gid, follow_symlinks=False)
 
 
+def _seal_tree_root_readonly(root):
+    root = Path(root)
+    for current, directories, files in os.walk(root, topdown=False, followlinks=False):
+        current_path = Path(current)
+        if current_path.is_symlink() or not current_path.is_dir():
+            _refuse("prepared-input-invalid")
+        for name in files:
+            path = current_path / name
+            try:
+                metadata = path.lstat()
+            except OSError:
+                _refuse("prepared-input-invalid")
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                _refuse("prepared-input-invalid")
+            try:
+                os.chown(path, 0, 0, follow_symlinks=False)
+                os.chmod(path, 0o444, follow_symlinks=False)
+            except OSError:
+                _refuse("prepared-input-invalid")
+        for name in directories:
+            path = current_path / name
+            if path.is_symlink() or not path.is_dir():
+                _refuse("prepared-input-invalid")
+            try:
+                os.chown(path, 0, 0, follow_symlinks=False)
+                os.chmod(path, 0o555, follow_symlinks=False)
+            except OSError:
+                _refuse("prepared-input-invalid")
+        try:
+            os.chown(current_path, 0, 0, follow_symlinks=False)
+            os.chmod(current_path, 0o555, follow_symlinks=False)
+        except OSError:
+            _refuse("prepared-input-invalid")
+
+
+def _stage_baseline_runtime_after_cut(source_root, namespace_root, source_sets):
+    """Move the authenticated baseline into a root-owned read-only post-cut mount."""
+    baseline = source_sets["baseline_runtime"]
+    source_parent = Path(source_root) / ".devlane"
+    source = source_parent / "baseline-runtime"
+    private_root = Path(namespace_root) / "workspace/.devlane-baseline-input/runtime"
+    mountpoint = Path(namespace_root) / "workspace/semver-baseline/runtime"
+    try:
+        if (source_parent.is_symlink() or not source_parent.is_dir()
+                or sorted(os.listdir(source_parent)) != ["baseline-runtime"]
+                or source.is_symlink() or not source.is_dir()
+                or private_root.exists() or private_root.is_symlink()
+                or mountpoint.exists() or mountpoint.is_symlink()):
+            _refuse("prepared-input-invalid")
+        files, total = bundle._read_regular_tree(source)
+        hashes = {name: hashlib.sha256(payload).hexdigest() for name, payload in files.items()}
+        if (len(files) != baseline["file_count"] or total != baseline["bytes"]
+                or bundle.r4_source_map_sha256(hashes) != baseline["map_sha256"]
+                or hashes.get("Cargo.toml") != baseline["runtime_manifest_sha256"]
+                or hashes.get("Cargo.lock") != baseline["runtime_lock_sha256"]):
+            _refuse("prepared-input-invalid")
+        if os.stat(source).st_dev != os.stat(private_root.parent.parent).st_dev:
+            _refuse("prepared-input-invalid")
+        private_root.parent.mkdir(mode=0o700, parents=True, exist_ok=False)
+        os.rename(source, private_root)
+        source_parent.rmdir()
+        _seal_tree_root_readonly(private_root)
+        mountpoint.parent.mkdir(mode=0o700, parents=True, exist_ok=False)
+        mountpoint.mkdir(mode=0o700)
+        _mount_bind(private_root, mountpoint, readonly=True)
+    except SupervisorRefusal:
+        raise
+    except (OSError, bundle.Refusal, KeyError, TypeError):
+        _refuse("prepared-input-invalid")
+    return mountpoint
+
+
 def _prepare_trusted_files(root, manifest):
     trusted = root / "trusted"
     trusted.mkdir(mode=0o755, exist_ok=True)
@@ -748,29 +825,32 @@ def _prepare_trusted_files(root, manifest):
             os.fsync(output.fileno())
 
 
-def _prepare_writable_scratch(root):
+def _prepare_writable_scratch(root, *, registry_v2=False):
     for relative in ("scratch/reports", "scratch/target", "scratch/tmp", "scratch/npm-cache", "scratch/cargo-home"):
         path = root / relative
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chown(str(path), WORKER_UID, WORKER_GID)
     cargo_config = root / "scratch/cargo-home/config.toml"
-    cargo_config.write_text(
-        '[source.crates-io]\nreplace-with = "vendored-sources"\n'
-        '[source.vendored-sources]\ndirectory = "/prepared/cargo-vendor"\n'
-        '[net]\noffline = true\n',
-        encoding="ascii",
-    )
+    if registry_v2:
+        config = ('[source.crates-io]\nreplace-with = "prepared-registry"\n'
+                  '[source.prepared-registry]\nlocal-registry = "/prepared/cargo-local-registry"\n'
+                  '[net]\noffline = true\nretry = 0\n')
+    else:
+        config = ('[source.crates-io]\nreplace-with = "vendored-sources"\n'
+                  '[source.vendored-sources]\ndirectory = "/prepared/cargo-vendor"\n'
+                  '[net]\noffline = true\n')
+    cargo_config.write_text(config, encoding="ascii")
     os.chmod(cargo_config, 0o444)
 
 
-def _copy_prepared_dependencies(root, profile):
+def _copy_prepared_dependencies(root, profile, *, registry_v2=False):
     if profile == "core-node":
         source = root / "prepared/node_modules"
         destination = root / "workspace/source/node_modules"
         _copy_prepared_tree(source, destination)
         _chown_tree(destination)
     elif profile == "core-rust":
-        vendor = root / "prepared/cargo-vendor"
+        vendor = root / ("prepared/cargo-local-registry" if registry_v2 else "prepared/cargo-vendor")
         if not vendor.is_dir() or vendor.is_symlink():
             _refuse("cargo-vendor-missing")
 
@@ -1086,6 +1166,8 @@ class Service:
         self.probe_passed = False
         self.probe_namespace_inode = None
         self.decrypted = False
+        self.baseline_staged = False
+        self.semver_temporary_project_ready = False
         self.execution_done = False
         self.summary = None
         self.outcomes = []
@@ -1246,15 +1328,67 @@ class Service:
         output = b""
         receipt = None
         self._verify_projection_bindings()
-        _copy_prepared_dependencies(self.root, self.context["profile"])
+        if self.manifest["schema"] == 2:
+            _stage_baseline_runtime_after_cut(
+                self.root / "workspace/source", self.root, self.manifest["source_sets"],
+            )
+            self.baseline_staged = True
+        _copy_prepared_dependencies(
+            self.root, self.context["profile"], registry_v2=self.manifest["schema"] == 2)
         _chown_tree(self.root / "workspace/source")
         _prepare_trusted_files(self.root, self.manifest)
-        _prepare_writable_scratch(self.root)
+        _prepare_writable_scratch(self.root, registry_v2=self.manifest["schema"] == 2)
+        if self.manifest["schema"] == 2:
+            self._generate_offline_locks()
         self.decrypted = True
         return {"ok": True}
 
+    def _generate_offline_locks(self):
+        self._verify_network_cut()
+        record_path = self.root / "prepared/registry-preparation.json"
+        preparation = bundle.strict_json(_read_regular(record_path, fetch.MAX_PROJECTION),
+                                         fetch.MAX_PROJECTION)
+        try:
+            packages = rust_lock_generation.validate_preparation(
+                preparation, self.projection_value, self.context["control_sha"])
+            for name in ("cargo", "rustc"):
+                _size, digest = _hash_file(
+                    self.root / "tools/rust/bin" / name, 256 * 1024 * 1024)
+                if digest != preparation["tool_hashes"][name + "_sha256"]:
+                    _refuse("offline-lock-generation-failed")
+            outer = deadline_budget._read(self.deadline_file)
+            budget = bounded_registry_io.PhaseBudget.from_outer_deadlines(
+                outer["work_deadline"], outer["work_deadline"] + outer["cleanup_reserve"])
+            bounded_registry_io.verify_bounded_registry_tree(
+                self.root / "prepared/cargo-local-registry", packages, budget)
+        except (bundle.Refusal, ValueError, KeyError, TypeError):
+            _refuse("offline-lock-generation-failed")
+        for index, (manifest, _lock) in enumerate(rust_lock_generation.LOCKS):
+            result = _run_profile_command(
+                self.root, rust_lock_generation.command(manifest), "rust-lock-generation",
+                "/scratch/reports/lock-generation-%d.log" % index, self.tool_info,
+                timeout=1200, deadline=self.deadline_file)
+            if result != 0:
+                _refuse("offline-lock-generation-failed")
+        locks = {name: _read_regular(self.root / "workspace/source" / name, 8 * 1024 * 1024)
+                 for _manifest, name in rust_lock_generation.LOCKS}
+        try:
+            record = rust_lock_generation.output_record(
+                locks, preparation, self.projection_value, self.context["control_sha"])
+        except (bundle.Refusal, ValueError, KeyError, TypeError):
+            _refuse("offline-lock-generation-failed")
+        destination = self.root / "trusted/generated-locks.json"
+        with destination.open("xb") as output:
+            output.write(bundle.canonical_json(record))
+        os.chmod(destination, 0o444)
+
     def _verify_projection_bindings(self):
         source = self.root / "workspace/source"
+        if self.manifest["schema"] == 2:
+            if (self.context["profile"] != "core-rust"
+                    or self.projection_value.get("schema") != 2
+                    or self.projection_value.get("source_sets") != self.manifest.get("source_sets")):
+                _refuse("source-set-projection-mismatch")
         if self.context["profile"] == "core-node":
             package_path = source / "package.json"
             lock_path = source / "package-lock.json"
@@ -1269,6 +1403,20 @@ class Service:
             if package != self.projection_value["npm_package"] or lock != self.projection_value["npm_lock"]:
                 _refuse("npm-projection-mismatch")
         else:
+            if self.manifest["schema"] == 2:
+                try:
+                    source_files, _source_bytes = bundle._read_regular_tree(source)
+                    inventory = {path: (len(payload), hashlib.sha256(payload).hexdigest())
+                                 for path, payload in source_files.items()}
+                    bundle._validate_core_rust_source_sets(self.manifest["source_sets"], inventory)
+                    rust_lock_generation.verify_manifest_constraints(
+                        source_files, self.projection_value, self.context["control_sha"])
+                except (OSError, bundle.Refusal, KeyError, TypeError):
+                    _refuse("source-set-projection-mismatch")
+                if set(self.manifest["original_lockfiles"]) != {
+                        "Cargo.lock", "fuzz/Cargo.lock", "runtime/Cargo.lock"}:
+                    _refuse("cargo-workspace-lock-set")
+                return
             lock_path = source / "Cargo.lock"
             if "Cargo.lock" not in self.manifest["original_lockfiles"]:
                 _refuse("cargo-lock-binding-missing")
@@ -1308,6 +1456,13 @@ class Service:
         commands = profile.get("commands")
         stages = profile.get("stages")
         if profile_name == "core-rust":
+            if self.manifest["schema"] == 2:
+                if not self.baseline_staged:
+                    _refuse("execution-order")
+                temporary_project = self.root / "workspace/semver-temporary-project"
+                if (not self.semver_temporary_project_ready or temporary_project.is_symlink()
+                        or not temporary_project.is_dir()):
+                    _refuse("semver-temporary-input-missing")
             if commands != [] or stages != ["format", "deny", "audit", "vet", "unit"]:
                 _refuse("profile-command-set")
             output = self.root / "scratch/reports/rust-matrix.jsonl"
@@ -1428,8 +1583,21 @@ class Service:
         failures = 0
         if self.root.is_symlink():
             _refuse("cleanup-root-invalid")
+        baseline_mount = self.root / "workspace/semver-baseline/runtime"
+        if os.path.ismount(baseline_mount):
+            try:
+                _run(["umount", str(baseline_mount)], timeout=8, cleanup=True)
+            except SupervisorRefusal:
+                try:
+                    _run(["umount", "-l", str(baseline_mount)], timeout=8, cleanup=True)
+                except SupervisorRefusal:
+                    pass
+            if os.path.ismount(baseline_mount):
+                failures += 1
         for relative in (
-            "workspace/source", "workspace/raw", "trusted", "scratch/tmp", "scratch/target",
+            "workspace/source", "workspace/raw", "workspace/.devlane-baseline-input",
+            "workspace/semver-baseline", "workspace/semver-temporary-project",
+            "trusted", "scratch/tmp", "scratch/target",
             "scratch/reports", "scratch/npm-cache", "scratch/cargo-home",
         ):
             if not _shred_tree(self.root / relative):

@@ -4,10 +4,94 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import subprocess
 from pathlib import Path
 
 import bundle
+import constraint_resolver
 import fetch
+
+
+def _source_manifests(repository, revision, *, baseline=False):
+    repository = Path(repository).resolve(strict=True)
+    result = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "--verify", revision + "^{commit}"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False, timeout=30)
+    if result.returncode != 0 or result.stdout.strip() != revision.encode("ascii"):
+        bundle._refuse("projection-source-revision")
+    if not baseline:
+        result = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "--verify", revision + "^{tree}"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False, timeout=30)
+        if result.returncode != 0 or result.stdout.strip() != bundle.CORE_RUST_SOURCE_TREE.encode("ascii"):
+            bundle._refuse("projection-source-tree")
+    result = subprocess.run(
+        ["git", "-C", str(repository), "ls-tree", "-r", "-z", "--full-tree", revision],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False, timeout=60)
+    if result.returncode != 0 or len(result.stdout) > bundle.MAX_EXPANDED:
+        bundle._refuse("projection-tree-unavailable")
+    manifests, selected, all_paths = {}, set(), set()
+    for row in result.stdout.split(b"\x00"):
+        if not row:
+            continue
+        try:
+            metadata, raw_name = row.split(b"\t", 1)
+            mode, kind, oid = metadata.split(b" ", 2)
+            name = raw_name.decode("utf-8", "strict")
+        except (ValueError, UnicodeDecodeError):
+            bundle._refuse("projection-tree-entry")
+        if name in all_paths:
+            bundle._refuse("projection-tree-entry")
+        all_paths.add(name)
+        if baseline:
+            if not name.startswith("runtime/"):
+                continue
+            name = name[len("runtime/"):]
+        elif name == ".npmrc":
+            continue
+        name = bundle._safe_member_name(name)
+        if (mode not in (b"100644", b"100755") or kind != b"blob"
+                or not re.fullmatch(rb"[a-f0-9]{40,64}", oid)):
+            bundle._refuse("projection-source-type")
+        selected.add(name)
+        if name == "Cargo.toml" or name.endswith("/Cargo.toml"):
+            if mode != b"100644":
+                bundle._refuse("projection-source-type")
+            manifests[name] = bundle._git_blob(repository, oid.decode("ascii"))
+    expected_count = (bundle.CORE_RUST_BASELINE_FILE_COUNT if baseline
+                      else bundle.CORE_RUST_SELECTED_FILE_COUNT)
+    if len(selected) != expected_count or not manifests:
+        bundle._refuse("projection-source-inventory")
+    if not baseline and all_paths - selected != {".npmrc"}:
+        bundle._refuse("projection-source-inventory")
+    expected = ({"Cargo.toml": bundle.CORE_RUST_BASELINE_RUNTIME_MANIFEST_SHA256} if baseline
+                else bundle.CORE_RUST_SELECTED_MANIFEST_SHA256)
+    if any(name not in manifests or hashlib.sha256(manifests[name]).hexdigest() != digest
+           for name, digest in expected.items()):
+        bundle._refuse("projection-source-manifest")
+    return manifests
+
+
+def build_source_bound_rust_projection(repository, control_sha, *, baseline_repository=None):
+    """Read immutable Git manifests locally and emit only sanitized public constraints."""
+    if type(control_sha) is not str or not re.fullmatch(r"[a-f0-9]{40}", control_sha):
+        bundle._refuse("projection-source-control")
+    candidate = _source_manifests(repository, bundle.CORE_RUST_SOURCE_REVISION)
+    baseline = _source_manifests(baseline_repository or repository,
+                                 bundle.CORE_RUST_BASELINE_REVISION, baseline=True)
+    constraints = {
+        "candidate": constraint_resolver.build_manifest_constraint_envelope(
+            manifests=candidate, source_commit=bundle.CORE_RUST_SOURCE_REVISION,
+            control_sha=control_sha, selected_manifests=list(constraint_resolver.PRODUCTION_MANIFESTS)),
+        "baseline_runtime": constraint_resolver.build_manifest_constraint_envelope(
+            manifests=baseline, source_commit=bundle.CORE_RUST_BASELINE_REVISION,
+            control_sha=control_sha, selected_manifests=["Cargo.toml"], allow_empty=True),
+    }
+    return build_projection({
+        "schema": 2, "profile": "core-rust", "control_sha": control_sha,
+        "tools": {"cargo": "1.99.1", "rustc": "1.99.1"},
+        "source_sets": bundle._expected_core_rust_source_sets(), "manifest_constraints": constraints})
 
 
 def build_projection(request):
@@ -16,6 +100,39 @@ def build_projection(request):
     profile = request.get("profile")
     if profile not in ("core-node", "core-rust"):
         bundle._refuse("projection-profile")
+    if profile == "core-rust" and type(request) is dict and request.get("schema") == 2:
+        expected = {"schema", "profile", "control_sha", "tools", "source_sets", "manifest_constraints"}
+        if set(request) != expected or type(request.get("control_sha")) is not str:
+            bundle._refuse("projection-request-shape")
+        if (type(request["source_sets"]) is not dict
+                or request["source_sets"] != bundle._expected_core_rust_source_sets()):
+            bundle._refuse("projection-source-identity")
+        if request["tools"] != {"cargo": "1.99.1", "rustc": "1.99.1"}:
+            bundle._refuse("projection-tool-versions")
+        result = {
+            "schema": 2,
+            "profile": "core-rust",
+            "tools": request["tools"],
+            "source_sets": request["source_sets"],
+            "manifest_constraints": request["manifest_constraints"],
+        }
+        constraints = result["manifest_constraints"]
+        if type(constraints) is not dict or set(constraints) != {"candidate", "baseline_runtime"}:
+            bundle._refuse("projection-constraint-scopes")
+        try:
+            candidate = constraints["candidate"]["manifest_projection_sha256"]
+            baseline = constraints["baseline_runtime"]["manifest_projection_sha256"]
+        except (KeyError, TypeError):
+            bundle._refuse("projection-constraint-scopes")
+        digest_input = {
+            "schema": 2, "profile": "core-rust", "tools": request["tools"],
+            "source_sets": request["source_sets"],
+            "manifest_constraints": {"candidate": candidate, "baseline_runtime": baseline},
+        }
+        result["manifest_projection_sha256"] = hashlib.sha256(bundle.canonical_json(digest_input)).hexdigest()
+        serialized = bundle.canonical_json(result)
+        fetch.validate_projection(serialized, profile, expected_control_sha=request["control_sha"])
+        return serialized
     common = {"schema", "repository", "source_revision", "profile", "tools", "playwright"}
     expected = common | ({"lockfile"} if profile == "core-node" else {"lockfiles"})
     if set(request) != expected or request.get("schema") != 1:
@@ -89,12 +206,22 @@ def build_projection(request):
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--request", required=True, help="owner-only coordinator request file")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--request", help="owner-only coordinator request file")
+    source.add_argument("--source-repository", help="owner-only Git source repository")
+    parser.add_argument("--baseline-repository")
+    parser.add_argument("--control-sha")
     parser.add_argument("--output", required=True)
     args = parser.parse_args(argv)
     try:
-        request = bundle.strict_json(Path(args.request).read_bytes(), 1024 * 1024)
-        output = build_projection(request)
+        if args.source_repository:
+            output = build_source_bound_rust_projection(
+                args.source_repository, args.control_sha, baseline_repository=args.baseline_repository)
+        else:
+            if args.control_sha or args.baseline_repository:
+                bundle._refuse("projection-request-shape")
+            request = bundle.strict_json(Path(args.request).read_bytes(), 1024 * 1024)
+            output = build_projection(request)
         descriptor = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "wb") as destination:
             destination.write(output)

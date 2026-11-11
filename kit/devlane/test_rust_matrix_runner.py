@@ -11,6 +11,7 @@ import multiprocessing
 import os
 import re
 import signal
+import shutil
 import stat
 import sys
 import subprocess
@@ -299,6 +300,36 @@ class RustMatrixRunnerTests(unittest.TestCase):
             "log": log_path,
             "paths": {"node": str(node), "npm": str(npm_link), "cargo": "", "rustc": ""},
         }
+
+    def _write_node_vendor_fixture(self, root, snapshot_id):
+        base = Path(root).resolve() / "node-vendor"
+        area = base / snapshot_id
+        area.mkdir(mode=0o700, parents=True)
+        fixture = self._write_node_toolchain_fixture(area)
+        cache = area / "cache"
+        cache.mkdir(mode=0o700)
+        shutil.move(str(fixture["cache"] / "node"), str(cache / "node"))
+        fixture["anchor"] = area
+        fixture["anchor_uid"] = os.getuid()
+        fixture["cache"] = cache
+        fixture["node_root"] = cache / "node" / "24.22.1" / "x64"
+        fixture["node"] = fixture["node_root"] / "bin/node"
+        fixture["npm"] = fixture["node_root"] / "bin/npm"
+        fixture["npm_cli"] = fixture["node_root"] / "lib/node_modules/npm/bin/npm-cli.js"
+        fixture["npm_root"] = fixture["node_root"] / "lib/node_modules/npm"
+        fixture["paths"] = {"node": str(fixture["node"]), "npm": str(fixture["npm"]),
+                            "cargo": "", "rustc": ""}
+        external_log = base.parent / (snapshot_id + "-node-fixture-log.jsonl")
+        node_source = fixture["node"].read_text(encoding="utf-8")
+        fixture["node"].write_text(node_source.replace(str(fixture["log"]), str(external_log)), encoding="utf-8")
+        fixture["node"].chmod(0o755)
+        fixture["log"] = external_log
+        vendor = supervisor.node_tool_prepare.node_vendor_source.VendorSource(
+            cache, fixture["node_root"], fixture["node"], fixture["npm"],
+            supervisor.node_tool_prepare.node_vendor_source.ARCHIVE_SHA256,
+            supervisor.node_tool_prepare.node_vendor_source.PREPARATION_ID,
+        )
+        return base, area, fixture, vendor
 
     @contextlib.contextmanager
     def _node_fixture_policy(self, fixture):
@@ -644,7 +675,6 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 "--projection", str(projection_path), "--output", str(root / "prepared"),
                 "--profile", "core-node", "--owner-uid", str(os.getuid()),
                 "--owner-gid", str(os.getgid()), "--deadline-file", str(deadline_path),
-                "--node-path", "/synthetic/node", "--npm-path", "/synthetic/npm",
             ]
 
             for code in sorted(diagnostic_contract.PREPARATION_REFUSAL_CODES):
@@ -1366,10 +1396,8 @@ class RustMatrixRunnerTests(unittest.TestCase):
     def test_prepare_main_parser_uses_snapshot_for_both_version_checks_before_mount_setup(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            fixture = self._write_node_toolchain_fixture(root / "node-fixture")
-            os.chown(fixture["anchor"], -1, os.getgid())
-            fixture["anchor_uid"] = 0
-            fixture["anchor"].chmod(0o2770)
+            snapshot_id = "test-prepare-main"
+            vendor_base, vendor_area, fixture, vendor = self._write_node_vendor_fixture(root, snapshot_id)
             _projection, payload = test_e2e._node_projection(
                 test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
             )
@@ -1378,7 +1406,6 @@ class RustMatrixRunnerTests(unittest.TestCase):
             deadline_path = root / "deadline.json"
             deadline_budget.create(deadline_path, 60, 5, 65)
             preparation = supervisor.node_tool_prepare
-            snapshot_id = "test-prepare-main"
             snapshot_base = root / "snapshot-base"
             expected = [
                 [str(snapshot_base / snapshot_id / "bin/node"), "--version"],
@@ -1401,11 +1428,15 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 "--profile", "core-node", "--owner-uid", str(os.getuid()),
                 "--owner-gid", str(os.getgid()), "--deadline-file", str(deadline_path),
                 "--node-snapshot-id", snapshot_id,
-                "--node-path", str(fixture["node"]), "--npm-path", str(fixture["npm"]),
             ]
             with self._node_fixture_policy(fixture), self._node_anchor_metadata(fixture), \
                     patch.object(preparation.sys, "platform", "linux"), \
                     patch.object(preparation, "os", _RootEffectiveUIDProxy()), \
+                    patch.object(preparation.node_vendor_source, "PROTECTED_BASE", vendor_base), \
+                    patch.object(preparation, "_node_vendor_system_anchors",
+                                 return_value=((vendor_area, os.getuid()),)), \
+                    patch.object(preparation.node_vendor_source, "acquire_node_source",
+                                 return_value=vendor), \
                     patch.object(node_tool_snapshot, "DEFAULT_SNAPSHOT_BASE", snapshot_base), \
                     patch.object(preparation.subprocess, "run", side_effect=record_then_stop), \
                     patch.object(preparation, "_kill_children"), \
@@ -1420,6 +1451,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
             self.assertEqual([command for command, _kwargs in calls], expected + [[
                 "mount", "--make-rprivate", "/",
             ]])
+            self.assertFalse(vendor_area.exists())
             self.assertTrue(all(kwargs.get("env") == {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
                                 for _command, kwargs in calls[:2]))
             fixture_rows = [json.loads(line) for line in fixture["log"].read_text().splitlines()]
@@ -2105,9 +2137,10 @@ class RustMatrixRunnerTests(unittest.TestCase):
             self.assertEqual(manifest["node_version"], "24.22.1")
             self.assertEqual(manifest["npm_version"], "11.19.1")
             run_job = public_audit.parse_workflow(".github/workflows/devlane-encrypted.yml")[public_audit.RUN_JOB]
-            setup = next(step for step in run_job["steps"] if step["name"] == "Set up pinned Node toolchain")
-            self.assertEqual(setup["uses"], node_tool_snapshot.PREPARATION_ID)
-            self.assertEqual(setup["with"]["node-version"], "24.22.1")
+            self.assertFalse(any((step.get("uses") or "").startswith("actions/setup-node@")
+                                 for step in run_job["steps"]))
+            self.assertEqual(node_tool_snapshot.PREPARATION_ID,
+                             "nodejs-dist-v24.22.1-linux-x64-sha256")
             self.assertEqual(
                 node_tool_snapshot.validate_snapshot(
                     "test-r10-mixed", str(deadline_path), snapshot_base=snapshot_base,
@@ -2203,12 +2236,17 @@ class RustMatrixRunnerTests(unittest.TestCase):
         prepare = supervisor.node_tool_prepare
         prepared_args = prepare._argument_parser().parse_args([
             "--projection", "projection", "--output", "prepared", "--profile", "core-node",
-            "--owner-uid", "501", "--owner-gid", "20", "--node-path", "/opt/node/bin/node",
-            "--npm-path", "/opt/node/bin/npm", "--node-snapshot-id", "devlane-123-1",
+            "--owner-uid", "501", "--owner-gid", "20", "--node-snapshot-id", "devlane-123-1",
             "--deadline-file", "deadline",
         ])
         self.assertEqual(prepared_args.deadline_file, "deadline")
         self.assertEqual(prepared_args.node_snapshot_id, "devlane-123-1")
+        with self.assertRaises(supervisor.bundle.Refusal):
+            prepare._argument_parser().parse_args([
+                "--projection", "projection", "--output", "prepared", "--profile", "core-node",
+                "--owner-uid", "501", "--owner-gid", "20", "--node-path", "/opt/node/bin/node",
+                "--node-snapshot-id", "devlane-123-1", "--deadline-file", "deadline",
+            ])
         with self.assertRaises(supervisor.bundle.Refusal):
             prepare._argument_parser().parse_args([
                 "--projection", "projection", "--output", "prepared", "--profile", "core-node",
@@ -2258,7 +2296,9 @@ class RustMatrixRunnerTests(unittest.TestCase):
 
             def record_snapshot_cleanup(argv, **kwargs):
                 observed.append((list(argv), dict(kwargs)))
-                return subprocess.CompletedProcess(argv, 0, b"node_snapshot_cleanup=confirmed\n", b"")
+                return subprocess.CompletedProcess(
+                    argv, 0, b"node_snapshot_cleanup=confirmed\nnode_vendor_cleanup=confirmed\n", b"",
+                )
 
             with patch.object(host_cleanup.subprocess, "run", side_effect=record_snapshot_cleanup), \
                     patch.object(host_cleanup, "_cleanup_timeout", return_value=10):
@@ -2273,6 +2313,32 @@ class RustMatrixRunnerTests(unittest.TestCase):
             self.assertEqual(options["env"], {
                 "PATH": "/usr/bin:/bin", "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1",
             })
+
+    def test_node_vendor_cleanup_removes_only_the_owned_area_without_following_links(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            base = root / "node-vendor"
+            area = base / "test-vendor-cleanup"
+            outside = root / "outside"
+            outside.mkdir()
+            canary = outside / "canary.txt"
+            canary.write_text("unchanged", encoding="ascii")
+            (area / "cache" / "node").mkdir(parents=True)
+            (area / "cache" / "node" / "bin").mkdir()
+            (area / "cache" / "node" / "bin" / "escape").symlink_to(outside, target_is_directory=True)
+            (area / "cache" / "node" / "payload").write_text("fixture", encoding="ascii")
+            for current, directories, _files in os.walk(area):
+                Path(current).chmod(0o555)
+                for name in directories:
+                    child = Path(current) / name
+                    if not child.is_symlink():
+                        child.chmod(0o555)
+            with patch.object(host_cleanup.node_vendor_source, "PROTECTED_BASE", base):
+                self.assertTrue(host_cleanup.clean_node_vendor_source(
+                    "test-vendor-cleanup", control_uid=os.getuid(),
+                ))
+            self.assertFalse(area.exists())
+            self.assertEqual(canary.read_text(encoding="ascii"), "unchanged")
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml").read_text()
         prepare_step = workflow.split("- name: Prepare dependencies before the cut", 1)[1].split("- name:", 1)[0]
         start_step = workflow.split("- name: Cut network and start the isolated supervisor", 1)[1].split("- name:", 1)[0]
@@ -2288,19 +2354,16 @@ class RustMatrixRunnerTests(unittest.TestCase):
         self.assertNotIn("/opt/hostedtoolcache", inspect.getsource(supervisor._mount_minimal_root))
         run_job = public_audit.parse_workflow(".github/workflows/devlane-encrypted.yml")[public_audit.RUN_JOB]
         steps = run_job["steps"]
-        setup_index = next(i for i, step in enumerate(steps) if step["name"] == "Set up pinned Node toolchain")
         prepare_index = next(i for i, step in enumerate(steps)
                              if step["name"] == "Prepare dependencies before the cut")
-        self.assertLess(setup_index, prepare_index)
-        intervening = steps[setup_index + 1:prepare_index]
-        self.assertEqual([step["name"] for step in intervening], ["Install pinned Rust toolchain"])
+        decrypt_index = next(i for i, step in enumerate(steps)
+                             if step["name"] == "Decrypt authenticated bundle")
+        self.assertLess(prepare_index, decrypt_index)
         rust_step = workflow.split("- name: Install pinned Rust toolchain", 1)[1].split("- name:", 1)[0]
         self.assertIn("if: ${{ inputs.profile == 'core-rust' }}", rust_step)
-        setup = steps[setup_index]
-        self.assertEqual(setup["uses"], node_tool_snapshot.PREPARATION_ID)
-        self.assertEqual(setup["with"]["node-version"], "24.22.1")
-        self.assertEqual(setup["with"]["check-latest"], "false")
-        self.assertEqual(setup["with"]["package-manager-cache"], "false")
+        self.assertFalse(any((step.get("uses") or "").startswith("actions/setup-node@") for step in steps))
+        self.assertIn("node_vendor_source.acquire_node_source", inspect.getsource(supervisor.node_tool_prepare.main))
+        self.assertNotIn("/opt/hostedtoolcache", workflow)
 
     def test_node_toolchain_rejects_untrusted_owners_permissions_and_layouts_before_execution(self):
         cases = (
@@ -2640,28 +2703,23 @@ class RustMatrixRunnerTests(unittest.TestCase):
         self.assertLess(group_capture, privileged_call)
         self.assertIn('--owner-uid "$owner_uid"', source)
         self.assertIn('--owner-gid "$owner_gid"', source)
-        self.assertIn('node_path="$(command -v node || true)"', source)
-        self.assertIn('npm_path="$(command -v npm || true)"', source)
-        self.assertIn('"$node_path" --npm-path "$npm_path"', source)
+        self.assertNotIn("command -v node", source)
+        self.assertNotIn("command -v npm", source)
+        self.assertNotIn("--node-path", source)
+        self.assertNotIn("--npm-path", source)
 
         steps = job["steps"]
-        setup_index = next(i for i, step in enumerate(steps) if step["name"] == "Set up pinned Node toolchain")
         prepare_index = next(i for i, step in enumerate(steps) if step["name"] == "Prepare dependencies before the cut")
         decrypt_index = next(i for i, step in enumerate(steps) if step["name"] == "Decrypt authenticated bundle")
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml").read_text()
         run_job_source = workflow.split("  devlane-encrypted-run:", 1)[1].split("  devlane-encrypted-audit:", 1)[0]
         self.assertRegex(run_job_source, r"(?m)^    runs-on: ubuntu-24\.04$")
-        self.assertLess(setup_index, prepare_index)
         self.assertLess(prepare_index, decrypt_index)
-        self.assertEqual(steps[setup_index]["uses"], node_tool_snapshot.PREPARATION_ID)
-        self.assertEqual(steps[setup_index]["with"]["node-version"], "24.22.1")
-        self.assertEqual(steps[setup_index]["with"]["check-latest"], "false")
-        self.assertEqual(steps[setup_index]["with"]["package-manager-cache"], "false")
+        self.assertFalse(any((step.get("uses") or "").startswith("actions/setup-node@") for step in steps))
         preparation = supervisor.node_tool_prepare
-        self.assertEqual(node_tool_snapshot.SHARED_TOOLCHAIN_ANCHOR, Path("/opt"))
-        self.assertEqual(preparation.NODE_TOOL_SYSTEM_ANCHORS,
-                         ((Path("/"), 0), (Path("/opt"), 0)))
-        self.assertEqual(preparation.NODE_TOOL_CACHE_ROOT, Path("/opt/hostedtoolcache"))
+        self.assertIn("node_vendor_source.acquire_node_source", inspect.getsource(preparation.main))
+        self.assertIsNone(preparation.NODE_TOOL_SYSTEM_ANCHORS)
+        self.assertIsNone(preparation.NODE_TOOL_CACHE_ROOT)
 
         self.assertEqual(preparation.TRUSTED_TOOLCHAIN_SYSTEM_UID, 0)
         self.assertEqual(preparation._trusted_toolchain_owner_uids(os.getuid()),
@@ -2673,21 +2731,20 @@ class RustMatrixRunnerTests(unittest.TestCase):
         for failure_kind in ("foreign-owner", "version-permission"):
             with self.subTest(failure_kind=failure_kind), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary).resolve()
-                fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+                snapshot_id = "test-prepare-failure"
+                vendor_base, vendor_area, fixture, vendor = self._write_node_vendor_fixture(root, snapshot_id)
                 lock = test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
                 _projection, payload = test_e2e._node_projection(lock)
                 projection_path = root / "projection.json"
                 projection_path.write_bytes(payload)
                 deadline_path = root / "deadline.json"
                 deadline_budget.create(deadline_path, 60, 5, 65)
-                snapshot_id = "test-prepare-failure"
                 snapshot_base = root / "snapshot-base"
                 arguments = [
                     "--projection", str(projection_path), "--output", str(root / "prepared"),
                     "--profile", "core-node", "--owner-uid", str(os.getuid()),
                     "--owner-gid", str(os.getgid()), "--deadline-file", str(deadline_path),
                     "--node-snapshot-id", snapshot_id,
-                    "--node-path", str(fixture["node"]), "--npm-path", str(fixture["npm"]),
                 ]
                 real_lstat = os.lstat
 
@@ -2713,6 +2770,11 @@ class RustMatrixRunnerTests(unittest.TestCase):
                     with self._node_fixture_policy(fixture), \
                             patch.object(preparation.sys, "platform", "linux"), \
                             patch.object(preparation, "os", _RootEffectiveUIDProxy()), \
+                            patch.object(preparation.node_vendor_source, "PROTECTED_BASE", vendor_base), \
+                            patch.object(preparation, "_node_vendor_system_anchors",
+                                         return_value=((vendor_area, os.getuid()),)), \
+                            patch.object(preparation.node_vendor_source, "acquire_node_source",
+                                         return_value=vendor), \
                             patch.object(node_tool_snapshot, "DEFAULT_SNAPSHOT_BASE", snapshot_base), \
                             patch.object(preparation.os, "lstat", side_effect=lstat_with_foreign_owner), \
                             patch.object(preparation.subprocess, "run", side_effect=refuse_version_or_mount), \
@@ -2729,7 +2791,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 ])
                 expected = (
                     "dependency_preparation_refusal=stage=prepare-node-toolchain-snapshot "
-                    "code=node-toolchain-owner cleanup=not-needed\n"
+                    "code=node-toolchain-owner cleanup=confirmed\n"
                     if failure_kind == "foreign-owner" else
                     "dependency_preparation_exception=stage=prepare-node-version-verification "
                     "class=permission-denied cleanup=confirmed\n"

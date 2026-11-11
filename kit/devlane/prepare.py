@@ -21,7 +21,9 @@ import bundle
 import fetch
 import deadline as deadline_budget
 import diagnostic_contract
+import node_vendor_source
 import node_tool_snapshot
+import owned_tree_cleanup
 
 
 UID = 65534
@@ -33,10 +35,10 @@ DEADLINE_FILE = ""
 NPMRC_TEXT = ("ignore-scripts=true\naudit=false\nfund=false\nupdate-notifier=false\n"
               "registry=https://registry.npmjs.org/\n")
 SCRIPT_SUPPRESSION_ENVIRONMENT = {"NPM_CONFIG_IGNORE_SCRIPTS": "true"}
+NODE_TOOL_CACHE_ROOT = None
+NODE_TOOL_ROOT = None
+NODE_TOOL_SYSTEM_ANCHORS = None
 NPM_CI_ARGUMENTS = ("ci", "--ignore-scripts", "--include=dev", "--include=optional", "--no-audit", "--no-fund")
-NODE_TOOL_CACHE_ROOT = Path("/opt/hostedtoolcache")
-NODE_TOOL_ROOT = NODE_TOOL_CACHE_ROOT / "node" / "24.22.1" / "x64"
-NODE_TOOL_SYSTEM_ANCHORS = ((Path("/"), 0), (node_tool_snapshot.SHARED_TOOLCHAIN_ANCHOR, 0))
 NODE_VERSION_ENVIRONMENT = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
 NODE_VERSION = "24.22.1"
 NPM_VERSION = "11.19.1"
@@ -216,9 +218,14 @@ def _validate_npm_tree(root, owner_uids, deadline_file=None):
 def validate_node_toolchain(paths, owner_uid, *, tool_cache_root=None, node_root=None, system_anchors=None,
                             deadline_file=None, trusted_source_group_gid=None):
     """Validate the trusted source tree; worker access is enforced on its sealed snapshot."""
-    cache_root = Path(tool_cache_root) if tool_cache_root is not None else NODE_TOOL_CACHE_ROOT
-    root = Path(node_root) if node_root is not None else NODE_TOOL_ROOT
-    anchors = tuple(system_anchors) if system_anchors is not None else NODE_TOOL_SYSTEM_ANCHORS
+    cache_value = tool_cache_root if tool_cache_root is not None else NODE_TOOL_CACHE_ROOT
+    node_value = node_root if node_root is not None else NODE_TOOL_ROOT
+    anchors_value = system_anchors if system_anchors is not None else NODE_TOOL_SYSTEM_ANCHORS
+    if cache_value is None or node_value is None or anchors_value is None:
+        _node_refuse("node-toolchain-missing")
+    cache_root = Path(cache_value)
+    root = Path(node_value)
+    anchors = tuple(anchors_value)
     expected_root = cache_root / "node" / NODE_VERSION / "x64"
     if type(paths) is not dict or not paths.get("node") or not paths.get("npm"):
         _node_refuse("node-toolchain-missing")
@@ -281,6 +288,32 @@ def validate_node_toolchain(paths, owner_uid, *, tool_cache_root=None, node_root
     _node_regular_file(npm_cli, owner_uids, executable=False, role="source-npm-file")
     _validate_npm_tree(root / "lib/node_modules/npm", owner_uids, deadline_file=deadline_file)
     return {"node": str(node), "npm": str(npm_launcher), "npm_cli": str(npm_cli), "root": str(root)}
+
+
+def _node_vendor_system_anchors(snapshot_id):
+    if not node_tool_snapshot.valid_snapshot_id(snapshot_id):
+        _node_refuse("node-snapshot-id")
+    area = node_vendor_source.PROTECTED_BASE / snapshot_id
+    return tuple((path, 0) for path in (
+        Path("/"), Path("/run"), Path("/run/platform-ci-devlane"),
+        node_vendor_source.PROTECTED_BASE, area,
+    ))
+
+
+def _remove_node_vendor_source(source):
+    if source is None:
+        return
+    deadline_budget.cleanup_remaining(DEADLINE_FILE)
+    area = Path(source.cache_root).parent
+    base = node_vendor_source.PROTECTED_BASE
+    if area.parent != base or not node_tool_snapshot.valid_snapshot_id(area.name):
+        refuse("node-tool-layout")
+    owned_tree_cleanup.remove_owned_tree(area, base, prefix="node-vendor-cleanup-")
+    try:
+        os.stat(area, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    refuse("cleanup-incomplete")
 
 
 def node_version_commands(validated):
@@ -535,7 +568,50 @@ def _prepare_root(root, tool_roots):
             _mount(tool_root, root / ("tools/node" if family == "node" else "tools/rust"))
 
 
+def _run_rust_v2_worker(root, projection, output_root, owner_uid, owner_gid):
+    work = root / "work"
+    control = root / "control/devlane"
+    control.mkdir(mode=0o755, parents=True)
+    names = ("rust_preparation_v2.py", "constraint_resolver.py", "bounded_registry_io.py",
+             "cargo_projection.py", "registry_prefetch.py", "deadline.py", "fetch.py", "bundle.py")
+    for name in names:
+        source = Path(__file__).resolve().parent / name
+        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 4 * 1024 * 1024:
+                refuse("preparation-control-type")
+            with os.fdopen(fd, "rb", closefd=False) as incoming:
+                payload = incoming.read(4 * 1024 * 1024 + 1)
+            if len(payload) > 4 * 1024 * 1024:
+                refuse("preparation-control-size")
+            (control / name).write_bytes(payload)
+            os.chmod(control / name, 0o444)
+        finally:
+            os.close(fd)
+    inputs = root / "control/input"
+    inputs.mkdir(mode=0o755)
+    (inputs / "projection.json").write_bytes(bundle.canonical_json(projection))
+    (inputs / "deadline.json").write_bytes(bundle.canonical_json(deadline_budget._read(DEADLINE_FILE)))
+    for name in ("projection.json", "deadline.json"):
+        os.chmod(inputs / name, 0o444)
+    resolver = work / "resolver"
+    resolver.mkdir(mode=0o700)
+    os.chown(resolver, UID, GID)
+    command = ["/usr/sbin/chroot", str(root), "/usr/bin/setpriv", "--reuid=65534",
+               "--regid=65534", "--clear-groups", "--no-new-privs", "--bounding-set=-all", "--",
+               "/usr/bin/python3", "-B", "-I", "/control/devlane/rust_preparation_v2.py",
+               "--control-sha", projection["manifest_constraints"]["candidate"]["control_sha"]]
+    _set_preparation_stage("prepare-cargo-vendor")
+    run(command, timeout=3600, log=work / "prepare-rust-v2.log", cwd="/",
+        environment={"PATH": "/tools/rust/bin:/usr/bin:/bin", "HOME": "/devlane-home",
+                     "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1"})
+    _publish_prepared_output(work / "prepared", output_root, owner_uid, owner_gid)
+
+
 def _run_worker(root, projection, profile, output_root, tool_paths, owner_uid, owner_gid):
+    if profile == "core-rust" and projection["schema"] == 2:
+        return _run_rust_v2_worker(root, projection, output_root, owner_uid, owner_gid)
     _set_preparation_stage("prepare-worker-setup")
     work = root / "work"
     project = work / "project"
@@ -623,6 +699,10 @@ def _run_worker(root, projection, profile, output_root, tool_paths, owner_uid, o
         """Browsers are installed directly under prepared/ (PLAYWRIGHT_BROWSERS_PATH)."""
         if not (prepared / "ms-playwright").is_dir() or (prepared / "ms-playwright").is_symlink():
             refuse("playwright-browsers-missing")
+    _publish_prepared_output(prepared, output_root, owner_uid, owner_gid)
+
+
+def _publish_prepared_output(prepared, output_root, owner_uid, owner_gid):
     destination = Path(output_root)
     _set_preparation_stage("prepare-prepared-output-copy")
     if destination.exists() or destination.is_symlink():
@@ -646,6 +726,9 @@ def _run_worker(root, projection, profile, output_root, tool_paths, owner_uid, o
 
 
 def _failure_from_exception(error):
+    if type(error) is node_vendor_source.VendorNodeRefusal:
+        code = error.args[0] if len(error.args) == 1 and type(error.args[0]) is str else ""
+        return "refusal", code if code in diagnostic_contract.PREPARATION_REFUSAL_CODES else "preparation-refusal-unlisted"
     if type(error) is node_tool_snapshot.SnapshotRefusal:
         code = error.code
         return "refusal", code if code in diagnostic_contract.PREPARATION_REFUSAL_CODES else "preparation-refusal-unlisted"
@@ -675,11 +758,12 @@ def _argument_parser():
     parser.add_argument("--projection", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--profile", choices=("core-node", "core-rust"), required=True)
+    parser.add_argument("--control-sha", default="")
     parser.add_argument("--owner-uid", type=int, required=True)
     parser.add_argument("--owner-gid", type=int, required=True)
     parser.add_argument("--deadline-file", required=True)
     parser.add_argument("--node-snapshot-id", default="")
-    for name in ("node", "npm", "cargo", "rustc"):
+    for name in ("cargo", "rustc"):
         parser.add_argument("--" + name + "-path", default="")
     return parser
 
@@ -692,6 +776,8 @@ def main(argv=None):
     root = None
     node_snapshot_id = ""
     node_snapshot_created = False
+    node_vendor_source_created = False
+    vendor_source = None
     failure = None
     failure_stage = None
     cleanup = "not-needed"
@@ -710,7 +796,10 @@ def main(argv=None):
             refuse("owner-identity")
         _set_preparation_stage("prepare-projection-validation")
         projection_path = Path(args.projection)
-        projection = fetch.validate_projection(projection_path.read_bytes(), args.profile)
+        projection = fetch.validate_projection(
+            projection_path.read_bytes(), args.profile,
+            expected_control_sha=args.control_sha or None,
+        )
         if projection["tools"] != ({"node": NODE_VERSION, "npm": NPM_VERSION} if args.profile == "core-node" else projection["tools"]):
             refuse("toolchain-version")
         _set_preparation_stage("prepare-toolchain-selection")
@@ -718,12 +807,25 @@ def main(argv=None):
             if not node_tool_snapshot.valid_snapshot_id(args.node_snapshot_id):
                 refuse("node-snapshot-id")
             node_snapshot_id = args.node_snapshot_id
-            paths = {"node": args.node_path, "npm": args.npm_path, "cargo": "", "rustc": ""}
+            _set_preparation_stage("prepare-node-vendor-acquisition")
+            vendor_source = node_vendor_source.acquire_node_source(node_snapshot_id, DEADLINE_FILE)
+            node_vendor_source_created = True
+            expected_cache = node_vendor_source.PROTECTED_BASE / node_snapshot_id / "cache"
+            expected_node_root = expected_cache / "node" / NODE_VERSION / "x64"
+            if (vendor_source.cache_root != expected_cache or vendor_source.node_root != expected_node_root
+                    or vendor_source.node != expected_node_root / "bin/node"
+                    or vendor_source.npm != expected_node_root / "bin/npm"
+                    or vendor_source.archive_sha256 != node_vendor_source.ARCHIVE_SHA256
+                    or vendor_source.preparation_id != node_tool_snapshot.PREPARATION_ID):
+                refuse("node-tool-layout")
+            paths = {"node": str(vendor_source.node), "npm": str(vendor_source.npm),
+                     "cargo": "", "rustc": ""}
         else:
             if args.node_snapshot_id:
                 refuse("node-snapshot-id")
-            paths = {name: getattr(args, name + "_path") or shutil.which(name) or ""
-                     for name in ("node", "npm", "cargo", "rustc")}
+            paths = {"node": "", "npm": "",
+                     "cargo": args.cargo_path or shutil.which("cargo") or "",
+                     "rustc": args.rustc_path or shutil.which("rustc") or ""}
         if args.profile == "core-rust":
             _set_preparation_stage("prepare-rust-toolchain-validation")
             for name in ("cargo", "rustc"):
@@ -732,7 +834,9 @@ def main(argv=None):
             _set_preparation_stage("prepare-node-toolchain-snapshot")
             node_tools = node_tool_snapshot.create_snapshot(
                 paths, node_snapshot_id, args.owner_uid, DEADLINE_FILE,
-                trusted_source_group_gid=args.owner_gid,
+                source_cache_root=vendor_source.cache_root,
+                source_node_root=vendor_source.node_root,
+                source_anchors=_node_vendor_system_anchors(node_snapshot_id),
             )
             node_snapshot_created = True
             _set_preparation_stage("prepare-node-snapshot-verification")
@@ -749,6 +853,10 @@ def main(argv=None):
                     refuse("node-toolchain-version" if name == "node" else "npm-toolchain-version")
                 if node_results[name].returncode != 0 or actual != expected_text:
                     refuse("node-toolchain-version" if name == "node" else "npm-toolchain-version")
+            _set_preparation_stage("prepare-node-vendor-cleanup")
+            _remove_node_vendor_source(vendor_source)
+            vendor_source = None
+            node_vendor_source_created = False
             paths["node"] = node_tools["node"]
             paths["npm"] = node_tools["npm"]
         elif not paths["cargo"] or not paths["rustc"]:
@@ -817,6 +925,15 @@ def main(argv=None):
                 except Exception:
                     clean = False
             else:
+                clean = False
+        if node_vendor_source_created and vendor_source is not None:
+            _set_preparation_stage("prepare-node-vendor-cleanup")
+            try:
+                _remove_node_vendor_source(vendor_source)
+                node_vendor_source_created = False
+                vendor_source = None
+                cleanup = "confirmed"
+            except Exception:
                 clean = False
         if not clean:
             cleanup = "unconfirmed"

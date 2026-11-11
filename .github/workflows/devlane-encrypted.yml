@@ -295,25 +295,10 @@ jobs:
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- bash -euo pipefail -c '
             python3 -B kit/devlane/fetch.py download --asset-id "$DEVLANE_BUNDLE_ASSET_ID" --size "$DEVLANE_BUNDLE_SIZE" --sha256 "$DEVLANE_BUNDLE_SHA256" --output "$RUN_ROOT/bundle.enc"
             python3 -B kit/devlane/fetch.py download --maximum 16777216 --asset-id "$DEVLANE_PROJECTION_ASSET_ID" --size "$DEVLANE_PROJECTION_SIZE" --sha256 "$DEVLANE_PROJECTION_SHA256" --output "$RUN_ROOT/projection.json"
-            python3 -B kit/devlane/fetch.py check-projection --file "$RUN_ROOT/projection.json" --profile "$DEVLANE_PROFILE"
+            python3 -B kit/devlane/fetch.py check-projection --file "$RUN_ROOT/projection.json" \
+              --profile "$DEVLANE_PROFILE" --control-sha "$CI_SHA"
           '
           mkdir -m 700 "$RUN_ROOT/workspace"
-      - name: Reserve work time for pinned Node action
-        timeout-minutes: 1
-        if: ${{ inputs.profile == 'core-node' }}
-        run: |
-          set -euo pipefail
-          python3 -B kit/devlane/deadline.py guard-action --file "$RUN_ROOT/deadline.json" \
-            --step-timeout-seconds 300 --margin-seconds 60
-      - name: Set up pinned Node toolchain
-        timeout-minutes: 5
-        if: ${{ inputs.profile == 'core-node' }}
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: "24.22.1"
-          check-latest: false
-          cache: ""
-          package-manager-cache: false
       - name: Install pinned Rust toolchain
         if: ${{ inputs.profile == 'core-rust' }}
         run: |
@@ -334,8 +319,6 @@ jobs:
           for tool in unshare mount umount setpriv chroot ip nft shred; do command -v "$tool" >/dev/null 2>&1; done
           owner_uid="$EUID"
           owner_gid="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- id -g)"
-          node_path="$(command -v node || true)"
-          npm_path="$(command -v npm || true)"
           node_snapshot_id=""
           cargo_path=""
           rustc_path=""
@@ -355,8 +338,9 @@ jobs:
             sudo -n unshare --mount --pid --ipc --fork --mount-proc --kill-child -- \
             python3 -B kit/devlane/prepare.py \
               --projection "$RUN_ROOT/projection.json" --output "$RUN_ROOT/prepared" \
-              --profile "$DEVLANE_PROFILE" --owner-uid "$owner_uid" --owner-gid "$owner_gid" \
-              --node-path "$node_path" --npm-path "$npm_path" --cargo-path "$cargo_path" --rustc-path "$rustc_path" \
+              --profile "$DEVLANE_PROFILE" --control-sha "$CI_SHA" \
+              --owner-uid "$owner_uid" --owner-gid "$owner_gid" \
+              --cargo-path "$cargo_path" --rustc-path "$rustc_path" \
               --node-snapshot-id "$node_snapshot_id" \
               --deadline-file "$RUN_ROOT/deadline.json"
           if [[ "$DEVLANE_PROFILE" == "core-rust" ]]; then

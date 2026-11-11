@@ -43,8 +43,6 @@ STEP_NAMES = (
     "Restore and verify persisted one-run permit",
     "Verify permit and emit bound dispatch marker",
     "Fetch ciphertext and sanitized dependency projection",
-    "Reserve work time for pinned Node action",
-    "Set up pinned Node toolchain",
     "Install pinned Rust toolchain",
     "Prepare dependencies before the cut",
     "Prove public connectivity before the cut",
@@ -218,6 +216,9 @@ class _Grammar:
         if self.environment != (DECRYPT_ENVIRONMENT if kind == "encrypted" and job_key == RUN_JOB else None):
             _refuse()
         self.steps = self.job["steps"]
+        if kind == "encrypted" and any(
+                step["uses"] and step["uses"].startswith("actions/setup-node@") for step in self.steps):
+            _refuse()
         self.names = [step["name"] for step in self.steps]
         self.identity = identity
         self.kind = kind
@@ -625,10 +626,7 @@ def _steps(job):
 
 
 def _expected_step_names(profile):
-    names = list(STEP_NAMES)
-    if profile == "core-node":
-        names.append("Post Set up pinned Node toolchain")
-    return names
+    return list(STEP_NAMES)
 
 
 def validate_job_contract(jobs, identity, profile):
@@ -664,14 +662,14 @@ def validate_job_contract(jobs, identity, profile):
     if [step.get("name") for step in steps] != expected_names:
         _refuse()
     step_by_name = {step["name"]: step for step in steps}
-    expected_tool_step = "Set up pinned Node toolchain" if profile == "core-node" else "Install pinned Rust toolchain"
-    skipped_tool_step = "Install pinned Rust toolchain" if profile == "core-node" else "Set up pinned Node toolchain"
+    expected_tool_step = "Prepare dependencies before the cut" if profile == "core-node" else "Install pinned Rust toolchain"
+    skipped_tool_step = "Install pinned Rust toolchain" if profile == "core-node" else None
     cleanup_step = step_by_name["Shred runner-local workspace"]
     if cleanup_step.get("status") != "completed" or cleanup_step.get("conclusion") != "success":
         _refuse()
     cancelled = run_job["conclusion"] in ("cancelled", "timed_out")
     for name, step in step_by_name.items():
-        if name == skipped_tool_step:
+        if skipped_tool_step is not None and name == skipped_tool_step:
             if step.get("status") != "completed" or step.get("conclusion") != "skipped":
                 _refuse()
             continue

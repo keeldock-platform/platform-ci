@@ -11,9 +11,10 @@ from pathlib import Path
 
 import bundle
 import deadline as deadline_budget
+import node_vendor_source
 
 
-PREPARATION_ID = "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1"
+PREPARATION_ID = node_vendor_source.PREPARATION_ID
 SHARED_TOOLCHAIN_ANCHOR = Path("/opt")
 PROTECTED_SNAPSHOT_BASE = Path("/run/platform-ci-devlane/node-tools")
 DEFAULT_SNAPSHOT_BASE = PROTECTED_SNAPSHOT_BASE
@@ -842,11 +843,11 @@ def create_snapshot(paths, snapshot_id, owner_uid, deadline_file, *, snapshot_ba
                  or trusted_source_group_gid < 1 or trusted_source_group_gid > 60000
                  or trusted_source_group_gid == 65534)):
         _refuse("node-toolchain-owner")
+    if source_cache_root is None or source_node_root is None or source_anchors is None:
+        _refuse("node-snapshot-source-layout")
     base = DEFAULT_SNAPSHOT_BASE if snapshot_base is None else Path(snapshot_base)
     return _snapshot_source(
-        Path(source_node_root) if source_node_root is not None else
-        (Path(source_cache_root) / "node" / "24.22.1" / "x64" if source_cache_root is not None else
-         Path("/opt/hostedtoolcache/node/24.22.1/x64")),
+        Path(source_node_root),
         owner_uid, deadline_file, control_uid=os.geteuid(), snapshot_base=base,
         snapshot_id=snapshot_id,
         source_paths=paths,

@@ -234,6 +234,16 @@ jobs:
           bounded() { python3 -B kit/devlane/deadline.py run --file "$RUNNER_TEMP/devlane-deadline.json" \
             --timeout-cleanup-reserve-seconds 300 -- "$@"; }
           quiet crypto-dependency-probe bounded python3 -B -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; assert AESGCM is not None'
+          quiet rust-v2-preparation-tests bounded python3 -B kit/devlane/test_rust_preparation_v2.py
+          quiet rust-v2-lock-tests bounded python3 -B kit/devlane/test_rust_lock_generation.py
+          quiet rust-v2-source-tests bounded python3 -B kit/devlane/test_source_projection.py
+          cargo_path="$(rustup which --toolchain 1.99.1 cargo)"
+          rustc_path="$(rustup which --toolchain 1.99.1 rustc)"
+          quiet rust-v2-public-runtime bounded sudo -n unshare --mount --pid --fork --mount-proc \
+            python3 -B kit/devlane/rust_preparation_smoke.py --cargo-path "$cargo_path" \
+            --rustc-path "$rustc_path" --control-sha "$CI_SHA" \
+            --deadline-file "$RUNNER_TEMP/devlane-deadline.json" \
+            --owner-uid "$(id -u)" --owner-gid "$(id -g)"
           quiet acceptance-unit-tests bounded python3 -B kit/devlane/test_acceptance.py
           quiet coordinator-contract-tests bounded python3 -B kit/devlane/test_coordinator.py
           quiet rust-matrix-runner-tests bounded python3 -B kit/devlane/test_rust_test_runner.py

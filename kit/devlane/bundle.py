@@ -35,11 +35,33 @@ ENVELOPE_FIELDS = frozenset((
     "format", "repository_id", "control_sha", "workflow_path", "profile",
     "wave_id", "bundle_id", "fetch_sha256", "expires",
 ))
-MANIFEST_FIELDS = frozenset((
+MANIFEST_FIELDS_V1 = frozenset((
     "schema", "profile", "profile_revision", "source_revision", "tree_sha256",
     "files", "original_lockfiles", "fetch_sha256", "allowed_files", "allowed_tests",
     "frames", "limits",
 ))
+MANIFEST_FIELDS_V2 = MANIFEST_FIELDS_V1 | {"source_sets"}
+MANIFEST_FIELDS = MANIFEST_FIELDS_V1
+SOURCE_SET_DOMAIN = "keeldock" + "-core/core-rust-candidate-baseline/v1"
+BASELINE_NAMESPACE = ".devlane/baseline-runtime"
+CORE_RUST_SOURCE_REVISION = "9d6cc9e68694e17857d7702e83654131804a1bda"
+CORE_RUST_SOURCE_TREE = "958e13e531d1b2601f241a91a9f80a44ac04d889"
+CORE_RUST_FULL_MAP_SHA256 = "d6ef344e2129babea26ac39c04bacf7eb4cbd3d770acb8416b2fe11a1c334eab"
+CORE_RUST_SELECTED_MAP_SHA256 = "ca99e9c82c8ea07bc4a1d73d881da673dc5f71194c0db4c61c179da5d248b6b3"
+CORE_RUST_BASELINE_REVISION = "bb1258247ebbbcfec7f112c67dd15902a0f4d4d1"
+CORE_RUST_BASELINE_MAP_SHA256 = "e0a6b6b1c822658b2d55555c2e790193d0fff402632d7df8c22e2d031e5cb1f3"
+CORE_RUST_BASELINE_FILE_COUNT = 59
+CORE_RUST_BASELINE_TOTAL_BYTES = 253657
+CORE_RUST_BASELINE_RUNTIME_MANIFEST_SHA256 = "7bbd52ff34a5db106b792b6764e0a032d99e935723227970514568fba48778dc"
+CORE_RUST_BASELINE_RUNTIME_LOCK_SHA256 = "d2196578c97f4fd7435bdc6b581f8b59f6020025e003bab91b697aa3a74a3cf7"
+CORE_RUST_SELECTED_FILE_COUNT = 2636
+CORE_RUST_SELECTED_TOTAL_BYTES = 16619832
+CORE_RUST_SELECTED_MANIFEST_SHA256 = {
+    "Cargo.toml": "98202cdbb1ce4a75cba138acaf6911de65430ba183640b0a45155ab7f8d5530a",
+    "fuzz/Cargo.toml": "053fb43372e34b20cfeb9bdc9f7f63e2c8fadfd5f8dbd10af9f0f76e75d797d0",
+    "runtime/Cargo.toml": "6696df8536d6b4c3ea8ae8ccf7e812cf516833f10302bcf277f3ff4e69aa7d20",
+}
+CORE_RUST_SOURCE_EXCLUSIONS = ({"path": ".npmrc", "status": "untransferred-unscanned"},)
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 GIT_SHA = re.compile(r"[a-f0-9]{40,64}\Z")
 OPAQUE_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{7,63}\Z")
@@ -86,6 +108,18 @@ def canonical_json(value):
         return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
     except (TypeError, ValueError, RecursionError):
         _refuse("json-invalid")
+
+
+def r4_source_map_sha256(path_hashes):
+    """Hash the sorted source path-to-SHA256 map encoding."""
+    if type(path_hashes) is not dict or not path_hashes:
+        _refuse("source-map-invalid")
+    if any(type(path) is not str or not path or type(digest) is not str
+           or not SHA256.fullmatch(digest) for path, digest in path_hashes.items()):
+        _refuse("source-map-invalid")
+    ordered = dict(sorted(path_hashes.items()))
+    encoded = (json.dumps(ordered, sort_keys=True, indent=2, ensure_ascii=True) + "\n").encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _valid_bindings(bindings):
@@ -185,7 +219,15 @@ def _safe_member_name(name):
 
 def _manifest(payload, expected, inventory):
     value = strict_json(payload, 4 * 1024 * 1024)
-    if type(value) is not dict or set(value) != MANIFEST_FIELDS or value.get("schema") != 1:
+    if type(value) is not dict or type(value.get("schema")) is not int:
+        _refuse("inner-manifest-shape")
+    if value["schema"] == 1:
+        if set(value) != MANIFEST_FIELDS_V1:
+            _refuse("inner-manifest-shape")
+    elif value["schema"] == 2:
+        if set(value) != MANIFEST_FIELDS_V2 or value.get("profile") != "core-rust":
+            _refuse("inner-manifest-shape")
+    else:
         _refuse("inner-manifest-shape")
     if value.get("profile") != expected["profile"] or value.get("fetch_sha256") != expected["fetch_sha256"]:
         _refuse("inner-binding-mismatch")
@@ -252,6 +294,10 @@ def _manifest(payload, expected, inventory):
             _refuse("inner-rust-test-map-incomplete")
         if set(value["original_lockfiles"]) != {"Cargo.lock", "fuzz/Cargo.lock", "runtime/Cargo.lock"}:
             _refuse("inner-rust-lockfile-set")
+    if value["schema"] == 2:
+        _validate_core_rust_source_sets(value["source_sets"], inventory)
+        if value["source_revision"] != value["source_sets"]["candidate"]["source_revision"]:
+            _refuse("inner-source-revision-mismatch")
     if value["limits"] != {
         "ciphertext_bytes": MAX_CIPHERTEXT,
         "expanded_bytes": MAX_EXPANDED,
@@ -263,6 +309,203 @@ def _manifest(payload, expected, inventory):
     if value["tree_sha256"] != expected_tree_sha256:
         _refuse("inner-tree-digest")
     return value
+
+
+def _validate_core_rust_source_sets(source_sets, inventory):
+    """Bind the selected candidate and baseline files in schema-v2 ciphertext."""
+    if type(source_sets) is not dict or set(source_sets) != {
+            "domain", "candidate", "baseline_runtime", "exclusions"}:
+        _refuse("source-sets-shape")
+    if source_sets["domain"] != SOURCE_SET_DOMAIN or source_sets["exclusions"] != list(CORE_RUST_SOURCE_EXCLUSIONS):
+        _refuse("source-sets-domain")
+    candidate = source_sets["candidate"]
+    baseline = source_sets["baseline_runtime"]
+    candidate_fields = {
+        "source_revision", "tree_oid", "full_map_sha256", "selected_map_sha256",
+        "selected_file_count", "selected_bytes", "selected_manifest_sha256",
+    }
+    baseline_fields = {
+        "source_revision", "map_sha256", "file_count", "bytes", "namespace",
+        "runtime_manifest_sha256", "runtime_lock_sha256",
+    }
+    if type(candidate) is not dict or set(candidate) != candidate_fields:
+        _refuse("source-sets-candidate")
+    if type(baseline) is not dict or set(baseline) != baseline_fields:
+        _refuse("source-sets-baseline")
+    if (candidate["source_revision"] != CORE_RUST_SOURCE_REVISION
+            or candidate["tree_oid"] != CORE_RUST_SOURCE_TREE
+            or candidate["full_map_sha256"] != CORE_RUST_FULL_MAP_SHA256
+            or candidate["selected_map_sha256"] != CORE_RUST_SELECTED_MAP_SHA256
+            or candidate["selected_file_count"] != CORE_RUST_SELECTED_FILE_COUNT
+            or candidate["selected_bytes"] != CORE_RUST_SELECTED_TOTAL_BYTES
+            or candidate["selected_manifest_sha256"] != CORE_RUST_SELECTED_MANIFEST_SHA256):
+        _refuse("source-sets-candidate-binding")
+    if (baseline["source_revision"] != CORE_RUST_BASELINE_REVISION
+            or baseline["map_sha256"] != CORE_RUST_BASELINE_MAP_SHA256
+            or baseline["file_count"] != CORE_RUST_BASELINE_FILE_COUNT
+            or baseline["bytes"] != CORE_RUST_BASELINE_TOTAL_BYTES
+            or baseline["namespace"] != BASELINE_NAMESPACE
+            or baseline["runtime_manifest_sha256"] != CORE_RUST_BASELINE_RUNTIME_MANIFEST_SHA256
+            or baseline["runtime_lock_sha256"] != CORE_RUST_BASELINE_RUNTIME_LOCK_SHA256):
+        _refuse("source-sets-baseline-binding")
+    prefix = BASELINE_NAMESPACE + "/"
+    candidate_hashes = {}
+    baseline_hashes = {}
+    baseline_bytes = 0
+    candidate_bytes = 0
+    for name, (size, digest) in inventory.items():
+        if name.startswith(prefix):
+            relative = name[len(prefix):]
+            if not relative or relative.startswith(BASELINE_NAMESPACE + "/"):
+                _refuse("source-sets-baseline-path")
+            _safe_member_name("baseline-runtime/" + relative)
+            baseline_hashes[relative] = digest
+            baseline_bytes += size
+        else:
+            if name == ".devlane" or name.startswith(".devlane/"):
+                _refuse("source-sets-candidate-path")
+            candidate_hashes[name] = digest
+            candidate_bytes += size
+    if (len(candidate_hashes) != candidate["selected_file_count"]
+            or candidate_bytes != candidate["selected_bytes"]
+            or r4_source_map_sha256(candidate_hashes) != candidate["selected_map_sha256"]):
+        _refuse("source-sets-candidate-map")
+    if any(candidate_hashes.get(path) != digest
+           for path, digest in candidate["selected_manifest_sha256"].items()):
+        _refuse("source-sets-selected-manifest")
+    if (len(baseline_hashes) != baseline["file_count"]
+            or baseline_bytes != baseline["bytes"]
+            or r4_source_map_sha256(baseline_hashes) != baseline["map_sha256"]
+            or baseline_hashes.get("Cargo.toml") != baseline["runtime_manifest_sha256"]
+            or baseline_hashes.get("Cargo.lock") != baseline["runtime_lock_sha256"]):
+        _refuse("source-sets-baseline-map")
+
+
+def _expected_core_rust_source_sets():
+    return {
+        "domain": SOURCE_SET_DOMAIN,
+        "candidate": {
+            "source_revision": CORE_RUST_SOURCE_REVISION,
+            "tree_oid": CORE_RUST_SOURCE_TREE,
+            "full_map_sha256": CORE_RUST_FULL_MAP_SHA256,
+            "selected_map_sha256": CORE_RUST_SELECTED_MAP_SHA256,
+            "selected_file_count": CORE_RUST_SELECTED_FILE_COUNT,
+            "selected_bytes": CORE_RUST_SELECTED_TOTAL_BYTES,
+            "selected_manifest_sha256": dict(CORE_RUST_SELECTED_MANIFEST_SHA256),
+        },
+        "baseline_runtime": {
+            "source_revision": CORE_RUST_BASELINE_REVISION,
+            "map_sha256": CORE_RUST_BASELINE_MAP_SHA256,
+            "file_count": CORE_RUST_BASELINE_FILE_COUNT,
+            "bytes": CORE_RUST_BASELINE_TOTAL_BYTES,
+            "namespace": BASELINE_NAMESPACE,
+            "runtime_manifest_sha256": CORE_RUST_BASELINE_RUNTIME_MANIFEST_SHA256,
+            "runtime_lock_sha256": CORE_RUST_BASELINE_RUNTIME_LOCK_SHA256,
+        },
+        "exclusions": list(CORE_RUST_SOURCE_EXCLUSIONS),
+    }
+
+
+def _read_regular_tree(root):
+    """Take a bounded descriptor-walked snapshot of a trusted input tree."""
+    if os.name != "posix":
+        _refuse("source-tree-platform")
+    root = Path(root)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        root_fd = os.open(str(root), flags)
+    except OSError:
+        _refuse("source-tree-root")
+    files = {}
+    total = 0
+    count = 0
+
+    def visit(directory_fd, prefix):
+        nonlocal total, count
+        try:
+            entries = sorted(os.listdir(directory_fd))
+        except OSError:
+            _refuse("source-tree-read")
+        for name in entries:
+            if type(name) is not str or name in ("", ".", "..") or "/" in name or "\\" in name:
+                _refuse("source-tree-path")
+            relative = name if not prefix else prefix + "/" + name
+            _safe_member_name(relative)
+            try:
+                before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError:
+                _refuse("source-tree-changed")
+            if stat.S_ISDIR(before.st_mode):
+                child_fd = None
+                try:
+                    child_fd = os.open(name, flags, dir_fd=directory_fd)
+                    opened = os.fstat(child_fd)
+                    if (not stat.S_ISDIR(opened.st_mode) or opened.st_dev != before.st_dev
+                            or opened.st_ino != before.st_ino):
+                        _refuse("source-tree-changed")
+                    visit(child_fd, relative)
+                    after = os.fstat(child_fd)
+                    if (after.st_dev != opened.st_dev or after.st_ino != opened.st_ino
+                            or after.st_mtime_ns != opened.st_mtime_ns
+                            or after.st_ctime_ns != opened.st_ctime_ns):
+                        _refuse("source-tree-changed")
+                except OSError:
+                    _refuse("source-tree-changed")
+                finally:
+                    if child_fd is not None:
+                        os.close(child_fd)
+                continue
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > MAX_FILE:
+                _refuse("source-tree-member")
+            descriptor = None
+            try:
+                descriptor = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                                     | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0),
+                                     dir_fd=directory_fd)
+                opened = os.fstat(descriptor)
+                if (not stat.S_ISREG(opened.st_mode) or opened.st_dev != before.st_dev
+                        or opened.st_ino != before.st_ino or opened.st_size != before.st_size
+                        or opened.st_nlink != 1):
+                    _refuse("source-tree-changed")
+                payload = bytearray()
+                while True:
+                    chunk = os.read(descriptor, min(65536, MAX_FILE + 1 - len(payload)))
+                    if not chunk:
+                        break
+                    payload.extend(chunk)
+                    if len(payload) > MAX_FILE:
+                        _refuse("source-tree-member-size")
+                after = os.fstat(descriptor)
+                if (len(payload) != opened.st_size or after.st_dev != opened.st_dev
+                        or after.st_ino != opened.st_ino or after.st_size != opened.st_size
+                        or after.st_mtime_ns != opened.st_mtime_ns
+                        or after.st_ctime_ns != opened.st_ctime_ns):
+                    _refuse("source-tree-changed")
+                count += 1
+                total += len(payload)
+                if count > MAX_FILES or total > MAX_EXPANDED:
+                    _refuse("source-tree-size")
+                files[relative] = bytes(payload)
+            except OSError:
+                _refuse("source-tree-read")
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+
+    try:
+        initial_root = os.fstat(root_fd)
+        if not stat.S_ISDIR(initial_root.st_mode):
+            _refuse("source-tree-root")
+        visit(root_fd, "")
+        final_root = os.fstat(root_fd)
+        if (final_root.st_dev != initial_root.st_dev or final_root.st_ino != initial_root.st_ino
+                or final_root.st_mtime_ns != initial_root.st_mtime_ns
+                or final_root.st_ctime_ns != initial_root.st_ctime_ns):
+            _refuse("source-tree-changed")
+    finally:
+        os.close(root_fd)
+    return files, total
 
 
 def inspect_archive(archive_bytes, expected):
@@ -411,7 +654,8 @@ def _validate_public_map(value, max_entries, code):
 
 
 def build_source_archive(repository, revision, profile, fetch_sha256, source_files,
-                         allowed_files, allowed_tests, frames):
+                         allowed_files, allowed_tests, frames, *,
+                         baseline_runtime_root=None, source_sets=None):
     repository = Path(repository).resolve(strict=True)
     if type(revision) is not str or not GIT_SHA.fullmatch(revision):
         _refuse("source-revision-invalid")
@@ -423,6 +667,18 @@ def build_source_archive(repository, revision, profile, fetch_sha256, source_fil
     )
     if verify.returncode != 0 or verify.stdout.decode("ascii", "ignore").strip() != revision:
         _refuse("source-revision-mismatch")
+    v2_source_sets = source_sets is not None or baseline_runtime_root is not None
+    if v2_source_sets:
+        if (profile != "core-rust" or source_sets != _expected_core_rust_source_sets()
+                or baseline_runtime_root is None or revision != CORE_RUST_SOURCE_REVISION):
+            _refuse("source-sets-request-binding")
+        tree_check = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "--verify", revision + "^{tree}"],
+            check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30,
+        )
+        if (tree_check.returncode != 0
+                or tree_check.stdout.decode("ascii", "ignore").strip() != CORE_RUST_SOURCE_TREE):
+            _refuse("source-tree-binding")
     tree = subprocess.run(
         ["git", "-C", str(repository), "ls-tree", "-r", "-z", "--full-tree", revision],
         check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60,
@@ -443,6 +699,7 @@ def build_source_archive(repository, revision, profile, fetch_sha256, source_fil
         _refuse("source-allowlist-empty")
     blobs = []
     names = set()
+    tree_paths = set()
     total = 0
     for row in tree.stdout.split(b"\x00"):
         if not row:
@@ -453,9 +710,12 @@ def build_source_archive(repository, revision, profile, fetch_sha256, source_fil
             path = raw_path.decode("utf-8", "strict")
         except (ValueError, UnicodeDecodeError):
             _refuse("source-tree-entry")
-        path = _safe_member_name(path)
+        if path in tree_paths:
+            _refuse("source-duplicate")
+        tree_paths.add(path)
         if selected is not None and path not in selected:
             continue
+        path = _safe_member_name(path)
         if _excluded_source_path(path):
             continue
         if mode not in (b"100644", b"100755") or kind != b"blob" or not re.fullmatch(rb"[a-f0-9]{40,64}", blob):
@@ -470,12 +730,42 @@ def build_source_archive(repository, revision, profile, fetch_sha256, source_fil
         blobs.append((path, payload))
     if set(selected) != names:
         _refuse("source-selection-mismatch")
+    if v2_source_sets:
+        if (len(tree_paths) != CORE_RUST_SELECTED_FILE_COUNT + 1
+                or tree_paths - selected != {".npmrc"}
+                or len(names) != CORE_RUST_SELECTED_FILE_COUNT
+                or sum(len(payload) for _name, payload in blobs) != CORE_RUST_SELECTED_TOTAL_BYTES
+                or r4_source_map_sha256({name: hashlib.sha256(payload).hexdigest()
+                                        for name, payload in blobs}) != CORE_RUST_SELECTED_MAP_SHA256):
+            _refuse("source-selected-map-mismatch")
+        if any(name == ".devlane" or name.startswith(".devlane/") for name in names):
+            _refuse("source-reserved-namespace")
+        baseline_files, baseline_total = _read_regular_tree(baseline_runtime_root)
+        baseline_hashes = {name: hashlib.sha256(payload).hexdigest()
+                           for name, payload in baseline_files.items()}
+        if (len(baseline_files) != CORE_RUST_BASELINE_FILE_COUNT
+                or baseline_total != CORE_RUST_BASELINE_TOTAL_BYTES
+                or r4_source_map_sha256(baseline_hashes) != CORE_RUST_BASELINE_MAP_SHA256
+                or baseline_hashes.get("Cargo.toml") != CORE_RUST_BASELINE_RUNTIME_MANIFEST_SHA256
+                or baseline_hashes.get("Cargo.lock") != CORE_RUST_BASELINE_RUNTIME_LOCK_SHA256):
+            _refuse("source-baseline-map-mismatch")
+        baseline_blobs = []
+        for relative, payload in sorted(baseline_files.items()):
+            archive_path = BASELINE_NAMESPACE + "/" + relative
+            _safe_member_name(archive_path)
+            baseline_blobs.append((archive_path, payload))
+        blobs.extend(baseline_blobs)
+        names.update(name for name, _payload in baseline_blobs)
+        total += baseline_total
+        if total > MAX_EXPANDED:
+            _refuse("source-expanded-size")
     if not set(allowed_files).issubset(names):
         _refuse("source-file-map-unavailable")
     if not any(PurePosixPath(path).name in ("package-lock.json", "Cargo.lock") for path in names):
         _refuse("source-lockfile-missing")
     if len(blobs) > MAX_FILES:
         _refuse("source-file-count")
+    candidate_blobs = [item for item in blobs if not item[0].startswith(BASELINE_NAMESPACE + "/")]
     inventory = [
         {"path": name, "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
         for name, payload in sorted(blobs)
@@ -483,11 +773,11 @@ def build_source_archive(repository, revision, profile, fetch_sha256, source_fil
     tree_digest = hashlib.sha256(canonical_json(inventory)).hexdigest()
     lockfiles = {
         name: hashlib.sha256(payload).hexdigest()
-        for name, payload in blobs
+        for name, payload in candidate_blobs
         if PurePosixPath(name).name in ("package-lock.json", "Cargo.lock")
     }
     manifest = {
-        "schema": 1,
+        "schema": 2 if v2_source_sets else 1,
         "profile": profile,
         "profile_revision": 1,
         "source_revision": revision,
@@ -505,6 +795,8 @@ def build_source_archive(repository, revision, profile, fetch_sha256, source_fil
             "file_bytes": MAX_FILE,
         },
     }
+    if v2_source_sets:
+        manifest["source_sets"] = source_sets
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w:gz", format=tarfile.USTAR_FORMAT) as archive:
         for name, payload in sorted(blobs):
@@ -575,11 +867,15 @@ def main(argv=None):
     try:
         if args.operation == "create":
             request = strict_json(Path(args.request).read_bytes(), 1024 * 1024)
-            required = {"repository", "source_revision", "profile", "fetch_sha256", "wave_id",
-                        "bundle_id", "control_sha", "expires", "source_files", "allowed_files",
-                        "allowed_tests", "frames"}
-            if type(request) is not dict or set(request) != required:
+            required_v1 = {"repository", "source_revision", "profile", "fetch_sha256", "wave_id",
+                           "bundle_id", "control_sha", "expires", "source_files", "allowed_files",
+                           "allowed_tests", "frames"}
+            required_v2 = required_v1 | {"baseline_runtime_root", "source_sets"}
+            if type(request) is not dict or set(request) not in (required_v1, required_v2):
                 _refuse("producer-request-shape")
+            if set(request) == required_v2 and (request["profile"] != "core-rust"
+                                                or request["source_sets"] != _expected_core_rust_source_sets()):
+                _refuse("producer-source-sets")
             key = AESGCM.generate_key(bit_length=256) if AESGCM is not None else None
             if key is None:
                 _refuse("crypto-unavailable")
@@ -598,6 +894,8 @@ def main(argv=None):
                 request["repository"], request["source_revision"], request["profile"],
                 request["fetch_sha256"], request["source_files"], request["allowed_files"],
                 request["allowed_tests"], request["frames"],
+                baseline_runtime_root=request.get("baseline_runtime_root"),
+                source_sets=request.get("source_sets"),
             )
             envelope = build_envelope(archive, key, bindings)
             write_private_key(args.key_file, key)

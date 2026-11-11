@@ -31,7 +31,6 @@ IDENTITY = {
 MARK = chr(35) * 2
 RUNNER_HOME = chr(47) + "home" + chr(47) + "runner"
 TMP = RUNNER_HOME + "/work/_temp"
-NODE_CACHE = "/opt/hostedtoolcache/node/24.22.1/x64"
 
 
 def _env_value(name, identity=IDENTITY, kind="encrypted"):
@@ -80,7 +79,7 @@ def _step_outputs(step, identity, kind, records):
         key = _with_value(step, "key", identity, kind)
         return ["Cache saved with key: " + key, "Cache saved successfully"]
     if uses.startswith("actions/setup-node"):
-        return ["Found in cache @ " + NODE_CACHE, "Environment details", "node: v24.22.1", "npm: 11.19.1",
+        return ["Found in cache @ " + audit.HOSTED_TOOL_CACHE, "Environment details", "node: v24.22.1", "npm: 11.19.1",
                 "yarn: 1.22.22"]
     outputs = {
         "Fetch public control and validate dispatch": ["dispatch_context=validated"] if kind == "encrypted" else [],
@@ -332,10 +331,10 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
     def test_closed_public_log_rejects_disguised_plaintext_and_excess_records(self):
         valid = self._valid_run_log()
         stamp = b"2026-11-10T12:00:00.1234567Z "
-        tool_line = ("Found in cache @ " + NODE_CACHE).encode()
+        tool_line = b"dependency_preparation=complete"
         mutations = {
-            "canary in tool-cache path": valid.replace(
-                tool_line, b"Found in cache @ /PRIVATE_SOURCE_CANARY/node/24.22.1/PRIVATE_KEY_CANARY"),
+            "canary in preparation output": valid.replace(
+                tool_line, b"dependency_preparation=complete /PRIVATE_SOURCE_CANARY/PRIVATE_KEY_CANARY"),
             "plaintext line": valid + stamp + b"PRIVATE_SOURCE_CANARY=unfiltered-plaintext\n",
             "plaintext inside a step": valid.replace(
                 b"dependency_preparation=complete", b"dependency_preparation=complete\n" + stamp + b"PRIVATE_SOURCE_CANARY"),

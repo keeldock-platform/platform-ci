@@ -1065,6 +1065,7 @@ def _prepare(profile, projection_path, prepared_path):
         "sudo", "-n", "unshare", "--mount", "--pid", "--ipc", "--fork", "--mount-proc", "--kill-child", "--",
         sys.executable, "-B", str(ROOT / "kit/devlane/prepare.py"),
         "--projection", str(projection_path), "--output", str(prepared_path), "--profile", profile,
+        "--control-sha", CONTROL_SHA,
         "--owner-uid", str(os.getuid()), "--owner-gid", str(os.getgid()),
         "--deadline-file", DEADLINE_FILE,
     ]
