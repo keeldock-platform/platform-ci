@@ -23,6 +23,7 @@ if sys.flags.isolated:
 
 import bundle
 import rust_test_runner
+import semver_stage
 
 
 EXPECTED_MATRIX = {
@@ -43,7 +44,7 @@ EXPECTED_MATRIX = {
         "audit-root", "audit-runtime", "audit-fuzz", "vet-root", "vet-runtime", "vet-fuzz",
         "root-default", "root-all-features", "runtime-default", "runtime-all-features",
         "fuzz-default", "fuzz-all-features", "listener-default", "listener-all-features",
-        "fuzz-replay-default", "fuzz-replay-all-features",
+        "fuzz-replay-default", "fuzz-replay-all-features", "semver-runtime",
     ],
 }
 MAX_CAPTURE = 256 * 1024 * 1024
@@ -173,6 +174,8 @@ def _stage_for(suite):
         return "audit"
     if suite.startswith("vet-"):
         return "vet"
+    if suite == semver_stage.SUITE:
+        return semver_stage.STAGE
     return "unit"
 
 
@@ -277,6 +280,17 @@ def _fuzz_replay(records, feature_set, deadline):
         return False
 
 
+def _semver_check(records, deadline):
+    try:
+        rows = semver_stage.request_stage(deadline)
+        records.extend(rows)
+        coverage = next(row for row in rows if row.get("kind") == "coverage")
+        return coverage["passed"] == 1
+    except Exception:
+        records.extend(semver_stage.records_for_exit(101))
+        return False
+
+
 def run(matrix, config_path, report_path, deadline):
     if matrix != EXPECTED_MATRIX:
         raise MatrixRefusal("matrix-profile-mismatch")
@@ -321,6 +335,7 @@ def run(matrix, config_path, report_path, deadline):
                            "all" if feature_set == "all" else "default", config_path, deadline)
     for feature_set in matrix["feature_sets"]:
         _fuzz_replay(records, "all" if feature_set == "all" else "default", deadline)
+    _semver_check(records, deadline)
     coverage = [record for record in records if record.get("kind") == "coverage"]
     seen = [record.get("suite") for record in coverage]
     coverage_complete = (

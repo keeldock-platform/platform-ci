@@ -45,6 +45,32 @@ class PreparationTests(unittest.TestCase):
                 with self.assertRaisesRegex(constraint_resolver.Refusal, "execute-file-access$"):
                     constraint_resolver.validate_tool_execution_access(str(tool))
 
+    def test_eacces_diagnostic_separates_cwd_mount_interpreter_and_policy_roles(self):
+        executable = "/tools/rust/bin/cargo"
+        cwd = "/work/resolver/cargo-constraints-fixed/resolver"
+        cases = (
+            (cwd, ("d", "s", "s", "s", "s"), "eacces-fc-cd-rs-bs-is-ls-p0"),
+            (executable, ("s", "s", "n", "s", "s"), "eacces-fe-cs-rs-bn-is-ls-p0"),
+            (executable, ("s", "s", "s", "a", "d"), "eacces-fe-cs-rs-bs-ia-lu-p0"),
+            (executable, ("s", "s", "s", "s", "s"), "eacces-fe-cs-rs-bs-is-ls-p1"),
+            ("/synthetic/unrelated", ("s", "s", "s", "s", "s"), "eacces-fo-cs-rs-bs-is-ls-p1"),
+        )
+        for filename, values, expected in cases:
+            with self.subTest(expected=expected):
+                error = OSError(errno.EACCES, "private-error-canary", filename)
+                with patch.object(bounded_registry_io, "_process_start_status",
+                                  side_effect=[values[0], values[1], values[4]]), \
+                     patch.object(bounded_registry_io, "_exec_access_status",
+                                  side_effect=[values[2], values[3]]), \
+                     patch.object(bounded_registry_io, "_elf_interpreter",
+                                  return_value="/lib/loader.so"):
+                    detail = bounded_registry_io._permission_start_diagnostic(
+                        error, [executable, "--version"], cwd, {"PATH": "/tools/rust/bin"},
+                        bounded_registry_io.PhaseBudget.start(10))
+                self.assertEqual(detail, expected)
+                self.assertNotIn("private", detail)
+                self.assertNotIn("/", detail)
+
     def test_process_start_errors_report_only_fixed_categories(self):
         categories = {
             errno.EACCES: "permission", errno.ENOENT: "missing-file",
@@ -57,9 +83,9 @@ class PreparationTests(unittest.TestCase):
                 bounded_registry_io.subprocess, "Popen",
                 side_effect=OSError(number, "private-path-canary"),
             ):
-                with self.assertRaisesRegex(
-                    bounded_registry_io.Refusal, "^process-start-" + category + "$",
-                ):
+                expected = (r"^process-start-eacces-fn-cd-rd-bm-iu-lu-p0$"
+                            if number == errno.EACCES else "^process-start-" + category + "$")
+                with self.assertRaisesRegex(bounded_registry_io.Refusal, expected):
                     bounded_registry_io.run_bounded_process(
                         ["fixed-command"], bounded_registry_io.PhaseBudget.start(10),
                         cwd="/", env={},

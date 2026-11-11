@@ -1197,6 +1197,11 @@ def run_cargo_fixed_point(envelope: dict[str, Any], *, expected_source_sha: str,
                 "process-start-memory", "process-start-policy", "process-start-format",
                 "process-start-busy", "process-start-os",
             } else "process"
+            if (error.args and type(error.args[0]) is str
+                    and re.fullmatch(
+                        r"process-start-eacces-f[ceon]-c[sxdpmtu]-r[sxdpmtu]-b[sxmanu]-i[sxzmanu]-l[sxzdpmtu]-p[01u]",
+                        error.args[0])):
+                reason = error.args[0].removeprefix("process-start-")
             _fail("resolver-" + Path(executable).name + "-version-" + reason)
         except OSError:
             _fail("resolver-" + Path(executable).name + "-version-io")

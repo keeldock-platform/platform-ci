@@ -938,6 +938,7 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/semver_cargo_wrapper.py',
             'kit/devlane/semver-pins.json',
             'kit/devlane/temp_project_checkpoints.py',
+            'kit/devlane/cgroup_exec.py',
             'kit/devlane/test_semver_review_fixes.py',
             'kit/devlane/test_node_vendor_source.py',
             'kit/devlane/test_node_vendor_source_r2.py',
@@ -1345,6 +1346,16 @@ class PublicTreeTests(unittest.TestCase):
 
     def test_rust_tooling_allows_only_exact_public_destinations_at_the_owned_path(self):
         from public_tree import PINNED_RUST_TOOLING_URLS
+        expected_urls = frozenset((
+            "https:" + "//github.com/" + "EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz",
+            "https:" + "//github.com/" + "RustSec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz",
+            "https:" + "//github.com/" + "mozilla/cargo-vet/releases/download/v0.10.3/cargo-vet-x86_64-unknown-linux-gnu.tar.xz",
+            "https:" + "//github.com/" + "obi1kenobi/cargo-semver-checks/releases/download/v0.51.0/cargo-semver-checks-x86_64-unknown-linux-gnu.tar.gz",
+            "https:" + "//github.com/" + "RustSec/advisory-db.git",
+        ))
+        self.assertEqual(PINNED_RUST_TOOLING_URLS, expected_urls)
+        actual_source = (ROOT / "kit/devlane/rust_tooling.py").read_text(encoding="ascii")
+        inspect_text(actual_source, "platform", "kit/devlane/rust_tooling.py")
         source = "\n".join('destination = "' + url + '"' for url in sorted(PINNED_RUST_TOOLING_URLS))
         inspect_text(source, "platform", "kit/devlane/rust_tooling.py")
         bad_sources = (

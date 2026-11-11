@@ -27,7 +27,7 @@ REAL_CARGO = "/tools/rust/bin/cargo"
 TEMP_ROOT = "/scratch/tmp"
 TARGET_ROOT = "/scratch/semver-target"
 PROJECT_ROOT = TARGET_ROOT + "/semver-checks"
-CHECKPOINT_SOCKET = "/control/matrix-worker.sock"
+CHECKPOINT_SOCKET = "/scratch/semver-state/matrix-worker.sock"
 TARGET_TRIPLE = "x86_64-unknown-linux-gnu"
 MAX_CONTEXT_BYTES = 64 * 1024
 MAX_ARGUMENTS = 32
@@ -252,20 +252,26 @@ def _project_root(manifest):
     return str(path.parent)
 
 
-def _send_checkpoint(event, operation, manifest):
+def _send_checkpoint(event, operation, manifest, deadline):
     payload = json.dumps({
         "op": "semver-checkpoint", "event": event,
         "operation": operation, "manifest": manifest,
     }, separators=(",", ":"), ensure_ascii=True).encode("ascii")
     if len(payload) > 16 * 1024:
         _refuse("semver-cargo-checkpoint-invalid")
+    stop = min(float(deadline), time.monotonic() + 60.0)
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    connection.settimeout(60)
     try:
+        if stop <= time.monotonic():
+            _refuse("semver-cargo-checkpoint-deadline")
+        connection.settimeout(min(5.0, stop - time.monotonic()))
         connection.connect(CHECKPOINT_SOCKET)
         connection.sendall(len(payload).to_bytes(4, "big") + payload)
         size_bytes = bytearray()
         while len(size_bytes) < 4:
+            if time.monotonic() >= stop:
+                _refuse("semver-cargo-checkpoint-deadline")
+            connection.settimeout(min(5.0, stop - time.monotonic()))
             chunk = connection.recv(4 - len(size_bytes))
             if not chunk:
                 _refuse("semver-cargo-checkpoint-unavailable")
@@ -275,6 +281,9 @@ def _send_checkpoint(event, operation, manifest):
             _refuse("semver-cargo-checkpoint-response")
         response_bytes = bytearray()
         while len(response_bytes) < size:
+            if time.monotonic() >= stop:
+                _refuse("semver-cargo-checkpoint-deadline")
+            connection.settimeout(min(5.0, stop - time.monotonic()))
             chunk = connection.recv(size - len(response_bytes))
             if not chunk:
                 _refuse("semver-cargo-checkpoint-response")
@@ -318,7 +327,7 @@ def _run(arguments, *, context=None, run_process=None):
             context = _read_context()
         for event, operation in _checkpoint_events(command):
             if operation == command["operation"] and event.startswith("before-"):
-                _send_checkpoint(event, operation, command["manifest"])
+                _send_checkpoint(event, operation, command["manifest"], context["work_deadline"])
 
     runner = subprocess.run if run_process is None else run_process
     invocation = [REAL_CARGO, *command["argv"]]
@@ -331,7 +340,7 @@ def _run(arguments, *, context=None, run_process=None):
     if command["project_kind"] in {"local", "registry"}:
         for event, operation in _checkpoint_events(command):
             if operation == command["operation"] and event.startswith("after-"):
-                _send_checkpoint(event, operation, command["manifest"])
+                _send_checkpoint(event, operation, command["manifest"], context["work_deadline"])
     return result.returncode
 
 

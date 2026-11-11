@@ -659,9 +659,9 @@ def source_map_digest(root: str | Path, budget: bounded_registry_io.PhaseBudget,
     return _sha(encoded), len(ordered), total
 
 
-def workspace_version(manifest_path: Path) -> str:
+def workspace_version(manifest_path: Path, budget=None) -> str:
     """Read the workspace package version without exposing parser details."""
-    payload = _read_file(manifest_path, MAX_FILE_BYTES)
+    payload = _read_file(manifest_path, MAX_FILE_BYTES, budget)
     try:
         value = tomllib.loads(payload.decode("utf-8", "strict"))
         version = value["workspace"]["package"]["version"]
@@ -1171,7 +1171,7 @@ def validate_rust_v2_semver_inputs(
             or type(projection.get("manifest_constraints")) is not dict):
         _refuse("semver-cache-projection-binding")
     projection_path = prepared / "projection.json"
-    if _read_file(projection_path, MAX_CONTRACT_BYTES) != _canonical(projection) + b"\n":
+    if _read_file(projection_path, MAX_CONTRACT_BYTES, budget) != _canonical(projection) + b"\n":
         _refuse("semver-cache-projection-binding")
     constraints = projection["manifest_constraints"]
     if (set(constraints) != {"candidate", "baseline_runtime"}
@@ -1213,13 +1213,13 @@ def validate_rust_v2_semver_inputs(
             or baseline_bytes != source_sets["baseline_runtime"]["bytes"]
             or candidate_runtime_map != identity["candidate_source_map_sha256"]):
         _refuse("semver-cache-source-map-binding")
-    if (workspace_version(baseline / "Cargo.toml") != identity["baseline_runtime_version"]
-            or workspace_version(candidate_root / "runtime/Cargo.toml")
+    if (workspace_version(baseline / "Cargo.toml", budget) != identity["baseline_runtime_version"]
+            or workspace_version(candidate_root / "runtime/Cargo.toml", budget)
             != identity["candidate_runtime_version"]
-            or _sha(_read_file(baseline / "Cargo.toml", MAX_FILE_BYTES))
+            or _sha(_read_file(baseline / "Cargo.toml", MAX_FILE_BYTES, budget))
             != identity["baseline_runtime_manifest_sha256"]):
         _refuse("semver-cache-workspace-version")
-    baseline_lock = _read_file(baseline / "Cargo.lock", MAX_FILE_BYTES)
+    baseline_lock = _read_file(baseline / "Cargo.lock", MAX_FILE_BYTES, budget)
     try:
         if constraint_resolver.lock_package_rows(baseline_lock):
             _refuse("semver-cache-baseline-external-closure")
@@ -1275,16 +1275,18 @@ def validate_rust_v2_semver_inputs(
     config = CARGO_CONFIG
     for home, exact_entries in ((cargo_home, True), (matrix_home, False)):
         try:
-            config_path = home / "config.toml"
-            if exact_entries and {entry.name for entry in home.iterdir()} != {"config.toml"}:
+            config_names = {"config.toml", "config"} if exact_entries else {"config.toml"}
+            if exact_entries and {entry.name for entry in home.iterdir()} != config_names:
                 _refuse("semver-cache-cargo-home-not-fresh")
-            if (config_path.is_symlink()
-                    or stat.S_IMODE(config_path.stat().st_mode) & 0o222
-                    or _read_file(config_path, 4096) != config):
-                _refuse("semver-cache-cargo-config-invalid")
+            for config_name in config_names:
+                config_path = home / config_name
+                if (config_path.is_symlink()
+                        or stat.S_IMODE(config_path.stat().st_mode) & 0o222
+                        or _read_file(config_path, 4096, budget) != config):
+                    _refuse("semver-cache-cargo-config-invalid")
         except OSError:
             _refuse("semver-cache-cargo-config-invalid")
-    if _read_file(prepared / "cargo-config.toml", 4096) != config:
+    if _read_file(prepared / "cargo-config.toml", 4096, budget) != config:
         _refuse("semver-cache-cargo-config-invalid")
 
     lock_fields = {
@@ -1310,7 +1312,7 @@ def validate_rust_v2_semver_inputs(
         _refuse("semver-cache-generated-output-binding")
     available = {(row["name"], row["version"]): row["checksum"] for row in packages}
     for relative in expected_locks:
-        lock_bytes = _read_file(candidate_root / relative, MAX_FILE_BYTES)
+        lock_bytes = _read_file(candidate_root / relative, MAX_FILE_BYTES, budget)
         if _sha(lock_bytes) != lock_hashes[relative]:
             _refuse("semver-cache-generated-lock-binding")
         try:
@@ -1321,10 +1323,21 @@ def validate_rust_v2_semver_inputs(
                for row in rows):
             _refuse("semver-cache-candidate-outside-closure")
 
+    candidate_full_map, candidate_full_count, candidate_full_bytes = source_map_digest(
+        candidate_root, budget,
+    )
+    composed_lock_map = dict(original_nonlock)
+    composed_lock_map.update(lock_hashes)
+    if candidate_full_map != _r4_source_map_sha256(composed_lock_map):
+        _refuse("semver-cache-generated-output-binding")
+
     return {
         "schema": "keeldock.rust-v2-semver-execution-inputs.v1",
         "authenticated_binding": identity,
         "expected_source_maps": maps,
+        "candidate_selected_map_after_ephemeral_lock_overlay": candidate_full_map,
+        "candidate_selected_file_count_after_ephemeral_lock_overlay": candidate_full_count,
+        "candidate_selected_bytes_after_ephemeral_lock_overlay": candidate_full_bytes,
         "_registry_package_rows": packages,
         "registry_tree_sha256": registry_tree_sha256,
         "generated_lock_sha256": dict(lock_hashes),

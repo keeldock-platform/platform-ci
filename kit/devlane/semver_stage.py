@@ -4,7 +4,9 @@ import hashlib
 import json
 import os
 import re
+import socket
 import stat
+import struct
 import tomllib
 import time
 from pathlib import Path
@@ -18,10 +20,12 @@ SUITE = "semver-runtime"
 STAGE = "semver"
 CHECK_SECONDS = 1800
 PIN_FILE = Path(__file__).with_name("semver-pins.json")
-PIN_FILE_SHA256 = "9c08ce2957c3561f93ffb2e19507abcc02a959d67f660000b0c27ac133269449"
+PIN_FILE_SHA256 = "fa82638c9c3690a9af408212e02045b938775079bb173debeaa02107067acbd8"
 MAX_PIN_BYTES = 16 * 1024
 MAX_SOURCE_FILE_BYTES = 32 * 1024 * 1024
 MAX_SOURCE_TREE_BYTES = 512 * 1024 * 1024
+MAX_SEMVER_TOOL_BYTES = 128 * 1024 * 1024
+SEMVER_WORKER_SOCKET = "/scratch/semver-state/matrix-worker.sock"
 SEMVER_TOOL = "cargo-semver-checks"
 SEMVER_VERSION = "0.51.0"
 SEMVER_ASSET_SHA256 = "cacadafaa5cd27ae6d05a74a103266917ebab4c5e43c898360e177d4fbf06a65"
@@ -37,16 +41,17 @@ SELECTED_TRANSFER_BYTES = 16619832
 EXCLUDED_SOURCE_PATHS = (".npmrc",)
 OFFLINE_CACHE_PIN = {
     "schema": "keeldock.rust-v2-semver-execution-inputs.v1",
-    "helper_sha256": "d2eccd210ef2f466e927daa3b5b9b1fccddb23c1a5b2387714464cbe58389b14",
-    "wrapper_sha256": "63ba0974db2388b3462f7dddded28fa7f89e5a60575a88ae68d8de9b17712336",
+    "helper_sha256": "6c0436afc81b570d805c6877b7286489b620244ac605527e26fb2e4eb972c199",
+    "wrapper_sha256": "0283e88b71a68ac00dc0d9b1aa4fc0265febdd1638048d931ee0dd7f1d069ba8",
     "support_modules": {
-        "bounded_registry_io.py": "4ba0d03215642857306056f8a52e051a67056642fca1b42c15921abddba584d5",
+        "bounded_registry_io.py": "ed5dcb8a3c746bfc7ccc2220287633fa2a4ee51ad2acf99a6e85ebf6da570f67",
         "cargo_projection.py": "ea0557e6a1d72dacbaa2449449d8ce994f579d8b42bb6263e25643a6da447328",
-        "constraint_resolver.py": "d66ea2eef15d91aa4eb4e97d443efaed3c760f4820c0877e554f349e87452e73",
+        "constraint_resolver.py": "e29d1a4bf3bf8068ef38b0ffba3ca401cbbf1bcd221c83fc1b72979bfac74b4f",
         "registry_prefetch.py": "585c02674ca6532b09a4ad426217c34f7a8279412d947b28fb33ebfe8525a45a",
         "rust_lock_generation.py": "86b999e05b6c24e320591f9a1e2853dcdd7e68615936b42707669c866fa9d3b5",
         "rust_preparation_v2.py": "f38b3049d0cfbf852406a3dc807341a8bba482e3a2f25530fa390a6182e86422",
         "temp_project_checkpoints.py": "93e47b3867f6c5e4c7051f5705fc4acea765438c88c73ba272941f6ea11db299",
+        "cgroup_exec.py": "8a8a7dbaa74488d7cc70fbd6630c19cb46c9c3311da1c579e6c17666a3b34dba",
     },
     "replay_mode": "verified-final-payload-only",
 }
@@ -172,7 +177,7 @@ def _sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def _read_fixed_file(path, maximum):
+def _read_fixed_file(path, maximum, budget=None):
     descriptor = None
     try:
         path = Path(path)
@@ -197,6 +202,8 @@ def _read_fixed_file(path, maximum):
         while True:
             if time.monotonic() >= deadline:
                 raise SemverRefusal("semver-input-invalid")
+            if budget is not None:
+                budget.remaining()
             chunk = os.read(descriptor, min(16_384, maximum + 1 - len(result)))
             if not chunk:
                 break
@@ -225,8 +232,8 @@ def _read_fixed_file(path, maximum):
             os.close(descriptor)
 
 
-def _pins():
-    raw = _read_fixed_file(PIN_FILE, MAX_PIN_BYTES)
+def _pins(budget=None):
+    raw = _read_fixed_file(PIN_FILE, MAX_PIN_BYTES, budget)
     if _sha(raw) != PIN_FILE_SHA256:
         raise SemverRefusal("semver-pins-invalid")
     try:
@@ -266,9 +273,9 @@ def _pins():
     return pins
 
 
-def offline_cache_source_maps():
+def offline_cache_source_maps(budget=None):
     """Return independently pinned source-map identities for the cache preflight."""
-    pins = _pins()
+    pins = _pins(budget)
     try:
         baseline = pins["baseline"]["runtime_map_sha256"]
         candidate_runtime = pins["candidate"]["runtime_semantic_map_sha256_excluding_cargo_lock"]
@@ -285,9 +292,9 @@ def offline_cache_source_maps():
     }
 
 
-def offline_cache_source_sets():
+def offline_cache_source_sets(budget=None):
     """Return the exact candidate/baseline identities carried by Rust manifest v2."""
-    _pins()
+    _pins(budget)
     return {
         "domain": SOURCE_SET_DOMAIN,
         "candidate": {
@@ -333,13 +340,13 @@ def offline_cache_input_identity(control_sha, projection_sha256, semver_tool_bin
     })
 
 
-def _hash_file(path):
+def _hash_file(path, *, maximum=MAX_SOURCE_FILE_BYTES, budget=None):
     descriptor = None
     try:
         path = Path(path)
         before = path.lstat()
         if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
-                or before.st_size > MAX_SOURCE_FILE_BYTES):
+                or before.st_size > maximum):
             raise SemverRefusal("semver-source-invalid")
         nofollow = getattr(os, "O_NOFOLLOW", None)
         nonblock = getattr(os, "O_NONBLOCK", None)
@@ -351,7 +358,7 @@ def _hash_file(path):
         if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
                 or opened.st_dev != before.st_dev
                 or opened.st_ino != before.st_ino or opened.st_size != before.st_size
-                or opened.st_size > MAX_SOURCE_FILE_BYTES):
+                or opened.st_size > maximum):
             raise SemverRefusal("semver-source-invalid")
         digest = hashlib.sha256()
         size = 0
@@ -359,11 +366,13 @@ def _hash_file(path):
         while True:
             if time.monotonic() >= deadline:
                 raise SemverRefusal("semver-source-invalid")
-            chunk = os.read(descriptor, min(65_536, MAX_SOURCE_FILE_BYTES + 1 - size))
+            if budget is not None:
+                budget.remaining()
+            chunk = os.read(descriptor, min(65_536, maximum + 1 - size))
             if not chunk:
                 break
             size += len(chunk)
-            if size > MAX_SOURCE_FILE_BYTES:
+            if size > maximum:
                 raise SemverRefusal("semver-source-invalid")
             digest.update(chunk)
         after = os.fstat(descriptor)
@@ -407,7 +416,7 @@ def _validated_directory_chain(root):
     return root
 
 
-def _tree_map(root, *, omit_runtime_lock=False):
+def _tree_map(root, *, omit_runtime_lock=False, budget=None):
     root = _validated_directory_chain(root)
     result = {}
     total_bytes = 0
@@ -433,7 +442,7 @@ def _tree_map(root, *, omit_runtime_lock=False):
                         or metadata.st_size > MAX_SOURCE_FILE_BYTES):
                     raise SemverRefusal("semver-lock-invalid")
                 continue
-            digest, size = _hash_file(path)
+            digest, size = _hash_file(path, budget=budget)
             total_bytes += size
             if total_bytes > MAX_SOURCE_TREE_BYTES:
                 raise SemverRefusal("semver-source-size")
@@ -444,9 +453,9 @@ def _tree_map(root, *, omit_runtime_lock=False):
     return ordered, _sha(encoded)
 
 
-def _workspace_version(root):
+def _workspace_version(root, budget=None):
     manifest = Path(root) / "Cargo.toml"
-    raw = _read_fixed_file(manifest, MAX_SOURCE_FILE_BYTES)
+    raw = _read_fixed_file(manifest, MAX_SOURCE_FILE_BYTES, budget)
     try:
         document = tomllib.loads(raw.decode("utf-8", "strict"))
         version = document["workspace"]["package"]["version"]
@@ -457,20 +466,22 @@ def _workspace_version(root):
     return _sha(raw), version
 
 
-def verify_source_maps(source_root=SOURCE_ROOT, baseline_root=BASELINE_ROOT):
+def verify_source_maps(source_root=SOURCE_ROOT, baseline_root=BASELINE_ROOT, budget=None):
     """Verify the frozen baseline and candidate semantic source bytes before launch.
 
     The candidate map deliberately omits only runtime/Cargo.lock: c706 owns its
     offline regeneration. The full candidate input map and generated lock proofs
     remain separate generated input requirements.
     """
-    pins = _pins()
+    pins = _pins(budget)
     source_root = Path(source_root)
     baseline_root = Path(baseline_root)
-    baseline_map, baseline_digest = _tree_map(baseline_root)
-    candidate_map, candidate_digest = _tree_map(source_root, omit_runtime_lock=True)
-    baseline_manifest_digest, baseline_version = _workspace_version(baseline_root)
-    candidate_manifest_digest, candidate_version = _workspace_version(source_root)
+    baseline_map, baseline_digest = _tree_map(baseline_root, budget=budget)
+    candidate_map, candidate_digest = _tree_map(
+        source_root, omit_runtime_lock=True, budget=budget,
+    )
+    baseline_manifest_digest, baseline_version = _workspace_version(baseline_root, budget)
+    candidate_manifest_digest, candidate_version = _workspace_version(source_root, budget)
     expected_baseline = pins["baseline"]
     expected_candidate = pins["candidate"]
     if (len(baseline_map) != expected_baseline["runtime_file_count"]
@@ -485,7 +496,7 @@ def verify_source_maps(source_root=SOURCE_ROOT, baseline_root=BASELINE_ROOT):
     return True
 
 
-def verify_tool(tools_root=TOOLS_ROOT):
+def verify_tool(tools_root=TOOLS_ROOT, budget=None):
     try:
         if not Path(tools_root).is_dir() or Path(tools_root).is_symlink():
             raise SemverRefusal("semver-tool-binding")
@@ -496,13 +507,16 @@ def verify_tool(tools_root=TOOLS_ROOT):
             if (not stat.S_ISREG(metadata.st_mode) or path.is_symlink()
                     or metadata.st_nlink != 1 or metadata.st_mode & 0o222):
                 raise SemverRefusal("semver-tool-binding")
-        if not os.access(tool, os.X_OK) or not 0 < tool.stat().st_size <= 128 * 1024 * 1024:
+        if (not os.access(tool, os.X_OK)
+                or not 0 < tool.stat().st_size <= MAX_SEMVER_TOOL_BYTES):
             raise SemverRefusal("semver-tool-binding")
-        raw = _read_fixed_file(receipt, 4096)
+        raw = _read_fixed_file(receipt, 4096, budget)
         value = json.loads(raw.decode("ascii", "strict"))
         canonical = json.dumps(value, sort_keys=True, separators=(",", ":"),
                                ensure_ascii=True).encode("ascii") + b"\n"
-        binary_sha, binary_size = _hash_file(tool)
+        binary_sha, binary_size = _hash_file(
+            tool, maximum=MAX_SEMVER_TOOL_BYTES, budget=budget,
+        )
         expected = {
             "schema": "keeldock.prepared-semver-tool.v1",
             "tool": SEMVER_TOOL,
@@ -538,10 +552,88 @@ def fixed_argv(tools_root=TOOLS_ROOT, baseline_root=BASELINE_ROOT):
     ]
 
 
-def verify_run_inputs(source_root=SOURCE_ROOT, baseline_root=BASELINE_ROOT, tools_root=TOOLS_ROOT):
-    verify_source_maps(source_root, baseline_root)
-    verify_tool(tools_root)
+def verify_run_inputs(source_root=SOURCE_ROOT, baseline_root=BASELINE_ROOT,
+                      tools_root=TOOLS_ROOT, budget=None):
+    verify_source_maps(source_root, baseline_root, budget)
+    verify_tool(tools_root, budget)
     return True
+
+
+def _recv_exact(connection, size, deadline):
+    if type(size) is not int or not 0 <= size <= 4096:
+        raise SemverRefusal("semver-stage-response-invalid")
+    result = bytearray()
+    while len(result) < size:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SemverRefusal("semver-stage-deadline")
+        connection.settimeout(min(5.0, remaining))
+        chunk = connection.recv(size - len(result))
+        if not chunk:
+            raise SemverRefusal("semver-stage-response-invalid")
+        result.extend(chunk)
+    return bytes(result)
+
+
+def _unique_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate")
+        result[key] = value
+    return result
+
+
+def request_stage(deadline):
+    """Ask the supervisor's peer-credential channel to run this fixed matrix stage."""
+    payload = b'{"op":"semver-stage"}'
+    stop = min(float(deadline), time.monotonic() + CHECK_SECONDS)
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        connection.settimeout(min(5.0, max(0.05, stop - time.monotonic())))
+        connection.connect(SEMVER_WORKER_SOCKET)
+        connection.sendall(struct.pack(">I", len(payload)) + payload)
+        size = struct.unpack(">I", _recv_exact(connection, 4, stop))[0]
+        response = json.loads(
+            _recv_exact(connection, size, stop).decode("ascii", "strict"),
+            object_pairs_hook=_unique_pairs,
+        )
+    except SemverRefusal:
+        raise
+    except (OSError, UnicodeError, ValueError, RecursionError, struct.error):
+        raise SemverRefusal("semver-stage-channel-unavailable") from None
+    finally:
+        connection.close()
+    if type(response) is not dict or set(response) != {"ok", "records"} or response["ok"] is not True:
+        raise SemverRefusal("semver-stage-response-invalid")
+    records = response["records"]
+    if type(records) is not list or not 1 <= len(records) <= 2:
+        raise SemverRefusal("semver-stage-response-invalid")
+    coverage = [row for row in records if type(row) is dict and row.get("kind") == "coverage"]
+    if len(coverage) != 1:
+        raise SemverRefusal("semver-stage-response-invalid")
+    row = coverage[0]
+    if (row != {
+            "kind": "coverage", "stage": STAGE, "suite": SUITE, "total": 1,
+            "passed": row.get("passed"), "failed": row.get("failed"), "ignored": 0,
+        } or type(row.get("passed")) is not int or row["passed"] not in (0, 1)
+            or type(row.get("failed")) is not int or row["failed"] != 1 - row["passed"]):
+        raise SemverRefusal("semver-stage-response-invalid")
+    if row["passed"] == 1:
+        if len(records) != 1:
+            raise SemverRefusal("semver-stage-response-invalid")
+    else:
+        controls = [record for record in records
+                    if type(record) is dict and record.get("kind") == "control"]
+        allowed = (
+            {"kind": "control", "stage": STAGE, "status": "fail",
+             "code": "DEVLANE_SEMVER_FINDINGS"},
+            {"kind": "control", "stage": STAGE, "status": "fail",
+             "code": "DEVLANE_SEMVER_EXECUTION"},
+        )
+        if len(records) != 2 or len(controls) != 1 or controls[0] not in allowed:
+            raise SemverRefusal("semver-stage-response-invalid")
+    return records
 
 
 def records_for_exit(exit_code):

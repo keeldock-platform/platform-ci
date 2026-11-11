@@ -9,6 +9,7 @@ import selectors
 import ssl
 import signal
 import stat
+import struct
 import subprocess
 import time
 import urllib.error
@@ -107,6 +108,139 @@ class PhaseBudget:
         self.members += 1
 
 
+def _exec_access_status(path: str) -> str:
+    """Report only fixed executable-access classes; never retain a path or OS message."""
+    try:
+        metadata = os.stat(path)
+    except FileNotFoundError:
+        return "m"
+    except (OSError, NotImplementedError):
+        return "u"
+    if not stat.S_ISREG(metadata.st_mode) or not metadata.st_mode & 0o111:
+        return "x"
+    try:
+        if os.statvfs(path).f_flag & getattr(os, "ST_NOEXEC", 8):
+            return "n"
+        if not os.access(path, os.X_OK, effective_ids=True):
+            return "a"
+    except OSError:
+        return "u"
+    return "s"
+
+
+def _elf_interpreter(executable: str) -> str | None:
+    """Read a bounded ELF64 PT_INTERP value without invoking the tool."""
+    try:
+        descriptor = os.open(executable, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                             | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        metadata = os.fstat(descriptor)
+        header = os.pread(descriptor, 64, 0)
+        if (not stat.S_ISREG(metadata.st_mode) or len(header) != 64
+                or header[:4] != b"\x7fELF" or header[4:7] != b"\x02\x01\x01"):
+            return None
+        phoff = struct.unpack_from("<Q", header, 32)[0]
+        phentsize, phnum = struct.unpack_from("<HH", header, 54)
+        table_size = phentsize * phnum
+        if (phentsize < 56 or phentsize > 256 or phnum > 256 or table_size > 65536
+                or phoff > metadata.st_size or table_size > metadata.st_size - phoff):
+            return None
+        table = os.pread(descriptor, table_size, phoff)
+        if len(table) != table_size:
+            return None
+        for index in range(phnum):
+            entry = table[index * phentsize:(index + 1) * phentsize]
+            if struct.unpack_from("<I", entry, 0)[0] != 3:
+                continue
+            offset = struct.unpack_from("<Q", entry, 8)[0]
+            size = struct.unpack_from("<Q", entry, 32)[0]
+            if size < 2 or size > 4096 or offset > metadata.st_size or size > metadata.st_size - offset:
+                return None
+            raw = os.pread(descriptor, size, offset)
+            if len(raw) != size or not raw.endswith(b"\x00"):
+                return None
+            value = raw[:-1]
+            if not value.startswith(b"/") or b"\x00" in value:
+                return None
+            return os.fsdecode(value)
+        return ""
+    except (OSError, OverflowError, struct.error, ValueError):
+        return None
+    finally:
+        os.close(descriptor)
+
+
+def _process_start_status(argv: list[str], cwd: str | Path, env: dict[str, str],
+                          budget: PhaseBudget) -> str:
+    """Run one fixed diagnostic command with no output and a short inherited deadline."""
+    try:
+        remaining = budget.remaining()
+        if remaining <= 0:
+            return "u"
+        process = subprocess.Popen(
+            argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=True, start_new_session=True,
+        )
+        try:
+            code = process.wait(timeout=min(1.0, remaining))
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=1.0)
+            except (OSError, subprocess.TimeoutExpired):
+                return "u"
+            return "t"
+        return "s" if code == 0 else "x"
+    except OSError as error:
+        return {errno.EACCES: "d", errno.EPERM: "p", errno.ENOENT: "m"}.get(error.errno, "u")
+    except (Refusal, ValueError, TypeError):
+        return "u"
+
+
+def _permission_start_diagnostic(error: OSError, argv: list[str], cwd: str | Path,
+                                 env: dict[str, str], budget: PhaseBudget) -> str:
+    """Build a fixed-role EACCES fingerprint without paths, errno text or tool output."""
+    executable = argv[0]
+    try:
+        filename = os.fsdecode(error.filename) if error.filename is not None else ""
+        cwd_value = os.fsdecode(os.fspath(cwd))
+    except (TypeError, ValueError):
+        filename, cwd_value = "", ""
+    filename_role = ("c" if filename and filename == cwd_value else
+                     "e" if filename and filename == executable else
+                     "o" if filename else "n")
+    control_env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+    cwd_control = _process_start_status(["/usr/bin/true"], cwd, control_env, budget)
+    root_control = _process_start_status(["/usr/bin/true"], "/", control_env, budget)
+    binary_access = _exec_access_status(executable)
+    interpreter = _elf_interpreter(executable)
+    if interpreter is None:
+        interpreter_access, loader_probe = "u", "u"
+    elif not interpreter:
+        interpreter_access, loader_probe = "z", "z"
+    else:
+        interpreter_access = _exec_access_status(interpreter)
+        loader_probe = ("u" if interpreter_access != "s" else
+                        _process_start_status([interpreter, "--list", executable], "/", env, budget))
+    if (cwd_control == "s" and root_control == "s" and binary_access == "s"
+            and interpreter_access == "s" and loader_probe in ("s", "x")):
+        policy = "1"
+    elif (filename_role == "c" or binary_access in ("m", "x", "a", "n")
+          or interpreter_access in ("m", "x", "a", "n") or loader_probe in ("d", "p")):
+        policy = "0"
+    else:
+        policy = "u"
+    return ("eacces-f%s-c%s-r%s-b%s-i%s-l%s-p%s" %
+            (filename_role, cwd_control, root_control, binary_access,
+             interpreter_access, loader_probe, policy))
+
+
 def run_bounded_process(argv: list[str], budget: PhaseBudget, *, cwd: str | Path,
                         env: dict[str, str], stdout=None, stderr=None,
                         expected: int = 0,
@@ -134,6 +268,12 @@ def run_bounded_process(argv: list[str], budget: PhaseBudget, *, cwd: str | Path
             errno.EAGAIN: "process-limit", errno.ENOMEM: "memory",
             errno.EPERM: "policy", errno.ENOEXEC: "format", errno.ETXTBSY: "busy",
         }.get(error.errno, "os")
+        if error.errno == errno.EACCES:
+            try:
+                detail = _permission_start_diagnostic(error, argv, cwd, env, budget)
+            except Exception:
+                detail = "eacces-fn-cu-ru-bu-iu-lu-pu"
+            _fail("process-start-" + detail)
         _fail("process-start-" + category)
     total = 0
     selector = selectors.DefaultSelector()

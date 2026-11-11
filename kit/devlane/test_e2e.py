@@ -12,8 +12,9 @@ commands, adapters, filter and cleanup; nothing is stubbed):
   inspection of the workload's environment, descriptors and files for key bytes),
   a wrong-key refusal, a failing test mapped to its opaque identity, and a
   cancellation while a profile command is running.
-* synthetic-rust: actual public root, fuzz and runtime workspaces with Cargo-generated
-  locks, a listener package, replay corpus and the full fixed production matrix.
+* synthetic-rust-v1-refusal: actual public root, fuzz and runtime workspaces with
+  Cargo-generated locks, a listener package, replay corpus and the fixed matrix;
+  the legacy schema-1 envelope must fail the SemVer v2 gate explicitly.
 * real-node: the pinned Vitest, Vite and TypeScript packages (native bindings
   included) installed online from the reviewed lock, run offline, with a passing
   and a failing real test.
@@ -49,6 +50,7 @@ import host_cleanup
 import owned_tree_cleanup
 import rust_matrix_runner
 import rust_tooling
+import semver_stage
 import deadline as deadline_budget
 import diagnostic_contract
 import filter as output_filter
@@ -85,6 +87,8 @@ DIAGNOSTIC_PHASES = frozenset((
     "tool-cargo-deny-download", "tool-cargo-deny-extract", "tool-cargo-deny-version", "tool-cargo-deny-copy",
     "tool-cargo-audit-download", "tool-cargo-audit-extract", "tool-cargo-audit-version", "tool-cargo-audit-copy",
     "tool-cargo-vet-download", "tool-cargo-vet-extract", "tool-cargo-vet-version", "tool-cargo-vet-copy",
+    "tool-cargo-semver-checks-download", "tool-cargo-semver-checks-extract",
+    "tool-cargo-semver-checks-version", "tool-cargo-semver-checks-copy",
     "scenario-projection-write", "scenario-dependency-prepare", "scenario-tool-install",
     "scenario-tool-verify", "scenario-after-prepare-hook", "scenario-variant-run",
     "scenario-node-snapshot-cleanup",
@@ -573,13 +577,13 @@ def _write_rust_fixture(root, cargo_path):
     (root / ".devlane-projection.json").write_bytes(projection_bytes)
     (root / ".devlane-lock-snapshot.json").write_bytes(bundle.canonical_json(snapshot) + b"\n")
     _validate_rust_fixture(root, files, projection, projection_bytes, snapshot)
-    print("rust_matrix_fixture=generated locks=3 suites=22")
+    print("rust_matrix_fixture=generated locks=3 matrix_coverage_ids=23")
 
 
 def _validate_rust_fixture(root, files, projection, projection_bytes, snapshot):
     root = Path(root)
     _require(rust_matrix_runner.EXPECTED_MATRIX["toolchain"] == RUST_VERSION, "rust-matrix-toolchain-mismatch")
-    _require(len(rust_matrix_runner.EXPECTED_MATRIX["coverage_ids"]) == 22, "rust-matrix-suite-count")
+    _require(len(rust_matrix_runner.EXPECTED_MATRIX["coverage_ids"]) == 23, "rust-matrix-suite-count")
     _require([item["path"] for item in projection["cargo_workspaces"]]
              == ["fuzz/Cargo.lock", "runtime/Cargo.lock"], "rust-matrix-projection-paths")
     validated = fetch.validate_projection(projection_bytes, "core-rust")
@@ -721,16 +725,20 @@ def _verify_prepared_rust_tools(prepared, source):
     tools = Path(prepared) / "devlane-tools"
     source = Path(source)
     _require(tools.is_dir() and not tools.is_symlink(), "rust-matrix-tools-missing")
-    expected_entries = set(rust_tooling.TOOLS) | {"advisory-db", "advisory-db-revision"}
+    expected_entries = set(rust_tooling.TOOLS) | {
+        "advisory-db", "advisory-db-revision", rust_tooling.SEMVER_RECEIPT,
+    }
     _require({path.name for path in tools.iterdir()} == expected_entries, "rust-matrix-tools-layout")
+    semver_stage.verify_tool(source)
+    semver_stage.verify_tool(tools)
     for name, (_, _, _, version, _) in rust_tooling.TOOLS.items():
         path = tools / name
         _require(path.is_file() and not path.is_symlink() and os.access(path, os.X_OK),
                  "rust-matrix-tool-layout")
         source_path = source / name
         _require(source_path.is_file() and not source_path.is_symlink()
-                 and hashlib.sha256(path.read_bytes()).digest()
-                 == hashlib.sha256(source_path.read_bytes()).digest(), "rust-matrix-tool-copy-binding")
+                 and rust_tooling._hash_prepared_binary(path)
+                 == rust_tooling._hash_prepared_binary(source_path), "rust-matrix-tool-copy-binding")
         result = _process_run([str(path), "--version"], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                 timeout=10, check=False, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
@@ -1123,21 +1131,37 @@ def _summary_records(summary, scenario):
     records = [bundle.strict_json(line, output_filter.MAX_RECORD_BYTES)
                for line in summary.splitlines()]
     if scenario["profile"] == "core-rust":
+        expected_semver_refusal = scenario.get("expect_semver_execution_refusal") is True
         expected = set(rust_matrix_runner.EXPECTED_MATRIX["coverage_ids"])
         coverage = [record for record in records if record.get("kind") == "coverage"]
         seen = [record.get("suite") for record in coverage]
         _require(len(seen) == len(expected) and len(seen) == len(set(seen)) and set(seen) == expected,
                  "rust-matrix-summary-coverage-set")
-        _require(not any(record.get("kind") == "test"
-                         or (record.get("kind") == "frame" and record.get("status") != "pass")
-                         or (record.get("kind") == "control" and record.get("status") != "pass")
-                         or (record.get("kind") == "diagnostic" and record.get("level") == "error")
-                         for record in records), "rust-matrix-summary-not-all-pass")
+        controls = [record for record in records if record.get("kind") == "control"]
+        if expected_semver_refusal:
+            _require(controls == [{
+                "kind": "control", "stage": "semver", "status": "fail",
+                "code": "DEVLANE_SEMVER_EXECUTION",
+            }], "rust-matrix-v1-semver-refusal")
+            _require(not any(record.get("kind") == "test"
+                             or (record.get("kind") == "frame" and record.get("status") != "pass")
+                             or (record.get("kind") == "diagnostic" and record.get("level") == "error")
+                             for record in records), "rust-matrix-v1-semver-refusal")
+        else:
+            _require(not any(record.get("kind") == "test"
+                             or (record.get("kind") == "frame" and record.get("status") != "pass")
+                             or (record.get("kind") == "control" and record.get("status") != "pass")
+                             or (record.get("kind") == "diagnostic" and record.get("level") == "error")
+                             for record in records), "rust-matrix-summary-not-all-pass")
         for row in coverage:
             counts = [row.get(name) for name in ("total", "passed", "failed", "ignored")]
             _require(all(type(value) is int and value >= 0 for value in counts)
                      and counts[0] > 0 and counts[1] + counts[2] + counts[3] == counts[0]
-                     and counts[2] == 0 and counts[3] == 0,
+                     and counts[3] == 0
+                     and ((expected_semver_refusal and row.get("suite") == "semver-runtime"
+                           and counts == [1, 0, 1, 0])
+                          or (row.get("suite") != "semver-runtime" and counts[2] == 0)
+                          or (not expected_semver_refusal and counts[2] == 0)),
                      "rust-matrix-summary-counts")
     return records
 
@@ -1420,11 +1444,18 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
                 _require(process.returncode != 0, "cancelled-execute-reported-success")
                 _scan_output(output + errors, "canary-after-cancel")
             else:
-                expected = 1 if variant in ("failing-test", "accept-with-failure") else 0
+                expected = 1 if (variant in ("failing-test", "accept-with-failure")
+                                 or (scenario.get("expect_semver_execution_refusal") is True
+                                     and variant == "accept")) else 0
                 result = _run(execute, timeout=60 * 40, expected=expected)
                 with DIAGNOSTICS.phase("variant-summary-validate"):
                     _require(result.stdout.endswith(b"\n"), "summary-schema-invalid")
                     records = _summary_records(result.stdout, scenario)
+                    if scenario.get("expect_semver_execution_refusal") is True and variant == "accept":
+                        _require(any(record.get("kind") == "coverage"
+                                     and record.get("suite") == "semver-runtime"
+                                     and record.get("failed") == 1 for record in records),
+                                 "rust-matrix-v1-semver-refusal")
                     summary = result.stdout.splitlines()
                     _require(len(summary) <= 100 and len(result.stdout) <= 16 * 1024, "summary-limits")
                     if variant in ("failing-test", "accept-with-failure"):
@@ -1575,9 +1606,10 @@ def main(argv=None):
     with DIAGNOSTICS.phase("tooling-root-create"):
         tooling_root = RUNNER_TEMP / ("devlane-rust-tools-" + RUN_ID)
         rust_scenario = {
-            "name": "synthetic-rust", "profile": "core-rust", "projection": projection,
+            "name": "synthetic-rust-v1-refusal", "profile": "core-rust", "projection": projection,
             "payload": projection_bytes, "files": lambda **kw: rust_files,
             "allowed_files": {}, "allowed_tests": RUST_FIXTURE_TESTS, "frames": {},
+            "expect_semver_execution_refusal": True,
             "original_lockfiles": {path: value["sha256"] for path, value in snapshot["lockfiles"].items()},
             "variants": ("accept", "wrong-key"),
         }

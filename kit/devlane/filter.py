@@ -18,7 +18,7 @@ LEVELS = frozenset(("error", "warning"))
 STATUS = frozenset(("pass", "fail", "skip"))
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 CODE = re.compile(r"(?:TS[0-9]{4,5}|E[0-9]{4}|DEVLANE_[A-Z_]{1,32})\Z")
-ALLOWED_STAGES = frozenset(("fetch", "prepare", "network", "decrypt", "format", "deny", "audit", "vet", "typecheck", "style", "unit", "browser", "d15", "cleanup"))
+ALLOWED_STAGES = frozenset(("fetch", "prepare", "network", "decrypt", "format", "deny", "audit", "vet", "semver", "typecheck", "style", "unit", "browser", "d15", "cleanup"))
 RECORD_FIELDS = {
     "diagnostic": frozenset(("kind", "stage", "code", "file", "line", "level")),
     "test": frozenset(("kind", "stage", "test")),
@@ -160,7 +160,8 @@ def _normalize(record, allowlists):
             "format" if type(suite) is str and suite.startswith("fmt-") else
             "deny" if type(suite) is str and suite.startswith("deny-") else
             "audit" if type(suite) is str and suite.startswith("audit-") else
-            "vet" if type(suite) is str and suite.startswith("vet-") else "unit"
+            "vet" if type(suite) is str and suite.startswith("vet-") else
+            "semver" if suite == "semver-runtime" else "unit"
         )
         if (stage not in allowlists["stages"] or suite not in allowlists["suites"]
                 or stage != expected_stage

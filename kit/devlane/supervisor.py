@@ -29,6 +29,7 @@ import bounded_registry_io
 import deadline as deadline_budget
 import fetch
 import rust_lock_generation
+import semver_stage
 import semver_cargo_wrapper
 import semver_offline_cache
 import temp_project_checkpoints
@@ -49,6 +50,10 @@ WORKER_GID = 65534
 SEMVER_TARGET_ROOT = "/scratch/semver-target"
 SEMVER_PROJECT_ROOT = SEMVER_TARGET_ROOT + "/semver-checks"
 SEMVER_CHECKPOINT_REPORT = "semver-checkpoints.json"
+SEMVER_WORKER_SOCKET = "/scratch/semver-state/matrix-worker.sock"
+SEMVER_CGROUP_ROOT = Path("/sys/fs/cgroup")
+SEMVER_LOG_MAX = 256 * 1024 * 1024
+SEMVER_MOUNTINFO_MAX = 4 * 1024 * 1024
 MAX_CGROUP_ROSTER_BYTES = 16 * 1024
 MAX_CGROUP_ROSTER_PIDS = 1024
 PROFILE_FILE = "ci/devlane-profiles.json"
@@ -60,6 +65,18 @@ MOUNT_TARGETS = []
 ACTIVE_DEADLINE_FILE = ""
 
 REFUSAL_CODES = frozenset((
+    "matrix-semver-cgroup-unavailable",
+    "matrix-semver-cgroup-cleanup",
+    "matrix-semver-context-write",
+    "matrix-semver-cargo-home",
+    "matrix-semver-inputs",
+    "matrix-semver-process",
+    "matrix-semver-runner-identity",
+    "matrix-semver-runner-order",
+    "matrix-semver-target",
+    "matrix-semver-tool-binding",
+    "matrix-semver-worker-channel",
+    "matrix-semver-worker-peer",
     'matrix-semver-checkpoint-cgroup',
     'matrix-semver-checkpoint-cgroup-not-quiescent',
     'matrix-semver-checkpoint-command',
@@ -193,6 +210,17 @@ class SupervisorRefusal(ValueError):
     def __init__(self, code="supervisor-failed"):
         super().__init__(code)
         self.code = code
+
+
+class SemverCgroupJob:
+    def __init__(self, path, attach_fd):
+        self.path = Path(path)
+        self.attach_fd = attach_fd
+
+    def close_attach(self):
+        if self.attach_fd is not None:
+            os.close(self.attach_fd)
+            self.attach_fd = None
 
 
 def _refuse(code):
@@ -522,6 +550,8 @@ def _chroot_worker_command(root, command):
 
 
 def _kill_workload_descendants():
+    if not sys.platform.startswith("linux") or os.getpid() != 1:
+        _refuse("linux-runner-required")
     with ACTIVE_CHILDREN_LOCK:
         process_groups = tuple(ACTIVE_CHILDREN)
     for process_group in process_groups:
@@ -543,6 +573,28 @@ def _kill_workload_descendants():
             os.waitpid(-1, 0)
         except ChildProcessError:
             break
+
+
+def _signal_workload_descendants():
+    """Request termination without stealing wait status from active Popen owners."""
+    if not sys.platform.startswith("linux") or os.getpid() != 1:
+        _refuse("linux-runner-required")
+    with ACTIVE_CHILDREN_LOCK:
+        process_groups = tuple(ACTIVE_CHILDREN)
+    for process_group in process_groups:
+        try:
+            os.killpg(process_group, signal.SIGTERM)
+        except OSError:
+            pass
+    try:
+        os.kill(-1, signal.SIGTERM)
+    except OSError:
+        pass
+    time.sleep(0.05)
+    try:
+        os.kill(-1, signal.SIGKILL)
+    except OSError:
+        pass
 
 
 def _wait_child(process, timeout):
@@ -626,7 +678,8 @@ def _run_profile_command(root, command, stage, log_path, tools, timeout=1200, de
     return code
 
 
-def _run_control_adapter(root, command, stage, tools, log_name, timeout=60, deadline=None, cpu_seconds=1200):
+def _run_control_adapter(root, command, stage, tools, log_name, timeout=60, deadline=None,
+                         cpu_seconds=1200, on_spawn=None):
     if CANCEL_REQUESTED.is_set():
         return 130
     if deadline is None:
@@ -651,6 +704,8 @@ def _run_control_adapter(root, command, stage, tools, log_name, timeout=60, dead
             return 125
         with ACTIVE_CHILDREN_LOCK:
             ACTIVE_CHILDREN.add(process.pid)
+        if on_spawn is not None:
+            on_spawn(process)
         code = _wait_child(process, timeout)
         with ACTIVE_CHILDREN_LOCK:
             ACTIVE_CHILDREN.discard(process.pid)
@@ -1200,6 +1255,14 @@ class Service:
         self.semver_active = None
         self.semver_active_lock = threading.Lock()
         self.semver_checkpoint_record = None
+        self.matrix_runner_active = None
+        self.matrix_runner_lock = threading.Lock()
+        self.matrix_runner_ready = threading.Event()
+        self.semver_worker_socket = None
+        self.semver_worker_socket_path = None
+        self.semver_worker_accept_thread = None
+        self.semver_worker_threads = []
+        self.semver_worker_threads_lock = threading.Lock()
         self.summary = None
         self.outcomes = []
         self.mounts = []
@@ -1244,6 +1307,13 @@ class Service:
         self.startup_phase = "profile"
         self.profile_config = _read_profiles(self.root)
         self.projection_value = projection_value
+        if self.context["profile"] == "core-rust":
+            try:
+                self.semver_tool_path = semver_stage.verify_tool(
+                    self.root / "prepared/devlane-tools",
+                )
+            except semver_stage.SemverRefusal:
+                _refuse("matrix-semver-tool-binding")
         if self.context["profile"] == "core-node":
             self.startup_phase = "versions"
             _node_info, versions = _node_snapshot_versions(self.tool_info["node_snapshot_id"], self.owner_uid)
@@ -1252,6 +1322,197 @@ class Service:
                 _refuse("node-toolchain-version")
         self.startup_phase = "ready"
         return True
+
+    def start_semver_worker_socket(self):
+        if self.context["profile"] != "core-rust":
+            return None
+        path = self.root / "scratch/semver-state/matrix-worker.sock"
+        server = None
+        try:
+            path.parent.mkdir(mode=0o711, parents=False, exist_ok=False)
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(str(path))
+            os.chown(str(path), WORKER_UID, WORKER_GID)
+            os.chmod(str(path), 0o600)
+            server.listen(16)
+            server.settimeout(0.5)
+        except OSError:
+            try:
+                server.close()
+            except (OSError, UnboundLocalError):
+                pass
+            _refuse("matrix-semver-worker-channel")
+        self.semver_worker_socket = server
+        self.semver_worker_socket_path = path
+        return server
+
+    def stop_semver_worker_socket(self):
+        server = self.semver_worker_socket
+        self.semver_worker_socket = None
+        if server is not None:
+            try:
+                server.close()
+            except OSError:
+                pass
+        path = self.semver_worker_socket_path
+        self.semver_worker_socket_path = None
+        if path is not None:
+            try:
+                metadata = path.lstat()
+                if not stat.S_ISSOCK(metadata.st_mode):
+                    _refuse("matrix-semver-worker-channel")
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                _refuse("matrix-semver-worker-channel")
+
+    def _handle_semver_worker_connection(self, connection):
+        with connection:
+            connection.settimeout(10)
+            try:
+                credentials = connection.getsockopt(
+                    socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"),
+                )
+                if len(credentials) != struct.calcsize("3i"):
+                    _refuse("matrix-semver-worker-peer")
+                peer_pid, peer_uid, peer_gid = struct.unpack("3i", credentials)
+                if peer_uid != WORKER_UID or peer_gid != WORKER_GID:
+                    _refuse("matrix-semver-worker-peer")
+                request = bundle.strict_json(_recv_frame(connection), MAX_RPC)
+                response = self.dispatch_semver_worker(
+                    request, peer_pid, peer_uid, peer_gid,
+                )
+                payload = bundle.canonical_json(response)
+            except SupervisorRefusal as error:
+                payload = bundle.canonical_json({"ok": False, "code": error.code})
+            except Exception:
+                payload = b'{"code":"matrix-semver-worker-channel","ok":false}'
+            try:
+                _send_frame(connection, payload)
+            except (OSError, SupervisorRefusal):
+                pass
+
+    def _shutdown_semver_workers(self):
+        self.stop_semver_worker_socket()
+        accept_thread = self.semver_worker_accept_thread
+        if accept_thread is not None and accept_thread is not threading.current_thread():
+            accept_thread.join(timeout=5)
+            if accept_thread.is_alive():
+                _refuse("matrix-semver-worker-channel")
+        with self.semver_worker_threads_lock:
+            workers = tuple(self.semver_worker_threads)
+        while True:
+            with self.semver_active_lock:
+                active = self.semver_active
+            if active is None:
+                break
+            job = active.get("job")
+            owner_done = active.get("owner_done")
+            if owner_done is not None and owner_done.is_set():
+                try:
+                    budget = bounded_registry_io.PhaseBudget(
+                        active["work_deadline"], active["cleanup_deadline"],
+                        cancelled=lambda: False,
+                    )
+                    cleaned = self._semver_cleanup_cgroup(
+                        active, active.get("process"), budget,
+                    )
+                except Exception:
+                    cleaned = False
+                if cleaned:
+                    with self.semver_active_lock:
+                        if self.semver_active is active:
+                            self.semver_active = None
+                    process = active.get("process")
+                    if process is not None:
+                        with ACTIVE_CHILDREN_LOCK:
+                            ACTIVE_CHILDREN.discard(process.pid)
+                    active["ready"].set()
+                    continue
+            if job is not None:
+                try:
+                    self._semver_kill_cgroup(job)
+                except SupervisorRefusal:
+                    pass
+            if time.monotonic() >= active.get("cleanup_deadline", 0):
+                _refuse("matrix-semver-cgroup-cleanup")
+            time.sleep(0.01)
+        for worker in workers:
+            if worker is threading.current_thread():
+                continue
+            worker.join(timeout=5)
+            if worker.is_alive():
+                _refuse("matrix-semver-worker-channel")
+
+    def dispatch_semver_worker(self, request, peer_pid, peer_uid, peer_gid):
+        if (type(request) is not dict or type(request.get("op")) is not str
+                or type(peer_pid) is not int or peer_pid <= 1
+                or peer_uid != WORKER_UID or peer_gid != WORKER_GID):
+            _refuse("matrix-semver-worker-peer")
+        if request["op"] == "semver-stage":
+            if set(request) != {"op"}:
+                _refuse("matrix-semver-runner-order")
+            return self._semver_stage_request(peer_pid)
+        if request["op"] == "semver-checkpoint":
+            return self._semver_checkpoint(request, peer_pid, peer_uid)
+        _refuse("matrix-semver-worker-channel")
+
+    def _semver_stage_request(self, peer_pid):
+        if not self.matrix_runner_ready.wait(timeout=5):
+            _refuse("matrix-semver-runner-order")
+        with self.matrix_runner_lock:
+            active = self.matrix_runner_active
+            if (active is None or active.get("pid") != peer_pid
+                    or active.get("semver_requested")):
+                _refuse("matrix-semver-runner-order")
+            active["semver_requested"] = True
+        try:
+            outer = deadline_budget._read(self.deadline_file)
+            peer_budget = bounded_registry_io.PhaseBudget.from_outer_deadlines(
+                outer["work_deadline"],
+                outer["work_deadline"] + outer["cleanup_reserve"],
+            )
+            status = self._semver_proc_bytes(
+                peer_pid, "status", 64 * 1024, peer_budget,
+            ).decode("ascii", "strict")
+            parent = None
+            effective_uid = None
+            for line in status.splitlines()[:64]:
+                if line.startswith("PPid:"):
+                    value = line[5:].strip()
+                    parent = int(value) if value.isascii() and value.isdecimal() else None
+                elif line.startswith("Uid:"):
+                    values = line[4:].split()
+                    if len(values) >= 2 and values[1].isascii() and values[1].isdecimal():
+                        effective_uid = int(values[1])
+            arguments = self._semver_proc_bytes(
+                peer_pid, "cmdline", 16 * 1024, peer_budget,
+            ).split(b"\x00")
+            if arguments and arguments[-1] == b"":
+                arguments.pop()
+            words = [item.decode("utf-8", "strict") for item in arguments]
+            expected_words = [
+                "/usr/bin/python3", "-B", "-I", "-S",
+                "/control/devlane/rust_matrix_runner.py",
+                "/control/profiles.json", "/trusted/adapter-config.json",
+                "/scratch/reports/rust-matrix.jsonl", "--deadline", str(self.deadline),
+            ]
+            if (parent != os.getpid() or effective_uid != WORKER_UID
+                    or words != expected_words):
+                _refuse("matrix-semver-runner-identity")
+        except (SupervisorRefusal, OSError, UnicodeError, ValueError):
+            _refuse("matrix-semver-runner-identity")
+        try:
+            records = self._run_semver_stage()
+        except (SupervisorRefusal, semver_stage.SemverRefusal,
+                semver_offline_cache.Refusal, bounded_registry_io.Refusal):
+            records = semver_stage.records_for_exit(101)
+        with self.semver_active_lock:
+            if self.semver_active is not None:
+                CANCEL_REQUESTED.set()
+                _refuse("matrix-semver-cgroup-cleanup")
+        return {"ok": True, "records": records}
 
     def _probe(self):
         if self.probe_passed:
@@ -1477,7 +1738,8 @@ class Service:
             _refuse("execution-order")
         profile_name = self.context["profile"]
         profile = self.profile_config["profiles"].get(profile_name)
-        if type(profile) is not dict or profile.get("revision") != 1:
+        expected_revision = 2 if profile_name == "core-rust" else 1
+        if type(profile) is not dict or profile.get("revision") != expected_revision:
             _refuse("profile-unknown")
         try:
             deadline_budget.remaining(self.deadline_file)
@@ -1490,7 +1752,7 @@ class Service:
             if self.manifest["schema"] == 2:
                 if not self.baseline_staged:
                     _refuse("execution-order")
-            if commands != [] or stages != ["format", "deny", "audit", "vet", "unit"]:
+            if commands != [] or stages != ["format", "deny", "audit", "vet", "unit", "semver"]:
                 _refuse("profile-command-set")
             output = self.root / "scratch/reports/rust-matrix.jsonl"
             if os.path.lexists(output):
@@ -1504,9 +1766,29 @@ class Service:
                 matrix_timeout = deadline_budget.remaining(self.deadline_file)
             except deadline_budget.DeadlineRefusal:
                 _refuse("total-deadline-exhausted")
-            result = _run_control_adapter(self.root, command, "unit", self.tool_info,
-                                          "rust-matrix-adapter.log", timeout=matrix_timeout,
-                                          deadline=self.deadline_file, cpu_seconds=9900)
+            self.matrix_runner_ready.clear()
+            runner_state = {"pid": None, "semver_requested": False}
+            with self.matrix_runner_lock:
+                if self.matrix_runner_active is not None:
+                    _refuse("matrix-semver-runner-order")
+                self.matrix_runner_active = runner_state
+
+            def register_matrix_runner(process):
+                with self.matrix_runner_lock:
+                    runner_state["pid"] = process.pid
+                    self.matrix_runner_ready.set()
+
+            try:
+                result = _run_control_adapter(
+                    self.root, command, "unit", self.tool_info,
+                    "rust-matrix-adapter.log", timeout=matrix_timeout,
+                    deadline=self.deadline_file, cpu_seconds=9900,
+                    on_spawn=register_matrix_runner,
+                )
+            finally:
+                with self.matrix_runner_lock:
+                    self.matrix_runner_active = None
+                    self.matrix_runner_ready.set()
             adapter_results = {"rust_matrix": result}
             self.outcomes = [("unit", result)]
             allowlists = _manifest_allowlists(self.manifest, profile, source_root)
@@ -1598,7 +1880,7 @@ class Service:
         return {"ok": True, "status": status, "summary": base64.b64encode(self.summary).decode("ascii"),
                 "catalogs": catalogs}
 
-    def _semver_proc_bytes(self, pid, name, maximum):
+    def _semver_proc_bytes(self, pid, name, maximum, budget=None):
         if type(pid) is not int or pid <= 1 or name not in {"status", "cmdline", "cgroup"}:
             _refuse("matrix-semver-checkpoint-peer")
         descriptor = None
@@ -1615,8 +1897,11 @@ class Service:
                 if time.monotonic() >= deadline:
                     _refuse("matrix-semver-checkpoint-peer")
                 try:
-                    deadline_budget.remaining(self.deadline_file)
-                except deadline_budget.DeadlineRefusal:
+                    if budget is not None:
+                        budget.remaining()
+                    else:
+                        deadline_budget.remaining(self.deadline_file)
+                except (deadline_budget.DeadlineRefusal, bounded_registry_io.Refusal):
                     _refuse("matrix-semver-checkpoint-peer")
                 chunk = os.read(descriptor, min(4096, maximum + 1 - len(data)))
                 if not chunk:
@@ -1637,7 +1922,53 @@ class Service:
             if descriptor is not None:
                 os.close(descriptor)
 
-    def _semver_read_cgroup_roster(self, path, maximum=MAX_CGROUP_ROSTER_BYTES):
+    def _semver_mountinfo_text(self, budget):
+        path = Path("/proc/self/mountinfo")
+        descriptor = None
+        try:
+            before = path.lstat()
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            nonblock = getattr(os, "O_NONBLOCK", 0)
+            if (not nofollow or not nonblock or not stat.S_ISREG(before.st_mode)
+                    or before.st_nlink != 1 or before.st_size > SEMVER_MOUNTINFO_MAX):
+                _refuse("matrix-semver-cgroup-unavailable")
+            descriptor = os.open(str(path), os.O_RDONLY | nofollow | nonblock
+                                 | getattr(os, "O_CLOEXEC", 0))
+            opened = os.fstat(descriptor)
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                    or opened.st_dev != before.st_dev or opened.st_ino != before.st_ino
+                    or opened.st_size > SEMVER_MOUNTINFO_MAX):
+                _refuse("matrix-semver-cgroup-unavailable")
+            payload = bytearray()
+            local_deadline = time.monotonic() + 5.0
+            while True:
+                if time.monotonic() >= local_deadline:
+                    _refuse("matrix-semver-cgroup-unavailable")
+                budget.remaining()
+                chunk = os.read(descriptor, min(16_384, SEMVER_MOUNTINFO_MAX + 1 - len(payload)))
+                if not chunk:
+                    break
+                payload.extend(chunk)
+                if len(payload) > SEMVER_MOUNTINFO_MAX:
+                    _refuse("matrix-semver-cgroup-unavailable")
+            after = os.fstat(descriptor)
+            after_path = path.lstat()
+            if (not stat.S_ISREG(after_path.st_mode) or after_path.st_nlink != 1
+                    or after.st_dev != opened.st_dev or after.st_ino != opened.st_ino
+                    or after.st_nlink != 1 or after.st_size > SEMVER_MOUNTINFO_MAX
+                    or after_path.st_dev != opened.st_dev or after_path.st_ino != opened.st_ino):
+                _refuse("matrix-semver-cgroup-unavailable")
+            return bytes(payload).decode("ascii", "strict")
+        except SupervisorRefusal:
+            raise
+        except (OSError, UnicodeError, bounded_registry_io.Refusal):
+            _refuse("matrix-semver-cgroup-unavailable")
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def _semver_read_cgroup_roster(self, path, maximum=MAX_CGROUP_ROSTER_BYTES,
+                                   budget=None, cleanup=False):
         descriptor = None
         try:
             path = Path(path)
@@ -1662,8 +1993,8 @@ class Service:
                 if time.monotonic() >= deadline:
                     _refuse("matrix-semver-checkpoint-cgroup")
                 try:
-                    deadline_budget.remaining(self.deadline_file)
-                except deadline_budget.DeadlineRefusal:
+                    budget.remaining(cleanup=cleanup) if budget is not None else deadline_budget.remaining(self.deadline_file)
+                except (deadline_budget.DeadlineRefusal, bounded_registry_io.Refusal):
                     _refuse("matrix-semver-checkpoint-cgroup")
                 chunk = os.read(descriptor, min(4096, maximum + 1 - len(data)))
                 if not chunk:
@@ -1680,6 +2011,8 @@ class Service:
                     or after_path.st_dev != opened.st_dev or after_path.st_ino != opened.st_ino):
                 _refuse("matrix-semver-checkpoint-cgroup")
             text = bytes(data).decode("ascii", "strict")
+            if not text:
+                return frozenset()
             if not text.endswith("\n"):
                 _refuse("matrix-semver-checkpoint-cgroup")
             rows = text[:-1].split("\n")
@@ -1705,7 +2038,13 @@ class Service:
                 os.close(descriptor)
 
     def _semver_checkpoint_peer(self, peer_pid, request, active):
-            status = self._semver_proc_bytes(peer_pid, "status", 64 * 1024).decode("ascii", "strict")
+            budget = bounded_registry_io.PhaseBudget.from_outer_deadlines(
+                active["work_deadline"], active["cleanup_deadline"],
+                cancelled=CANCEL_REQUESTED.is_set,
+            )
+            status = self._semver_proc_bytes(
+                peer_pid, "status", 64 * 1024, budget,
+            ).decode("ascii", "strict")
             parent = None
             effective_uid = None
             for line in status.splitlines()[:64]:
@@ -1718,14 +2057,16 @@ class Service:
                         effective_uid = int(fields[1])
             if parent != active["pid"] or effective_uid != WORKER_UID:
                 _refuse("matrix-semver-checkpoint-peer")
-            arguments = self._semver_proc_bytes(peer_pid, "cmdline", 16 * 1024).split(b"\x00")
+            arguments = self._semver_proc_bytes(
+                peer_pid, "cmdline", 16 * 1024, budget,
+            ).split(b"\x00")
             if arguments and arguments[-1] == b"":
                 arguments.pop()
             try:
                 words = [item.decode("utf-8", "strict") for item in arguments]
             except UnicodeDecodeError:
                 _refuse("matrix-semver-checkpoint-peer")
-            if (len(words) < 7 or words[1:5] != [
+            if (len(words) < 7 or words[0] != "/usr/bin/python3" or words[1:5] != [
                     "-B", "-I", "-S", "/control/devlane/semver_cargo_wrapper.py"]):
                 _refuse("matrix-semver-checkpoint-peer")
             cargo_arguments = words[5:]
@@ -1751,13 +2092,18 @@ class Service:
             if request["event"] not in allowed_events[parsed["project_kind"]].get(
                     parsed["operation"], set()):
                 _refuse("matrix-semver-checkpoint-order")
-            cgroup_text = self._semver_proc_bytes(peer_pid, "cgroup", 16 * 1024).decode("ascii", "strict")
+            cgroup_text = self._semver_proc_bytes(
+                peer_pid, "cgroup", 16 * 1024, budget,
+            ).decode("ascii", "strict")
             if not any(row.endswith("::/" + active["job"].path.name)
                        for row in cgroup_text.splitlines()):
                 _refuse("matrix-semver-checkpoint-peer")
-            pids = self._semver_read_cgroup_roster(active["job"].path / "cgroup.procs")
+            pids = self._semver_read_cgroup_roster(
+                active["job"].path / "cgroup.procs", budget=budget,
+            )
             if pids != frozenset({active["pid"], peer_pid}):
                 _refuse("matrix-semver-checkpoint-cgroup-not-quiescent")
+            active["observed_pids"].update(pids)
             return parsed
 
     def _semver_checkpoint_snapshot(self, virtual_root, active):
@@ -1771,7 +2117,7 @@ class Service:
                     cancelled=CANCEL_REQUESTED.is_set,
                 )
                 manifest_bytes = semver_offline_cache._read_file(
-                    root / "Cargo.toml", semver_offline_cache.MAX_FILE_BYTES,
+                    root / "Cargo.toml", semver_offline_cache.MAX_FILE_BYTES, budget,
                 )
                 map_without_lock, count_without_lock, bytes_without_lock = (
                     semver_offline_cache.source_map_digest(
@@ -1792,7 +2138,7 @@ class Service:
                     rows = None
                 else:
                     lock_bytes = semver_offline_cache._read_file(
-                        lock_path, semver_offline_cache.MAX_FILE_BYTES,
+                        lock_path, semver_offline_cache.MAX_FILE_BYTES, budget,
                     )
                     lock_sha = hashlib.sha256(lock_bytes).hexdigest()
                     lock_size = len(lock_bytes)
@@ -1820,7 +2166,7 @@ class Service:
                     constraint_resolver.Refusal):
                 _refuse("matrix-semver-checkpoint-snapshot")
 
-    def _semver_checkpoint(self, request, peer_pid):
+    def _semver_checkpoint(self, request, peer_pid, peer_uid):
             if (type(request) is not dict or set(request) != {
                     "op", "event", "operation", "manifest"} or request.get("op") != "semver-checkpoint"
                     or type(request.get("event")) is not str
@@ -1829,8 +2175,14 @@ class Service:
                     or len(request["manifest"]) > 4096):
                 _refuse("matrix-semver-checkpoint-request")
             with self.semver_active_lock:
+                pending = self.semver_active
+                ready = pending.get("ready") if pending is not None else None
+            if ready is None or not ready.wait(timeout=5):
+                _refuse("matrix-semver-checkpoint-order")
+            with self.semver_active_lock:
                 active = self.semver_active
-                if active is None or CANCEL_REQUESTED.is_set():
+                if (peer_uid != WORKER_UID or active is None or active is not pending
+                        or CANCEL_REQUESTED.is_set()):
                     _refuse("matrix-semver-checkpoint-order")
                 parsed = self._semver_checkpoint_peer(peer_pid, request, active)
                 project_root = str(PurePosixPath(request["manifest"]).parent)
@@ -1898,7 +2250,7 @@ class Service:
             payload = bundle.canonical_json(record)
             if len(payload) > 4 * 1024 * 1024:
                 _refuse("matrix-semver-checkpoint-record-size")
-            report = self.root / "scratch/reports" / SEMVER_CHECKPOINT_REPORT
+            report = self.root / "trusted" / SEMVER_CHECKPOINT_REPORT
             try:
                 descriptor = os.open(
                     str(report), os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -1924,6 +2276,464 @@ class Service:
                 _refuse("matrix-semver-checkpoint-record-write")
             self.semver_checkpoint_record = record
 
+    def _create_semver_cgroup(self, mountinfo, budget):
+        root = SEMVER_CGROUP_ROOT
+        path = None
+        attach_fd = None
+        try:
+            metadata = root.lstat()
+            if (stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode)
+                    or not os.path.ismount(root)):
+                _refuse("matrix-semver-cgroup-unavailable")
+            if type(mountinfo) is not str or len(mountinfo) > SEMVER_MOUNTINFO_MAX:
+                _refuse("matrix-semver-cgroup-unavailable")
+            budget.remaining()
+            mounted = False
+            for line in mountinfo.splitlines():
+                budget.remaining()
+                fields = line.split()
+                if "-" not in fields:
+                    continue
+                separator = fields.index("-")
+                if (separator + 1 < len(fields) and fields[separator + 1] == "cgroup2"
+                        and len(fields) > 4 and fields[4] == str(root)):
+                    mounted = True
+                    break
+            if not mounted:
+                _refuse("matrix-semver-cgroup-unavailable")
+            name = "semver-job-%d-%s" % (os.getpid(), os.urandom(8).hex())
+            path = root / name
+            path.mkdir(mode=0o700)
+            for child in ("cgroup.procs", "cgroup.events", "cgroup.kill"):
+                item = path / child
+                item_mode = item.lstat().st_mode
+                if not stat.S_ISREG(item_mode) or item.is_symlink():
+                    _refuse("matrix-semver-cgroup-unavailable")
+            flags = os.O_WRONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+            attach_fd = os.open(str(path / "cgroup.procs"), flags)
+            opened = os.fstat(attach_fd)
+            if not stat.S_ISREG(opened.st_mode):
+                os.close(attach_fd)
+                attach_fd = None
+                _refuse("matrix-semver-cgroup-unavailable")
+            return SemverCgroupJob(path, attach_fd)
+        except SupervisorRefusal:
+            if attach_fd is not None:
+                os.close(attach_fd)
+            if path is not None:
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+            raise
+        except OSError:
+            if attach_fd is not None:
+                os.close(attach_fd)
+            if path is not None:
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+            _refuse("matrix-semver-cgroup-unavailable")
+
+    def _prepare_semver_scratch(self, binding, expected_source_maps, work_deadline,
+                                cleanup_deadline):
+        scratch = self.root / "scratch"
+        cargo_home = scratch / "semver-cargo-home"
+        cargo_bin = scratch / "semver-cargo-bin"
+        target_root = scratch / "semver-target"
+        context_path = scratch / "semver-state/context.json"
+        for path in (cargo_home, cargo_bin, target_root, context_path):
+            if os.path.lexists(path):
+                _refuse("matrix-semver-cargo-home")
+        try:
+            cargo_home.mkdir(mode=0o1777)
+            os.chmod(cargo_home, 0o1777)
+            cargo_bin.mkdir(mode=0o755)
+            os.chmod(cargo_bin, 0o755)
+            target_root.mkdir(mode=0o700)
+            os.chown(target_root, WORKER_UID, WORKER_GID)
+            payload = semver_offline_cache.CARGO_CONFIG
+            for config_name in ("config.toml", "config"):
+                config_path = cargo_home / config_name
+                descriptor = os.open(str(config_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                     | getattr(os, "O_NOFOLLOW", 0), 0o440)
+                try:
+                    os.fchown(descriptor, 0, WORKER_GID)
+                    os.fchmod(descriptor, 0o440)
+                    if os.write(descriptor, payload) != len(payload):
+                        _refuse("matrix-semver-cargo-home")
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            shim = cargo_bin / "cargo"
+            shim_payload = (
+                bytes((35,)) + b"!/bin/sh\nexec /usr/bin/python3 -B -I -S "
+                b"/control/devlane/semver_cargo_wrapper.py \"$@\"\n"
+            )
+            descriptor = os.open(str(shim), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                 | getattr(os, "O_NOFOLLOW", 0), 0o555)
+            try:
+                os.fchmod(descriptor, 0o555)
+                if os.write(descriptor, shim_payload) != len(shim_payload):
+                    _refuse("matrix-semver-cargo-home")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            context = {
+                "schema": "keeldock.semver-worker-context.v2",
+                "authenticated_binding": binding,
+                "expected_source_maps": expected_source_maps,
+                "work_deadline": work_deadline,
+                "cleanup_deadline": cleanup_deadline,
+            }
+            payload = bundle.canonical_json(context)
+            descriptor = os.open(str(context_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                 | getattr(os, "O_NOFOLLOW", 0), 0o440)
+            try:
+                os.fchown(descriptor, 0, WORKER_GID)
+                os.fchmod(descriptor, 0o440)
+                view = memoryview(payload)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        _refuse("matrix-semver-context-write")
+                    view = view[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except SupervisorRefusal:
+            raise
+        except OSError:
+            _refuse("matrix-semver-context-write")
+
+    def _semver_launch_environment(self):
+        environment = semver_cargo_wrapper._cargo_environment()
+        environment["PATH"] = "/scratch/semver-cargo-bin:" + environment["PATH"]
+        return environment
+
+    def _semver_launch_command(self, attach_fd):
+        tool_argv = semver_stage.fixed_argv()
+        return [
+            "/usr/sbin/chroot", str(self.root), "/usr/bin/python3", "-B", "-I", "-S",
+            "/control/devlane/cgroup_exec.py", "--cgroup-fd", str(attach_fd), "--",
+            "/usr/bin/setpriv", "--reuid=65534", "--regid=65534", "--clear-groups",
+            "--no-new-privs", "--bounding-set=-all", "--", *tool_argv,
+        ]
+
+    def _semver_kill_cgroup(self, job):
+        descriptor = None
+        try:
+            target = job.path / "cgroup.kill"
+            metadata = target.lstat()
+            if not stat.S_ISREG(metadata.st_mode) or target.is_symlink():
+                _refuse("matrix-semver-cgroup-cleanup")
+            descriptor = os.open(str(target), os.O_WRONLY | os.O_NONBLOCK
+                                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+            if os.write(descriptor, b"1\n") != 2:
+                _refuse("matrix-semver-cgroup-cleanup")
+        except SupervisorRefusal:
+            raise
+        except OSError:
+            _refuse("matrix-semver-cgroup-cleanup")
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def _semver_cgroup_events(self, path, budget, *, cleanup=False):
+        descriptor = None
+        try:
+            path = Path(path)
+            before = path.lstat()
+            if not stat.S_ISREG(before.st_mode) or before.st_size > 1024:
+                _refuse("matrix-semver-cgroup-cleanup")
+            descriptor = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK
+                                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+            opened = os.fstat(descriptor)
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_dev != before.st_dev
+                    or opened.st_ino != before.st_ino or opened.st_size > 1024):
+                _refuse("matrix-semver-cgroup-cleanup")
+            result = bytearray()
+            while True:
+                budget.remaining(cleanup=cleanup)
+                chunk = os.read(descriptor, 1025 - len(result))
+                if not chunk:
+                    break
+                result.extend(chunk)
+                if len(result) > 1024:
+                    _refuse("matrix-semver-cgroup-cleanup")
+            values = {}
+            for line in bytes(result).decode("ascii", "strict").splitlines():
+                fields = line.split()
+                if len(fields) != 2 or fields[0] in values or fields[1] not in {"0", "1"}:
+                    _refuse("matrix-semver-cgroup-cleanup")
+                values[fields[0]] = fields[1]
+            if set(values) != {"populated", "frozen"}:
+                _refuse("matrix-semver-cgroup-cleanup")
+            return values
+        except SupervisorRefusal:
+            raise
+        except (OSError, UnicodeError, bounded_registry_io.Refusal):
+            _refuse("matrix-semver-cgroup-cleanup")
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def _semver_cleanup_cgroup(self, active, process, budget):
+        job = active["job"]
+        known_pids = set(active.get("observed_pids", ()))
+        if process is not None:
+            known_pids.add(process.pid)
+        try:
+            known_pids.update(self._semver_read_cgroup_roster(
+                job.path / "cgroup.procs", budget=budget, cleanup=True,
+            ))
+            self._semver_kill_cgroup(job)
+            job.close_attach()
+            empty_observations = 0
+            while budget.remaining(cleanup=True) > 0:
+                if process is not None and process.poll() is None:
+                    try:
+                        process.wait(timeout=min(0.1, budget.remaining(cleanup=True)))
+                    except subprocess.TimeoutExpired:
+                        pass
+                for pid in tuple(known_pids):
+                    if process is not None and pid == process.pid:
+                        continue
+                    try:
+                        os.waitpid(pid, os.WNOHANG)
+                    except ChildProcessError:
+                        pass
+                    except OSError as error:
+                        if error.errno != 10:
+                            raise
+                current = self._semver_read_cgroup_roster(
+                    job.path / "cgroup.procs", budget=budget, cleanup=True,
+                )
+                known_pids.update(current)
+                events = self._semver_cgroup_events(
+                    job.path / "cgroup.events", budget, cleanup=True,
+                )
+                if not current and events["populated"] == "0":
+                    empty_observations += 1
+                    if empty_observations >= 2:
+                        if process is not None and process.poll() is None:
+                            process.wait(timeout=budget.remaining(cleanup=True))
+                        job.path.rmdir()
+                        return True
+                else:
+                    empty_observations = 0
+                time.sleep(min(0.02, budget.remaining(cleanup=True)))
+        except (SupervisorRefusal, bounded_registry_io.Refusal,
+                OSError, subprocess.SubprocessError):
+            try:
+                job.close_attach()
+            except OSError:
+                pass
+            return False
+        return False
+
+    def _run_semver_stage(self):
+        if (self.context.get("profile") != "core-rust" or self.manifest.get("schema") != 2
+                or not self.baseline_staged or CANCEL_REQUESTED.is_set()):
+            return semver_stage.records_for_exit(101)
+        active = None
+        process = None
+        job = None
+        code = 101
+        cleaned = False
+        report_written = False
+        try:
+            outer = deadline_budget._read(self.deadline_file)
+            work_deadline = outer["work_deadline"]
+            cleanup_deadline = work_deadline + outer["cleanup_reserve"]
+            budget = bounded_registry_io.PhaseBudget.from_outer_deadlines(
+                work_deadline, cleanup_deadline, cancelled=CANCEL_REQUESTED.is_set,
+            )
+            source_revision = self.manifest.get("source_revision")
+            control_sha = self.context.get("control_sha")
+            projection_sha = self.projection_value.get("manifest_projection_sha256")
+            if (source_revision != semver_stage.SOURCE_REVISION
+                    or type(control_sha) is not str
+                    or projection_sha != self.manifest.get("fetch_sha256")):
+                _refuse("matrix-semver-inputs")
+            tool_root = self.root / "prepared/devlane-tools"
+            tool = semver_stage.verify_tool(tool_root, budget)
+            receipt = bundle.strict_json(semver_offline_cache._read_file(
+                tool_root / "semver-tool-receipt.json", 4096, budget,
+            ), 4096)
+            binary_sha = receipt.get("binary_sha256") if type(receipt) is dict else None
+            if type(binary_sha) is not str:
+                _refuse("matrix-semver-tool-binding")
+            identity = semver_stage.offline_cache_input_identity(
+                control_sha, projection_sha, binary_sha,
+            )
+            source_maps = semver_stage.offline_cache_source_maps(budget)
+            source_sets = semver_stage.offline_cache_source_sets(budget)
+            mountinfo = self._semver_mountinfo_text(budget)
+            binding = {
+                "source_commit": identity["source_commit"],
+                "control_sha": identity["control_sha"],
+                "manifest_projection_sha256": identity["manifest_projection_sha256"],
+                "candidate_git_tree_map_sha256": source_sets["candidate"]["full_map_sha256"],
+                "candidate_transfer_map_sha256": identity["candidate_full_source_map_sha256"],
+                "baseline_source_map_sha256": identity["baseline_source_map_sha256"],
+                "semver_tool_binary_sha256": identity["semver_tool_binary_sha256"],
+            }
+            self._prepare_semver_scratch(binding, source_maps, work_deadline, cleanup_deadline)
+            preparation = bundle.strict_json(semver_offline_cache._read_file(
+                self.root / "prepared/registry-preparation.json", semver_offline_cache.MAX_CONTRACT_BYTES, budget,
+            ), semver_offline_cache.MAX_CONTRACT_BYTES)
+            generated = bundle.strict_json(semver_offline_cache._read_file(
+                self.root / "trusted/generated-locks.json", semver_offline_cache.MAX_CONTRACT_BYTES, budget,
+            ), semver_offline_cache.MAX_CONTRACT_BYTES)
+            prepared = semver_offline_cache.validate_rust_v2_semver_inputs(
+                self.root / "prepared", self.root / "workspace/source",
+                self.root / "workspace/semver-baseline/runtime",
+                self.root / "scratch/semver-cargo-home", self.root / "scratch/cargo-home",
+                self.root / "tools/rust", self.manifest, self.projection_value,
+                preparation, generated, identity, source_sets, source_maps, budget,
+                expected_source_sha=source_revision, expected_control_sha=control_sha,
+                expected_projection_sha256=projection_sha,
+                mountinfo=mountinfo,
+            )
+            semver_stage.verify_run_inputs(
+                self.root / "workspace/source/runtime",
+                self.root / "workspace/semver-baseline/runtime", tool_root, budget,
+            )
+            candidate_post_lock_map = prepared[
+                "candidate_selected_map_after_ephemeral_lock_overlay"
+            ]
+            job = self._create_semver_cgroup(mountinfo, budget)
+            active = {
+                "owner_done": threading.Event(),
+                "pid": None,
+                "job": job,
+                "ready": threading.Event(),
+                "trackers": {},
+                "events": [],
+                "observed_pids": set(),
+                "checkpoint_binding": binding,
+                "candidate_selected_map_after_ephemeral_lock_overlay": candidate_post_lock_map,
+                "generated_lock_status": prepared["generated_lock_status"],
+                "generated_lock_sha256": prepared["generated_lock_sha256"],
+                "rust_tool_hashes": prepared["rust_tool_hashes"],
+                "rust_tool_provenance_status": prepared["rust_tool_provenance_status"],
+                "registry_tree_sha256": prepared["registry_tree_sha256"],
+                "registry_package_rows": prepared["_registry_package_rows"],
+                "work_deadline": work_deadline,
+                "cleanup_deadline": cleanup_deadline,
+            }
+            with self.semver_active_lock:
+                if self.semver_active is not None:
+                    _refuse("matrix-semver-runner-order")
+                self.semver_active = active
+            raw_log = self.root / "workspace/raw/semver-analyzer.log"
+            descriptor = os.open(str(raw_log), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                 | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            try:
+                log = os.fdopen(descriptor, "wb")
+                descriptor = None
+                with log:
+                    attach_fd = job.attach_fd
+                    command = self._semver_launch_command(attach_fd)
+                    process = subprocess.Popen(
+                        command, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                        env=self._semver_launch_environment(), cwd="/", close_fds=True,
+                        pass_fds=(attach_fd,), start_new_session=True,
+                    )
+                    with ACTIVE_CHILDREN_LOCK:
+                        ACTIVE_CHILDREN.add(process.pid)
+                    with self.semver_active_lock:
+                        active["pid"] = process.pid
+                        active["process"] = process
+                        active["ready"].set()
+                    timeout = min(semver_stage.CHECK_SECONDS, budget.remaining())
+                    end = time.monotonic() + timeout
+                    while True:
+                        if CANCEL_REQUESTED.is_set():
+                            code = 130
+                            break
+                        remaining = end - time.monotonic()
+                        if remaining <= 0:
+                            code = 124
+                            break
+                        try:
+                            code = process.wait(timeout=min(0.2, remaining))
+                            break
+                        except subprocess.TimeoutExpired:
+                            continue
+                    log.flush()
+                    if os.fstat(log.fileno()).st_size > SEMVER_LOG_MAX:
+                        code = 101
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+                try:
+                    job.close_attach()
+                except OSError:
+                    pass
+            budget.cleanup_deadline = cleanup_deadline
+            cleaned = self._semver_cleanup_cgroup(active, process, budget)
+            if not cleaned:
+                _refuse("matrix-semver-cgroup-cleanup")
+            with ACTIVE_CHILDREN_LOCK:
+                if process is not None:
+                    ACTIVE_CHILDREN.discard(process.pid)
+            with self.semver_active_lock:
+                if self.semver_active is active:
+                    self.semver_active = None
+            active["ready"].set()
+            if code in (124, 130) or CANCEL_REQUESTED.is_set():
+                return semver_stage.records_for_exit(101)
+            try:
+                self._write_semver_checkpoint_record(active, require_complete=True)
+                report_written = True
+            except SupervisorRefusal:
+                return semver_stage.records_for_exit(101)
+            return semver_stage.records_for_exit(code)
+        except (SupervisorRefusal, semver_stage.SemverRefusal, semver_offline_cache.Refusal,
+                bounded_registry_io.Refusal, bundle.Refusal, OSError, ValueError,
+                subprocess.SubprocessError):
+            return semver_stage.records_for_exit(101)
+        finally:
+            if active is not None:
+                if not cleaned and job is not None:
+                    try:
+                        budget = bounded_registry_io.PhaseBudget(
+                            active["work_deadline"], active["cleanup_deadline"],
+                            cancelled=lambda: False,
+                        )
+                        cleaned = self._semver_cleanup_cgroup(active, process, budget)
+                    except Exception:
+                        cleaned = False
+                with self.semver_active_lock:
+                    if self.semver_active is active:
+                        if cleaned:
+                            self.semver_active = None
+                        else:
+                            active["cleanup_failed"] = True
+                            active["process"] = process
+                active["ready"].set()
+                if not cleaned:
+                    active["owner_done"].set()
+                    CANCEL_REQUESTED.set()
+                    _refuse("matrix-semver-cgroup-cleanup")
+                if process is not None:
+                    with ACTIVE_CHILDREN_LOCK:
+                        ACTIVE_CHILDREN.discard(process.pid)
+                active["owner_done"].set()
+            elif job is not None:
+                try:
+                    job.close_attach()
+                except OSError:
+                    pass
+                try:
+                    self._semver_kill_cgroup(job)
+                    job.path.rmdir()
+                except (SupervisorRefusal, OSError):
+                    pass
+
     def _summary(self):
         if not self.execution_done or self.summary is None:
             _refuse("summary-not-ready")
@@ -1932,8 +2742,23 @@ class Service:
 
     def _cleanup(self):
         CANCEL_REQUESTED.set()
-        _kill_workload_descendants()
+        _signal_workload_descendants()
         failures = 0
+        shutdown_failed = False
+        try:
+            self._shutdown_semver_workers()
+        except (SupervisorRefusal, OSError):
+            shutdown_failed = True
+            failures += 1
+        try:
+            _kill_workload_descendants()
+        except (SupervisorRefusal, OSError):
+            failures += 1
+        if shutdown_failed:
+            try:
+                self._shutdown_semver_workers()
+            except (SupervisorRefusal, OSError):
+                failures += 1
         if self.root.is_symlink():
             _refuse("cleanup-root-invalid")
         baseline_mount = self.root / "workspace/semver-baseline/runtime"
@@ -1952,6 +2777,8 @@ class Service:
             "workspace/semver-baseline", "workspace/semver-temporary-project",
             "trusted", "scratch/tmp", "scratch/target",
             "scratch/reports", "scratch/npm-cache", "scratch/cargo-home",
+            "scratch/semver-cargo-home", "scratch/semver-cargo-bin",
+            "scratch/semver-target", "scratch/semver-state",
         ):
             if not _shred_tree(self.root / relative):
                 failures += 1
@@ -1985,7 +2812,7 @@ class Service:
         op = value["op"]
         if op == "cancel" and set(value) == {"op"}:
             CANCEL_REQUESTED.set()
-            _kill_workload_descendants()
+            _signal_workload_descendants()
             return {"ok": True, "status": "cancellation-requested"}
         if op == "probe" and set(value) == {"op"}:
             return self._probe()
@@ -1997,11 +2824,38 @@ class Service:
             return self._summary()
         if op == "cleanup" and set(value) == {"op"}:
             CANCEL_REQUESTED.set()
-            _kill_workload_descendants()
+            _signal_workload_descendants()
             response = self._cleanup()
             response["shutdown"] = True
             return response
         _refuse("control-operation-invalid")
+
+
+def _serve_semver_worker(service, shutdown):
+    server = service.semver_worker_socket
+    if server is None:
+        return
+    while not shutdown.is_set():
+        try:
+            connection, _ = server.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            return
+        with service.semver_worker_threads_lock:
+            service.semver_worker_threads = [
+                worker for worker in service.semver_worker_threads if worker.is_alive()
+            ]
+            if len(service.semver_worker_threads) >= 16:
+                connection.close()
+                continue
+            worker = threading.Thread(
+                target=service._handle_semver_worker_connection,
+                args=(connection,), daemon=True,
+                name="devlane-semver-worker-request",
+            )
+            service.semver_worker_threads.append(worker)
+            worker.start()
 
 
 def _serve(args):
@@ -2022,6 +2876,13 @@ def _serve(args):
         startup_phase = "prepare"
         service.prepare()
         startup_phase = "socket"
+        if service.context["profile"] == "core-rust":
+            service.start_semver_worker_socket()
+            service.semver_worker_accept_thread = threading.Thread(
+                target=_serve_semver_worker, args=(service, shutdown),
+                daemon=True, name="devlane-semver-worker-listener",
+            )
+            service.semver_worker_accept_thread.start()
         socket_path = Path(args.state_dir) / SOCKET_NAME
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server.bind(str(socket_path))
@@ -2050,7 +2911,7 @@ def _serve(args):
                     else:
                         if operation == "cleanup":
                             CANCEL_REQUESTED.set()
-                            _kill_workload_descendants()
+                            _signal_workload_descendants()
                         with SERVICE_LOCK:
                             response = service.request(request)
                     stop = response.pop("shutdown", False) or operation == "cleanup"
@@ -2109,7 +2970,7 @@ def _serve(args):
             except OSError:
                 pass
         CANCEL_REQUESTED.set()
-        _kill_workload_descendants()
+        _signal_workload_descendants()
         for worker in workers:
             worker.join(timeout=5)
         if service is not None:

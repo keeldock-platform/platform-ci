@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -30,7 +31,20 @@ TOOLS = {
         "e83878b80913fbe43629c28768e14ab51f4e86a4ba8f9dd08cc25b8dbc503c19",
         "cargo-vet.tar.xz", "cargo-vet 0.10.3", "r:xz",
     ),
+    "cargo-semver-checks": (
+        "https://github.com/obi1kenobi/cargo-semver-checks/releases/download/v0.51.0/cargo-semver-checks-x86_64-unknown-linux-gnu.tar.gz",
+        "cacadafaa5cd27ae6d05a74a103266917ebab4c5e43c898360e177d4fbf06a65",
+        "cargo-semver-checks-x86_64-unknown-linux-gnu.tar.gz",
+        "cargo 0.51.0", "r:gz",
+    ),
 }
+SEMVER_RELEASE_COMMIT = "260fad71517e8b320c5c1ad1f367900ab37362a1"
+SEMVER_TARGET = "x86_64-unknown-linux-gnu"
+SEMVER_RECEIPT = "semver-tool-receipt.json"
+SEMVER_MAX_BINARY = 128 * 1024 * 1024
+SEMVER_RECEIPT_VERIFICATION = (
+    "published release-asset digest matched; executable version matched pinned output"
+)
 ADVISORY_REPO = "https://github.com/RustSec/advisory-db.git"
 MAX_ARCHIVE = 256 * 1024 * 1024
 MAX_MEMBERS = 20_000
@@ -101,6 +115,55 @@ def _binary(root, name, version):
     return candidate
 
 
+def _hash_prepared_binary(path):
+    digest = hashlib.sha256()
+    size = 0
+    descriptor = None
+    try:
+        path = Path(path)
+        metadata = path.lstat()
+        if (not metadata.st_mode & 0o111 or not path.is_file()
+                or path.is_symlink() or metadata.st_nlink != 1
+                or metadata.st_size <= 0 or metadata.st_size > SEMVER_MAX_BINARY):
+            raise ToolingRefusal("tool-binary-invalid")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        if not flags & getattr(os, "O_NOFOLLOW", 0) or not flags & getattr(os, "O_NONBLOCK", 0):
+            raise ToolingRefusal("tool-binary-invalid")
+        descriptor = os.open(str(path), flags | getattr(os, "O_CLOEXEC", 0))
+        opened = os.fstat(descriptor)
+        if (not os.path.isfile(path) or not opened.st_mode & 0o111
+                or opened.st_nlink != 1 or opened.st_dev != metadata.st_dev
+                or opened.st_ino != metadata.st_ino or opened.st_size != metadata.st_size
+                or opened.st_size > SEMVER_MAX_BINARY):
+            raise ToolingRefusal("tool-binary-invalid")
+        while True:
+            _remaining(10)
+            chunk = os.read(descriptor, min(65_536, SEMVER_MAX_BINARY + 1 - size))
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > SEMVER_MAX_BINARY:
+                raise ToolingRefusal("tool-binary-size")
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        after_path = path.lstat()
+        if (size != opened.st_size or after.st_dev != opened.st_dev
+                or after.st_ino != opened.st_ino or after.st_size != opened.st_size
+                or after.st_nlink != 1 or after.st_mtime_ns != opened.st_mtime_ns
+                or after.st_ctime_ns != opened.st_ctime_ns
+                or after_path.st_dev != opened.st_dev or after_path.st_ino != opened.st_ino
+                or after_path.st_nlink != 1 or not after_path.st_mode & 0o111):
+            raise ToolingRefusal("tool-binary-invalid")
+    except ToolingRefusal:
+        raise
+    except OSError:
+        raise ToolingRefusal("tool-binary-invalid") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return digest.hexdigest(), size
+
+
 def _phase_context(phase_context, name):
     return phase_context(name) if phase_context is not None else nullcontext()
 
@@ -139,6 +202,7 @@ def fetch_tools(output, deadline_file, *, phase_context=None):
             "cargo-deny": "tool-cargo-deny",
             "cargo-audit": "tool-cargo-audit",
             "cargo-vet": "tool-cargo-vet",
+            "cargo-semver-checks": "tool-cargo-semver-checks",
         }
         for name, (url, checksum, archive_name, version, mode) in TOOLS.items():
             prefix = phase_names[name]
@@ -152,8 +216,37 @@ def fetch_tools(output, deadline_file, *, phase_context=None):
             with _phase_context(phase_context, prefix + "-version"):
                 binary = _binary(extract, name, version)
             with _phase_context(phase_context, prefix + "-copy"):
-                shutil.copyfile(binary, output / name)
-                (output / name).chmod(0o500)
+                destination = output / name
+                shutil.copyfile(binary, destination)
+                destination.chmod(0o500)
+                if name == "cargo-semver-checks":
+                    source_digest, source_size = _hash_prepared_binary(binary)
+                    copied_digest, copied_size = _hash_prepared_binary(destination)
+                    if source_digest != copied_digest or source_size != copied_size:
+                        raise ToolingRefusal("tool-copy-invalid")
+                    receipt = {
+                        "schema": "keeldock.prepared-semver-tool.v1",
+                        "tool": name,
+                        "version": "0.51.0",
+                        "release_tag": "v0.51.0",
+                        "release_commit": SEMVER_RELEASE_COMMIT,
+                        "asset_sha256": TOOLS[name][1],
+                        "asset_name": TOOLS[name][2],
+                        "target": SEMVER_TARGET,
+                        "version_output": TOOLS[name][3],
+                        "binary_sha256": copied_digest,
+                        "binary_size_bytes": copied_size,
+                        "verification": SEMVER_RECEIPT_VERIFICATION,
+                    }
+                    receipt_path = output / SEMVER_RECEIPT
+                    with receipt_path.open("xb") as output_file:
+                        output_file.write(json.dumps(
+                            receipt, sort_keys=True, separators=(",", ":"),
+                            ensure_ascii=True,
+                        ).encode("ascii") + b"\n")
+                        output_file.flush()
+                        os.fsync(output_file.fileno())
+                    receipt_path.chmod(0o444)
         advisory = output / "advisory-db"
         with _phase_context(phase_context, "tool-advisory-clone"):
             result = subprocess.run(
@@ -194,6 +287,11 @@ def install(source, prepared, deadline_file):
         if not path.is_file() or path.is_symlink():
             raise ToolingRefusal("tool-copy-invalid")
         path.chmod(0o555)
+    receipt = destination / SEMVER_RECEIPT
+    if (not receipt.is_file() or receipt.is_symlink()
+            or receipt.stat().st_nlink != 1):
+        raise ToolingRefusal("tool-copy-invalid")
+    receipt.chmod(0o444)
     for root, directories, files in os.walk(destination / "advisory-db", followlinks=False):
         for name in directories + files:
             path = Path(root) / name

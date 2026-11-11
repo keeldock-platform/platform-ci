@@ -27,6 +27,7 @@ import public_audit
 import filter as output_filter
 import rust_matrix_runner
 import rust_tooling
+import cgroup_exec
 import deadline as deadline_budget
 import diagnostic_contract
 import node_tool_snapshot
@@ -1020,6 +1021,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
 
             with patch.object(supervisor, "Service", return_value=FailingService()), \
                     patch.object(supervisor, "_kill_workload_descendants"), \
+                    patch.object(supervisor, "_signal_workload_descendants"), \
                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 result = supervisor.main(args)
             receipt = (state / supervisor.STARTUP_REFUSAL_NAME).read_bytes()
@@ -3103,12 +3105,16 @@ class RustMatrixRunnerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             report = Path(temporary) / "matrix.jsonl"
+            deadline = time.monotonic() + 60
             with patch.object(rust_matrix_runner, "_copy_advisory_database"), \
                     patch.object(rust_matrix_runner, "_simple_check", side_effect=simple), \
                     patch.object(rust_matrix_runner, "_rust_test_arm", side_effect=rust_arm), \
-                    patch.object(rust_matrix_runner, "_fuzz_replay", side_effect=replay):
+                    patch.object(rust_matrix_runner, "_fuzz_replay", side_effect=replay), \
+                    patch.object(rust_matrix_runner, "_semver_check",
+                                 side_effect=lambda records, _deadline:
+                                 records.extend(rust_matrix_runner.semver_stage.records_for_exit(0)) or True):
                 result = rust_matrix_runner.run(
-                    rust_matrix_runner.EXPECTED_MATRIX, "fixed-test-map", str(report), time.monotonic() + 60,
+                    rust_matrix_runner.EXPECTED_MATRIX, "fixed-test-map", str(report), deadline,
                 )
         self.assertEqual(result, 0)
 
@@ -3305,8 +3311,10 @@ class RustMatrixRunnerTests(unittest.TestCase):
             (tools / "advisory-db-revision").write_text("0" * 40, encoding="ascii")
             for entry in rust_tooling.TOOLS:
                 (source / entry).write_text("tool")
+            (tools / rust_tooling.SEMVER_RECEIPT).write_text("{}", encoding="ascii")
             outside_mode = outside.stat().st_mode & 0o777
-            with self.assertRaisesRegex(RuntimeError, "rust-matrix-tool-layout"):
+            with patch.object(test_e2e.semver_stage, "verify_tool"), \
+                    self.assertRaisesRegex(RuntimeError, "rust-matrix-tool-layout"):
                 test_e2e._verify_prepared_rust_tools(prepared, source)
             self.assertEqual(outside.stat().st_mode & 0o777, outside_mode)
 
@@ -3322,7 +3330,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
         self.assertEqual(set(test_e2e.RUST_LOCKFILES), {
             "Cargo.lock", "fuzz/Cargo.lock", "runtime/Cargo.lock",
         })
-        self.assertEqual(len(matrix["coverage_ids"]), 22)
+        self.assertEqual(len(matrix["coverage_ids"]), 23)
         self.assertEqual(set(test_e2e.RUST_FIXTURE_TESTS), {
             "root::Cargo.toml::tests::child_has_no_control_secrets_or_sockets",
             "runtime::runtime/crates/services/listener/Cargo.toml::tests::listener_fixture_is_reachable",
@@ -3344,7 +3352,11 @@ class RustMatrixRunnerTests(unittest.TestCase):
         tooling_versions = {name: row[3].rsplit(" ", 1)[-1] for name, row in rust_tooling.TOOLS.items()}
         self.assertEqual(tooling_versions, {
             "cargo-deny": "0.20.2", "cargo-audit": "0.22.2", "cargo-vet": "0.10.3",
+            "cargo-semver-checks": "0.51.0",
         })
+        semver_tool = rust_tooling.TOOLS["cargo-semver-checks"]
+        self.assertEqual(semver_tool[1], rust_matrix_runner.semver_stage.SEMVER_ASSET_SHA256)
+        self.assertEqual(semver_tool[3], "cargo 0.51.0")
         generator = inspect.getsource(test_e2e._write_rust_fixture)
         self.assertIn("generate-lockfile", generator)
         contract = inspect.getsource(test_e2e._validate_rust_fixture)
@@ -3359,7 +3371,9 @@ class RustMatrixRunnerTests(unittest.TestCase):
         main = inspect.getsource(test_e2e.main)
         self.assertLess(main.index("rust_tooling.fetch_tools"), main.index('_phase_call("scenario-run", _run_scenario'))
         prepared_tools = inspect.getsource(test_e2e._verify_prepared_rust_tools)
-        self.assertIn("hashlib.sha256(path.read_bytes())", prepared_tools)
+        self.assertIn("rust_tooling._hash_prepared_binary(path)", prepared_tools)
+        self.assertIn("semver_stage.verify_tool(source)", prepared_tools)
+        self.assertIn("semver_stage.verify_tool(tools)", prepared_tools)
         self.assertIn('"advisory-db"', prepared_tools)
         self.assertIn('"advisory-db-revision"', prepared_tools)
         self.assertIn("advisory-database-binding", prepared_tools)
@@ -3373,12 +3387,13 @@ class RustMatrixRunnerTests(unittest.TestCase):
         profile = document["profiles"]["core-rust"]
         self.assertEqual(profile["rust_matrix"], rust_matrix_runner.EXPECTED_MATRIX)
         self.assertEqual(profile["commands"], [])
-        self.assertEqual(profile["stages"], ["format", "deny", "audit", "vet", "unit"])
+        self.assertEqual(profile["stages"], ["format", "deny", "audit", "vet", "unit", "semver"])
         self.assertEqual(profile["budget_seconds"], 8700)
 
     def test_fixed_matrix_runs_each_tool_and_every_workspace_feature_arm(self):
         checks = []
         arms = []
+        semver_stages = []
 
         def simple(records, suite, argv, deadline, timeout=1800):
             checks.append((suite, argv))
@@ -3393,14 +3408,21 @@ class RustMatrixRunnerTests(unittest.TestCase):
             suffix = "all-features" if feature_set == "all" else "default"
             return _coverage(records, "fuzz-replay-" + suffix)
 
+        def semver(records, deadline):
+            semver_stages.append(deadline)
+            records.extend(rust_matrix_runner.semver_stage.records_for_exit(0))
+            return True
+
         with tempfile.TemporaryDirectory() as temporary:
             report = Path(temporary) / "matrix.jsonl"
+            deadline = time.monotonic() + 60
             with patch.object(rust_matrix_runner, "_copy_advisory_database"), \
                     patch.object(rust_matrix_runner, "_simple_check", side_effect=simple), \
                     patch.object(rust_matrix_runner, "_rust_test_arm", side_effect=rust_arm), \
-                    patch.object(rust_matrix_runner, "_fuzz_replay", side_effect=replay):
+                    patch.object(rust_matrix_runner, "_fuzz_replay", side_effect=replay), \
+                    patch.object(rust_matrix_runner, "_semver_check", side_effect=semver):
                 result = rust_matrix_runner.run(
-                    rust_matrix_runner.EXPECTED_MATRIX, "fixed-test-map", str(report), time.monotonic() + 60,
+                    rust_matrix_runner.EXPECTED_MATRIX, "fixed-test-map", str(report), deadline,
                 )
             self.assertEqual(result, 0)
             records = [json.loads(line) for line in report.read_text(encoding="ascii").splitlines()]
@@ -3408,6 +3430,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
             self.assertEqual(suites, rust_matrix_runner.EXPECTED_MATRIX["coverage_ids"])
             self.assertEqual(len(checks), 12)
             self.assertEqual(len(arms), 8)
+            self.assertEqual(semver_stages, [deadline])
             self.assertEqual(
                 {(scope, workspace_mode, mode) for scope, _, workspace_mode, mode in arms},
                 {(scope, workspace_mode, mode)
@@ -3420,8 +3443,8 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 {"/workspace/source/runtime/crates/services/listener/Cargo.toml"},
             )
             self.assertEqual(
-                [row["suite"] for row in records if row["kind"] == "coverage"][-2:],
-                ["fuzz-replay-default", "fuzz-replay-all-features"],
+                [row["suite"] for row in records if row["kind"] == "coverage"][-3:],
+                ["fuzz-replay-default", "fuzz-replay-all-features", "semver-runtime"],
             )
             self.assertTrue(all(row["ignored"] == 0 for row in records))
             fmt_argv = {suite: argv for suite, argv in checks if suite.startswith("fmt-")}
@@ -3519,7 +3542,10 @@ class RustMatrixRunnerTests(unittest.TestCase):
             with patch.object(rust_matrix_runner, "_copy_advisory_database"), \
                     patch.object(rust_matrix_runner, "_simple_check", side_effect=simple), \
                     patch.object(rust_matrix_runner, "_rust_test_arm", side_effect=arm), \
-                    patch.object(rust_matrix_runner, "_fuzz_replay", side_effect=replay):
+                    patch.object(rust_matrix_runner, "_fuzz_replay", side_effect=replay), \
+                    patch.object(rust_matrix_runner, "_semver_check",
+                                 side_effect=lambda records, _deadline:
+                                 records.extend(rust_matrix_runner.semver_stage.records_for_exit(0)) or True):
                 result = rust_matrix_runner.run(rust_matrix_runner.EXPECTED_MATRIX, "fixed-map",
                                                str(Path(temporary) / "report.jsonl"), time.monotonic() + 60)
         self.assertEqual(result, 0)
@@ -3683,6 +3709,592 @@ class RustMatrixRunnerTests(unittest.TestCase):
         changed[-1] = json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         with self.assertRaises(public_audit.AuditRefusal):
             public_audit.validate_summary_records(changed, "core-rust")
+
+
+class SemverExecutableIntegrationTests(unittest.TestCase):
+    def test_matrix_runner_client_sends_fixed_request_and_reads_fragmented_reply(self):
+        semver = rust_matrix_runner.semver_stage
+        client_socket, server_socket = semver.socket.socketpair()
+        failures = []
+        expected_records = semver.records_for_exit(0)
+
+        def receive_exact(connection, size):
+            result = bytearray()
+            while len(result) < size:
+                chunk = connection.recv(size - len(result))
+                if not chunk:
+                    raise AssertionError("synthetic worker request truncated")
+                result.extend(chunk)
+            return bytes(result)
+
+        def serve():
+            try:
+                size = int.from_bytes(receive_exact(server_socket, 4), "big")
+                self.assertEqual(receive_exact(server_socket, size), b'{"op":"semver-stage"}')
+                payload = json.dumps(
+                    {"ok": True, "records": expected_records}, sort_keys=True,
+                    separators=(",", ":"), ensure_ascii=True,
+                ).encode("ascii")
+                framed = len(payload).to_bytes(4, "big") + payload
+                for offset in range(0, len(framed), 1):
+                    server_socket.sendall(framed[offset:offset + 1])
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                server_socket.close()
+
+        class OneByteClient:
+            def settimeout(self, value):
+                client_socket.settimeout(value)
+
+            def connect(self, _path):
+                return None
+
+            def sendall(self, value):
+                client_socket.sendall(value)
+
+            def recv(self, size):
+                return client_socket.recv(min(size, 1))
+
+            def close(self):
+                client_socket.close()
+
+        server_thread = supervisor.threading.Thread(target=serve)
+        server_thread.start()
+        with patch.object(semver.socket, "socket", return_value=OneByteClient()):
+            records = semver.request_stage(time.monotonic() + 5)
+        server_thread.join(timeout=5)
+        self.assertFalse(server_thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(records, expected_records)
+
+    def test_legacy_schema_e2e_is_only_a_semver_refusal_negative_control(self):
+        rows = []
+        expected = rust_matrix_runner.EXPECTED_MATRIX["coverage_ids"]
+        for suite in expected:
+            failed = int(suite == "semver-runtime")
+            rows.append({
+                "kind": "coverage", "stage": rust_matrix_runner._stage_for(suite),
+                "suite": suite, "total": 1, "passed": 1 - failed,
+                "failed": failed, "ignored": 0,
+            })
+        rows.append({
+            "kind": "control", "stage": "semver", "status": "fail",
+            "code": "DEVLANE_SEMVER_EXECUTION",
+        })
+        scenario = {
+            "profile": "core-rust", "allowed_files": {}, "allowed_tests": {}, "frames": {},
+            "expect_semver_execution_refusal": True,
+        }
+        profile = test_e2e.bundle.strict_json(
+            (test_e2e.ROOT / "ci/devlane-profiles.json").read_bytes()
+        )["profiles"]["core-rust"]
+        allowlists = {
+            "files": {}, "tests": {}, "frames": {}, "stages": list(profile["stages"]),
+            "codes": sorted(set(profile.get("diagnostic_codes", []) + ["DEVLANE_FAILURE"])),
+            "max_lines": {}, "suites": sorted(expected),
+        }
+        summary = output_filter.filter_records(
+            [test_e2e.bundle.canonical_json(row) for row in rows], allowlists,
+        )
+        parsed = test_e2e._summary_records(summary, scenario)
+        semver = [row for row in parsed if row.get("kind") == "coverage"
+                  and row.get("suite") == "semver-runtime"]
+        self.assertEqual(semver[0]["failed"], 1)
+
+        scenario["expect_semver_execution_refusal"] = False
+        with self.assertRaises(RuntimeError):
+            test_e2e._summary_records(summary, scenario)
+
+    def test_schema_one_semver_stage_refuses_before_any_launch(self):
+        service = object.__new__(supervisor.Service)
+        service.context = {"profile": "core-rust"}
+        service.manifest = {"schema": 1}
+        service.baseline_staged = False
+        with patch.object(supervisor.CANCEL_REQUESTED, "is_set", return_value=False), \
+                patch.object(supervisor.subprocess, "Popen") as popen:
+            records = service._run_semver_stage()
+        popen.assert_not_called()
+        self.assertEqual(records, rust_matrix_runner.semver_stage.records_for_exit(101))
+
+    def _run_semver_stage_with_synthetic_boundaries(self, *, exit_code=0,
+                                                   cancel_on_spawn=False,
+                                                   report_error=None, cleanup_result=True):
+        events = []
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name) / "namespace-root"
+        (root / "workspace/raw").mkdir(parents=True)
+        service = object.__new__(supervisor.Service)
+        service.context = {"profile": "core-rust", "control_sha": "1" * 40}
+        service.manifest = {
+            "schema": 2, "source_revision": rust_matrix_runner.semver_stage.SOURCE_REVISION,
+            "fetch_sha256": "2" * 64,
+        }
+        service.projection_value = {"manifest_projection_sha256": "2" * 64}
+        service.baseline_staged = True
+        service.deadline_file = Path("synthetic-deadline")
+        service.deadline = time.monotonic() + 30
+        service.root = root
+        service.semver_active = None
+        service.semver_active_lock = supervisor.threading.Lock()
+        service.semver_checkpoint_record = None
+        outer = {"work_deadline": service.deadline, "cleanup_reserve": 10}
+        binary_sha = "3" * 64
+        identity = {
+            "source_commit": service.manifest["source_revision"],
+            "control_sha": service.context["control_sha"],
+            "manifest_projection_sha256": service.projection_value["manifest_projection_sha256"],
+            "candidate_full_source_map_sha256": "4" * 64,
+            "baseline_source_map_sha256": "5" * 64,
+            "semver_tool_binary_sha256": binary_sha,
+        }
+        source_maps = {
+            "baseline_source_map_sha256": "5" * 64,
+            "candidate_source_map_sha256": "6" * 64,
+            "candidate_full_source_map_sha256": "4" * 64,
+        }
+        source_sets = {
+            "candidate": {"full_map_sha256": "7" * 64},
+            "baseline_runtime": {"map_sha256": "5" * 64},
+        }
+        prepared = {
+            "candidate_selected_map_after_ephemeral_lock_overlay": "8" * 64,
+            "generated_lock_status": "ephemeral-offline-generated-not-committed",
+            "generated_lock_sha256": {"Cargo.lock": "9" * 64},
+            "rust_tool_hashes": {},
+            "rust_tool_provenance_status": "binary-hash-bound-origin-unverified",
+            "registry_tree_sha256": "a" * 64,
+            "_registry_package_rows": [],
+        }
+
+        class Job:
+            path = Path("/synthetic-cgroup")
+            attach_fd = 73
+
+            def close_attach(self):
+                events.append("close-attach")
+
+        class Process:
+            pid = 874
+
+            def wait(self, timeout=None):
+                events.append("wait")
+                return exit_code
+
+            def poll(self):
+                return exit_code
+
+        job = Job()
+
+        def read_file(path, _maximum, _budget=None):
+            name = Path(path).name
+            return {
+                "semver-tool-receipt.json": b"receipt",
+                "registry-preparation.json": b"preparation",
+                "generated-locks.json": b"generated",
+            }[name]
+
+        def strict_json(payload, _maximum):
+            return {
+                b"receipt": {"binary_sha256": binary_sha},
+                b"preparation": {},
+                b"generated": {},
+            }[payload]
+
+        def spawn(command, **kwargs):
+            events.append("spawn")
+            if cancel_on_spawn:
+                supervisor.CANCEL_REQUESTED.set()
+            process = Process()
+            spawn.call = (command, kwargs)
+            return process
+
+        def report(_active, *, require_complete):
+            events.append("report")
+            self.assertTrue(require_complete)
+            if report_error is not None:
+                raise supervisor.SupervisorRefusal(report_error)
+
+        with patch.object(supervisor.deadline_budget, "_read", return_value=outer), \
+                patch.object(rust_matrix_runner.semver_stage, "verify_tool",
+                             side_effect=lambda *_args, **_kwargs: events.append("tool") or Path("/prepared/tool")), \
+                patch.object(rust_matrix_runner.semver_stage, "offline_cache_input_identity",
+                             return_value=identity), \
+                patch.object(rust_matrix_runner.semver_stage, "offline_cache_source_maps",
+                             return_value=source_maps), \
+                patch.object(rust_matrix_runner.semver_stage, "offline_cache_source_sets",
+                             return_value=source_sets), \
+                patch.object(supervisor.semver_offline_cache, "_read_file", side_effect=read_file), \
+                patch.object(supervisor.bundle, "strict_json", side_effect=strict_json), \
+                patch.object(service, "_semver_mountinfo_text",
+                             side_effect=lambda _budget: events.append("mountinfo") or "synthetic-mountinfo\n"), \
+                patch.object(service, "_prepare_semver_scratch",
+                             side_effect=lambda *_args: events.append("scratch")), \
+                patch.object(supervisor.semver_offline_cache, "validate_rust_v2_semver_inputs",
+                             side_effect=lambda *_args, **kwargs:
+                             events.append(("validate", kwargs["mountinfo"])) or prepared), \
+                patch.object(rust_matrix_runner.semver_stage, "verify_run_inputs",
+                             side_effect=lambda *_args, **_kwargs: events.append("verify")), \
+                patch.object(service, "_create_semver_cgroup",
+                             side_effect=lambda *_args: events.append("cgroup") or job), \
+                patch.object(service, "_semver_cleanup_cgroup",
+                             side_effect=lambda *_args: events.append("reap") or cleanup_result), \
+                patch.object(service, "_write_semver_checkpoint_record", side_effect=report), \
+                patch.object(supervisor.subprocess, "Popen", side_effect=spawn) as popen:
+            supervisor.CANCEL_REQUESTED.clear()
+            self.last_stage_probe = {"service": service, "events": events}
+            try:
+                records = service._run_semver_stage()
+            finally:
+                self.last_stage_probe["cancelled"] = supervisor.CANCEL_REQUESTED.is_set()
+                supervisor.CANCEL_REQUESTED.clear()
+        return service, records, events, popen, spawn
+
+    def test_failed_cleanup_keeps_process_tracked_and_escalates_without_records(self):
+        try:
+            with self.assertRaisesRegex(supervisor.SupervisorRefusal, "matrix-semver-cgroup-cleanup"):
+                self._run_semver_stage_with_synthetic_boundaries(cleanup_result=False)
+            probe = self.last_stage_probe
+            self.assertEqual(probe["events"].count("reap"), 2)
+            self.assertNotIn("report", probe["events"])
+            self.assertTrue(probe["cancelled"])
+            active = probe["service"].semver_active
+            self.assertIsNotNone(active)
+            self.assertTrue(active["cleanup_failed"])
+            self.assertIn(874, supervisor.ACTIVE_CHILDREN)
+        finally:
+            with supervisor.ACTIVE_CHILDREN_LOCK:
+                supervisor.ACTIVE_CHILDREN.discard(874)
+            supervisor.CANCEL_REQUESTED.clear()
+
+    def test_actual_semver_stage_orders_receipt_validation_launch_reap_then_report(self):
+        service, records, events, popen, spawn = self._run_semver_stage_with_synthetic_boundaries()
+        self.assertEqual(records, rust_matrix_runner.semver_stage.records_for_exit(0))
+        self.assertEqual(
+            events,
+            ["tool", "mountinfo", "scratch", ("validate", "synthetic-mountinfo\n"),
+             "verify", "cgroup", "spawn", "wait",
+             "close-attach", "reap", "report"],
+        )
+        self.assertIsNone(service.semver_active)
+        command, kwargs = spawn.call
+        self.assertIn("/control/devlane/cgroup_exec.py", command)
+        self.assertEqual(command[-len(rust_matrix_runner.semver_stage.fixed_argv()):],
+                         rust_matrix_runner.semver_stage.fixed_argv())
+        self.assertEqual(kwargs["pass_fds"], (73,))
+        self.assertNotIn("preexec_fn", kwargs)
+        self.assertTrue(kwargs["env"]["PATH"].startswith("/scratch/semver-cargo-bin:"))
+        self.assertEqual(kwargs["env"]["CARGO_NET_OFFLINE"], "true")
+        self.assertEqual(kwargs["env"]["CARGO_TARGET_DIR"], "/scratch/semver-target")
+        popen.assert_called_once()
+
+    def test_semver_scratch_context_matches_the_fixed_wrapper_schema(self):
+        binding = {
+            "source_commit": "1" * 40,
+            "control_sha": "2" * 40,
+            "manifest_projection_sha256": "3" * 64,
+            "candidate_git_tree_map_sha256": "4" * 64,
+            "candidate_transfer_map_sha256": "5" * 64,
+            "baseline_source_map_sha256": "6" * 64,
+            "semver_tool_binary_sha256": "7" * 64,
+        }
+        expected_source_maps = {
+            "baseline_source_map_sha256": "8" * 64,
+            "candidate_source_map_sha256": "9" * 64,
+            "candidate_full_source_map_sha256": "a" * 64,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            service = object.__new__(supervisor.Service)
+            service.root = Path(temporary).resolve()
+            (service.root / "scratch/semver-state").mkdir(parents=True)
+            with patch.object(supervisor.os, "chown") as chown, \
+                    patch.object(supervisor.os, "fchown") as fchown:
+                service._prepare_semver_scratch(
+                    binding, expected_source_maps, 100.0, 110.0,
+                )
+            cargo_home = service.root / "scratch/semver-cargo-home"
+            cargo_bin = service.root / "scratch/semver-cargo-bin"
+            shim = cargo_bin / "cargo"
+            self.assertEqual(cargo_home.stat().st_mode & 0o7777, 0o1777)
+            self.assertEqual(cargo_home.stat().st_uid, os.getuid())
+            self.assertEqual(cargo_bin.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(cargo_bin.stat().st_uid, os.getuid())
+            self.assertEqual(shim.stat().st_mode & 0o777, 0o555)
+            self.assertEqual(shim.stat().st_uid, os.getuid())
+            chown.assert_called_once_with(service.root / "scratch/semver-target",
+                                          supervisor.WORKER_UID, supervisor.WORKER_GID)
+            self.assertEqual(fchown.call_count, 3)
+            for name in ("config.toml", "config"):
+                config = cargo_home / name
+                self.assertEqual(config.read_bytes(), supervisor.semver_offline_cache.CARGO_CONFIG)
+                self.assertEqual(config.stat().st_mode & 0o777, 0o440)
+            context = json.loads(
+                (service.root / "scratch/semver-state/context.json").read_text(encoding="ascii"),
+            )
+        self.assertEqual(set(context), {
+            "schema", "authenticated_binding", "expected_source_maps",
+            "work_deadline", "cleanup_deadline",
+        })
+        self.assertEqual(context["schema"], "keeldock.semver-worker-context.v2")
+        self.assertEqual(context["authenticated_binding"], binding)
+        self.assertEqual(context["expected_source_maps"], expected_source_maps)
+        self.assertEqual(context["work_deadline"], 100.0)
+        self.assertEqual(context["cleanup_deadline"], 110.0)
+
+    def test_cgroup_creation_refuses_and_removes_an_incomplete_new_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            mountinfo = "36 25 0:32 / %s rw - cgroup2 cgroup rw\n" % root
+            service = object.__new__(supervisor.Service)
+            budget = Mock()
+            budget.remaining.return_value = 10.0
+            with patch.object(supervisor, "SEMVER_CGROUP_ROOT", root), \
+                    patch.object(supervisor.os.path, "ismount", return_value=True):
+                with self.assertRaisesRegex(
+                        supervisor.SupervisorRefusal, "matrix-semver-cgroup-unavailable"):
+                    service._create_semver_cgroup(mountinfo, budget)
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_actual_semver_stage_failure_cancel_and_incomplete_checkpoint_fail_closed(self):
+        service, records, events, _popen, _spawn = self._run_semver_stage_with_synthetic_boundaries(
+            exit_code=101,
+        )
+        self.assertEqual(records, rust_matrix_runner.semver_stage.records_for_exit(101))
+        self.assertLess(events.index("reap"), events.index("report"))
+        self.assertIsNone(service.semver_active)
+
+        service, records, events, _popen, _spawn = self._run_semver_stage_with_synthetic_boundaries(
+            cancel_on_spawn=True,
+        )
+        self.assertEqual(records, rust_matrix_runner.semver_stage.records_for_exit(101))
+        self.assertIn("reap", events)
+        self.assertNotIn("report", events)
+        self.assertIsNone(service.semver_active)
+
+        service, records, events, _popen, _spawn = self._run_semver_stage_with_synthetic_boundaries(
+            report_error="matrix-semver-checkpoint-incomplete",
+        )
+        self.assertEqual(records, rust_matrix_runner.semver_stage.records_for_exit(101))
+        self.assertLess(events.index("reap"), events.index("report"))
+        self.assertIsNone(service.semver_active)
+
+    def test_worker_socket_uses_kernel_peer_credentials_and_no_service_lock(self):
+        class Connection:
+            def __init__(self, request, credentials):
+                payload = json.dumps(request, sort_keys=True, separators=(",", ":")).encode("ascii")
+                self.incoming = bytearray(len(payload).to_bytes(4, "big") + payload)
+                self.credentials = credentials
+                self.outgoing = bytearray()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def settimeout(self, _timeout):
+                pass
+
+            def getsockopt(self, _level, _option, _size):
+                return self.credentials
+
+            def recv(self, size):
+                chunk = bytes(self.incoming[:size])
+                del self.incoming[:size]
+                return chunk
+
+            def sendall(self, payload):
+                self.outgoing.extend(payload)
+
+        service = object.__new__(supervisor.Service)
+        service.dispatch_semver_worker = Mock(return_value={"ok": True})
+        peer = Connection(
+            {"op": "semver-stage"},
+            __import__("struct").pack("3i", 713, supervisor.WORKER_UID, supervisor.WORKER_GID),
+        )
+        with patch.object(supervisor.socket, "SO_PEERCRED", 17, create=True):
+            service._handle_semver_worker_connection(peer)
+        self.assertEqual(
+            service.dispatch_semver_worker.call_args.args,
+            ({"op": "semver-stage"}, 713, supervisor.WORKER_UID, supervisor.WORKER_GID),
+        )
+        size = int.from_bytes(peer.outgoing[:4], "big")
+        self.assertEqual(json.loads(peer.outgoing[4:4 + size]), {"ok": True})
+        self.assertNotIn("SERVICE_LOCK", inspect.getsource(supervisor.Service._handle_semver_worker_connection))
+
+        rejected = Connection(
+            {"op": "semver-stage"},
+            __import__("struct").pack("3i", 713, 1234, supervisor.WORKER_GID),
+        )
+        with patch.object(supervisor.socket, "SO_PEERCRED", 17, create=True):
+            service._handle_semver_worker_connection(rejected)
+        self.assertEqual(service.dispatch_semver_worker.call_count, 1)
+        size = int.from_bytes(rejected.outgoing[:4], "big")
+        self.assertEqual(json.loads(rejected.outgoing[4:4 + size])["ok"], False)
+
+    def test_semver_stage_broker_requires_exact_runner_pid_parent_uid_and_argv(self):
+        def make_service(*, parent=None, uid=supervisor.WORKER_UID, arguments=None):
+            service = object.__new__(supervisor.Service)
+            service.matrix_runner_ready = supervisor.threading.Event()
+            service.matrix_runner_ready.set()
+            service.matrix_runner_lock = supervisor.threading.Lock()
+            service.matrix_runner_active = {"pid": 713, "semver_requested": False}
+            service.semver_active = None
+            service.semver_active_lock = supervisor.threading.Lock()
+            service.deadline_file = Path("synthetic-deadline")
+            service.deadline = 456.0
+            runner_parent = os.getpid() if parent is None else parent
+            status = (
+                "Name:\tpython3\nPPid:\t%d\nUid:\t1000\t%d\t%d\t%d\n"
+                % (runner_parent, uid, uid, uid)
+            ).encode("ascii")
+            words = arguments or [
+                "/usr/bin/python3", "-B", "-I", "-S",
+                "/control/devlane/rust_matrix_runner.py",
+                "/control/profiles.json", "/trusted/adapter-config.json",
+                "/scratch/reports/rust-matrix.jsonl", "--deadline", "456.0",
+            ]
+            command = b"\x00".join(item.encode("ascii") for item in words) + b"\x00"
+            service._semver_proc_bytes = Mock(
+                side_effect=lambda _pid, name, _maximum, _budget=None:
+                status if name == "status" else command,
+            )
+            service._run_semver_stage = Mock(
+                return_value=rust_matrix_runner.semver_stage.records_for_exit(0),
+            )
+            return service
+
+        outer = {"work_deadline": time.monotonic() + 30, "cleanup_reserve": 10}
+        with patch.object(supervisor.deadline_budget, "_read", return_value=outer):
+            service = make_service()
+            self.assertEqual(service._semver_stage_request(713)["records"][0]["passed"], 1)
+            service._run_semver_stage.assert_called_once_with()
+
+            for service in (
+                make_service(parent=os.getpid() + 2),
+                make_service(uid=777),
+                make_service(arguments=["/usr/bin/python3", "-B", "-I", "-S",
+                                       "/control/devlane/rust_matrix_runner.py", "extra"]),
+            ):
+                with self.assertRaises(supervisor.SupervisorRefusal):
+                    service._semver_stage_request(713)
+                service._run_semver_stage.assert_not_called()
+
+    def test_checkpoint_callback_accepts_complete_sequence_and_does_not_retain_rejected_first_event(self):
+        binding = {
+            "source_commit": "1" * 40,
+            "control_sha": "2" * 40,
+            "manifest_projection_sha256": "3" * 64,
+            "candidate_git_tree_map_sha256": "4" * 64,
+            "candidate_transfer_map_sha256": "5" * 64,
+            "baseline_source_map_sha256": "6" * 64,
+            "semver_tool_binary_sha256": "7" * 64,
+        }
+        base = {
+            "manifest_sha256": "8" * 64,
+            "project_map_without_lock_sha256": "9" * 64,
+            "project_file_count_without_lock": 1,
+            "project_tree_bytes_without_lock": 10,
+            "project_map_sha256": "9" * 64,
+            "project_file_count": 1,
+            "project_tree_bytes": 10,
+            "lock_sha256": None,
+            "lock_size": None,
+        }
+        locked = dict(base)
+        locked.update({
+            "project_map_sha256": "a" * 64,
+            "project_file_count": 2,
+            "project_tree_bytes": 15,
+            "lock_sha256": "b" * 64,
+            "lock_size": 5,
+        })
+
+        def make_service():
+            service = object.__new__(supervisor.Service)
+            service.semver_active_lock = supervisor.threading.Lock()
+            active = {
+                "ready": supervisor.threading.Event(), "trackers": {}, "events": [],
+                "checkpoint_binding": binding,
+            }
+            active["ready"].set()
+            service.semver_active = active
+            service._semver_checkpoint_peer = Mock(return_value={"project_kind": "local"})
+            service._semver_checkpoint_snapshot = Mock(
+                side_effect=lambda _root, _active: base,
+            )
+            return service, active
+
+        manifest = "/scratch/semver-target/semver-checks/local-alpha/Cargo.toml"
+        sequence = (
+            ("before-update", "update", base),
+            ("after-update", "update", locked),
+            ("after-metadata", "metadata", locked),
+            ("after-doc", "doc", locked),
+        )
+        service, active = make_service()
+        supervisor.CANCEL_REQUESTED.clear()
+        service._semver_checkpoint_snapshot.side_effect = [row for _event, _op, row in sequence]
+        try:
+            for event, operation, _snapshot in sequence:
+                result = service._semver_checkpoint({
+                    "op": "semver-checkpoint", "event": event,
+                    "operation": operation, "manifest": manifest,
+                }, 900, supervisor.WORKER_UID)
+                self.assertEqual(result, {"ok": True})
+            self.assertEqual(active["trackers"]["/scratch/semver-target/semver-checks/local-alpha"].finish()[
+                "checkpoint_count"], 4)
+            self.assertEqual(len(active["events"]), 4)
+        finally:
+            supervisor.CANCEL_REQUESTED.clear()
+
+        service, active = make_service()
+        service._semver_checkpoint_snapshot.return_value = base
+        with self.assertRaisesRegex(supervisor.SupervisorRefusal, "matrix-semver-checkpoint-contract"):
+            service._semver_checkpoint({
+                "op": "semver-checkpoint", "event": "after-update",
+                "operation": "update", "manifest": manifest,
+            }, 900, supervisor.WORKER_UID)
+        self.assertEqual(active["trackers"], {})
+        self.assertEqual(active["events"], [])
+
+    def test_cgroup_launcher_attaches_before_fixed_privilege_drop_and_exec(self):
+        class ExecReached(BaseException):
+            pass
+
+        with tempfile.NamedTemporaryFile(delete=False) as cgroup_control:
+            cgroup_control_path = Path(cgroup_control.name)
+        descriptor = os.open(cgroup_control_path, os.O_RDONLY)
+        try:
+            arguments = ["--cgroup-fd", str(descriptor), "--",
+                         *cgroup_exec.SET_PRIV_PREFIX, *cgroup_exec.SEMVER_ARGUMENTS]
+            writes = []
+            calls = []
+
+            def write(fd, payload):
+                writes.append((fd, payload))
+                return len(payload)
+
+            def execve(path, command, environment):
+                calls.append((path, command, environment))
+                raise ExecReached()
+
+            with patch.object(cgroup_exec.os, "geteuid", return_value=0), \
+                    patch.object(cgroup_exec.resource, "setrlimit") as setrlimit, \
+                    patch.object(cgroup_exec.os, "umask"):
+                with self.assertRaises(ExecReached):
+                    cgroup_exec.main(arguments, write=write, execve=execve)
+            self.assertEqual(writes, [(descriptor, (str(os.getpid()) + "\n").encode("ascii"))])
+            self.assertEqual(calls[0][0], "/usr/bin/setpriv")
+            self.assertEqual(calls[0][1], [*cgroup_exec.SET_PRIV_PREFIX, *cgroup_exec.SEMVER_ARGUMENTS])
+            self.assertEqual(setrlimit.call_count, 5)
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            cgroup_control_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

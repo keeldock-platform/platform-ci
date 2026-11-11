@@ -29,7 +29,7 @@
       "diagnostic_codes": ["TS1005", "TS2322", "TS2339", "TS2345", "TS2551", "TS7006", "TS2307", "TS2688"]
     },
     "core-rust": {
-      "revision": 1,
+      "revision": 2,
       "budget_seconds": 8700,
       "rust_matrix": {
         "schema": 1,
@@ -59,14 +59,14 @@
           "vet-root", "vet-runtime", "vet-fuzz",
           "root-default", "root-all-features", "runtime-default", "runtime-all-features",
             "fuzz-default", "fuzz-all-features", "listener-default", "listener-all-features",
-            "fuzz-replay-default", "fuzz-replay-all-features"
+            "fuzz-replay-default", "fuzz-replay-all-features", "semver-runtime"
         ]
       },
       "commands": [],
-      "stages": ["format", "deny", "audit", "vet", "unit"],
+      "stages": ["format", "deny", "audit", "vet", "unit", "semver"],
       "test_ids": [],
       "file_ids": [],
-      "diagnostic_codes": ["E0001", "E0002", "E0277", "E0308", "E0425", "E0432", "E0599", "E0609"]
+      "diagnostic_codes": ["E0001", "E0002", "E0277", "E0308", "E0425", "E0432", "E0599", "E0609", "DEVLANE_SEMVER_FINDINGS", "DEVLANE_SEMVER_EXECUTION"]
     },
     "synthetic": {
       "revision": 1,

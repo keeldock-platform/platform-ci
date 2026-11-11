@@ -1,20 +1,24 @@
 import ast
 import hashlib
 import inspect
+import json
 import os
 import subprocess
 import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import bounded_registry_io
 import constraint_resolver
 import semver_cargo_wrapper
 import semver_offline_cache
 import semver_stage
 import supervisor
+import rust_tooling
 
 
 class Budget:
@@ -79,6 +83,65 @@ def _swap_regular_for_fifo(module, path, reader):
 
 
 class ToolReceiptTests(unittest.TestCase):
+    def test_semver_tool_preparation_writes_a_bound_receipt_and_readonly_copy(self):
+        phases = []
+
+        @contextmanager
+        def phase(name):
+            phases.append(name)
+            yield
+
+        def fake_download(_url, destination, _digest):
+            Path(destination).write_bytes(b"synthetic archive bytes")
+
+        def fake_binary(extract, name, _version):
+            executable = Path(extract) / name
+            executable.write_bytes(("synthetic-binary:" + name).encode("ascii"))
+            executable.chmod(0o500)
+            return executable
+
+        def fake_git(argv, **_kwargs):
+            if argv[:2] == ["git", "clone"]:
+                Path(argv[-1]).mkdir()
+                return subprocess.CompletedProcess(argv, 0, b"", b"")
+            if "rev-parse" in argv:
+                return subprocess.CompletedProcess(argv, 0, b"f" * 40 + b"\n", b"")
+            raise AssertionError("unexpected synthetic git operation")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "downloaded-tools"
+            prepared = root / "prepared"
+            prepared.mkdir()
+            with patch.object(rust_tooling, "_remaining", return_value=30), \
+                    patch.object(rust_tooling, "_download", side_effect=fake_download), \
+                    patch.object(rust_tooling, "_safe_extract"), \
+                    patch.object(rust_tooling, "_binary", side_effect=fake_binary), \
+                    patch.object(rust_tooling.subprocess, "run", side_effect=fake_git):
+                rust_tooling.fetch_tools(source, "synthetic-deadline", phase_context=phase)
+                receipt_bytes = (source / rust_tooling.SEMVER_RECEIPT).read_bytes()
+                receipt = json.loads(receipt_bytes.decode("ascii"))
+                rust_tooling.install(source, prepared, "synthetic-deadline")
+            self.assertEqual(receipt["schema"], "keeldock.prepared-semver-tool.v1")
+            self.assertEqual(receipt["asset_sha256"],
+                             rust_tooling.TOOLS["cargo-semver-checks"][1])
+            self.assertEqual(receipt["version"], "0.51.0")
+            self.assertEqual(receipt["version_output"], "cargo 0.51.0")
+            self.assertEqual(receipt["binary_sha256"],
+                             _sha((source / "cargo-semver-checks").read_bytes()))
+            self.assertEqual(receipt_bytes,
+                             json.dumps(receipt, sort_keys=True, separators=(",", ":"),
+                                        ensure_ascii=True).encode("ascii") + b"\n")
+            copied = prepared / "devlane-tools"
+            self.assertEqual((copied / "cargo-semver-checks").stat().st_mode & 0o777, 0o555)
+            self.assertEqual((copied / rust_tooling.SEMVER_RECEIPT).stat().st_mode & 0o777, 0o444)
+            self.assertEqual(semver_stage.verify_tool(source), source / "cargo-semver-checks")
+            self.assertEqual(semver_stage.verify_tool(copied), copied / "cargo-semver-checks")
+        self.assertEqual(phases.count("tool-cargo-semver-checks-download"), 1)
+        self.assertEqual(phases.count("tool-cargo-semver-checks-extract"), 1)
+        self.assertEqual(phases.count("tool-cargo-semver-checks-version"), 1)
+        self.assertEqual(phases.count("tool-cargo-semver-checks-copy"), 1)
+
     def test_consumer_matches_actual_verbose_producer_commands_and_loader(self):
         source = inspect.getsource(constraint_resolver.run_cargo_fixed_point)
         tree = ast.parse(source)
@@ -142,6 +205,53 @@ class ToolReceiptTests(unittest.TestCase):
             "--color=never",
         ])
         self.assertEqual(update["operation"], "update")
+
+    def test_official_cargo_argv_shapes_are_fixed_and_target_bound(self):
+        local_manifest = "/scratch/semver-target/semver-checks/local-example-runtime/Cargo.toml"
+        registry_manifest = "/scratch/semver-target/semver-checks/registry-smallvec/Cargo.toml"
+        update = semver_cargo_wrapper._parse_cargo_arguments([
+            "update", "--offline", "--manifest-path", local_manifest, "--color=never",
+        ])
+        metadata = semver_cargo_wrapper._parse_cargo_arguments([
+            "metadata", "--format-version", "1", "--no-deps",
+            "--manifest-path", local_manifest,
+        ])
+        doc = semver_cargo_wrapper._parse_cargo_arguments([
+            "doc", "--target-dir", "/scratch/semver-target",
+            "--package", "example-runtime@0.2.0", "--lib", "--no-deps",
+            "--color=never", "--target", "x86_64-unknown-linux-gnu",
+            "--manifest-path", registry_manifest,
+        ])
+        registry_metadata = semver_cargo_wrapper._parse_cargo_arguments([
+            "metadata", "--format-version", "1", "--no-deps",
+            "--manifest-path", registry_manifest,
+        ])
+        self.assertEqual((update["operation"], update["project_kind"]), ("update", "local"))
+        self.assertEqual((metadata["operation"], metadata["project_kind"]), ("metadata", "local"))
+        self.assertEqual((doc["operation"], doc["project_kind"]), ("doc", "registry"))
+        self.assertEqual(
+            (registry_metadata["operation"], registry_metadata["project_kind"]),
+            ("metadata", "registry"),
+        )
+        self.assertEqual(semver_stage.fixed_argv()[-2:], ["--target", semver_stage.TARGET_TRIPLE])
+        environment = semver_cargo_wrapper._cargo_environment()
+        self.assertEqual(environment["CARGO_TARGET_DIR"], "/scratch/semver-target")
+        self.assertEqual(environment["TMPDIR"], "/scratch/tmp")
+        self.assertEqual(environment["CARGO_HOME"], "/scratch/semver-cargo-home")
+        self.assertEqual(environment["CARGO_NET_OFFLINE"], "true")
+        self.assertEqual(environment["RUSTC_BOOTSTRAP"], "1")
+        self.assertIn("--output-format=json", environment["RUSTDOCFLAGS"])
+        self.assertEqual(environment["RUSTFLAGS"], "--cap-lints=allow")
+        for arguments in (
+            ["doc", "--target-dir", "/scratch/target", "--package", "bad@1.0.0",
+             "--lib", "--no-deps", "--color=never", "--target", semver_stage.TARGET_TRIPLE,
+             "--manifest-path", registry_manifest],
+            ["metadata", "--format-version", "1", "--no-deps", "--manifest-path",
+             "/scratch/semver-target/semver-checks/elsewhere/Cargo.toml"],
+        ):
+            with self.subTest(arguments=arguments), self.assertRaises(
+                    semver_cargo_wrapper.WrapperRefusal):
+                semver_cargo_wrapper._parse_cargo_arguments(arguments)
 
 
 class BoundedReaderTests(unittest.TestCase):
@@ -298,7 +408,9 @@ class SupervisorCheckpointTests(unittest.TestCase):
             "events": [],
             "work_deadline": time.monotonic() + 30,
             "cleanup_deadline": time.monotonic() + 60,
+            "ready": threading.Event(),
         }
+        active["ready"].set()
         service = object.__new__(supervisor.Service)
         service.root = Path(tempfile.gettempdir())
         service.semver_active = active
@@ -316,7 +428,7 @@ class SupervisorCheckpointTests(unittest.TestCase):
                 request = {"op": "semver-checkpoint", "event": "before-update",
                            "operation": "update", "manifest": manifest}
                 with self.assertRaises(supervisor.SupervisorRefusal):
-                    service._semver_checkpoint(request, 200)
+                    service._semver_checkpoint(request, 200, supervisor.WORKER_UID)
                 self.assertEqual(active["trackers"], {})
                 self.assertEqual(active["events"], [])
         with patch.object(supervisor.Service, "_semver_checkpoint_peer",
@@ -325,9 +437,108 @@ class SupervisorCheckpointTests(unittest.TestCase):
                              return_value=valid):
             request = {"op": "semver-checkpoint", "event": "before-update",
                        "operation": "update", "manifest": paths[0]}
-            self.assertEqual(service._semver_checkpoint(request, 200), {"ok": True})
+            self.assertEqual(
+                service._semver_checkpoint(request, 200, supervisor.WORKER_UID),
+                {"ok": True},
+            )
         self.assertEqual(set(active["trackers"]), {str(Path(paths[0]).parent)})
         self.assertEqual(len(active["events"]), 1)
+
+
+class TeardownTests(unittest.TestCase):
+    def test_namespace_wide_signals_refuse_before_any_signal_on_host(self):
+        for function in (supervisor._signal_workload_descendants,
+                         supervisor._kill_workload_descendants):
+            for platform, pid in (("darwin", 1), ("linux", 1234)):
+                with self.subTest(function=function.__name__, platform=platform, pid=pid), \
+                        patch.object(supervisor.sys, "platform", platform), \
+                        patch.object(supervisor.os, "getpid", return_value=pid), \
+                        patch.object(supervisor.os, "kill") as kill, \
+                        patch.object(supervisor.os, "killpg") as killpg:
+                    with self.assertRaises(supervisor.SupervisorRefusal):
+                        function()
+                    kill.assert_not_called()
+                    killpg.assert_not_called()
+
+    def test_real_cleanup_accepts_initially_empty_and_occupied_to_empty_rosters(self):
+        for initial in (b"", b"777\n"):
+            with self.subTest(initial=initial), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                (root / "cgroup.procs").write_bytes(initial)
+                (root / "cgroup.events").write_bytes(b"populated 0\nfrozen 0\n")
+                removed = []
+
+                class JobPath:
+                    def __truediv__(self, name):
+                        return root / name
+
+                    def rmdir(self):
+                        removed.append(True)
+
+                job = Mock(path=JobPath())
+                service = object.__new__(supervisor.Service)
+                budget = bounded_registry_io.PhaseBudget(time.monotonic() - 5,
+                                                          time.monotonic() + 30)
+                with patch.object(service, "_semver_kill_cgroup",
+                                  side_effect=lambda _job: (root / "cgroup.procs").write_bytes(b"")), \
+                        patch.object(supervisor.os, "waitpid", side_effect=ChildProcessError), \
+                        patch.object(supervisor.time, "sleep"):
+                    self.assertTrue(service._semver_cleanup_cgroup({"job": job}, None, budget))
+                self.assertEqual(removed, [True])
+                job.close_attach.assert_called_once()
+
+    def test_shutdown_recovers_handed_off_job_after_work_expiry(self):
+        service = object.__new__(supervisor.Service)
+        service.stop_semver_worker_socket = Mock()
+        service.semver_worker_accept_thread = None
+        service.semver_worker_threads_lock = threading.Lock()
+        service.semver_worker_threads = set()
+        service.semver_active_lock = threading.Lock()
+        done = threading.Event()
+        done.set()
+        active = {"owner_done": done, "cleanup_failed": True, "ready": threading.Event(),
+                  "work_deadline": time.monotonic() - 10,
+                  "cleanup_deadline": time.monotonic() + 30,
+                  "job": Mock(), "process": Mock(pid=987)}
+        service.semver_active = active
+
+        def reap(actual, process, budget):
+            self.assertIs(actual, active)
+            self.assertGreater(budget.remaining(cleanup=True), 0)
+            with self.assertRaises(bounded_registry_io.Refusal):
+                budget.remaining()
+            return True
+
+        with patch.object(service, "_semver_cleanup_cgroup", side_effect=reap) as reaper:
+            service._shutdown_semver_workers()
+        reaper.assert_called_once()
+        self.assertIsNone(service.semver_active)
+        self.assertTrue(active["ready"].is_set())
+
+    def test_outer_cleanup_attempts_namespace_reap_and_shredding_after_shutdown_refusal(self):
+        service = object.__new__(supervisor.Service)
+        events = []
+
+        def shutdown():
+            events.append("shutdown")
+            raise supervisor.SupervisorRefusal("matrix-semver-cgroup-cleanup")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            service.root = Path(temporary) / "absent"
+            with patch.object(service, "_shutdown_semver_workers", side_effect=shutdown), \
+                    patch.object(supervisor, "_signal_workload_descendants"), \
+                    patch.object(supervisor, "_kill_workload_descendants",
+                                 side_effect=lambda: events.append("namespace-reap")), \
+                    patch.object(supervisor, "_shred_tree",
+                                 side_effect=lambda _path: events.append("shred") or True), \
+                    patch.object(supervisor.os.path, "ismount", return_value=False), \
+                    patch.object(supervisor, "MOUNT_TARGETS", []):
+                with self.assertRaises(supervisor.SupervisorRefusal):
+                    service._cleanup()
+        self.assertEqual(events[:3], ["shutdown", "namespace-reap", "shutdown"])
+        self.assertIn("shred", events)
+        supervisor.CANCEL_REQUESTED.clear()
+
 
 
 if __name__ == "__main__":

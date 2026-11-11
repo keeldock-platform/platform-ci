@@ -46,16 +46,17 @@
   },
   "offline_cache": {
     "schema": "keeldock.rust-v2-semver-execution-inputs.v1",
-    "helper_sha256": "d2eccd210ef2f466e927daa3b5b9b1fccddb23c1a5b2387714464cbe58389b14",
-    "wrapper_sha256": "63ba0974db2388b3462f7dddded28fa7f89e5a60575a88ae68d8de9b17712336",
+    "helper_sha256": "6c0436afc81b570d805c6877b7286489b620244ac605527e26fb2e4eb972c199",
+    "wrapper_sha256": "0283e88b71a68ac00dc0d9b1aa4fc0265febdd1638048d931ee0dd7f1d069ba8",
     "support_modules": {
-      "bounded_registry_io.py": "4ba0d03215642857306056f8a52e051a67056642fca1b42c15921abddba584d5",
+      "bounded_registry_io.py": "ed5dcb8a3c746bfc7ccc2220287633fa2a4ee51ad2acf99a6e85ebf6da570f67",
       "cargo_projection.py": "ea0557e6a1d72dacbaa2449449d8ce994f579d8b42bb6263e25643a6da447328",
-      "constraint_resolver.py": "d66ea2eef15d91aa4eb4e97d443efaed3c760f4820c0877e554f349e87452e73",
+      "constraint_resolver.py": "e29d1a4bf3bf8068ef38b0ffba3ca401cbbf1bcd221c83fc1b72979bfac74b4f",
       "registry_prefetch.py": "585c02674ca6532b09a4ad426217c34f7a8279412d947b28fb33ebfe8525a45a",
       "rust_lock_generation.py": "86b999e05b6c24e320591f9a1e2853dcdd7e68615936b42707669c866fa9d3b5",
       "rust_preparation_v2.py": "f38b3049d0cfbf852406a3dc807341a8bba482e3a2f25530fa390a6182e86422",
-      "temp_project_checkpoints.py": "93e47b3867f6c5e4c7051f5705fc4acea765438c88c73ba272941f6ea11db299"
+      "temp_project_checkpoints.py": "93e47b3867f6c5e4c7051f5705fc4acea765438c88c73ba272941f6ea11db299",
+      "cgroup_exec.py": "8a8a7dbaa74488d7cc70fbd6630c19cb46c9c3311da1c579e6c17666a3b34dba"
     },
     "replay_mode": "verified-final-payload-only"
   }
