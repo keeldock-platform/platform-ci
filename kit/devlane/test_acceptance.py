@@ -503,7 +503,9 @@ class SupervisorOrderAcceptanceTests(unittest.TestCase):
             "cargo_path": "", "rustc_path": "",
         })()
         service = type("Service", (), {
-            "prepare": lambda self: (_ for _ in ()).throw(supervisor.SupervisorRefusal("startup-refused")),
+            "prepare": lambda self: (_ for _ in ()).throw(
+                supervisor.SupervisorRefusal("projection-binding-mismatch")
+            ),
             "cleanup_calls": 0,
             "_cleanup": lambda self: setattr(self, "cleanup_calls", self.cleanup_calls + 1) or {"ok": True},
         })()
@@ -516,7 +518,7 @@ class SupervisorOrderAcceptanceTests(unittest.TestCase):
                 refusal = bundle.strict_json(
                     (Path(args.state_dir) / supervisor.STARTUP_REFUSAL_NAME).read_bytes(), 1024,
                 )
-                self.assertEqual(refusal, {"code": "startup-refused"})
+                self.assertEqual(refusal, {"code": "projection-binding-mismatch"})
         finally:
             supervisor.CANCEL_REQUESTED.clear()
             import shutil

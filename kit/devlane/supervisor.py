@@ -27,6 +27,7 @@ import deadline as deadline_budget
 import fetch
 import filter as output_filter
 import network_probe
+import prepare as node_tool_prepare
 
 
 MAX_RPC = 32 * 1024
@@ -44,6 +45,94 @@ CANCEL_REQUESTED = threading.Event()
 SERVICE_LOCK = threading.RLock()
 MOUNT_TARGETS = []
 ACTIVE_DEADLINE_FILE = ""
+
+REFUSAL_CODES = frozenset((
+    "allowlisted-file-too-large", "allowlisted-file-unavailable", "browser-profile-command",
+    "bundle-binding-mismatch", "cargo-lock-binding-missing", "cargo-lock-projection-invalid",
+    "cargo-projection-mismatch", "cargo-vendor-missing", "cargo-workspace-count-mismatch",
+    "cargo-workspace-lock-set", "cargo-workspace-projection-invalid", "cargo-workspace-projection-mismatch",
+    "cleanup-incomplete", "cleanup-process-remains", "cleanup-receipt-invalid", "cleanup-root-invalid",
+    "control-operation-invalid", "control-protocol-size", "control-protocol-truncated",
+    "control-request-invalid", "control-response-invalid", "deadline-file-invalid", "decrypt-key-unavailable",
+    "decrypt-manifest-unavailable", "decrypt-order", "decrypt-rejected", "decrypt-timeout",
+    "dispatch-context-invalid", "dispatch-context-unavailable", "execution-cancelled", "execution-order",
+    "firewall-unavailable", "input-size", "input-unavailable", "key-invalid", "linux-root-required",
+    "linux-runner-required", "mount-source-unavailable", "network-namespace-changed",
+    "network-namespace-not-isolated", "network-probe-failed", "node-tool-layout",
+    "node-toolchain-executable", "node-toolchain-missing", "node-toolchain-owner",
+    "node-toolchain-permissions", "node-toolchain-version", "npm-lock-binding-missing",
+    "npm-lock-projection-invalid", "npm-projection-mismatch", "positive-control-failed",
+    "positive-control-unavailable", "prepared-file-count", "prepared-input-invalid", "prepared-link-invalid",
+    "prepared-member-type", "prepared-tree-size", "probe-replay", "profile-command-invalid",
+    "profile-command-set", "profile-config-invalid", "profile-config-unavailable", "profile-unknown",
+    "projection-binding-mismatch", "projection-invalid", "raw-record-size", "record-count",
+    "report-file-changed", "report-file-invalid", "report-file-size", "rust-matrix-coverage-incomplete",
+    "rust-matrix-report-exists", "rust-matrix-report-incomplete", "rust-matrix-report-invalid",
+    "rust-matrix-report-unavailable", "rust-matrix-status-mismatch", "rust-tool-layout",
+    "rust-toolchain-missing", "rust-toolchain-path", "state-directory-not-empty",
+    "state-directory-permissions", "summary-catalog-invalid", "summary-not-ready",
+    "summary-response-invalid", "supervisor-failed", "supervisor-operation-failed",
+    "supervisor-start-failed", "supervisor-start-timeout", "supervisor-unavailable", "swap-enabled",
+    "swap-state-unavailable", "tool-manifest-invalid", "tool-path-invalid", "tool-version-mismatch",
+    "tool-version-unavailable", "total-deadline-exhausted", "total-deadline-unavailable",
+    "typescript-report-incomplete",
+))
+STARTUP_REFUSAL_CODES = frozenset((
+    "deadline-file-invalid", "dispatch-context-invalid", "dispatch-context-unavailable",
+    "firewall-unavailable", "input-size", "input-unavailable", "linux-root-required",
+    "linux-runner-required", "mount-source-unavailable", "node-tool-layout", "node-toolchain-executable",
+    "node-toolchain-missing", "node-toolchain-owner", "node-toolchain-permissions", "node-toolchain-version",
+    "positive-control-failed", "positive-control-unavailable",
+    "profile-config-invalid", "profile-config-unavailable", "profile-unknown",
+    "projection-binding-mismatch", "projection-invalid", "report-file-changed", "report-file-invalid",
+    "report-file-size", "rust-tool-layout", "rust-toolchain-missing", "rust-toolchain-path",
+    "state-directory-not-empty", "state-directory-permissions", "supervisor-failed",
+    "supervisor-operation-failed", "supervisor-start-failed", "supervisor-start-timeout",
+    "swap-enabled", "swap-state-unavailable", "tool-manifest-invalid", "tool-path-invalid",
+    "tool-version-mismatch", "tool-version-unavailable", "total-deadline-exhausted",
+    "total-deadline-unavailable",
+))
+STARTUP_DIAGNOSTIC_PHASES = frozenset((
+    "construct", "deadline", "projection", "linux", "swap", "priv-mount", "firewall",
+    "root-mount", "bundle-bind", "tools", "profile", "versions", "socket", "listen",
+    "ready", "serve", "parent",
+))
+_STARTUP_EXCEPTION_LABELS = {
+    AssertionError: "assertion", AttributeError: "attribute", FileExistsError: "file-exists",
+    FileNotFoundError: "file-missing", IsADirectoryError: "is-directory", KeyError: "key",
+    NameError: "name", NotADirectoryError: "not-directory", OSError: "os",
+    PermissionError: "permission", RuntimeError: "runtime", TimeoutError: "timeout",
+    TypeError: "type", ValueError: "value", UnicodeError: "unicode",
+    UnicodeDecodeError: "unicode-decode", json.JSONDecodeError: "json-decode",
+    subprocess.SubprocessError: "subprocess", subprocess.TimeoutExpired: "proc-timeout",
+    subprocess.CalledProcessError: "proc-exit", ImportError: "import", ModuleNotFoundError: "module-missing",
+    MemoryError: "memory", OverflowError: "overflow", IndexError: "index",
+}
+STARTUP_DIAGNOSTIC_CODES = frozenset(
+    "child-" + phase + "-" + label
+    for phase in STARTUP_DIAGNOSTIC_PHASES
+    for label in {*_STARTUP_EXCEPTION_LABELS.values(), "unclassified"}
+)
+
+
+def _startup_exception_code(phase, error):
+    trusted_phase = phase if phase in STARTUP_DIAGNOSTIC_PHASES else "serve"
+    label = _STARTUP_EXCEPTION_LABELS.get(type(error), "unclassified")
+    return "child-" + trusted_phase + "-" + label
+
+
+def _record_startup_refusal(state_dir, owner_uid, code):
+    if code not in STARTUP_REFUSAL_CODES and code not in STARTUP_DIAGNOSTIC_CODES:
+        code = "supervisor-failed"
+    refusal_path = Path(state_dir) / STARTUP_REFUSAL_NAME
+    payload = json.dumps({"code": code}, sort_keys=True, separators=(",", ":")).encode("ascii")
+    descriptor = os.open(refusal_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                         | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(descriptor, "wb") as output:
+        os.fchown(output.fileno(), owner_uid, -1)
+        output.write(payload)
+        output.flush()
+        os.fsync(output.fileno())
 
 
 class SupervisorRefusal(ValueError):
@@ -694,16 +783,34 @@ def _summary_failed(summary):
     return False
 
 
-def _preflight_tools(profile, projection, tool_paths):
+def _node_tool_versions(paths, owner_uid):
+    def run(argv, *, env):
+        try:
+            return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, timeout=_bounded_timeout(10),
+                                  check=False, env=env)
+        except (OSError, subprocess.SubprocessError):
+            _refuse("tool-version-unavailable")
+
+    try:
+        validated, results = node_tool_prepare.run_node_version_checks(paths, owner_uid, run)
+    except bundle.Refusal as error:
+        _refuse(str(error))
+    versions = {}
+    for name, result in results.items():
+        if result.returncode != 0:
+            _refuse("tool-version-unavailable")
+        try:
+            versions[name] = result.stdout.decode("ascii", "strict").strip()
+        except UnicodeDecodeError:
+            _refuse("tool-version-unavailable")
+    return validated, versions
+
+
+def _preflight_tools(profile, projection, tool_paths, owner_uid=None):
     """Keep the selected profile pinned to already prepared executable paths."""
     paths = dict(tool_paths)
-    for name, path in paths.items():
-        if path is None:
-            continue
-        real = Path(path).resolve(strict=True)
-        if not real.is_file() or real.is_symlink():
-            _refuse("tool-path-invalid")
-    if profile == "core-node" and (not paths["node"] or not paths["npm"]):
+    if profile == "core-node" and (not paths.get("node") or not paths.get("npm")):
         _refuse("node-toolchain-missing")
     if profile == "core-rust" and (not paths["cargo"] or not paths["rustc"]):
         _refuse("rust-toolchain-missing")
@@ -712,35 +819,51 @@ def _preflight_tools(profile, projection, tool_paths):
     required = {"node", "npm"} if profile == "core-node" else ({"cargo", "rustc"} if profile == "core-rust" else set())
     if set(projection["tools"]) != required:
         _refuse("tool-manifest-invalid")
+    node_root = None
+    node_versions = None
+    if profile == "core-node":
+        node_tool_info, node_versions = _node_tool_versions(paths, owner_uid)
+        node_root = Path(node_tool_info["root"])
+        paths.update({name: node_tool_info[name] for name in ("node", "npm", "npm_cli")})
+    for name in ("node", "npm", "cargo", "rustc"):
+        path = paths.get(name)
+        if path is None or path == "":
+            continue
+        try:
+            real = Path(path).resolve(strict=True)
+        except OSError:
+            _refuse("tool-path-invalid")
+        if not real.is_file() or real.is_symlink():
+            _refuse("tool-path-invalid")
     for name, expected_version in projection["tools"].items():
         if name not in paths or not paths[name] or type(expected_version) is not str:
             _refuse("tool-manifest-invalid")
-        try:
-            version = subprocess.run([paths[name], "--version"], stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL, timeout=_bounded_timeout(10), check=False,
-                                     env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}).stdout.decode("ascii", "strict").strip()
-        except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
-            _refuse("tool-version-unavailable")
         expected_text = ("v" + expected_version) if name == "node" else expected_version
-        if name in ("npm", "node"):
-            actual_version = version
-        elif name == "cargo":
-            actual_version = version.split()[1] if len(version.split()) >= 2 else ""
-        elif name == "rustc":
-            actual_version = version.split()[1] if len(version.split()) >= 2 else ""
+        if profile == "core-node":
+            actual_version = node_versions[name]
         else:
-            actual_version = version
+            try:
+                output = subprocess.run([paths[name], "--version"], stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                        timeout=_bounded_timeout(10), check=False,
+                                        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}).stdout
+                version = output.decode("ascii", "strict").strip()
+            except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+                _refuse("tool-version-unavailable")
+            if name in ("cargo", "rustc"):
+                words = version.split()
+                actual_version = words[1] if len(words) >= 2 else ""
+            else:
+                actual_version = version
         if name == "node" and actual_version != expected_text:
             _refuse("tool-version-mismatch")
         if name != "node" and actual_version != expected_version:
             _refuse("tool-version-mismatch")
-        _hash_file(paths[name], 256 * 1024 * 1024)
-    node_root = None
+        _hash_file(paths["npm_cli"] if profile == "core-node" and name == "npm" else paths[name],
+                   256 * 1024 * 1024)
     rust_root = None
-    if paths.get("node"):
-        node_root = str(Path(paths["node"]).resolve().parent.parent)
-        if not Path(paths["npm"]).resolve().is_relative_to(Path(node_root)):
-            _refuse("node-tool-layout")
+    if node_root:
+        node_root = str(node_root)
     if paths.get("cargo"):
         rust_root = str(Path(paths["cargo"]).resolve().parent.parent)
         if not Path(paths["rustc"]).resolve().is_relative_to(Path(rust_root)):
@@ -911,6 +1034,7 @@ class Service:
     def __init__(self, state_dir, context_path, workspace, prepared, bundle_path, projection_path,
                  host_net_inode, owner_uid, tool_paths, deadline_file):
         global ACTIVE_DEADLINE_FILE
+        self.startup_phase = "construct"
         self.state_dir = Path(state_dir)
         self.context = _context_from_file(context_path)
         self.workspace = Path(workspace).resolve(strict=True)
@@ -936,21 +1060,31 @@ class Service:
         self.mounts = []
 
     def prepare(self):
+        self.startup_phase = "deadline"
         try:
             self.deadline = deadline_budget._read(self.deadline_file)["work_deadline"]
             deadline_budget.remaining(self.deadline_file)
         except (OSError, deadline_budget.DeadlineRefusal):
             _refuse("total-deadline-unavailable")
+        self.startup_phase = "projection"
         _projection_bytes, projection_value = _bound_projection(self.context, self.projection_path)
+        self.startup_phase = "linux"
         _require_linux_root()
+        self.startup_phase = "swap"
         _require_swap_disabled()
+        self.startup_phase = "priv-mount"
         _mount_private()
+        self.startup_phase = "firewall"
         _configure_firewall()
+        self.startup_phase = "root-mount"
         _mount_minimal_root(self.root, self.workspace, self.prepared, self.workspace)
+        self.startup_phase = "bundle-bind"
         _mount_bind(self.bundle_path, self.root / "control/bundle.enc", readonly=True)
+        self.startup_phase = "tools"
         _ensure_directory(self.root / "tools/node")
         _ensure_directory(self.root / "tools/rust")
-        self.tool_info = _preflight_tools(self.context["profile"], projection_value, self.tool_paths)
+        self.tool_info = _preflight_tools(self.context["profile"], projection_value,
+                                         self.tool_paths, self.owner_uid)
         if self.tool_info["node_root"]:
             _mount_bind(self.tool_info["node_root"], self.root / "tools/node", readonly=True)
         if self.tool_info["rust_root"]:
@@ -962,17 +1096,16 @@ class Service:
             self.root / "tools/rust", self.root / "tools/node", self.root / "lib64", self.root / "lib",
             self.root / "usr", self.root,
         ]
+        self.startup_phase = "profile"
         self.profile_config = _read_profiles(self.root)
         self.projection_value = projection_value
         if self.context["profile"] == "core-node":
-            node_version = subprocess.run([self.tool_info["paths"]["node"], "--version"], stdout=subprocess.PIPE,
-                                          stderr=subprocess.DEVNULL, timeout=_bounded_timeout(10), check=False)
-            npm_version = subprocess.run([self.tool_info["paths"]["npm"], "--version"], stdout=subprocess.PIPE,
-                                         stderr=subprocess.DEVNULL, timeout=_bounded_timeout(10), check=False)
-            if node_version.returncode != 0 or npm_version.returncode != 0:
+            self.startup_phase = "versions"
+            _node_info, versions = _node_tool_versions(self.tool_info["paths"], self.owner_uid)
+            if versions != {"node": "v" + node_tool_prepare.NODE_VERSION,
+                            "npm": node_tool_prepare.NPM_VERSION}:
                 _refuse("node-toolchain-version")
-            if node_version.stdout.strip() != b"v24.22.1" or npm_version.stdout.strip() != b"11.19.1":
-                _refuse("node-toolchain-version")
+        self.startup_phase = "ready"
         return True
 
     def _probe(self):
@@ -1324,6 +1457,8 @@ def _serve(args):
     workers = []
     shutdown = threading.Event()
     result = 2
+    startup_phase = "construct"
+    ready = False
     try:
         service = Service(
             args.state_dir, args.context, args.workspace, args.prepared,
@@ -1331,19 +1466,25 @@ def _serve(args):
             {"node": args.node_path or None, "npm": args.npm_path or None,
              "cargo": args.cargo_path or None, "rustc": args.rustc_path or None}, args.deadline_file,
         )
+        startup_phase = "prepare"
         service.prepare()
+        startup_phase = "socket"
         socket_path = Path(args.state_dir) / SOCKET_NAME
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server.bind(str(socket_path))
         os.chown(str(socket_path), args.owner_uid, -1)
         os.chmod(str(socket_path), 0o600)
+        startup_phase = "listen"
         server.listen(8)
         server.settimeout(0.5)
+        startup_phase = "ready"
         ready_path = Path(args.state_dir) / READY_NAME
         """The supervisor's PID inside its own namespace is not a host identity; the privileged cleanup client resolves the host PID from the host /proc."""
         ready_path.write_text(json.dumps({"ready": True}), encoding="ascii")
         os.chown(str(ready_path), args.owner_uid, -1)
         os.chmod(str(ready_path), 0o600)
+        ready = True
+        startup_phase = "serve"
 
         def handle(connection):
             with connection:
@@ -1391,20 +1532,21 @@ def _serve(args):
             worker.start()
         result = 0
     except SupervisorRefusal as error:
-        try:
-            refusal_path = Path(args.state_dir) / STARTUP_REFUSAL_NAME
-            payload = json.dumps({"code": error.code}, sort_keys=True, separators=(",", ":")).encode("ascii")
-            descriptor = os.open(refusal_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                                 | getattr(os, "O_NOFOLLOW", 0), 0o600)
-            with os.fdopen(descriptor, "wb") as output:
-                os.fchown(output.fileno(), args.owner_uid, -1)
-                output.write(payload)
-                output.flush()
-                os.fsync(output.fileno())
-        except OSError:
-            pass
+        if not ready:
+            try:
+                _record_startup_refusal(args.state_dir, args.owner_uid, error.code)
+            except OSError:
+                pass
         result = 2
-    except Exception:
+    except Exception as error:
+        if not ready:
+            phase = service.startup_phase if startup_phase == "prepare" and service is not None else startup_phase
+            try:
+                _record_startup_refusal(
+                    args.state_dir, args.owner_uid, _startup_exception_code(phase, error),
+                )
+            except OSError:
+                pass
         result = 2
     finally:
         shutdown.set()
@@ -1453,8 +1595,23 @@ def _start(args):
         _refuse("positive-control-unavailable")
     if positive != {"connected": True, "target": "public-tls-control"}:
         _refuse("positive-control-failed")
-    tool_paths = {name: getattr(args, name + "_path") or shutil.which(name) or ""
-                  for name in ("node", "npm", "cargo", "rustc")}
+    if context["profile"] == "core-node":
+        tool_paths = {
+            "node": getattr(args, "node_path") or "", "npm": getattr(args, "npm_path") or "",
+            "cargo": "", "rustc": "",
+        }
+        try:
+            node_tool_info = node_tool_prepare.validate_node_toolchain(tool_paths, os.getuid())
+        except bundle.Refusal as error:
+            _refuse(str(error))
+        tool_paths["node"] = node_tool_info["node"]
+        tool_paths["npm"] = node_tool_info["npm"]
+    else:
+        tool_paths = {
+            "node": "", "npm": "",
+            "cargo": getattr(args, "cargo_path") or shutil.which("cargo") or "",
+            "rustc": getattr(args, "rustc_path") or shutil.which("rustc") or "",
+        }
     if context["profile"] == "core-rust":
         try:
             for name in ("cargo", "rustc"):
@@ -1506,7 +1663,8 @@ def _start(args):
                     refusal = bundle.strict_json(refusal_path.read_bytes(), 1024)
                     if (type(refusal) is dict and set(refusal) == {"code"}
                             and type(refusal["code"]) is str
-                            and re.fullmatch(r"[a-z][a-z0-9-]{0,63}", refusal["code"])):
+                            and (refusal["code"] in STARTUP_REFUSAL_CODES
+                                 or refusal["code"] in STARTUP_DIAGNOSTIC_CODES)):
                         code = refusal["code"]
                 except (OSError, bundle.Refusal):
                     pass
@@ -1524,8 +1682,8 @@ def _start(args):
         _refuse("supervisor-start-timeout")
     except SupervisorRefusal:
         raise
-    except Exception:
-        _refuse("supervisor-start-failed")
+    except Exception as error:
+        _refuse(_startup_exception_code("parent", error))
 
 
 def _client(args):
@@ -1658,8 +1816,10 @@ def main(argv=None):
     except SupervisorRefusal as error:
         print("devlane_supervisor_refusal=" + error.code, file=sys.stderr)
         return 2
-    except Exception:
-        print("devlane_supervisor_refusal=supervisor-failed", file=sys.stderr)
+    except Exception as error:
+        code = (_startup_exception_code("parent", error) if args.operation == "start"
+                else "supervisor-failed")
+        print("devlane_supervisor_refusal=" + code, file=sys.stderr)
         return 2
 
 

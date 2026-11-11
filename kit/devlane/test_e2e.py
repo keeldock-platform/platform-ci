@@ -50,6 +50,7 @@ import rust_matrix_runner
 import rust_tooling
 import deadline as deadline_budget
 import filter as output_filter
+import supervisor
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -86,9 +87,10 @@ DIAGNOSTIC_PHASES = frozenset((
     "variant-projection-write", "variant-source-build", "variant-archive-build", "variant-rust-archive-verify",
     "variant-envelope-build", "variant-context-build", "variant-context-validate", "variant-context-write",
     "variant-positive-control",
-    "variant-supervisor-start", "variant-startup-tamper", "variant-startup-command",
-    "variant-startup-refusal-check", "variant-supervisor-probe",
-    "variant-key-create", "variant-decrypt", "variant-key-cleanup", "variant-execute",
+    "variant-supervisor-start", "variant-supervisor-start-command", "variant-supervisor-start-check",
+    "variant-startup-tamper", "variant-startup-command", "variant-startup-refusal-check",
+    "variant-supervisor-probe-command", "variant-supervisor-probe-check",
+    "variant-key-create", "variant-decrypt", "variant-decrypt-check", "variant-key-cleanup", "variant-execute",
     "variant-summary-validate", "variant-host-cleanup", "variant-teardown-confirm",
     "variant-host-cleanup-finally", "variant-teardown-confirm-finally",
 ))
@@ -126,33 +128,35 @@ _EXCEPTION_CATEGORIES = {
     rust_tooling.ToolingRefusal: "tooling-refusal",
 }
 
-STARTUP_REFUSAL_CODES = frozenset((
-    "deadline-file-invalid", "dispatch-context-invalid", "dispatch-context-unavailable",
-    "firewall-unavailable", "input-size", "input-unavailable", "linux-root-required",
-    "linux-runner-required", "mount-source-unavailable", "node-tool-layout",
-    "node-toolchain-missing", "node-toolchain-version", "positive-control-failed",
-    "positive-control-unavailable", "profile-config-invalid", "profile-config-unavailable",
-    "profile-unknown", "projection-binding-mismatch", "projection-invalid", "report-file-changed",
-    "report-file-invalid", "report-file-size", "rust-tool-layout", "rust-toolchain-missing",
-    "rust-toolchain-path", "state-directory-not-empty", "state-directory-permissions",
-    "supervisor-failed", "supervisor-operation-failed", "supervisor-start-failed",
-    "supervisor-start-timeout", "swap-enabled", "swap-state-unavailable", "tool-manifest-invalid",
-    "tool-path-invalid", "tool-version-mismatch", "tool-version-unavailable",
-    "total-deadline-exhausted", "total-deadline-unavailable",
-))
+STARTUP_REFUSAL_CODES = supervisor.STARTUP_REFUSAL_CODES
+SUPERVISOR_OPERATION_REFUSAL_CODES = supervisor.REFUSAL_CODES - STARTUP_REFUSAL_CODES
+SUPERVISOR_REFUSAL_CODES = (STARTUP_REFUSAL_CODES | supervisor.REFUSAL_CODES
+                            | supervisor.STARTUP_DIAGNOSTIC_CODES)
 _STARTUP_DIAGNOSTIC_CATEGORIES = STARTUP_REFUSAL_CODES | frozenset((
     "startup-exit-one", "startup-exit-signal", "startup-exit-unexpected",
     "startup-import-failure", "startup-output-canary", "startup-parser-refusal",
     "startup-refusal-unlisted", "startup-stderr-empty", "startup-stderr-invalid",
+    "startup-success-output-invalid", "startup-success-output-missing", "startup-success-stderr",
     "startup-traceback", "startup-unexpected-success", "startup-stdout-unexpected",
 ))
+_STARTUP_DIAGNOSTIC_CATEGORIES |= SUPERVISOR_OPERATION_REFUSAL_CODES
+_STARTUP_DIAGNOSTIC_CATEGORIES |= supervisor.STARTUP_DIAGNOSTIC_CODES
+_REFUSAL_CATEGORY_ALIASES = {
+    "cargo-workspace-projection-invalid": "cargo-ws-projection-invalid",
+    "cargo-workspace-projection-mismatch": "cargo-ws-projection-mismatch",
+}
+_STARTUP_DIAGNOSTIC_CATEGORIES |= frozenset(_REFUSAL_CATEGORY_ALIASES.values())
 
 
 class StartupRefusalMismatch(RuntimeError):
     """A startup result that differs from the one exact expected refusal."""
 
     def __init__(self, category):
-        self.category = category if category in _STARTUP_DIAGNOSTIC_CATEGORIES else "startup-refusal-unlisted"
+        self.refusal_code = category if category in SUPERVISOR_REFUSAL_CODES else ""
+        if category in _STARTUP_DIAGNOSTIC_CATEGORIES:
+            self.category = _REFUSAL_CATEGORY_ALIASES.get(category, category)
+        else:
+            self.category = "startup-refusal-unlisted"
         super().__init__("startup-refusal-contract-mismatch")
 
 
@@ -1032,40 +1036,82 @@ def _supervisor(*arguments):
     return [sys.executable, "-B", str(ROOT / "kit/devlane/supervisor.py"), *arguments]
 
 
-def _assert_startup_projection_refusal(result):
+def _assert_supervisor_result(result, expected_returncode, expected_stdout, expected_stderr):
     stdout = result.stdout if type(result.stdout) is bytes else b""
     stderr = result.stderr if type(result.stderr) is bytes else b""
     if _contains_output_canary(stdout + stderr):
         raise StartupRefusalMismatch("startup-output-canary")
-    if result.stdout != b"":
-        raise StartupRefusalMismatch("startup-stdout-unexpected")
     if b"ModuleNotFoundError:" in stderr or b"ImportError:" in stderr:
         raise StartupRefusalMismatch("startup-import-failure")
     if b"Traceback (most recent call last):" in stderr:
         raise StartupRefusalMismatch("startup-traceback")
-    if result.returncode != 2:
+    if (type(result.stdout) is not bytes or type(result.stderr) is not bytes
+            or type(result.returncode) is not int):
+        raise StartupRefusalMismatch("startup-stderr-invalid")
+    if not expected_stdout and stdout:
+        raise StartupRefusalMismatch("startup-stdout-unexpected")
+    if result.returncode != expected_returncode and stdout and stdout != expected_stdout:
+        raise StartupRefusalMismatch("startup-stdout-unexpected")
+    if (result.returncode == expected_returncode and stdout == expected_stdout
+            and stderr == expected_stderr):
+        return
+
+    if result.returncode == 2 and not stdout:
+        if stderr.startswith(b"usage: ") or b"error: the following arguments are required" in stderr:
+            raise StartupRefusalMismatch("startup-parser-refusal")
+        refusal = re.fullmatch(rb"devlane_supervisor_refusal=([a-z][a-z0-9-]{0,63})\n", stderr)
+        if refusal is not None:
+            code = refusal.group(1).decode("ascii")
+            raise StartupRefusalMismatch(code if code in SUPERVISOR_REFUSAL_CODES else "startup-refusal-unlisted")
+        if not stderr:
+            raise StartupRefusalMismatch("startup-stderr-empty")
+        if b"usage:" in stderr or b"error:" in stderr:
+            raise StartupRefusalMismatch("startup-parser-refusal")
+        raise StartupRefusalMismatch("startup-stderr-invalid")
+
+    if result.returncode != expected_returncode:
         if result.returncode == 0:
             category = "startup-unexpected-success"
         elif result.returncode == 1:
             category = "startup-exit-one"
-        elif type(result.returncode) is int and result.returncode < 0:
+        elif result.returncode < 0:
             category = "startup-exit-signal"
         else:
             category = "startup-exit-unexpected"
         raise StartupRefusalMismatch(category)
-    if stderr == b"devlane_supervisor_refusal=projection-binding-mismatch\n":
-        return
-    if stderr.startswith(b"usage: ") or b"error: the following arguments are required" in stderr:
-        raise StartupRefusalMismatch("startup-parser-refusal")
-    refusal = re.fullmatch(rb"devlane_supervisor_refusal=([a-z][a-z0-9-]{0,63})\n", stderr)
-    if refusal is not None:
-        code = refusal.group(1).decode("ascii")
-        raise StartupRefusalMismatch(code if code in STARTUP_REFUSAL_CODES else "startup-refusal-unlisted")
-    if not stderr:
-        raise StartupRefusalMismatch("startup-stderr-empty")
-    if b"usage:" in stderr or b"error:" in stderr:
-        raise StartupRefusalMismatch("startup-parser-refusal")
+    if stdout != expected_stdout:
+        if expected_stdout and not stdout:
+            raise StartupRefusalMismatch("startup-success-output-missing")
+        if expected_stdout:
+            raise StartupRefusalMismatch("startup-success-output-invalid")
+        raise StartupRefusalMismatch("startup-stdout-unexpected")
+    if result.returncode == 0 and stderr:
+        raise StartupRefusalMismatch("startup-success-stderr")
     raise StartupRefusalMismatch("startup-stderr-invalid")
+
+
+def _assert_startup_projection_refusal(result):
+    return _assert_supervisor_result(
+        result, 2, b"", b"devlane_supervisor_refusal=projection-binding-mismatch\n",
+    )
+
+
+def _assert_supervisor_start_ready(result):
+    return _assert_supervisor_result(result, 0, b"offline_supervisor=ready\n", b"")
+
+
+def _assert_supervisor_probe_pass(result):
+    return _assert_supervisor_result(result, 0, b"network_cut_probe=pass\n", b"")
+
+
+def _assert_supervisor_decrypt_pass(result):
+    return _assert_supervisor_result(result, 0, b"authenticated_decryption=pass\n", b"")
+
+
+def _assert_supervisor_refusal(result, code):
+    if code not in SUPERVISOR_REFUSAL_CODES:
+        raise RuntimeError("startup-refusal-code-invalid")
+    return _assert_supervisor_result(result, 2, b"", ("devlane_supervisor_refusal=" + code + "\n").encode("ascii"))
 
 
 class _SupervisorLifecycle:
@@ -1183,9 +1229,18 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
                         deadline_file=DEADLINE_FILE)
             _phase_call("variant-teardown-confirm", lifecycle.confirm_teardown)
             return
-        _phase_call("variant-supervisor-start", _run, start, timeout=90)
-        _phase_call("variant-supervisor-probe", _run,
-                    _supervisor("probe", "--state-dir", str(state_path)), timeout=90)
+        start_result = _phase_call(
+            "variant-supervisor-start-command", _process_run, start, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90, close_fds=True, check=False,
+        )
+        _phase_call("variant-supervisor-start-check", _assert_supervisor_start_ready, start_result)
+        probe = _phase_call("variant-supervisor-probe-command", _supervisor,
+                            "probe", "--state-dir", str(state_path))
+        probe_result = _phase_call(
+            "variant-supervisor-probe-command", _process_run, probe, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90, close_fds=True, check=False,
+        )
+        _phase_call("variant-supervisor-probe-check", _assert_supervisor_probe_pass, probe_result)
 
         key_path = root / "synthetic-key.hex"
         _phase_call("variant-key-create", bundle.write_private_key, key_path, key_bytes)
@@ -1195,8 +1250,17 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
         decrypt_env = os.environ.copy()
         decrypt_env["DEVLANE_DECRYPT_KEY"] = supplied_key
         try:
-            _phase_call("variant-decrypt", _run, _supervisor("decrypt", "--state-dir", str(state_path)),
-                        env=decrypt_env, timeout=180, expected=2 if variant == "wrong-key" else 0)
+            decrypt = _phase_call("variant-decrypt", _supervisor, "decrypt", "--state-dir", str(state_path))
+            decrypt_result = _phase_call(
+                "variant-decrypt", _process_run, decrypt, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=decrypt_env,
+                timeout=180, close_fds=True, check=False,
+            )
+            if variant == "wrong-key":
+                _phase_call("variant-decrypt-check", _assert_supervisor_refusal,
+                            decrypt_result, "decrypt-rejected")
+            else:
+                _phase_call("variant-decrypt-check", _assert_supervisor_decrypt_pass, decrypt_result)
         finally:
             decrypt_error = sys.exc_info()[1]
             decrypt_env.pop("DEVLANE_DECRYPT_KEY", None)

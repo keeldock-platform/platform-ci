@@ -1,11 +1,13 @@
 """Source-free regressions for the closed Core PR1 Rust matrix."""
 
 import argparse
+import ast
 import contextlib
 import io
 import json
 import inspect
 import os
+import re
 import signal
 import sys
 import subprocess
@@ -14,6 +16,7 @@ import time
 import tomllib
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import public_audit
@@ -109,6 +112,65 @@ class RustMatrixRunnerTests(unittest.TestCase):
             })
         return rows
 
+    def _write_node_toolchain_fixture(self, root):
+        root = Path(root)
+        anchor = root / "trusted-system-anchor"
+        cache = anchor / "hostedtoolcache"
+        node_root = cache / "node" / "24.22.1" / "x64"
+        node_bin = node_root / "bin"
+        npm_root = node_root / "lib/node_modules/npm"
+        npm_cli = node_root / "lib/node_modules/npm/bin/npm-cli.js"
+        npm_link = node_bin / "npm"
+        log_path = root / "node-fixture-log.jsonl"
+        for directory in (
+            anchor, cache, cache / "node", cache / "node/24.22.1", node_root,
+            node_bin, node_root / "lib", node_root / "lib/node_modules",
+            npm_root, npm_root / "bin", npm_root / "node_modules",
+        ):
+            directory.mkdir(mode=0o755, parents=True, exist_ok=True)
+            directory.chmod(0o700 if directory == anchor else 0o755)
+        node = node_bin / "node"
+        node.write_text(
+            chr(35) + "!" + sys.executable + "\n"
+            "import json, os, sys\n"
+            "log_path = " + repr(str(log_path)) + "\n"
+            "with open(log_path, 'a', encoding='utf-8') as output:\n"
+            "    output.write(json.dumps({'executable': sys.argv[0], 'argv': sys.argv[1:], "
+            "'path': os.environ.get('PATH', ''), "
+            "'node_options': os.environ.get('NODE_OPTIONS', ''), "
+            "'npm_userconfig': os.environ.get('NPM_CONFIG_USERCONFIG', '')}) + '\\n')\n"
+            "if sys.argv[1:] == ['--version']:\n"
+            "    print('v24.22.1')\n"
+            "elif len(sys.argv[1:]) == 2 and sys.argv[1].endswith('npm-cli.js') and sys.argv[2] == '--version':\n"
+            "    print('11.19.1')\n"
+            "else:\n"
+            "    raise SystemExit(97)\n",
+            encoding="utf-8",
+        )
+        node.chmod(0o755)
+        npm_cli.write_text(chr(35) + "!/usr/bin/env node\n", encoding="ascii")
+        npm_cli.chmod(0o755)
+        npm_shared = npm_root / "node_modules/shared.js"
+        npm_shared.write_text("synthetic shared npm module fixture\n", encoding="ascii")
+        npm_shared.chmod(0o644)
+        (npm_root / "node_modules/shared-link.js").symlink_to("shared.js")
+        npm_link.symlink_to("../lib/node_modules/npm/bin/npm-cli.js")
+        return {
+            "anchor": anchor, "cache": cache, "node_root": node_root, "node": node,
+            "npm": npm_link, "npm_cli": npm_cli, "npm_root": npm_root,
+            "log": log_path,
+            "paths": {"node": str(node), "npm": str(npm_link), "cargo": "", "rustc": ""},
+        }
+
+    @contextlib.contextmanager
+    def _node_fixture_policy(self, fixture):
+        node_tool_prepare = supervisor.node_tool_prepare
+        with patch.object(node_tool_prepare, "NODE_TOOL_CACHE_ROOT", fixture["cache"]), \
+                patch.object(node_tool_prepare, "NODE_TOOL_ROOT", fixture["node_root"]), \
+                patch.object(node_tool_prepare, "NODE_TOOL_SYSTEM_ANCHORS",
+                             ((fixture["anchor"], os.getuid()),)):
+            yield
+
     def test_harness_parses_complete_producer_shaped_rust_summary(self):
         payload = self._summary_payload(self._coverage_rows())
         records = test_e2e._summary_records(payload, self._summary_scenario())
@@ -196,6 +258,804 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 self.assertRegex(line, r"stage=variant-startup-refusal-check exception=[a-z0-9-]{1,32}$")
                 for marker in ("private-path", "private-canary", "KEYCANARY-73A10X", "unknown-private-code"):
                     self.assertNotIn(marker, line)
+
+    def test_positive_supervisor_status_and_refusal_results_are_finite(self):
+        passing = (
+            (test_e2e._assert_supervisor_start_ready, b"offline_supervisor=ready\n"),
+            (test_e2e._assert_supervisor_probe_pass, b"network_cut_probe=pass\n"),
+            (test_e2e._assert_supervisor_decrypt_pass, b"authenticated_decryption=pass\n"),
+        )
+        for check, marker in passing:
+            with self.subTest(success=marker):
+                result = subprocess.CompletedProcess(["supervisor.py"], 0, marker, b"")
+                self.assertIsNone(check(result))
+
+        errors = (
+            (subprocess.CompletedProcess(["supervisor.py"], 0, b"", b""), "startup-success-output-missing"),
+            (subprocess.CompletedProcess(["supervisor.py"], 0, b"wrong marker", b""),
+             "startup-success-output-invalid"),
+            (subprocess.CompletedProcess(["supervisor.py"], 0, b"offline_supervisor=ready\n", b"private path"),
+             "startup-success-stderr"),
+            (subprocess.CompletedProcess(["supervisor.py"], 1, b"", b""), "startup-exit-one"),
+            (subprocess.CompletedProcess(["supervisor.py"], -9, b"", b""), "startup-exit-signal"),
+            (subprocess.CompletedProcess(["supervisor.py"], 3, b"", b""), "startup-exit-unexpected"),
+            (subprocess.CompletedProcess(["supervisor.py"], 2, b"", b""), "startup-stderr-empty"),
+            (subprocess.CompletedProcess(["supervisor.py"], 2, b"", b"private diagnostic\n"),
+             "startup-stderr-invalid"),
+            (subprocess.CompletedProcess(["supervisor.py"], 2, b"unexpected", b""),
+             "startup-stdout-unexpected"),
+            (subprocess.CompletedProcess(["supervisor.py"], 2, b"", b"devlane_supervisor_refusal=KEYCANARY-73A10X\n"),
+             "startup-output-canary"),
+            (subprocess.CompletedProcess(["supervisor.py"], 2, b"", b"usage: supervisor.py start\n"),
+             "startup-parser-refusal"),
+            (subprocess.CompletedProcess(["supervisor.py"], 1, b"",
+             b"Traceback (most recent call last):\nModuleNotFoundError: private path\n"),
+             "startup-import-failure"),
+            (subprocess.CompletedProcess(["supervisor.py"], 1, b"",
+             b"Traceback (most recent call last):\nRuntimeError: private path\n"), "startup-traceback"),
+            (subprocess.CompletedProcess(["supervisor.py"], 2, b"",
+             b"devlane_supervisor_refusal=unknown-private-code\n"), "startup-refusal-unlisted"),
+        )
+        refusals = sorted(test_e2e.SUPERVISOR_REFUSAL_CODES)
+        for code in refusals:
+            errors += ((subprocess.CompletedProcess(
+                ["supervisor.py"], 2, b"", ("devlane_supervisor_refusal=" + code + "\n").encode("ascii"),
+            ), code),)
+
+        for result, category in errors:
+            with self.subTest(category=category):
+                with self.assertRaises(test_e2e.StartupRefusalMismatch) as caught:
+                    test_e2e._assert_supervisor_start_ready(result)
+                self.assertEqual(caught.exception.category,
+                                 test_e2e._REFUSAL_CATEGORY_ALIASES.get(category, category))
+                if category in test_e2e.SUPERVISOR_REFUSAL_CODES:
+                    self.assertEqual(caught.exception.refusal_code, category)
+                state = test_e2e._DiagnosticState()
+                state.capture("variant-supervisor-start-check", caught.exception)
+                line = state.refusal_line(caught.exception)
+                self.assertRegex(line, r"stage=variant-supervisor-start-check exception=[a-z0-9-]{1,32}$")
+                for marker in ("private path", "private diagnostic", "KEYCANARY-73A10X", "unknown-private-code"):
+                    self.assertNotIn(marker, line)
+
+    def test_supervisor_refusal_registry_covers_literal_production_refusals(self):
+        source = Path(supervisor.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        literal_codes = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            function = node.func
+            name = function.id if isinstance(function, ast.Name) else (
+                function.attr if isinstance(function, ast.Attribute) else ""
+            )
+            if name not in ("_refuse", "SupervisorRefusal"):
+                continue
+            value = node.args[0]
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                literal_codes.add(value.value)
+        self.assertTrue(literal_codes)
+        self.assertLessEqual(literal_codes, supervisor.REFUSAL_CODES)
+        self.assertLessEqual(supervisor.STARTUP_REFUSAL_CODES, supervisor.REFUSAL_CODES)
+        self.assertTrue(supervisor.STARTUP_DIAGNOSTIC_CODES)
+        self.assertTrue(all(re.fullmatch(r"child-[a-z0-9-]{1,26}", code)
+                            and len(code) <= 32 for code in supervisor.STARTUP_DIAGNOSTIC_CODES))
+
+    def test_actual_supervisor_start_parser_requires_deadline_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self._write_projection_startup_fixture(root)
+            command = ["start"]
+            for name in ("state_dir", "context", "workspace", "prepared", "bundle", "projection",
+                         "positive_control"):
+                command.extend(("--" + name.replace("_", "-"), getattr(args, name)))
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as caught:
+                    supervisor.main(command)
+            self.assertEqual(caught.exception.code, 2)
+            self.assertIn("--deadline-file", stderr.getvalue())
+            self.assertFalse(Path(args.state_dir).exists())
+
+    def test_actual_supervisor_startup_exceptions_keep_finite_child_stage_and_class(self):
+        known = (
+            ("firewall", RuntimeError("private path and canary"), "child-firewall-runtime"),
+            ("tools", PermissionError("private path"), "child-tools-permission"),
+            ("versions", FileNotFoundError("private path"), "child-versions-file-missing"),
+            ("profile", TypeError("private path"), "child-profile-type"),
+            ("ready", ValueError("private path"), "child-ready-value"),
+        )
+        for phase, error, code in known:
+            with self.subTest(phase=phase, code=code):
+                self.assertEqual(supervisor._startup_exception_code(phase, error), code)
+                self.assertIn(code, supervisor.STARTUP_DIAGNOSTIC_CODES)
+                self.assertLessEqual(len(code), 32)
+        self.assertEqual(supervisor._startup_exception_code("not-a-phase", RuntimeError("private")),
+                         "child-serve-runtime")
+        self.assertEqual(supervisor._startup_exception_code("tools", Exception("private")),
+                         "child-tools-unclassified")
+        for phase in supervisor.STARTUP_DIAGNOSTIC_PHASES:
+            for exception_type, label in supervisor._STARTUP_EXCEPTION_LABELS.items():
+                if exception_type is subprocess.TimeoutExpired:
+                    error = exception_type("source-free", 1)
+                elif exception_type is subprocess.CalledProcessError:
+                    error = exception_type(1, "source-free")
+                elif exception_type is UnicodeDecodeError:
+                    error = exception_type("ascii", b"source-free", 0, 1, "fixture")
+                elif exception_type is json.JSONDecodeError:
+                    error = exception_type("source-free", "fixture", 0)
+                else:
+                    error = exception_type("source-free")
+                code = supervisor._startup_exception_code(phase, error)
+                self.assertEqual(code, "child-" + phase + "-" + label)
+                self.assertIn(code, supervisor.STARTUP_DIAGNOSTIC_CODES)
+                self.assertLessEqual(len(code), 32)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            args = ["_serve", "--state-dir", str(state), "--context", str(root / "context"),
+                    "--workspace", str(root), "--prepared", str(root), "--bundle", str(root / "bundle"),
+                    "--projection", str(root / "projection"), "--deadline-file", str(root / "deadline"),
+                    "--host-net-inode", "193847", "--owner-uid", str(os.getuid())]
+
+            class FailingService:
+                startup_phase = "firewall"
+
+                def prepare(self):
+                    raise RuntimeError("private path KEYCANARY-73A10X")
+
+                def _cleanup(self):
+                    return None
+
+            with patch.object(supervisor, "Service", return_value=FailingService()), \
+                    patch.object(supervisor, "_kill_workload_descendants"), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                result = supervisor.main(args)
+            receipt = (state / supervisor.STARTUP_REFUSAL_NAME).read_bytes()
+            self.assertEqual(result, 2)
+            self.assertEqual(receipt, b'{"code":"child-firewall-runtime"}')
+            self.assertNotIn(b"private path", receipt)
+            self.assertNotIn(b"KEYCANARY-73A10X", receipt)
+
+    def test_actual_supervisor_parent_maps_only_allowlisted_child_start_receipts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self._write_projection_startup_fixture(root)
+            node_fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+            args.node_path = node_fixture["paths"]["node"]
+            args.npm_path = node_fixture["paths"]["npm"]
+            projection, _payload = test_e2e._node_projection(
+                test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
+            )
+            self._bind_projection_payload(args, projection)
+            command = ["start"]
+            for name in ("state_dir", "context", "workspace", "prepared", "bundle", "projection",
+                         "positive_control", "deadline_file"):
+                command.extend(("--" + name.replace("_", "-"), getattr(args, name)))
+            command.extend(("--node-path", args.node_path, "--npm-path", args.npm_path))
+            real_stat = os.stat
+
+            def stat_with_control_namespace(path, *positional, **keywords):
+                if os.fspath(path) == "/proc/self/ns/net":
+                    return SimpleNamespace(st_ino=193847)
+                return real_stat(path, *positional, **keywords)
+
+            for receipt_code, expected in (
+                ("child-firewall-runtime", "child-firewall-runtime"),
+                ("node-toolchain-version", "node-toolchain-version"),
+                ("private-path-and-key", "supervisor-start-failed"),
+            ):
+                with self.subTest(receipt=receipt_code):
+                    state = Path(args.state_dir)
+                    state.mkdir(mode=0o700)
+
+                    def fake_spawn(argv, **_kwargs):
+                        child_state = Path(argv[argv.index("--state-dir") + 1])
+                        (child_state / supervisor.STARTUP_REFUSAL_NAME).write_text(
+                            json.dumps({"code": receipt_code}), encoding="ascii",
+                        )
+                        return SimpleNamespace(pid=48124, poll=lambda: 0)
+
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with self._node_fixture_policy(node_fixture), \
+                            patch.object(supervisor.sys, "platform", "linux"), \
+                            patch.object(supervisor.os, "stat", side_effect=stat_with_control_namespace), \
+                            patch.object(supervisor.subprocess, "Popen", side_effect=fake_spawn), \
+                            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        result_code = supervisor.main(command)
+                    result = subprocess.CompletedProcess(
+                        ["supervisor.py", *command], result_code,
+                        stdout.getvalue().encode(), stderr.getvalue().encode(),
+                    )
+                    with self.assertRaises(test_e2e.StartupRefusalMismatch) as caught:
+                        test_e2e._assert_supervisor_start_ready(result)
+                    self.assertEqual(caught.exception.category, expected)
+                    self.assertNotIn("private-path-and-key", stderr.getvalue())
+                    self.assertFalse((state / supervisor.PID_NAME).exists())
+                    self.assertFalse((state / supervisor.STARTUP_REFUSAL_NAME).is_symlink())
+                    (state / supervisor.STARTUP_REFUSAL_NAME).unlink()
+                    state.rmdir()
+
+    def test_actual_positive_supervisor_parent_launch_uses_the_fixed_ready_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self._write_projection_startup_fixture(root)
+            node_fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+            args.node_path = node_fixture["paths"]["node"]
+            args.npm_path = node_fixture["paths"]["npm"]
+            projection, _payload = test_e2e._node_projection(
+                test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
+            )
+            self._bind_projection_payload(args, projection)
+            command = ["start"]
+            for name in ("state_dir", "context", "workspace", "prepared", "bundle", "projection",
+                         "positive_control", "deadline_file"):
+                command.extend(("--" + name.replace("_", "-"), getattr(args, name)))
+            command.extend(("--node-path", args.node_path, "--npm-path", args.npm_path))
+            spawned = []
+
+            def fake_spawn(argv, **kwargs):
+                spawned.append((argv, kwargs))
+                state = Path(argv[argv.index("--state-dir") + 1])
+                (state / supervisor.READY_NAME).write_text('{"ready":true}', encoding="ascii")
+                return SimpleNamespace(pid=48123, poll=lambda: None)
+
+            real_stat = os.stat
+
+            def stat_with_control_namespace(path, *positional, **keywords):
+                if os.fspath(path) == "/proc/self/ns/net":
+                    return SimpleNamespace(st_ino=193847)
+                return real_stat(path, *positional, **keywords)
+
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with self._node_fixture_policy(node_fixture), \
+                    patch.object(supervisor.sys, "platform", "linux"), \
+                    patch.object(supervisor.os, "stat", side_effect=stat_with_control_namespace), \
+                    patch.object(supervisor.subprocess, "Popen", side_effect=fake_spawn), \
+                    contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = supervisor.main(command)
+            result = subprocess.CompletedProcess(
+                ["supervisor.py", *command], code, stdout.getvalue().encode(), stderr.getvalue().encode(),
+            )
+            self.assertIsNone(test_e2e._assert_supervisor_start_ready(result), stderr.getvalue())
+            self.assertEqual(code, 0)
+            self.assertEqual(len(spawned), 1)
+            argv, options = spawned[0]
+            self.assertEqual(argv[:10], ["sudo", "-n", "unshare", "--net", "--mount", "--pid", "--ipc",
+                                         "--fork", "--mount-proc", "--kill-child"])
+            self.assertEqual(argv[10], sys.executable)
+            self.assertEqual(argv[11], str(Path(supervisor.__file__).resolve()))
+            self.assertEqual(argv[12], "_serve")
+            self.assertEqual(argv[argv.index("--deadline-file") + 1], str(Path(args.deadline_file).resolve()))
+            self.assertEqual(argv[argv.index("--node-path") + 1], args.node_path)
+            self.assertEqual(argv[argv.index("--npm-path") + 1], args.npm_path)
+            self.assertEqual(options["stdin"], subprocess.DEVNULL)
+            self.assertEqual(options["stdout"], subprocess.DEVNULL)
+            self.assertEqual(options["stderr"], subprocess.DEVNULL)
+            self.assertTrue(options["close_fds"])
+            self.assertTrue(options["start_new_session"])
+            self.assertEqual(options["env"], {
+                "PATH": "/usr/bin:/bin", "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1",
+            })
+
+    def test_actual_service_prepare_positive_platform_seams_follow_validated_projection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self._write_projection_startup_fixture(root)
+            node_fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+            projection, _payload = test_e2e._node_projection(
+                test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
+            )
+            self._bind_projection_payload(args, projection)
+            previous_deadline_file = supervisor.ACTIVE_DEADLINE_FILE
+            real_run = subprocess.run
+            version_calls = []
+            events = []
+
+            def record(name, value=None):
+                def call(*_args, **_kwargs):
+                    events.append(name)
+                    return value
+                return call
+
+            def recording_run(argv, **kwargs):
+                version_calls.append((list(argv), dict(kwargs)))
+                return real_run(argv, **kwargs)
+
+            try:
+                service = supervisor.Service(
+                    args.state_dir, args.context, args.workspace, args.prepared, args.bundle,
+                    args.projection, 193847, os.getuid(),
+                    node_fixture["paths"],
+                    args.deadline_file,
+                )
+                with self._node_fixture_policy(node_fixture), \
+                        patch.dict(os.environ, {"PATH": "/ambient-poison", "NODE_OPTIONS": "--require ignored",
+                                                "NPM_CONFIG_USERCONFIG": "/ambient-poison/npmrc"}), \
+                        patch.object(supervisor, "_require_linux_root", side_effect=record("root")), \
+                        patch.object(supervisor, "_require_swap_disabled", side_effect=record("swap")), \
+                        patch.object(supervisor, "_mount_private", side_effect=record("private-mount")), \
+                        patch.object(supervisor, "_configure_firewall", side_effect=record("firewall")), \
+                        patch.object(supervisor, "_mount_minimal_root", side_effect=record("minimal-root")), \
+                        patch.object(supervisor, "_mount_bind", side_effect=record("bundle-bind")), \
+                        patch.object(supervisor, "_read_profiles", side_effect=record("profile-read", {"schema": 1})), \
+                        patch.object(supervisor.subprocess, "run", side_effect=recording_run):
+                    self.assertTrue(service.prepare())
+                self.assertEqual(events, ["root", "swap", "private-mount", "firewall", "minimal-root",
+                                          "bundle-bind", "bundle-bind", "profile-read"])
+                self.assertEqual(service.projection_value, projection)
+                self.assertEqual(service.startup_phase, "ready")
+                self.assertEqual(service.tool_info["node_root"], str(node_fixture["node_root"]))
+                self.assertEqual(supervisor._worker_environment("unit", service.root, service.tool_info)["PATH"],
+                                 "/tools/node/bin:/usr/bin:/bin")
+                expected_commands = [
+                    [str(node_fixture["node"]), "--version"],
+                    [str(node_fixture["node"]), str(node_fixture["npm_cli"]), "--version"],
+                ] * 2
+                self.assertEqual([call[0] for call in version_calls], expected_commands)
+                for _argv, kwargs in version_calls:
+                    self.assertEqual(kwargs["env"], {"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+                fixture_rows = [json.loads(line) for line in node_fixture["log"].read_text().splitlines()]
+                self.assertEqual([(row["executable"], row["argv"]) for row in fixture_rows], [
+                    (str(node_fixture["node"]), ["--version"]),
+                    (str(node_fixture["node"]), [str(node_fixture["npm_cli"]), "--version"]),
+                    (str(node_fixture["node"]), ["--version"]),
+                    (str(node_fixture["node"]), [str(node_fixture["npm_cli"]), "--version"]),
+                ])
+                self.assertTrue(all(row["path"] == "/usr/bin:/bin" for row in fixture_rows))
+                self.assertTrue(all(row["node_options"] == "" and row["npm_userconfig"] == ""
+                                    for row in fixture_rows))
+            finally:
+                supervisor.ACTIVE_DEADLINE_FILE = previous_deadline_file
+
+    def test_node_preflight_uses_exact_node_for_resolved_npm_cli_without_ambient_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+            poison = root / "ambient-poison"
+            poison.mkdir()
+            poison_node = poison / "node"
+            poison_node.write_text(chr(35) + "!" + sys.executable + "\nraise SystemExit('ambient-node-ran')\n", encoding="utf-8")
+            poison_node.chmod(0o755)
+            projection = {"tools": {"node": "24.22.1", "npm": "11.19.1"}}
+            real_run = subprocess.run
+            calls = []
+
+            def recording_run(argv, **kwargs):
+                calls.append((list(argv), dict(kwargs)))
+                return real_run(argv, **kwargs)
+
+            with self._node_fixture_policy(fixture), \
+                    patch.object(supervisor.subprocess, "run", side_effect=recording_run), \
+                    patch.dict(os.environ, {"PATH": str(poison), "NODE_OPTIONS": "--require ambient-canary",
+                                            "NPM_CONFIG_USERCONFIG": str(poison / "npmrc")}):
+                info = supervisor._preflight_tools("core-node", projection, fixture["paths"], os.getuid())
+            self.assertEqual([argv for argv, _kwargs in calls], [
+                [str(fixture["node"]), "--version"],
+                [str(fixture["node"]), str(fixture["npm_cli"]), "--version"],
+            ])
+            for _argv, kwargs in calls:
+                self.assertEqual(kwargs["env"], {"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+            self.assertEqual(info["node_root"], str(fixture["node_root"]))
+            self.assertEqual(info["paths"]["npm"], str(fixture["npm"]))
+            self.assertEqual(info["paths"]["npm_cli"], str(fixture["npm_cli"]))
+            fixture_rows = [json.loads(line) for line in fixture["log"].read_text().splitlines()]
+            self.assertEqual([(row["executable"], row["argv"]) for row in fixture_rows], [
+                (str(fixture["node"]), ["--version"]),
+                (str(fixture["node"]), [str(fixture["npm_cli"]), "--version"]),
+            ])
+            self.assertTrue(all(row["path"] == "/usr/bin:/bin" for row in fixture_rows))
+            self.assertTrue(all(row["node_options"] == "" and row["npm_userconfig"] == ""
+                                for row in fixture_rows))
+
+    def test_service_prepare_rechecks_tool_permissions_before_second_version_call(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self._write_projection_startup_fixture(root)
+            fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+            projection, _payload = test_e2e._node_projection(
+                test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
+            )
+            self._bind_projection_payload(args, projection)
+            previous_deadline_file = supervisor.ACTIVE_DEADLINE_FILE
+            real_preflight = supervisor._preflight_tools
+            real_run = subprocess.run
+            calls = []
+
+            def preflight_then_make_bin_untrusted(profile, value, paths, owner_uid):
+                result = real_preflight(profile, value, paths, owner_uid)
+                (fixture["node_root"] / "bin").chmod(0o777)
+                return result
+
+            def recording_run(argv, **kwargs):
+                calls.append(list(argv))
+                return real_run(argv, **kwargs)
+
+            try:
+                service = supervisor.Service(
+                    args.state_dir, args.context, args.workspace, args.prepared, args.bundle,
+                    args.projection, 193847, os.getuid(), fixture["paths"], args.deadline_file,
+                )
+                with self._node_fixture_policy(fixture), \
+                        patch.object(supervisor, "_require_linux_root"), \
+                        patch.object(supervisor, "_require_swap_disabled"), \
+                        patch.object(supervisor, "_mount_private"), \
+                        patch.object(supervisor, "_configure_firewall"), \
+                        patch.object(supervisor, "_mount_minimal_root"), \
+                        patch.object(supervisor, "_mount_bind"), \
+                        patch.object(supervisor, "_preflight_tools", side_effect=preflight_then_make_bin_untrusted), \
+                        patch.object(supervisor, "_read_profiles", return_value={"schema": 1}), \
+                        patch.object(supervisor.subprocess, "run", side_effect=recording_run):
+                    with self.assertRaises(supervisor.SupervisorRefusal) as caught:
+                        service.prepare()
+                self.assertEqual(caught.exception.code, "node-toolchain-permissions")
+                self.assertEqual(calls, [
+                    [str(fixture["node"]), "--version"],
+                    [str(fixture["node"]), str(fixture["npm_cli"]), "--version"],
+                ])
+                self.assertEqual(len(fixture["log"].read_text().splitlines()), 2)
+            finally:
+                supervisor.ACTIVE_DEADLINE_FILE = previous_deadline_file
+                (fixture["node_root"] / "bin").chmod(0o755)
+
+    def test_prepare_node_version_path_uses_the_validated_node_and_npm_cli(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+            deadline_path = root / "deadline.json"
+            deadline_budget.create(deadline_path, 60, 5, 65)
+            real_run = subprocess.run
+            calls = []
+
+            def recording_run(argv, **kwargs):
+                calls.append((list(argv), dict(kwargs)))
+                return real_run(argv, **kwargs)
+
+            with self._node_fixture_policy(fixture), \
+                    patch.object(supervisor.node_tool_prepare, "DEADLINE_FILE", str(deadline_path)), \
+                    patch.object(supervisor.subprocess, "run", side_effect=recording_run):
+                validated, results = supervisor.node_tool_prepare.verify_node_toolchain_versions(
+                    fixture["paths"], os.getuid(),
+                )
+            self.assertEqual(validated["node"], str(fixture["node"]))
+            self.assertEqual(validated["npm_cli"], str(fixture["npm_cli"]))
+            self.assertEqual(results["node"].stdout.strip(), b"v24.22.1")
+            self.assertEqual(results["npm"].stdout.strip(), b"11.19.1")
+            self.assertEqual([argv for argv, _kwargs in calls], [
+                [str(fixture["node"]), "--version"],
+                [str(fixture["node"]), str(fixture["npm_cli"]), "--version"],
+            ])
+            self.assertTrue(all(kwargs["env"] == {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+                                for _argv, kwargs in calls))
+            fixture_rows = [json.loads(line) for line in fixture["log"].read_text().splitlines()]
+            self.assertTrue(all(row["node_options"] == "" and row["npm_userconfig"] == ""
+                                for row in fixture_rows))
+
+    def test_prepare_main_parser_uses_explicit_node_paths_before_mount_setup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+            _projection, payload = test_e2e._node_projection(
+                test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
+            )
+            projection_path = root / "projection.json"
+            projection_path.write_bytes(payload)
+            deadline_path = root / "deadline.json"
+            deadline_budget.create(deadline_path, 60, 5, 65)
+            preparation = supervisor.node_tool_prepare
+            expected = [
+                [str(fixture["node"]), "--version"],
+                [str(fixture["node"]), str(fixture["npm_cli"]), "--version"],
+            ]
+            real_run = subprocess.run
+            calls = []
+            stderr = io.StringIO()
+
+            def record_then_stop(argv, **kwargs):
+                command = list(argv)
+                calls.append((command, dict(kwargs)))
+                if command in expected:
+                    return real_run(argv, **kwargs)
+                raise supervisor.bundle.Refusal("synthetic-preparation-stop")
+
+            arguments = [
+                "--projection", str(projection_path), "--output", str(root / "prepared"),
+                "--profile", "core-node", "--owner-uid", str(os.getuid()),
+                "--owner-gid", str(os.getgid()), "--deadline-file", str(deadline_path),
+                "--node-path", str(fixture["node"]), "--npm-path", str(fixture["npm"]),
+            ]
+            with self._node_fixture_policy(fixture), \
+                    patch.object(preparation.sys, "platform", "linux"), \
+                    patch.object(preparation.os, "geteuid", return_value=0), \
+                    patch.object(preparation.subprocess, "run", side_effect=record_then_stop), \
+                    patch.object(preparation, "_kill_children"), \
+                    patch.object(preparation, "MOUNT_TARGETS", []), \
+                    contextlib.redirect_stderr(stderr):
+                result = preparation.main(arguments)
+
+            self.assertEqual(result, 2)
+            self.assertEqual(stderr.getvalue(),
+                             "dependency_preparation_refusal=synthetic-preparation-stop\n", calls)
+            self.assertEqual([command for command, _kwargs in calls], expected + [[
+                "mount", "--make-rprivate", "/",
+            ]])
+            self.assertTrue(all(kwargs.get("env") == {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+                                for _command, kwargs in calls[:2]))
+            fixture_rows = [json.loads(line) for line in fixture["log"].read_text().splitlines()]
+            self.assertEqual([(row["executable"], row["argv"]) for row in fixture_rows], [
+                (str(fixture["node"]), ["--version"]),
+                (str(fixture["node"]), [str(fixture["npm_cli"]), "--version"]),
+            ])
+
+    def test_npm_shebang_sibling_is_not_used_by_fixed_node_version_commands(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+            poison = root / "ambient-poison"
+            poison.mkdir()
+            (poison / "node").write_text(
+                chr(35) + "!" + sys.executable + "\nprint('wrong-sibling-node')\n", encoding="utf-8",
+            )
+            (poison / "node").chmod(0o755)
+            deadline_path = root / "deadline.json"
+            deadline_budget.create(deadline_path, 60, 5, 65)
+
+            sibling_result = subprocess.run(
+                [str(fixture["npm"]), "--version"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=5,
+                env={"PATH": str(poison) + os.pathsep + str(fixture["node_root"] / "bin")},
+                check=False,
+            )
+            self.assertEqual(sibling_result.returncode, 0)
+            self.assertEqual(sibling_result.stdout.strip(), b"wrong-sibling-node")
+
+            with self._node_fixture_policy(fixture), \
+                    patch.object(supervisor.node_tool_prepare, "DEADLINE_FILE", str(deadline_path)), \
+                    patch.dict(os.environ, {"PATH": str(poison), "NODE_OPTIONS": "--require ambient-canary"}):
+                validated, results = supervisor.node_tool_prepare.verify_node_toolchain_versions(
+                    fixture["paths"], os.getuid(),
+                )
+            self.assertEqual(validated["node"], str(fixture["node"]))
+            self.assertEqual(results["node"].stdout.strip(), b"v24.22.1")
+            self.assertEqual(results["npm"].stdout.strip(), b"11.19.1")
+            fixture_rows = [json.loads(line) for line in fixture["log"].read_text().splitlines()]
+            self.assertEqual([(row["executable"], row["argv"]) for row in fixture_rows], [
+                (str(fixture["node"]), ["--version"]),
+                (str(fixture["node"]), [str(fixture["npm_cli"]), "--version"]),
+            ])
+            self.assertTrue(all(row["path"] == "/usr/bin:/bin" for row in fixture_rows))
+            self.assertTrue(all(row["node_options"] == "" for row in fixture_rows))
+
+    def test_node_toolchain_rejects_untrusted_owners_permissions_and_layouts_before_execution(self):
+        cases = (
+            ("world-writable-cache", "node-toolchain-permissions"),
+            ("world-writable-bin", "node-toolchain-permissions"),
+            ("world-writable-node", "node-toolchain-permissions"),
+            ("world-writable-npm-parent", "node-toolchain-permissions"),
+            ("bad-owner-cache", "node-toolchain-owner"),
+            ("bad-owner-bin", "node-toolchain-owner"),
+            ("bad-owner-node", "node-toolchain-owner"),
+            ("bad-owner-npm-link", "node-toolchain-owner"),
+            ("bad-owner-npm-cli", "node-toolchain-owner"),
+            ("bad-owner-npm-dependency", "node-toolchain-owner"),
+            ("missing-node", "node-toolchain-missing"),
+            ("missing-npm-cli", "node-toolchain-missing"),
+            ("non-executable-node", "node-toolchain-executable"),
+            ("owner-only-node", "node-toolchain-executable"),
+            ("owner-only-npm-cli", "node-toolchain-permissions"),
+            ("owner-only-npm-dependency-dir", "node-toolchain-permissions"),
+            ("symlinked-node", "node-tool-layout"),
+            ("alternate-node-name", "node-tool-layout"),
+            ("npm-escape-link", "node-tool-layout"),
+            ("npm-nested-escape-link", "node-tool-layout"),
+            ("world-writable-npm-dependency-dir", "node-toolchain-permissions"),
+            ("world-writable-npm-dependency-file", "node-toolchain-permissions"),
+            ("npm-cli-writable", "node-toolchain-permissions"),
+        )
+        for label, expected_code in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+                paths = dict(fixture["paths"])
+                owner_target = None
+                if label == "world-writable-cache":
+                    fixture["cache"].chmod(0o777)
+                elif label == "world-writable-bin":
+                    (fixture["node_root"] / "bin").chmod(0o777)
+                elif label == "world-writable-node":
+                    fixture["node"].chmod(0o777)
+                elif label == "world-writable-npm-parent":
+                    (fixture["node_root"] / "lib/node_modules/npm/bin").chmod(0o777)
+                elif label == "bad-owner-cache":
+                    owner_target = fixture["cache"]
+                elif label == "bad-owner-bin":
+                    owner_target = fixture["node_root"] / "bin"
+                elif label == "bad-owner-node":
+                    owner_target = fixture["node"]
+                elif label == "bad-owner-npm-link":
+                    owner_target = fixture["npm"]
+                elif label == "bad-owner-npm-cli":
+                    owner_target = fixture["npm_cli"]
+                elif label == "bad-owner-npm-dependency":
+                    owner_target = fixture["npm_root"] / "node_modules/shared.js"
+                elif label == "missing-node":
+                    fixture["node"].unlink()
+                elif label == "missing-npm-cli":
+                    fixture["npm_cli"].unlink()
+                elif label == "non-executable-node":
+                    fixture["node"].chmod(0o644)
+                elif label == "owner-only-node":
+                    fixture["node"].chmod(0o700)
+                elif label == "owner-only-npm-cli":
+                    fixture["npm_cli"].chmod(0o600)
+                elif label == "owner-only-npm-dependency-dir":
+                    (fixture["npm_root"] / "node_modules").chmod(0o700)
+                elif label == "symlinked-node":
+                    real_node = fixture["node_root"] / "bin/node-real"
+                    fixture["node"].rename(real_node)
+                    fixture["node"].symlink_to(real_node.name)
+                elif label == "alternate-node-name":
+                    alternate = fixture["node_root"] / "bin/validated-node"
+                    alternate.write_bytes(fixture["node"].read_bytes())
+                    alternate.chmod(0o755)
+                    fixture["node"].write_text(
+                        chr(35) + "!" + sys.executable + "\nprint('wrong-sibling-node')\n", encoding="utf-8",
+                    )
+                    fixture["node"].chmod(0o755)
+                    paths["node"] = str(alternate)
+                elif label == "npm-escape-link":
+                    fixture["npm"].unlink()
+                    outside = root / "outside-npm-cli.js"
+                    outside.write_text("outside synthetic npm cli fixture\n", encoding="ascii")
+                    fixture["npm"].symlink_to(outside)
+                elif label == "npm-nested-escape-link":
+                    nested_link = fixture["npm_root"] / "node_modules/shared-link.js"
+                    nested_link.unlink()
+                    outside = root / "outside-npm-module.js"
+                    outside.write_text("outside synthetic npm module fixture\n", encoding="ascii")
+                    nested_link.symlink_to(outside)
+                elif label == "world-writable-npm-dependency-dir":
+                    (fixture["npm_root"] / "node_modules").chmod(0o777)
+                elif label == "world-writable-npm-dependency-file":
+                    (fixture["npm_root"] / "node_modules/shared.js").chmod(0o666)
+                elif label == "npm-cli-writable":
+                    fixture["npm_cli"].chmod(0o666)
+
+                with self._node_fixture_policy(fixture):
+                    if owner_target is None:
+                        with patch.object(supervisor.subprocess, "run",
+                                          side_effect=AssertionError("version command ran before trust refusal")):
+                            with self.assertRaises(supervisor.SupervisorRefusal) as caught:
+                                supervisor._preflight_tools(
+                                    "core-node", {"tools": {"node": "24.22.1", "npm": "11.19.1"}},
+                                    paths, os.getuid(),
+                                )
+                    else:
+                        original_lstat = os.lstat
+
+                        def lstat_with_untrusted_owner(path, *args, **kwargs):
+                            metadata = original_lstat(path, *args, **kwargs)
+                            if Path(path) == owner_target:
+                                return SimpleNamespace(st_mode=metadata.st_mode, st_uid=os.getuid() + 1)
+                            return metadata
+
+                        with patch.object(supervisor.node_tool_prepare.os, "lstat",
+                                          side_effect=lstat_with_untrusted_owner), \
+                                patch.object(supervisor.subprocess, "run",
+                                             side_effect=AssertionError("version command ran before owner refusal")):
+                            with self.assertRaises(supervisor.SupervisorRefusal) as caught:
+                                supervisor._preflight_tools(
+                                    "core-node", {"tools": {"node": "24.22.1", "npm": "11.19.1"}},
+                                    paths, os.getuid(),
+                                )
+                self.assertEqual(caught.exception.code, expected_code)
+
+    def test_actual_start_requires_explicit_canonical_node_paths_without_system_fallback(self):
+        for case in ("missing-node", "alternate-node-name"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                args = self._write_projection_startup_fixture(root)
+                fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+                args.npm_path = fixture["paths"]["npm"]
+                if case == "alternate-node-name":
+                    alternate = fixture["node_root"] / "bin/validated-node"
+                    alternate.write_bytes(fixture["node"].read_bytes())
+                    alternate.chmod(0o755)
+                    args.node_path = str(alternate)
+                    expected = "node-tool-layout"
+                else:
+                    args.node_path = ""
+                    expected = "node-toolchain-missing"
+                projection, _payload = test_e2e._node_projection(
+                    test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
+                )
+                self._bind_projection_payload(args, projection)
+                command = ["start"]
+                for name in ("state_dir", "context", "workspace", "prepared", "bundle", "projection",
+                             "positive_control", "deadline_file"):
+                    command.extend(("--" + name.replace("_", "-"), getattr(args, name)))
+                command.extend(("--npm-path", args.npm_path))
+                if args.node_path:
+                    command.extend(("--node-path", args.node_path))
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with self._node_fixture_policy(fixture), \
+                        patch.object(supervisor.sys, "platform", "linux"), \
+                        patch.object(supervisor.shutil, "which") as which, \
+                        patch.object(supervisor.subprocess, "Popen") as spawn, \
+                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    result = supervisor.main(command)
+                self.assertEqual(result, 2)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), "devlane_supervisor_refusal=" + expected + "\n")
+                which.assert_not_called()
+                spawn.assert_not_called()
+                Path(args.state_dir).rmdir()
+
+    def test_actual_supervisor_probe_and_decrypt_clients_emit_only_fixed_success_markers(self):
+        with patch.object(supervisor, "_rpc", return_value={"ok": True}) as rpc:
+            probe_out, probe_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(probe_out), contextlib.redirect_stderr(probe_err):
+                probe_code = supervisor.main(["probe", "--state-dir", "/source-free/state"])
+            probe = subprocess.CompletedProcess(
+                ["supervisor.py", "probe"], probe_code, probe_out.getvalue().encode(), probe_err.getvalue().encode(),
+            )
+            self.assertIsNone(test_e2e._assert_supervisor_probe_pass(probe))
+            rpc.assert_called_once_with("/source-free/state", {"op": "probe"})
+
+        rpc.reset_mock()
+        rpc.return_value = {"ok": True}
+        with patch.dict(os.environ, {"DEVLANE_DECRYPT_KEY": "a" * 64}):
+            decrypt_out, decrypt_err = io.StringIO(), io.StringIO()
+            with patch.object(supervisor, "_rpc", rpc), \
+                    contextlib.redirect_stdout(decrypt_out), contextlib.redirect_stderr(decrypt_err):
+                decrypt_code = supervisor.main(["decrypt", "--state-dir", "/source-free/state"])
+            self.assertNotIn("DEVLANE_DECRYPT_KEY", os.environ)
+        decrypt = subprocess.CompletedProcess(
+            ["supervisor.py", "decrypt"], decrypt_code,
+            decrypt_out.getvalue().encode(), decrypt_err.getvalue().encode(),
+        )
+        self.assertIsNone(test_e2e._assert_supervisor_decrypt_pass(decrypt))
+        rpc.assert_called_once_with("/source-free/state", {"op": "decrypt", "key": "a" * 64})
+
+        class RefusingSocket:
+            def __init__(self):
+                response = json.dumps({"ok": False, "code": "decrypt-rejected"},
+                                      separators=(",", ":")).encode("ascii")
+                self.buffer = len(response).to_bytes(4, "big") + response
+                self.sent = b""
+
+            def settimeout(self, _timeout):
+                return None
+
+            def connect(self, _path):
+                return None
+
+            def sendall(self, value):
+                self.sent += value
+
+            def recv(self, amount):
+                value, self.buffer = self.buffer[:amount], self.buffer[amount:]
+                return value
+
+            def close(self):
+                return None
+
+        refusing_socket = RefusingSocket()
+        with patch.dict(os.environ, {"DEVLANE_DECRYPT_KEY": "b" * 64}):
+            refused_out, refused_err = io.StringIO(), io.StringIO()
+            with patch.object(supervisor.socket, "socket", return_value=refusing_socket), \
+                    contextlib.redirect_stdout(refused_out), contextlib.redirect_stderr(refused_err):
+                refused_code = supervisor.main(["decrypt", "--state-dir", "/source-free/state"])
+            self.assertNotIn("DEVLANE_DECRYPT_KEY", os.environ)
+        refused = subprocess.CompletedProcess(
+            ["supervisor.py", "decrypt"], refused_code,
+            refused_out.getvalue().encode(), refused_err.getvalue().encode(),
+        )
+        self.assertIsNone(test_e2e._assert_supervisor_refusal(refused, "decrypt-rejected"))
+        self.assertNotIn(b"b" * 64, refused.stdout + refused.stderr)
+        self.assertTrue(refusing_socket.sent.startswith((len(b'{"op":"decrypt","key":"' + b"b" * 64 + b'"}')).to_bytes(4, "big")))
 
     def _write_projection_startup_fixture(self, root):
         workspace = root / "workspace"
@@ -339,19 +1199,32 @@ class RustMatrixRunnerTests(unittest.TestCase):
     def test_isolated_rust_runner_launch_imports_only_the_trusted_control_siblings(self):
         root = Path(__file__).resolve().parents[2]
         supervisor_source = inspect.getsource(supervisor)
+        runner_source = (root / "kit/devlane/rust_matrix_runner.py").read_text(encoding="utf-8")
         self.assertIn('"/usr/bin/python3", "-B", "-I", "-S", "/control/devlane/rust_matrix_runner.py"',
                       supervisor_source)
         self.assertIn('control_root / "kit/devlane", root / "control/devlane", readonly=True',
                       supervisor_source)
         self.assertNotIn("/workspace/source/rust_matrix_runner.py", supervisor_source)
-        result = subprocess.run(
-            [sys.executable, "-B", "-I", "-S", str(root / "kit/devlane/rust_matrix_runner.py")],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=10, check=False,
-        )
-        self.assertEqual(result.returncode, 2, result.stderr.decode("utf-8", "replace"))
-        self.assertIn(b"the following arguments are required", result.stderr)
-        self.assertNotIn(b"ModuleNotFoundError", result.stderr)
+        self.assertIn("sys.path.insert(0, str(Path(__file__).resolve().parent))", runner_source)
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate = Path(temporary)
+            (candidate / "bundle.py").write_text(
+                "raise RuntimeError('candidate-import-canary')\n", encoding="ascii",
+            )
+            (candidate / "rust_test_runner.py").write_text(
+                "raise RuntimeError('candidate-import-canary')\n", encoding="ascii",
+            )
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(candidate)
+            result = subprocess.run(
+                [sys.executable, "-B", "-I", "-S", str(root / "kit/devlane/rust_matrix_runner.py")],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                cwd=candidate, env=environment, timeout=10, check=False,
+            )
+            self.assertEqual(result.returncode, 2, result.stderr.decode("utf-8", "replace"))
+            self.assertIn(b"the following arguments are required", result.stderr)
+            self.assertNotIn(b"ModuleNotFoundError", result.stderr)
+            self.assertNotIn(b"candidate-import-canary", result.stderr)
 
     def test_deny_policy_and_offline_tool_argv_match_pinned_contracts(self):
         deny_policy = tomllib.loads(test_e2e.RUST_FIXTURE_SOURCES["deny.toml"].decode("ascii"))
@@ -495,10 +1368,12 @@ class RustMatrixRunnerTests(unittest.TestCase):
                     if path.name == "synthetic-key.hex":
                         raise PermissionError("synthetic-unlink-failure")
                     return original_unlink(path, *args, **kwargs)
-                def run(command, **kwargs):
+                def process_run(command, **kwargs):
                     if failure_phase in command:
                         raise RuntimeError("original-" + failure_phase + "-failure")
-                    return subprocess.CompletedProcess(command, 0, b"", b"")
+                    marker = (b"offline_supervisor=ready\n" if "start" in command else
+                              b"network_cut_probe=pass\n" if "probe" in command else b"")
+                    return subprocess.CompletedProcess(command, 0, marker, b"")
                 with patch.object(test_e2e, "RUNNER_TEMP", root), \
                         patch.object(test_e2e, "RUN_ID", "unlink-negative"), \
                         patch.object(test_e2e, "_archive", return_value=b"archive"), \
@@ -507,7 +1382,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                         patch.object(test_e2e.bundle, "read_key_file", return_value=b"key"), \
                         patch.object(test_e2e.fetch, "validate_dispatch"), \
                         patch.object(test_e2e, "_positive_control"), \
-                        patch.object(test_e2e, "_run", side_effect=run), \
+                        patch.object(test_e2e, "_process_run", side_effect=process_run), \
                         patch.object(Path, "unlink", refuse_key), \
                         patch.object(test_e2e.host_cleanup, "clean") as clean, \
                         patch.object(lifecycle, "confirm_teardown") as confirm:

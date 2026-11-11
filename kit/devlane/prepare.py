@@ -31,6 +31,185 @@ NPMRC_TEXT = ("ignore-scripts=true\naudit=false\nfund=false\nupdate-notifier=fal
               "registry=https://registry.npmjs.org/\n")
 SCRIPT_SUPPRESSION_ENVIRONMENT = {"NPM_CONFIG_IGNORE_SCRIPTS": "true"}
 NPM_CI_ARGUMENTS = ("ci", "--ignore-scripts", "--include=dev", "--include=optional", "--no-audit", "--no-fund")
+NODE_TOOL_CACHE_ROOT = Path("/opt/hostedtoolcache")
+NODE_TOOL_ROOT = NODE_TOOL_CACHE_ROOT / "node" / "24.22.1" / "x64"
+NODE_TOOL_SYSTEM_ANCHORS = ((Path("/"), 0), (Path("/opt"), 0))
+NODE_VERSION_ENVIRONMENT = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+NODE_VERSION = "24.22.1"
+NPM_VERSION = "11.19.1"
+MAX_NPM_TOOL_ENTRIES = 100_000
+
+
+def _node_refuse(code):
+    raise bundle.Refusal(code)
+
+
+def _node_directory(path, owner_uid, *, worker_access=False):
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        _node_refuse("node-toolchain-missing")
+    if not stat.S_ISDIR(metadata.st_mode):
+        _node_refuse("node-tool-layout")
+    if metadata.st_uid != owner_uid:
+        _node_refuse("node-toolchain-owner")
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (mode & 0o022 or not mode & stat.S_IRUSR or not mode & stat.S_IXUSR
+            or worker_access and (not mode & stat.S_IROTH or not mode & stat.S_IXOTH)):
+        _node_refuse("node-toolchain-permissions")
+
+
+def _node_regular_file(path, owner_uid, *, executable):
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        _node_refuse("node-toolchain-missing")
+    if not stat.S_ISREG(metadata.st_mode):
+        _node_refuse("node-tool-layout")
+    if metadata.st_uid != owner_uid:
+        _node_refuse("node-toolchain-owner")
+    mode = stat.S_IMODE(metadata.st_mode)
+    if mode & (0o022 | stat.S_ISUID | stat.S_ISGID):
+        _node_refuse("node-toolchain-permissions")
+    if not mode & stat.S_IRUSR:
+        _node_refuse("node-toolchain-permissions")
+    if executable and (not mode & stat.S_IXUSR or not mode & stat.S_IXOTH):
+        _node_refuse("node-toolchain-executable")
+    if not executable and not mode & stat.S_IROTH:
+        _node_refuse("node-toolchain-permissions")
+
+
+def _validate_npm_tree(root, owner_uid):
+    root = Path(root)
+    try:
+        canonical_root = root.resolve(strict=True)
+    except (OSError, RuntimeError):
+        _node_refuse("node-toolchain-missing")
+    pending = [root]
+    seen = 0
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as scan:
+                entries = list(scan)
+        except PermissionError:
+            _node_refuse("node-toolchain-permissions")
+        except OSError:
+            _node_refuse("node-toolchain-missing")
+        for entry in entries:
+            seen += 1
+            if seen > MAX_NPM_TOOL_ENTRIES:
+                _node_refuse("node-tool-layout")
+            path = Path(entry.path)
+            try:
+                metadata = os.lstat(path)
+            except OSError:
+                _node_refuse("node-toolchain-missing")
+            if stat.S_ISDIR(metadata.st_mode):
+                _node_directory(path, owner_uid, worker_access=True)
+                pending.append(path)
+            elif stat.S_ISREG(metadata.st_mode):
+                _node_regular_file(path, owner_uid, executable=False)
+            elif stat.S_ISLNK(metadata.st_mode):
+                if metadata.st_uid != owner_uid:
+                    _node_refuse("node-toolchain-owner")
+                try:
+                    target = os.readlink(path)
+                    lexical_target = Path(os.path.normpath(os.path.join(str(path.parent), target)))
+                    resolved_target = path.resolve(strict=True)
+                    target_mode = resolved_target.stat().st_mode
+                except (OSError, RuntimeError):
+                    _node_refuse("node-tool-layout")
+                if (Path(target).is_absolute() or not lexical_target.is_relative_to(root)
+                        or not resolved_target.is_relative_to(canonical_root)
+                        or not (stat.S_ISDIR(target_mode) or stat.S_ISREG(target_mode))):
+                    _node_refuse("node-tool-layout")
+            else:
+                _node_refuse("node-tool-layout")
+
+
+def validate_node_toolchain(paths, owner_uid, *, tool_cache_root=None, node_root=None, system_anchors=None):
+    """Bind Node and npm to the runner-owned pinned toolcache tree before privileged use."""
+    cache_root = Path(tool_cache_root) if tool_cache_root is not None else NODE_TOOL_CACHE_ROOT
+    root = Path(node_root) if node_root is not None else NODE_TOOL_ROOT
+    anchors = tuple(system_anchors) if system_anchors is not None else NODE_TOOL_SYSTEM_ANCHORS
+    expected_root = cache_root / "node" / NODE_VERSION / "x64"
+    if type(paths) is not dict or not paths.get("node") or not paths.get("npm"):
+        _node_refuse("node-toolchain-missing")
+    if type(owner_uid) is not int or owner_uid < 0:
+        _node_refuse("node-toolchain-owner")
+    if root != expected_root:
+        _node_refuse("node-tool-layout")
+    if not anchors:
+        _node_refuse("node-tool-layout")
+    for index, (anchor, anchor_uid) in enumerate(anchors):
+        anchor = Path(anchor)
+        if index and anchor.parent != Path(anchors[index - 1][0]):
+            _node_refuse("node-tool-layout")
+        _node_directory(anchor, anchor_uid)
+    if cache_root.parent != Path(anchors[-1][0]):
+        _node_refuse("node-tool-layout")
+    _node_directory(cache_root, owner_uid)
+
+    relative_directories = (
+        Path("node"), Path("node") / NODE_VERSION, Path("node") / NODE_VERSION / "x64",
+        Path("node") / NODE_VERSION / "x64/bin", Path("node") / NODE_VERSION / "x64/lib",
+        Path("node") / NODE_VERSION / "x64/lib/node_modules",
+        Path("node") / NODE_VERSION / "x64/lib/node_modules/npm",
+        Path("node") / NODE_VERSION / "x64/lib/node_modules/npm/bin",
+    )
+    for relative in relative_directories:
+        _node_directory(cache_root / relative, owner_uid, worker_access=True)
+
+    node = root / "bin/node"
+    npm_launcher = root / "bin/npm"
+    npm_cli = root / "lib/node_modules/npm/bin/npm-cli.js"
+    if paths.get("node") != str(node) or paths.get("npm") != str(npm_launcher):
+        _node_refuse("node-tool-layout")
+    _node_regular_file(node, owner_uid, executable=True)
+    try:
+        launcher_metadata = os.lstat(npm_launcher)
+        launcher_target = os.readlink(npm_launcher)
+    except OSError:
+        _node_refuse("node-toolchain-missing")
+    if (not stat.S_ISLNK(launcher_metadata.st_mode)
+            or launcher_target != "../lib/node_modules/npm/bin/npm-cli.js"):
+        _node_refuse("node-tool-layout")
+    if launcher_metadata.st_uid != owner_uid:
+        _node_refuse("node-toolchain-owner")
+    _node_regular_file(npm_cli, owner_uid, executable=False)
+    _validate_npm_tree(root / "lib/node_modules/npm", owner_uid)
+    return {"node": str(node), "npm": str(npm_launcher), "npm_cli": str(npm_cli), "root": str(root)}
+
+
+def node_version_commands(validated):
+    """Run npm's resolved JavaScript entry point with this exact Node executable."""
+    return {
+        "node": [validated["node"], "--version"],
+        "npm": [validated["node"], validated["npm_cli"], "--version"],
+    }
+
+
+def run_node_version_checks(paths, owner_uid, run):
+    validated = validate_node_toolchain(paths, owner_uid)
+    results = {
+        name: run(argv, env=dict(NODE_VERSION_ENVIRONMENT))
+        for name, argv in node_version_commands(validated).items()
+    }
+    return validated, results
+
+
+def _prepare_node_version_process(argv, *, env):
+    try:
+        return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=_bounded_timeout(10),
+                              check=False, env=env)
+    except (OSError, subprocess.SubprocessError):
+        refuse("node-toolchain-version" if len(argv) == 2 else "npm-toolchain-version")
+
+
+def verify_node_toolchain_versions(paths, owner_uid):
+    return run_node_version_checks(paths, owner_uid, _prepare_node_version_process)
 
 
 def refuse(code):
@@ -394,22 +573,28 @@ def main(argv=None):
             refuse("owner-identity")
         projection_path = Path(args.projection)
         projection = fetch.validate_projection(projection_path.read_bytes(), args.profile)
-        if projection["tools"] != ({"node": "24.22.1", "npm": "11.19.1"} if args.profile == "core-node" else projection["tools"]):
+        if projection["tools"] != ({"node": NODE_VERSION, "npm": NPM_VERSION} if args.profile == "core-node" else projection["tools"]):
             refuse("toolchain-version")
-        paths = {name: getattr(args, name + "_path") or shutil.which(name) or ""
-                 for name in ("node", "npm", "cargo", "rustc")}
+        if args.profile == "core-node":
+            paths = {"node": args.node_path, "npm": args.npm_path, "cargo": "", "rustc": ""}
+        else:
+            paths = {name: getattr(args, name + "_path") or shutil.which(name) or ""
+                     for name in ("node", "npm", "cargo", "rustc")}
         if args.profile == "core-rust":
             for name in ("cargo", "rustc"):
                 paths[name] = _resolve_rust_tool(paths[name], name)
         if args.profile == "core-node":
-            if not paths["node"] or not paths["npm"]:
-                refuse("node-toolchain-missing")
-            if subprocess.run([paths["node"], "--version"], capture_output=True,
-                              timeout=_bounded_timeout(10)).stdout.strip() != b"v24.22.1":
-                refuse("node-toolchain-version")
-            if subprocess.run([paths["npm"], "--version"], capture_output=True,
-                              timeout=_bounded_timeout(10)).stdout.strip() != b"11.19.1":
-                refuse("npm-toolchain-version")
+            node_tools, node_results = verify_node_toolchain_versions(paths, args.owner_uid)
+            for name, expected in (("node", NODE_VERSION), ("npm", NPM_VERSION)):
+                expected_text = ("v" + expected) if name == "node" else expected
+                try:
+                    actual = node_results[name].stdout.decode("ascii", "strict").strip()
+                except UnicodeDecodeError:
+                    refuse("node-toolchain-version" if name == "node" else "npm-toolchain-version")
+                if node_results[name].returncode != 0 or actual != expected_text:
+                    refuse("node-toolchain-version" if name == "node" else "npm-toolchain-version")
+            paths["node"] = node_tools["node"]
+            paths["npm"] = node_tools["npm"]
         elif not paths["cargo"] or not paths["rustc"]:
             refuse("rust-toolchain-missing")
         if args.profile == "core-rust":
@@ -421,11 +606,7 @@ def main(argv=None):
                 if version_result.returncode != 0 or len(words) < 2 or words[1] != projection["tools"][name]:
                     refuse("rust-toolchain-version")
         if args.profile == "core-node":
-            node_root = Path(paths["node"]).resolve(strict=True).parent.parent
-            npm_path = Path(paths["npm"]).resolve(strict=True)
-            if not npm_path.is_relative_to(node_root):
-                refuse("node-tool-layout")
-            tool_roots = {"node": node_root, "rust": None}
+            tool_roots = {"node": Path(node_tools["root"]), "rust": None}
         else:
             cargo_root = Path(paths["cargo"]).resolve(strict=True).parent.parent
             rustc_path = Path(paths["rustc"]).resolve(strict=True)
