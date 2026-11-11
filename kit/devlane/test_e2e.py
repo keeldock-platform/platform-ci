@@ -187,10 +187,14 @@ class _DiagnosticState:
     def __init__(self):
         self.first_failure = None
         self.cleanup_state = ""
+        self.tooling_reason = ""
+        self.tooling_version = ""
 
     def reset(self):
         self.first_failure = None
         self.cleanup_state = ""
+        self.tooling_reason = ""
+        self.tooling_version = ""
 
     def capture(self, phase, error):
         if self.first_failure is None:
@@ -200,6 +204,13 @@ class _DiagnosticState:
             else:
                 category = (error.category if type(error) is StartupRefusalMismatch
                             else _EXCEPTION_CATEGORIES.get(type(error), "unclassified"))
+                if type(error) is rust_tooling.ToolingRefusal:
+                    self.tooling_reason = (
+                        error.code if error.code in diagnostic_contract.TOOLING_REFUSAL_CODES
+                        else "tooling-refusal-unlisted"
+                    )
+                    if self.tooling_reason == "tool-version-mismatch":
+                        self.tooling_version = _public_tool_version_line(error.version_output)
             self.first_failure = (phase, category)
 
     @contextmanager
@@ -217,9 +228,35 @@ class _DiagnosticState:
             self.capture("harness-startup", error)
         phase, category = self.first_failure
         line = "devlane_production_e2e=refused stage=" + phase + " exception=" + category
+        if category == "tooling-refusal":
+            reason = self.tooling_reason or "tooling-refusal-unlisted"
+            line += " reason=" + reason
+            if reason == "tool-version-mismatch" and self.tooling_version:
+                line += ' version="' + self.tooling_version + '"'
         if self.cleanup_state == "unconfirmed":
             line += " cleanup=unconfirmed"
         return line
+
+
+def _public_tool_version_line(output):
+    """Keep one short, path-free public version line from a pinned tool probe."""
+    if type(output) is not bytes:
+        return ""
+    first_line = output.partition(b"\n")[0].partition(b"\r")[0][:256]
+    text = first_line.decode("ascii", "replace").strip()
+    if any(marker in text for marker in (
+        "SYNTHETIC_SOURCE_CANARY", "PRIVATE_SOURCE_CANARY", "SYNTHETIC_KEY_CANARY",
+        "PRIVATE_KEY_CANARY", "KEYCANARY",
+    )):
+        return "redacted"
+    sanitized = "".join(character if character in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ._+-"
+                        else "_" for character in text)
+    sanitized = " ".join(sanitized.split())[:32].strip()
+    if not sanitized:
+        return ""
+    if not sanitized[0].isalnum() and sanitized[0] not in "._+-":
+        return ""
+    return sanitized
 
 
 DIAGNOSTICS = _DiagnosticState()

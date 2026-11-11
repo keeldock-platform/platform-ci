@@ -314,6 +314,80 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
         self.assertEqual(state.refusal_line(NameError()),
                          "devlane_production_e2e=refused stage=fixture-load exception=name-error")
 
+    def test_tooling_refusal_reports_allowlisted_reason_and_sanitized_version_probe(self):
+        state = test_e2e._DiagnosticState()
+        private_path = chr(47) + "private/runner"
+        error = test_e2e.rust_tooling.ToolingRefusal(
+            "tool-version-mismatch",
+            version_output=(b"cargo-semver-checks 0.51.0\n"
+                            + private_path.encode("ascii") + b"\n"),
+        )
+        state.capture("tool-cargo-semver-checks-version", error)
+        line = state.refusal_line(error)
+        self.assertEqual(
+            line,
+            'devlane_production_e2e=refused stage=tool-cargo-semver-checks-version '
+            'exception=tooling-refusal reason=tool-version-mismatch '
+            'version="cargo-semver-checks 0.51.0"',
+        )
+        self.assertTrue(test_e2e.diagnostic_contract.public_preparation_diagnostic(line))
+        self.assertLessEqual(len(line.encode("ascii")),
+                             test_e2e.diagnostic_contract.MAX_PUBLIC_DIAGNOSTIC_BYTES)
+        self.assertNotIn(private_path, line)
+        self.assertTrue(
+            test_e2e.rust_tooling.TOOLING_REFUSAL_CODES
+            <= test_e2e.diagnostic_contract.TOOLING_REFUSAL_CODES,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            diagnostic = Path(temporary) / "diagnostic"
+            self.assertTrue(test_e2e._write_diagnostic_file(str(diagnostic), line))
+            self.assertEqual(test_e2e._read_reportable_diagnostic_file(str(diagnostic)), line)
+
+        self.assertEqual(
+            test_e2e._public_tool_version_line(
+                b"cargo " + private_path.encode("ascii") + b"\x1b[31m",
+            ),
+            "cargo _private_runner__31m",
+        )
+        self.assertEqual(
+            test_e2e._public_tool_version_line(b"cargo KEYCANARY-73A10X 0.51.0"),
+            "redacted",
+        )
+        self.assertLessEqual(len(test_e2e._public_tool_version_line(b"x" * 200)), 32)
+
+        invalid_lines = (
+            "devlane_production_e2e=refused stage=tool-cargo-semver-checks-version "
+            "exception=tooling-refusal",
+            "devlane_production_e2e=refused stage=tool-cargo-semver-checks-version "
+            "exception=tooling-refusal reason=private-path",
+            "devlane_production_e2e=refused stage=tool-cargo-semver-checks-version "
+            "exception=tooling-refusal reason=tool-binary-missing version=\"cargo 0.51.0\"",
+            "devlane_production_e2e=refused stage=tool-cargo-semver-checks-version "
+            "exception=runtime-error reason=tool-version-mismatch",
+        )
+        for invalid in invalid_lines:
+            with self.subTest(line=invalid):
+                self.assertFalse(test_e2e.diagnostic_contract.public_preparation_diagnostic(invalid))
+
+        missing = test_e2e.rust_tooling.ToolingRefusal("tool-binary-missing")
+        state.reset()
+        state.capture("tool-cargo-semver-checks-version", missing)
+        missing_line = state.refusal_line(missing)
+        self.assertIn("reason=tool-binary-missing", missing_line)
+        self.assertNotIn("version=", missing_line)
+        self.assertTrue(test_e2e.diagnostic_contract.public_preparation_diagnostic(missing_line))
+
+        untrusted = test_e2e.rust_tooling.ToolingRefusal(
+            "private path KEYCANARY-73A10X",
+            version_output=b"cargo KEYCANARY-73A10X\n",
+        )
+        state.reset()
+        state.capture("tool-cargo-semver-checks-version", untrusted)
+        untrusted_line = state.refusal_line(untrusted)
+        self.assertIn("reason=tooling-refusal-unlisted", untrusted_line)
+        self.assertNotIn("private path", untrusted_line)
+        self.assertNotIn("KEYCANARY", untrusted_line)
+
     def test_every_production_phase_has_a_bounded_allowlisted_failure_line(self):
         private_path = chr(47) + "private/runner"
         secret_marker = "SYNTHETIC_SOURCE_CANARY KEYCANARY-73A10X " + private_path + "/candidate"
@@ -354,7 +428,7 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
                         raise error
                 except Exception as caught:
                     line = state.refusal_line(caught)
-                self.assertTrue(line.endswith("exception=" + category))
+                self.assertIn("exception=" + category, line)
                 self.assertNotIn("SYNTHETIC_SOURCE_CANARY", line)
                 self.assertNotIn(private_path, line)
                 self.assertNotIn("KEYCANARY-73A10X", line)

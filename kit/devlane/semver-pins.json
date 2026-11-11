@@ -7,7 +7,7 @@
     "release_commit": "260fad71517e8b320c5c1ad1f367900ab37362a1",
     "asset_sha256": "cacadafaa5cd27ae6d05a74a103266917ebab4c5e43c898360e177d4fbf06a65",
     "target": "x86_64-unknown-linux-gnu",
-    "version_output": "cargo 0.51.0"
+    "version_output": "cargo-semver-checks 0.51.0"
   },
   "baseline": {
     "identity": "staged baseline runtime",

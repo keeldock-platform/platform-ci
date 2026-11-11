@@ -99,11 +99,24 @@ ACCEPTANCE_FAILURE_STAGES = frozenset((
     "rehearsal-tests", "production-path-e2e",
 ))
 
-PREPARATION_PUBLIC_PHASES = PREPARATION_STAGES
+TOOLING_E2E_PHASES = frozenset((
+    "tooling-root-create", "tooling-root-fetch", "tooling-root-cleanup",
+    "tool-staging-create", "tool-staging-cleanup", "tool-fetch-setup",
+    "tool-advisory-clone", "tool-advisory-revision", "tool-fetch-finish",
+    "tool-cargo-deny-download", "tool-cargo-deny-extract", "tool-cargo-deny-version",
+    "tool-cargo-deny-copy", "tool-cargo-audit-download", "tool-cargo-audit-extract",
+    "tool-cargo-audit-version", "tool-cargo-audit-copy", "tool-cargo-vet-download",
+    "tool-cargo-vet-extract", "tool-cargo-vet-version", "tool-cargo-vet-copy",
+    "tool-cargo-semver-checks-download", "tool-cargo-semver-checks-extract",
+    "tool-cargo-semver-checks-version", "tool-cargo-semver-checks-copy",
+    "scenario-tool-install", "scenario-tool-verify",
+))
+PUBLIC_DIAGNOSTIC_PHASES = PREPARATION_STAGES | TOOLING_E2E_PHASES
 PREPARATION_E2E_CATEGORIES = frozenset(
     set(PREPARATION_REFUSAL_CODES)
     | {"prepare-" + label for label in PREPARATION_EXCEPTION_LABELS}
     | set(PREPARATION_PARENT_CATEGORIES)
+    | {"tooling-refusal"}
 )
 
 _REFUSAL_RESULT = re.compile(
@@ -116,8 +129,19 @@ _EXCEPTION_RESULT = re.compile(
 )
 _E2E_REFUSAL = re.compile(
     r"devlane_production_e2e=refused stage=([a-z0-9-]{1,48}) "
-    r"exception=([a-z0-9-]{1,48})(?: cleanup=(unconfirmed))?\Z"
+    r"exception=([a-z0-9-]{1,48})"
+    r"(?: reason=([a-z0-9-]{1,48})(?: version=\"([A-Za-z0-9._+-][A-Za-z0-9 ._+-]{0,31})\")?)?"
+    r"(?: cleanup=(unconfirmed))?\Z"
 )
+TOOLING_REFUSAL_CODES = frozenset((
+    "deadline-file-required", "tool-download-failed", "tool-archive-size",
+    "tool-digest-mismatch", "tool-archive-members", "tool-archive-path",
+    "tool-binary-missing", "tool-version-unavailable", "tool-version-mismatch",
+    "tool-binary-invalid", "tool-binary-size", "tool-output-exists",
+    "tool-copy-invalid", "advisory-database-fetch-failed",
+    "advisory-database-revision", "tool-tree-invalid", "tool-destination-exists",
+    "advisory-database-link", "tooling-refusal-unlisted",
+))
 MAX_PREPARATION_OUTPUT_BYTES = 512
 MAX_PUBLIC_DIAGNOSTIC_BYTES = 192
 MAX_ACCEPTANCE_DETAIL_BYTES = 384
@@ -171,9 +195,17 @@ def public_preparation_diagnostic(line):
     match = _E2E_REFUSAL.fullmatch(line)
     if not match:
         return False
-    stage, category, cleanup = match.groups()
-    return (stage in PREPARATION_PUBLIC_PHASES and category in PREPARATION_E2E_CATEGORIES
-            and (cleanup is None or cleanup == "unconfirmed"))
+    stage, category, reason, version, cleanup = match.groups()
+    if stage not in PUBLIC_DIAGNOSTIC_PHASES or category not in PREPARATION_E2E_CATEGORIES:
+        return False
+    if category == "tooling-refusal":
+        if reason not in TOOLING_REFUSAL_CODES:
+            return False
+        if version is not None and reason != "tool-version-mismatch":
+            return False
+    elif reason is not None or version is not None:
+        return False
+    return cleanup is None or cleanup == "unconfirmed"
 
 
 def public_acceptance_detail(line):

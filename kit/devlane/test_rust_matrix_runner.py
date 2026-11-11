@@ -3390,7 +3390,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
         })
         semver_tool = rust_tooling.TOOLS["cargo-semver-checks"]
         self.assertEqual(semver_tool[1], rust_matrix_runner.semver_stage.SEMVER_ASSET_SHA256)
-        self.assertEqual(semver_tool[3], "cargo 0.51.0")
+        self.assertEqual(semver_tool[3], "cargo-semver-checks 0.51.0")
         generator = inspect.getsource(test_e2e._write_rust_fixture)
         self.assertIn("generate-lockfile", generator)
         contract = inspect.getsource(test_e2e._validate_rust_fixture)

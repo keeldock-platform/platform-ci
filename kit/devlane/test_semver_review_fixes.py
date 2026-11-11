@@ -126,7 +126,7 @@ class ToolReceiptTests(unittest.TestCase):
             self.assertEqual(receipt["asset_sha256"],
                              rust_tooling.TOOLS["cargo-semver-checks"][1])
             self.assertEqual(receipt["version"], "0.51.0")
-            self.assertEqual(receipt["version_output"], "cargo 0.51.0")
+            self.assertEqual(receipt["version_output"], "cargo-semver-checks 0.51.0")
             self.assertEqual(receipt["binary_sha256"],
                              _sha((source / "cargo-semver-checks").read_bytes()))
             self.assertEqual(receipt_bytes,
@@ -141,6 +141,25 @@ class ToolReceiptTests(unittest.TestCase):
         self.assertEqual(phases.count("tool-cargo-semver-checks-extract"), 1)
         self.assertEqual(phases.count("tool-cargo-semver-checks-version"), 1)
         self.assertEqual(phases.count("tool-cargo-semver-checks-copy"), 1)
+
+    def test_semver_cli_version_probe_uses_tagged_command_name_and_keeps_bounded_mismatch_line(self):
+        self.assertEqual(
+            rust_tooling.TOOLS["cargo-semver-checks"][3],
+            "cargo-semver-checks 0.51.0",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = Path(temporary) / "cargo-semver-checks"
+            binary.write_bytes(b"synthetic executable")
+            observed = b"cargo-semver-checks 0.50.0\n" + (b"unexpected detail\n" * 100)
+            with patch.object(rust_tooling, "_remaining", return_value=10), \
+                    patch.object(rust_tooling.subprocess, "run", return_value=subprocess.CompletedProcess(
+                        [str(binary), "--version"], 0, observed, b"private stderr")):
+                with self.assertRaises(rust_tooling.ToolingRefusal) as caught:
+                    rust_tooling._binary(temporary, "cargo-semver-checks",
+                                         rust_tooling.TOOLS["cargo-semver-checks"][3])
+        self.assertEqual(caught.exception.code, "tool-version-mismatch")
+        self.assertEqual(caught.exception.version_output, b"cargo-semver-checks 0.50.0")
+        self.assertNotIn(b"private stderr", caught.exception.version_output)
 
     def test_consumer_matches_actual_verbose_producer_commands_and_loader(self):
         source = inspect.getsource(constraint_resolver.run_cargo_fixed_point)

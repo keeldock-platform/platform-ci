@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 from urllib.request import Request, urlopen
 
 
+SEMVER_VERSION_OUTPUT = "cargo-semver-checks 0.51.0"
 TOOLS = {
     "cargo-deny": (
         "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz",
@@ -35,13 +36,22 @@ TOOLS = {
         "https://github.com/obi1kenobi/cargo-semver-checks/releases/download/v0.51.0/cargo-semver-checks-x86_64-unknown-linux-gnu.tar.gz",
         "cacadafaa5cd27ae6d05a74a103266917ebab4c5e43c898360e177d4fbf06a65",
         "cargo-semver-checks-x86_64-unknown-linux-gnu.tar.gz",
-        "cargo 0.51.0", "r:gz",
+        SEMVER_VERSION_OUTPUT, "r:gz",
     ),
 }
 SEMVER_RELEASE_COMMIT = "260fad71517e8b320c5c1ad1f367900ab37362a1"
 SEMVER_TARGET = "x86_64-unknown-linux-gnu"
 SEMVER_RECEIPT = "semver-tool-receipt.json"
 SEMVER_MAX_BINARY = 128 * 1024 * 1024
+TOOLING_REFUSAL_CODES = frozenset((
+    "deadline-file-required", "tool-download-failed", "tool-archive-size",
+    "tool-digest-mismatch", "tool-archive-members", "tool-archive-path",
+    "tool-binary-missing", "tool-version-unavailable", "tool-version-mismatch",
+    "tool-binary-invalid", "tool-binary-size", "tool-output-exists",
+    "tool-copy-invalid", "advisory-database-fetch-failed",
+    "advisory-database-revision", "tool-tree-invalid", "tool-destination-exists",
+    "advisory-database-link",
+))
 SEMVER_RECEIPT_VERIFICATION = (
     "published release-asset digest matched; executable version matched pinned output"
 )
@@ -52,7 +62,11 @@ _DEADLINE_FILE = ""
 
 
 class ToolingRefusal(ValueError):
-    pass
+    def __init__(self, code, *, version_output=b""):
+        self.code = (code if type(code) is str and code in TOOLING_REFUSAL_CODES
+                     else "tooling-refusal-unlisted")
+        self.version_output = version_output if type(version_output) is bytes else b""
+        super().__init__(self.code)
 
 
 def _remaining(cap):
@@ -110,8 +124,13 @@ def _binary(root, name, version):
                                 env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, check=False)
     except (OSError, subprocess.SubprocessError):
         raise ToolingRefusal("tool-version-unavailable") from None
-    if result.returncode != 0 or result.stdout.decode("ascii", "strict").strip() != version:
-        raise ToolingRefusal("tool-version-mismatch")
+    try:
+        observed = result.stdout.decode("ascii", "strict").strip()
+    except UnicodeDecodeError:
+        observed = ""
+    if result.returncode != 0 or observed != version:
+        first_line = result.stdout.partition(b"\n")[0].partition(b"\r")[0][:256]
+        raise ToolingRefusal("tool-version-mismatch", version_output=first_line)
     return candidate
 
 

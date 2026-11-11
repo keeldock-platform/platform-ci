@@ -20,7 +20,7 @@ SUITE = "semver-runtime"
 STAGE = "semver"
 CHECK_SECONDS = 1800
 PIN_FILE = Path(__file__).with_name("semver-pins.json")
-PIN_FILE_SHA256 = "fa82638c9c3690a9af408212e02045b938775079bb173debeaa02107067acbd8"
+PIN_FILE_SHA256 = "e18a8428350c9e9843081623697dfcba76bcefbe23a08491460480f1cb112688"
 MAX_PIN_BYTES = 16 * 1024
 MAX_SOURCE_FILE_BYTES = 32 * 1024 * 1024
 MAX_SOURCE_TREE_BYTES = 512 * 1024 * 1024
@@ -28,6 +28,7 @@ MAX_SEMVER_TOOL_BYTES = 128 * 1024 * 1024
 SEMVER_WORKER_SOCKET = "/scratch/semver-state/matrix-worker.sock"
 SEMVER_TOOL = "cargo-semver-checks"
 SEMVER_VERSION = "0.51.0"
+SEMVER_VERSION_OUTPUT = "cargo-semver-checks " + SEMVER_VERSION
 SEMVER_ASSET_SHA256 = "cacadafaa5cd27ae6d05a74a103266917ebab4c5e43c898360e177d4fbf06a65"
 SEMVER_RELEASE_COMMIT = "260fad71517e8b320c5c1ad1f367900ab37362a1"
 TARGET_TRIPLE = "x86_64-unknown-linux-gnu"
@@ -526,7 +527,7 @@ def verify_tool(tools_root=TOOLS_ROOT, budget=None):
             "asset_sha256": SEMVER_ASSET_SHA256,
             "asset_name": SEMVER_TOOL + "-x86_64-unknown-linux-gnu.tar.gz",
             "target": TARGET_TRIPLE,
-            "version_output": "cargo " + SEMVER_VERSION,
+            "version_output": SEMVER_VERSION_OUTPUT,
             "binary_sha256": binary_sha,
             "binary_size_bytes": binary_size,
             "verification": "published release-asset digest matched; executable version matched pinned output",
