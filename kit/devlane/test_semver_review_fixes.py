@@ -446,6 +446,24 @@ class SupervisorCheckpointTests(unittest.TestCase):
 
 
 class TeardownTests(unittest.TestCase):
+    def test_actual_fixture_validator_has_the_complete_independent_coverage_set(self):
+        import test_e2e
+        expected = [
+            "fmt-root", "fmt-runtime", "fmt-fuzz", "deny-root", "deny-runtime", "deny-fuzz",
+            "audit-root", "audit-runtime", "audit-fuzz", "vet-root", "vet-runtime", "vet-fuzz",
+            "root-default", "root-all-features", "runtime-default", "runtime-all-features",
+            "fuzz-default", "fuzz-all-features", "listener-default", "listener-all-features",
+            "fuzz-replay-default", "fuzz-replay-all-features", "semver-runtime",
+        ]
+        tree = ast.parse(inspect.getsource(test_e2e._validate_rust_fixture))
+        comparisons = [node for node in ast.walk(tree) if isinstance(node, ast.Compare)
+                       and isinstance(node.left, ast.Subscript)
+                       and isinstance(node.left.slice, ast.Constant)
+                       and node.left.slice.value == "coverage_ids"]
+        self.assertEqual(len(comparisons), 1)
+        self.assertEqual(ast.literal_eval(comparisons[0].comparators[0]), expected)
+        self.assertEqual(test_e2e.rust_matrix_runner.EXPECTED_MATRIX["coverage_ids"], expected)
+
     def test_namespace_wide_signals_refuse_before_any_signal_on_host(self):
         for function in (supervisor._signal_workload_descendants,
                          supervisor._kill_workload_descendants):

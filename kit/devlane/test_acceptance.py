@@ -1029,10 +1029,12 @@ class SupervisorOrderAcceptanceTests(unittest.TestCase):
         })()
         try:
             with patch.object(supervisor, "Service", return_value=service), \
+                    patch.object(supervisor, "_signal_workload_descendants") as signal_children, \
                     patch.object(supervisor, "_kill_workload_descendants") as kill_children:
                 self.assertEqual(supervisor._serve(args), 2)
                 self.assertEqual(service.cleanup_calls, 1)
-                self.assertGreaterEqual(kill_children.call_count, 1)
+                self.assertGreaterEqual(signal_children.call_count, 1)
+                kill_children.assert_not_called()
                 refusal = bundle.strict_json(
                     (Path(args.state_dir) / supervisor.STARTUP_REFUSAL_NAME).read_bytes(), 1024,
                 )

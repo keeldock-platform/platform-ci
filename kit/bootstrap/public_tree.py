@@ -392,7 +392,7 @@ PINNED_FILE_SHA256 = {
     'kit/bootstrap/policy_linux.py': '0b314a645e43f2aaec58ca23150386b5865e8a27c3101459d00d42370e7d5a5f',
     'kit/bootstrap/policy_npm.py': 'b110b4573b2919003792e05bdcec60a0108f9e2ea1ebc1ce820ff77216271794',
     'kit/bootstrap/policy_rust.py': '4306a55701a5a04c884b2b21091a6d06307134e3570f0d5d65cb103ff84023ec',
-    'kit/bootstrap/public_tree.py': 'aab71493cd61adfc264b65f0e247f7b44f8108bad6b9ad1465ee4a9a9ad10d4e',
+    'kit/bootstrap/public_tree.py': 'fde657d12f466a5203be985878397e7d49a61132b4640f34ff9d11a2035c4df2',
     'kit/bootstrap/test_policy_baselines.py': '690980cc3a140970d2b813d854823e3e9f32d8b09db9e25c0ca143140c3af627',
     'kit/bootstrap/test_policy_handoff.py': '3cf707fec6cc1a62e49a948b496fe00765a04ec171fd4cdc57b07d214d3100a2',
     'kit/bootstrap/test_policy_linux.py': 'f1c62480d608d680e73cdbf0ca8b7c83552919bd5de4caa095d5e04e8c3e5f8c',
@@ -581,11 +581,11 @@ PINNED_FILE_SHA256 = {
     'kit/devlane/rust_test_runner.py': 'd0e93a2b5c08369464db30a781a4f48abcaebbf1a316e8a2c38dfb1616061727',
     'kit/devlane/safe_json.mjs': '17d44acd9970efeea8b9b2c80d746efc940460008287f75e7dc2a749239ee169',
     'kit/devlane/supervisor.py': 'c318eab88d3bcf659ccd506985c7245e60b22b7519dadd2eeaa88aaa00e05a89',
-    'kit/devlane/test_acceptance.py': '08e9852bafea85db7054f7c0c8703572fea579836bfd06943802c530390e42ac',
+    'kit/devlane/test_acceptance.py': 'a58bb43d0fa464de6f1e7bde17851cd6ef74df5e028bd03a89dada86361fc6e2',
     'kit/devlane/test_adapters.mjs': '72eefa32c212af17202c0d0e5df0113327b9649f988f57c1101edd825ff742c0',
     'kit/devlane/test_audit_contracts.py': 'a316d0ec12aebcd1b3a9e8d427af87b419226979032bb39940f3f1a47653e53d',
     'kit/devlane/test_coordinator.py': 'eb33d700feba5b7c244b4d2b754d096dc56050e7149fa348f2df658e50d95e95',
-    'kit/devlane/test_e2e.py': '07627b109b1e970fa7a5374cb54cbeae54c29ad9a53bbfb54b15fb80cd01b028',
+    'kit/devlane/test_e2e.py': '8cb811f444132fa4003f5605c3f018161d745badac50dcfb9ece8b2ab5d074fb',
     'kit/devlane/test_linux_runtime.py': '482a626731eb6e7bd91d74e911aa00f5f112bad053caf7432356f7905b159606',
     'kit/devlane/test_rust_report.py': '24c1574d01a8f2a8e1e042f947b1eabe480667c52cadfa9c1e2171ce93938799',
     'kit/devlane/test_rust_test_runner.py': '4ca721b0a527ce12a5ce0068ff05d8ea5821f00b47febef3555f0fe794236ce3',
@@ -612,7 +612,7 @@ PINNED_FILE_SHA256 = {
     'kit/devlane/semver_stage.py': '8cd8361d7b4db14a153c0e555579ba2c7a1a8fedbfec83e69809b86e63ca2b85',
     'kit/devlane/cgroup_exec.py': '8a8a7dbaa74488d7cc70fbd6630c19cb46c9c3311da1c579e6c17666a3b34dba',
     'kit/devlane/temp_project_checkpoints.py': '93e47b3867f6c5e4c7051f5705fc4acea765438c88c73ba272941f6ea11db299',
-    'kit/devlane/test_semver_review_fixes.py': 'c4d3467859804113e93d822b4238b5ace35c05af45241d8ef0ff3ec3e7c19304',
+    'kit/devlane/test_semver_review_fixes.py': 'e59809ed682e6779422c648fa9e84ec7be9695f28f09ed349df395012c4d0b77',
 }
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
 SHA512_SRI_PATTERN = re.compile(r"sha512-[A-Za-z0-9+/]{86}==\Z")

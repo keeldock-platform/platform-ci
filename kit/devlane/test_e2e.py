@@ -646,7 +646,7 @@ def _validate_rust_fixture(root, files, projection, projection_bytes, snapshot):
         "audit-root", "audit-runtime", "audit-fuzz", "vet-root", "vet-runtime", "vet-fuzz",
         "root-default", "root-all-features", "runtime-default", "runtime-all-features",
         "fuzz-default", "fuzz-all-features", "listener-default", "listener-all-features",
-        "fuzz-replay-default", "fuzz-replay-all-features",
+        "fuzz-replay-default", "fuzz-replay-all-features", "semver-runtime",
     ], "rust-matrix-suite-set")
     for path in ("deny.toml", "supply-chain/config.toml", "supply-chain/audits.toml",
                  "runtime/supply-chain/config.toml", "runtime/supply-chain/audits.toml",
