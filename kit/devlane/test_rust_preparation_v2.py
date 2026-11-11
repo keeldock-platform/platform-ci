@@ -1,11 +1,12 @@
 """Source-free regressions for pre-cut registry preparation."""
 import errno
+import io
 import os
 from pathlib import Path
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import bundle
 import bounded_registry_io
@@ -189,15 +190,14 @@ class PreparationTests(unittest.TestCase):
                     patch.object(smoke.deadline, "remaining"), \
                     patch.object(smoke.tempfile, "mkdtemp", return_value=temporary), \
                     patch.object(smoke, "smoke", side_effect=fail_after_phase), \
-                    patch.object(smoke.os.path, "ismount", return_value=False), \
-                    patch.object(smoke.shutil, "rmtree", side_effect=OSError(errno.EIO, "cleanup-path-canary")):
+                    patch.object(smoke, "_mountpoints_beneath", return_value=((), "ok")), \
+                    patch.object(smoke, "_bounded_cleanup_command", return_value="errno-5"):
                 with self.assertRaises(OSError) as result:
                     smoke.main(args)
             diagnostic = smoke.failure_diagnostic(result.exception)
-            self.assertEqual(diagnostic,
-                             "unexpected-filesystem-smoke-projection-envelope-errno-13-cleanup-unconfirmed")
+            self.assertEqual(diagnostic, "unexpected-filesystem-smoke-projection-envelope-errno-13-"
+                             "cleanup-unmount-not-mounted-fds-0-tree-errno-5")
             self.assertNotIn("private-path-canary", diagnostic)
-            self.assertNotIn("cleanup-path-canary", diagnostic)
 
     def test_public_smoke_cleanup_failure_cannot_report_success(self):
         args = ["--cargo-path", "unused", "--rustc-path", "unused", "--control-sha", CONTROL_SHA,
@@ -208,13 +208,147 @@ class PreparationTests(unittest.TestCase):
                     patch.object(smoke.deadline, "remaining"), \
                     patch.object(smoke.tempfile, "mkdtemp", return_value=temporary), \
                     patch.object(smoke, "smoke"), \
-                    patch.object(smoke.os.path, "ismount", return_value=False), \
-                    patch.object(smoke.shutil, "rmtree", side_effect=OSError(errno.EIO, "cleanup-path-canary")):
+                    patch.object(smoke, "_mountpoints_beneath", return_value=((), "ok")), \
+                    patch.object(smoke, "_bounded_cleanup_command", return_value="exit-5"):
                 with self.assertRaises(bundle.Refusal) as result:
                     smoke.main(args)
             diagnostic = smoke.failure_diagnostic(result.exception)
-            self.assertEqual(diagnostic, "rust-preparation-smoke-cleanup-cleanup-unconfirmed")
-            self.assertNotIn("cleanup-path-canary", diagnostic)
+            self.assertEqual(diagnostic, "rust-preparation-smoke-cleanup-cleanup-unmount-not-mounted-"
+                             "fds-0-tree-exit-5")
+
+    def test_cleanup_keeps_mounted_readonly_tree_intact_after_umount_refusal(self):
+        args = ["--cargo-path", "unused", "--rustc-path", "unused", "--control-sha", CONTROL_SHA,
+                "--deadline-file", "unused", "--owner-uid", "1001", "--owner-gid", "1001"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            toolchain = root / "toolchain"
+            calls = []
+            def cleanup(argv, _deadline_file, **_kwargs):
+                calls.append(argv[0])
+                return "exit-32"
+
+            with patch.object(smoke.sys, "platform", "linux"), \
+                    patch.object(smoke.os, "geteuid", return_value=0), \
+                    patch.object(smoke.deadline, "remaining"), \
+                    patch.object(smoke.tempfile, "mkdtemp", return_value=temporary), \
+                    patch.object(smoke, "smoke"), \
+                    patch.object(smoke, "_mountpoints_beneath", return_value=((toolchain,), "ok")), \
+                    patch.object(smoke, "_mount_fd_count", return_value=2), \
+                    patch.object(smoke, "_bounded_cleanup_command", side_effect=cleanup):
+                with self.assertRaises(bundle.Refusal) as result:
+                    smoke.main(args)
+            self.assertEqual(calls, ["/usr/bin/umount"])
+            self.assertEqual(smoke.SMOKE_CLEANUP_TREE, "skipped-mounted")
+            self.assertEqual(smoke.failure_diagnostic(result.exception),
+                             "rust-preparation-smoke-cleanup-cleanup-unmount-umount-exit-32-mounted-1-"
+                             "fds-2-tree-skipped-mounted")
+
+    def test_mountinfo_parser_matches_mountpoint_after_kernel_escaping(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "mount proof"
+            escaped = str(root).replace(" ", r"\040")
+            payload = ("36 25 0:32 / %s rw,nosuid - tmpfs tmpfs rw\n" % escaped).encode("ascii")
+            with patch.object(Path, "open", return_value=io.BytesIO(payload)):
+                mountpoints, state = smoke._mountpoints_beneath(root)
+            self.assertEqual(state, "ok")
+            self.assertEqual(mountpoints, (root,))
+
+    def test_cleanup_command_uses_owned_process_group_and_reaps_successful_helper(self):
+        with patch.object(smoke.deadline, "cleanup_remaining", return_value=10):
+            result = smoke._bounded_cleanup_command(
+                [smoke.sys.executable, "-I", "-S", "-B", "-c", "pass"], "unused")
+        self.assertEqual(result, "ok")
+
+    def test_cleanup_tree_helper_captures_only_numeric_errno_and_removes_owned_tree(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(smoke.deadline, "cleanup_remaining", return_value=10):
+            root = Path(temporary) / "owned"
+            root.mkdir()
+            (root / "fixture").write_text("public", encoding="ascii")
+            removed = smoke._bounded_cleanup_command(
+                [smoke.sys.executable, "-I", "-S", "-B", "-c", smoke._CLEANUP_TREE_SCRIPT,
+                 str(root)], "unused", capture_errno=True)
+            self.assertEqual(removed, "ok")
+            self.assertFalse(root.exists())
+
+            missing = smoke._bounded_cleanup_command(
+                [smoke.sys.executable, "-I", "-S", "-B", "-c", smoke._CLEANUP_TREE_SCRIPT,
+                 str(root)], "unused", capture_errno=True)
+            self.assertEqual(missing, "errno-2")
+
+    def test_cleanup_tree_helper_rejects_unbounded_or_path_bearing_output(self):
+        command = [smoke.sys.executable, "-I", "-S", "-B", "-c",
+                   "import sys; print('unexpected-output'); sys.exit(3)"]
+        with patch.object(smoke.deadline, "cleanup_remaining", return_value=10):
+            result = smoke._bounded_cleanup_command(command, "unused", capture_errno=True)
+        self.assertEqual(result, "output-invalid")
+        self.assertNotIn("private", result)
+
+    def test_cleanup_root_removes_owned_tree_only_after_mount_table_confirms_none(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(smoke, "_mountpoints_beneath", return_value=((), "ok")), \
+                patch.object(smoke.deadline, "cleanup_remaining", return_value=10):
+            root = Path(temporary) / "owned"
+            root.mkdir()
+            (root / "fixture").write_text("public", encoding="ascii")
+            smoke._cleanup_root(root, "unused")
+            self.assertFalse(root.exists())
+            self.assertEqual(smoke.SMOKE_CLEANUP_UNMOUNT, "not-mounted")
+            self.assertEqual(smoke.SMOKE_CLEANUP_TREE, "removed")
+
+    def test_cleanup_will_not_unmount_while_owned_child_group_is_unconfirmed(self):
+        process = type("Process", (), {"pid": 42, "poll": lambda _self: None})()
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(smoke, "SMOKE_CHILD_PROCESS", process), \
+                patch.object(smoke, "SMOKE_CHILD_PROCESS_GROUP", 42), \
+                patch.object(smoke, "SMOKE_CHILD_REAP", "confirmed"), \
+                patch.object(smoke, "_stop_and_reap_group", return_value="unconfirmed"), \
+                patch.object(smoke, "_mountpoints_beneath") as mounts, \
+                patch.object(smoke, "_bounded_cleanup_command") as cleanup:
+            smoke._cleanup_root(Path(temporary), "unused")
+            mounts.assert_not_called()
+            cleanup.assert_not_called()
+            self.assertEqual(smoke.SMOKE_CLEANUP_UNMOUNT, "children-unconfirmed")
+            self.assertEqual(smoke.SMOKE_CLEANUP_TREE, "skipped-unsafe")
+
+    def test_cleanup_reaps_owned_child_group_before_releasing_mount_and_tree(self):
+        process = type("Process", (), {"pid": 42, "poll": lambda _self: 0})()
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(smoke, "SMOKE_CHILD_PROCESS", process), \
+                patch.object(smoke, "SMOKE_CHILD_PROCESS_GROUP", 42), \
+                patch.object(smoke, "SMOKE_CHILD_REAP", "confirmed"), \
+                patch.object(smoke, "_stop_and_reap_group", return_value="reaped") as reap, \
+                patch.object(smoke, "_mountpoints_beneath", return_value=((), "ok")), \
+                patch.object(smoke.deadline, "cleanup_remaining", return_value=10):
+            root = Path(temporary) / "owned"
+            root.mkdir()
+            (root / "fixture").write_text("public", encoding="ascii")
+            smoke._cleanup_root(root, "unused")
+            reap.assert_called_once_with(42, "unused", process)
+            self.assertIsNone(smoke.SMOKE_CHILD_PROCESS)
+            self.assertIsNone(smoke.SMOKE_CHILD_PROCESS_GROUP)
+            self.assertFalse(root.exists())
+            self.assertEqual(smoke.SMOKE_CLEANUP_TREE, "removed")
+
+    def test_leftover_child_group_is_stopped_before_mount_cleanup(self):
+        process = type("Process", (), {"poll": lambda _self: None})()
+        with patch.object(smoke, "_process_group_alive", side_effect=(True, False)), \
+                patch.object(smoke, "_reap_group_children", return_value=True), \
+                patch.object(smoke.deadline, "_read", return_value={
+                    "work_deadline": time.monotonic() + 10, "cleanup_reserve": 5}), \
+                patch.object(smoke.os, "killpg") as kill_group:
+            result = smoke._stop_and_reap_group(42, "unused", process)
+        self.assertEqual(result, "reaped")
+        kill_group.assert_called_once_with(42, smoke.signal.SIGTERM)
+
+    def test_disappearing_process_group_still_reaps_its_direct_child(self):
+        process = type("Process", (), {"pid": 42})()
+        process.poll = Mock(side_effect=(None, 0))
+        with patch.object(smoke, "_process_group_alive", return_value=True), \
+                patch.object(smoke.os, "killpg", side_effect=ProcessLookupError):
+            result = smoke._stop_and_reap_group(42, "unused", process)
+        self.assertEqual(result, "confirmed")
+        self.assertEqual(process.poll.call_count, 2)
 
     def test_smoke_preserves_the_preparation_child_file_limit_without_privileged_raise(self):
         def child(*_args, **kwargs):
