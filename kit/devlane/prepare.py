@@ -36,7 +36,7 @@ SCRIPT_SUPPRESSION_ENVIRONMENT = {"NPM_CONFIG_IGNORE_SCRIPTS": "true"}
 NPM_CI_ARGUMENTS = ("ci", "--ignore-scripts", "--include=dev", "--include=optional", "--no-audit", "--no-fund")
 NODE_TOOL_CACHE_ROOT = Path("/opt/hostedtoolcache")
 NODE_TOOL_ROOT = NODE_TOOL_CACHE_ROOT / "node" / "24.22.1" / "x64"
-NODE_TOOL_SYSTEM_ANCHORS = ((Path("/"), 0), (Path("/opt"), 0))
+NODE_TOOL_SYSTEM_ANCHORS = ((Path("/"), 0), (node_tool_snapshot.SHARED_TOOLCHAIN_ANCHOR, 0))
 NODE_VERSION_ENVIRONMENT = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
 NODE_VERSION = "24.22.1"
 NPM_VERSION = "11.19.1"
@@ -94,6 +94,8 @@ def _node_refuse(code):
 
 _NODE_DIRECTORY_WRITE_CODES = {
     "source-anchor": "node-toolchain-source-anchor-write-mode",
+    "source-root-anchor": "node-toolchain-source-root-anchor-write-mode",
+    "source-opt-anchor": "node-toolchain-source-opt-anchor-write-mode",
     "source-cache-root": "node-toolchain-source-cache-root-write-mode",
     "source-node-layout": "node-toolchain-source-node-layout-write-mode",
     "source-npm-layout": "node-toolchain-source-npm-layout-write-mode",
@@ -105,7 +107,13 @@ _NODE_FILE_WRITE_CODES = {
 }
 
 
-def _node_directory(path, owner_uids, *, role):
+def _shared_toolchain_anchor_group_write(metadata, path, trusted_source_group_gid):
+    return node_tool_snapshot._trusted_shared_anchor_group_write(
+        metadata, path, trusted_source_group_gid,
+    )
+
+
+def _node_directory(path, owner_uids, *, role, trusted_source_group_gid=None):
     write_code = _NODE_DIRECTORY_WRITE_CODES.get(role)
     if write_code is None:
         _node_refuse("node-tool-layout")
@@ -118,7 +126,8 @@ def _node_directory(path, owner_uids, *, role):
     if metadata.st_uid not in owner_uids:
         _node_refuse("node-toolchain-owner")
     mode = stat.S_IMODE(metadata.st_mode)
-    if mode & 0o022:
+    if (mode & 0o022
+            and not _shared_toolchain_anchor_group_write(metadata, path, trusted_source_group_gid)):
         _node_refuse(write_code)
     if not mode & stat.S_IRUSR or not mode & stat.S_IXUSR:
         _node_refuse("node-toolchain-directory-control-access")
@@ -205,7 +214,7 @@ def _validate_npm_tree(root, owner_uids, deadline_file=None):
 
 
 def validate_node_toolchain(paths, owner_uid, *, tool_cache_root=None, node_root=None, system_anchors=None,
-                            deadline_file=None):
+                            deadline_file=None, trusted_source_group_gid=None):
     """Validate the trusted source tree; worker access is enforced on its sealed snapshot."""
     cache_root = Path(tool_cache_root) if tool_cache_root is not None else NODE_TOOL_CACHE_ROOT
     root = Path(node_root) if node_root is not None else NODE_TOOL_ROOT
@@ -218,11 +227,24 @@ def validate_node_toolchain(paths, owner_uid, *, tool_cache_root=None, node_root
         _node_refuse("node-tool-layout")
     if not anchors:
         _node_refuse("node-tool-layout")
+    if (trusted_source_group_gid is not None
+            and (type(trusted_source_group_gid) is not int
+                 or trusted_source_group_gid < 1 or trusted_source_group_gid > 60000
+                 or trusted_source_group_gid == GID)):
+        _node_refuse("node-toolchain-owner")
     for index, (anchor, anchor_uid) in enumerate(anchors):
         anchor = Path(anchor)
         if index and anchor.parent != Path(anchors[index - 1][0]):
             _node_refuse("node-tool-layout")
-        _node_directory(anchor, frozenset((anchor_uid,)), role="source-anchor")
+        role = (
+            "source-root-anchor" if anchor == Path("/") else
+            "source-opt-anchor" if anchor == node_tool_snapshot.SHARED_TOOLCHAIN_ANCHOR else
+            "source-anchor"
+        )
+        _node_directory(
+            anchor, frozenset((anchor_uid,)), role=role,
+            trusted_source_group_gid=trusted_source_group_gid,
+        )
     if cache_root.parent != Path(anchors[-1][0]):
         _node_refuse("node-tool-layout")
     _node_directory(cache_root, owner_uids, role="source-cache-root")
@@ -710,6 +732,7 @@ def main(argv=None):
             _set_preparation_stage("prepare-node-toolchain-snapshot")
             node_tools = node_tool_snapshot.create_snapshot(
                 paths, node_snapshot_id, args.owner_uid, DEADLINE_FILE,
+                trusted_source_group_gid=args.owner_gid,
             )
             node_snapshot_created = True
             _set_preparation_stage("prepare-node-snapshot-verification")

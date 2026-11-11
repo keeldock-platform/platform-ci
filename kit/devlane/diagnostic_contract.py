@@ -37,6 +37,7 @@ PREPARATION_REFUSAL_CODES = frozenset((
     "node-toolchain-file-control-access",
     "node-toolchain-owner", "node-toolchain-version",
     "node-toolchain-source-anchor-write-mode", "node-toolchain-source-cache-root-write-mode",
+    "node-toolchain-source-root-anchor-write-mode", "node-toolchain-source-opt-anchor-write-mode",
     "node-toolchain-source-node-layout-write-mode", "node-toolchain-source-npm-layout-write-mode",
     "node-toolchain-source-npm-tree-write-mode", "node-toolchain-source-node-file-write-mode",
     "node-toolchain-source-npm-file-write-mode",

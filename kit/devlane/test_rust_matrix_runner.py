@@ -303,10 +303,29 @@ class RustMatrixRunnerTests(unittest.TestCase):
     @contextlib.contextmanager
     def _node_fixture_policy(self, fixture):
         node_tool_prepare = supervisor.node_tool_prepare
+        anchor_uid = fixture.get("anchor_uid", os.getuid())
         with patch.object(node_tool_prepare, "NODE_TOOL_CACHE_ROOT", fixture["cache"]), \
                 patch.object(node_tool_prepare, "NODE_TOOL_ROOT", fixture["node_root"]), \
+                patch.object(node_tool_snapshot, "SHARED_TOOLCHAIN_ANCHOR", fixture["anchor"]), \
                 patch.object(node_tool_prepare, "NODE_TOOL_SYSTEM_ANCHORS",
-                             ((fixture["anchor"], os.getuid()),)):
+                             ((fixture["anchor"], anchor_uid),)):
+            yield
+
+    @contextlib.contextmanager
+    def _node_anchor_metadata(self, fixture):
+        anchor_uid = fixture.get("anchor_uid", os.getuid())
+        if anchor_uid == os.getuid():
+            yield
+            return
+        real_lstat = os.lstat
+
+        def lstat_with_anchor_owner(path, *args, **kwargs):
+            metadata = real_lstat(path, *args, **kwargs)
+            if Path(path) == fixture["anchor"]:
+                return SimpleNamespace(st_mode=metadata.st_mode, st_uid=anchor_uid, st_gid=metadata.st_gid)
+            return metadata
+
+        with patch.object(os, "lstat", side_effect=lstat_with_anchor_owner):
             yield
 
     def _create_node_snapshot(self, fixture, snapshot_base, snapshot_id, deadline_path):
@@ -1348,6 +1367,9 @@ class RustMatrixRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+            os.chown(fixture["anchor"], -1, os.getgid())
+            fixture["anchor_uid"] = 0
+            fixture["anchor"].chmod(0o2770)
             _projection, payload = test_e2e._node_projection(
                 test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
             )
@@ -1381,7 +1403,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 "--node-snapshot-id", snapshot_id,
                 "--node-path", str(fixture["node"]), "--npm-path", str(fixture["npm"]),
             ]
-            with self._node_fixture_policy(fixture), \
+            with self._node_fixture_policy(fixture), self._node_anchor_metadata(fixture), \
                     patch.object(preparation.sys, "platform", "linux"), \
                     patch.object(preparation, "os", _RootEffectiveUIDProxy()), \
                     patch.object(node_tool_snapshot, "DEFAULT_SNAPSHOT_BASE", snapshot_base), \
@@ -1478,7 +1500,9 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 else:
                     member.chmod(0o700 if member in (fixture["node"], fixture["npm_cli"]) else 0o600)
             fixture["node_root"].chmod(0o700)
-            fixture["anchor"].chmod(0o750)
+            os.chown(fixture["anchor"], -1, os.getgid())
+            fixture["anchor_uid"] = 0
+            fixture["anchor"].chmod(0o2770)
             fixture["cache"].chmod(0o750)
 
             sealed_cache = root / "sealed-tool-cache"
@@ -1502,18 +1526,20 @@ class RustMatrixRunnerTests(unittest.TestCase):
             real_run = subprocess.run
             previous_deadline_file = supervisor.ACTIVE_DEADLINE_FILE
             try:
-                with self._node_fixture_policy(fixture):
+                with self._node_fixture_policy(fixture), self._node_anchor_metadata(fixture):
                     source_validation = supervisor.node_tool_prepare.validate_node_toolchain(
                         fixture["paths"], os.getuid(), tool_cache_root=fixture["cache"],
                         node_root=fixture["node_root"],
-                        system_anchors=((fixture["anchor"], os.getuid()),),
+                        system_anchors=((fixture["anchor"], fixture["anchor_uid"]),),
                         deadline_file=str(deadline_path),
+                        trusted_source_group_gid=os.getgid(),
                     )
                     snapshot = node_tool_snapshot.create_snapshot(
                         fixture["paths"], snapshot_id, os.getuid(), str(deadline_path),
                         snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
                         source_node_root=fixture["node_root"],
-                        source_anchors=((fixture["anchor"], os.getuid()),),
+                        source_anchors=((fixture["anchor"], fixture["anchor_uid"]),),
+                        trusted_source_group_gid=os.getgid(),
                     )
                 with patch.object(node_tool_snapshot, "DEFAULT_SNAPSHOT_BASE", snapshot_base), \
                         patch.object(supervisor.node_tool_prepare, "DEADLINE_FILE", str(deadline_path)), \
@@ -1550,7 +1576,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                                   stat.S_IMODE(fixture["node"].stat().st_mode),
                                   stat.S_IMODE(fixture["npm_cli"].stat().st_mode),
                                   stat.S_IMODE((fixture["npm_root"] / "node_modules/shared.js").stat().st_mode)),
-                                 (0o750, 0o750, 0o700, 0o700, 0o700, 0o700, 0o700, 0o600))
+                                 (0o2770, 0o750, 0o700, 0o700, 0o700, 0o700, 0o700, 0o600))
                 self.assertEqual(source_validation["root"], str(fixture["node_root"]))
                 self.assertEqual(validated["root"], str(snapshot_root))
                 self.assertEqual((stat.S_IMODE(snapshot_root.stat().st_mode),
@@ -2282,7 +2308,10 @@ class RustMatrixRunnerTests(unittest.TestCase):
             ("world-writable-bin", "node-toolchain-source-node-layout-write-mode"),
             ("world-writable-node", "node-toolchain-source-node-file-write-mode"),
             ("world-writable-npm-parent", "node-toolchain-source-npm-layout-write-mode"),
-            ("group-writable-anchor", "node-toolchain-source-anchor-write-mode"),
+            ("group-writable-anchor", "node-toolchain-source-opt-anchor-write-mode"),
+            ("trusted-anchor-foreign-group", "node-toolchain-source-opt-anchor-write-mode"),
+            ("trusted-anchor-world-writable", "node-toolchain-source-opt-anchor-write-mode"),
+            ("foreign-owner-shared-anchor", "node-toolchain-owner"),
             ("group-writable-npm-subtree", "node-toolchain-source-npm-tree-write-mode"),
             ("group-writable-npm-file", "node-toolchain-source-npm-file-write-mode"),
             ("bad-owner-cache", "node-toolchain-owner"),
@@ -2314,6 +2343,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 paths = dict(fixture["paths"])
                 owner_target = None
                 foreign_group_target = None
+                trusted_source_group_gid = None
                 if label == "world-writable-cache":
                     fixture["cache"].chmod(0o777)
                 elif label == "world-writable-bin":
@@ -2325,6 +2355,20 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 elif label == "group-writable-anchor":
                     fixture["anchor"].chmod(0o775)
                     foreign_group_target = fixture["anchor"]
+                elif label == "trusted-anchor-foreign-group":
+                    os.chown(fixture["anchor"], -1, os.getgid())
+                    fixture["anchor"].chmod(0o2770)
+                    foreign_group_target = fixture["anchor"]
+                    trusted_source_group_gid = os.getgid()
+                elif label == "trusted-anchor-world-writable":
+                    os.chown(fixture["anchor"], -1, os.getgid())
+                    fixture["anchor"].chmod(0o2777)
+                    trusted_source_group_gid = os.getgid()
+                elif label == "foreign-owner-shared-anchor":
+                    os.chown(fixture["anchor"], -1, os.getgid())
+                    fixture["anchor"].chmod(0o2770)
+                    owner_target = fixture["anchor"]
+                    trusted_source_group_gid = os.getgid()
                 elif label == "group-writable-npm-subtree":
                     (fixture["npm_root"] / "node_modules").chmod(0o775)
                     foreign_group_target = fixture["npm_root"] / "node_modules"
@@ -2394,6 +2438,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                                     snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
                                     source_node_root=fixture["node_root"],
                                     source_anchors=((fixture["anchor"], os.getuid()),),
+                                    trusted_source_group_gid=trusted_source_group_gid,
                                 )
                     else:
                         original_lstat = os.lstat
@@ -2420,6 +2465,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                                     snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
                                     source_node_root=fixture["node_root"],
                                     source_anchors=((fixture["anchor"], os.getuid()),),
+                                    trusted_source_group_gid=trusted_source_group_gid,
                                 )
                 self.assertEqual(caught.exception.args[0], expected_code)
                 self.assertFalse(snapshot_base.exists())
@@ -2427,6 +2473,62 @@ class RustMatrixRunnerTests(unittest.TestCase):
                     fixture["node"].chmod(0o755)
                 elif label == "owner-inaccessible-npm-directory":
                     (fixture["npm_root"] / "node_modules").chmod(0o755)
+
+    def test_root_source_anchor_never_accepts_runner_group_write_authority(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._write_node_toolchain_fixture(Path(temporary) / "node-fixture")
+            real_lstat = os.lstat
+
+            def group_writable_root(path, *args, **kwargs):
+                if Path(path) == Path("/"):
+                    return SimpleNamespace(
+                        st_mode=stat.S_IFDIR | 0o2775,
+                        st_uid=0,
+                        st_gid=os.getgid(),
+                    )
+                return real_lstat(path, *args, **kwargs)
+
+            with patch.object(supervisor.node_tool_prepare.os, "lstat", side_effect=group_writable_root):
+                with self.assertRaises(supervisor.bundle.Refusal) as caught:
+                    supervisor.node_tool_prepare.validate_node_toolchain(
+                        fixture["paths"], os.getuid(), tool_cache_root=fixture["cache"],
+                        node_root=fixture["node_root"],
+                        system_anchors=((Path("/"), 0), (Path("/opt"), 0)),
+                        trusted_source_group_gid=os.getgid(),
+                    )
+
+        self.assertEqual(caught.exception.args[0], "node-toolchain-source-root-anchor-write-mode")
+
+    def test_snapshot_rechecks_shared_anchor_before_descriptor_copy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+            os.chown(fixture["anchor"], -1, os.getgid())
+            fixture["anchor"].chmod(0o2770)
+            deadline_path = root / "deadline.json"
+            deadline_budget.create(deadline_path, 60, 5, 65)
+            snapshot_base = root / "snapshot-base"
+
+            def change_anchor_after_preflight(stage):
+                if stage == "after-source-validation":
+                    fixture["anchor"].chmod(0o2777)
+
+            try:
+                with self._node_fixture_policy(fixture):
+                    with self.assertRaises(node_tool_snapshot.SnapshotRefusal) as caught:
+                        node_tool_snapshot.create_snapshot(
+                            fixture["paths"], "anchor-race", os.getuid(), str(deadline_path),
+                            snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
+                            source_node_root=fixture["node_root"],
+                            source_anchors=((fixture["anchor"], os.getuid()),),
+                            trusted_source_group_gid=os.getgid(),
+                            test_checkpoint=change_anchor_after_preflight,
+                        )
+            finally:
+                fixture["anchor"].chmod(0o2770)
+
+            self.assertEqual(caught.exception.code, "node-toolchain-source-opt-anchor-write-mode")
+            self.assertFalse(snapshot_base.exists())
 
     def test_node_toolchain_scan_permission_failures_have_finite_refusal(self):
         for denied_directory in ("npm_root", "npm_node_modules"):
@@ -2532,14 +2634,35 @@ class RustMatrixRunnerTests(unittest.TestCase):
             step["run"] for step in job["steps"] if step["name"] == "Prepare dependencies before the cut"
         ))
         owner_capture = source.index('owner_uid="$EUID"')
+        group_capture = source.index('owner_gid="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- id -g)"')
         privileged_call = source.index("sudo -n unshare")
         self.assertLess(owner_capture, privileged_call)
+        self.assertLess(group_capture, privileged_call)
         self.assertIn('--owner-uid "$owner_uid"', source)
+        self.assertIn('--owner-gid "$owner_gid"', source)
         self.assertIn('node_path="$(command -v node || true)"', source)
         self.assertIn('npm_path="$(command -v npm || true)"', source)
         self.assertIn('"$node_path" --npm-path "$npm_path"', source)
 
+        steps = job["steps"]
+        setup_index = next(i for i, step in enumerate(steps) if step["name"] == "Set up pinned Node toolchain")
+        prepare_index = next(i for i, step in enumerate(steps) if step["name"] == "Prepare dependencies before the cut")
+        decrypt_index = next(i for i, step in enumerate(steps) if step["name"] == "Decrypt authenticated bundle")
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml").read_text()
+        run_job_source = workflow.split("  devlane-encrypted-run:", 1)[1].split("  devlane-encrypted-audit:", 1)[0]
+        self.assertRegex(run_job_source, r"(?m)^    runs-on: ubuntu-24\.04$")
+        self.assertLess(setup_index, prepare_index)
+        self.assertLess(prepare_index, decrypt_index)
+        self.assertEqual(steps[setup_index]["uses"], node_tool_snapshot.PREPARATION_ID)
+        self.assertEqual(steps[setup_index]["with"]["node-version"], "24.22.1")
+        self.assertEqual(steps[setup_index]["with"]["check-latest"], "false")
+        self.assertEqual(steps[setup_index]["with"]["package-manager-cache"], "false")
         preparation = supervisor.node_tool_prepare
+        self.assertEqual(node_tool_snapshot.SHARED_TOOLCHAIN_ANCHOR, Path("/opt"))
+        self.assertEqual(preparation.NODE_TOOL_SYSTEM_ANCHORS,
+                         ((Path("/"), 0), (Path("/opt"), 0)))
+        self.assertEqual(preparation.NODE_TOOL_CACHE_ROOT, Path("/opt/hostedtoolcache"))
+
         self.assertEqual(preparation.TRUSTED_TOOLCHAIN_SYSTEM_UID, 0)
         self.assertEqual(preparation._trusted_toolchain_owner_uids(os.getuid()),
                          frozenset((0, os.getuid())))

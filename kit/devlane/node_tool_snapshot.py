@@ -14,6 +14,7 @@ import deadline as deadline_budget
 
 
 PREPARATION_ID = "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1"
+SHARED_TOOLCHAIN_ANCHOR = Path("/opt")
 PROTECTED_SNAPSHOT_BASE = Path("/run/platform-ci-devlane/node-tools")
 DEFAULT_SNAPSHOT_BASE = PROTECTED_SNAPSHOT_BASE
 MANIFEST_NAME = ".devlane-node-snapshot.json"
@@ -64,6 +65,19 @@ def _metadata_token(value):
             value.st_size, value.st_mtime_ns, value.st_ctime_ns)
 
 
+def _trusted_shared_anchor_group_write(value, path, trusted_source_group_gid):
+    mode = stat.S_IMODE(value.st_mode)
+    return (
+        Path(path) == SHARED_TOOLCHAIN_ANCHOR
+        and type(trusted_source_group_gid) is int
+        and value.st_gid == trusted_source_group_gid
+        and bool(mode & stat.S_IWGRP)
+        and not mode & stat.S_IWOTH
+        and bool(mode & stat.S_IRGRP)
+        and bool(mode & stat.S_IXGRP)
+    )
+
+
 def _secure_directory(fd, allowed_uids, *, exact_mode=None):
     value = os.fstat(fd)
     if not stat.S_ISDIR(value.st_mode) or value.st_uid not in allowed_uids:
@@ -77,12 +91,30 @@ def _secure_directory(fd, allowed_uids, *, exact_mode=None):
     return value
 
 
-def _secure_source_ancestor(value, allowed_uids):
+def _secure_source_ancestor(value, allowed_uids, *, path, trusted_source_group_gid=None):
     if not stat.S_ISDIR(value.st_mode) or value.st_uid not in allowed_uids:
         _refuse("node-snapshot-source-owner")
     mode = stat.S_IMODE(value.st_mode)
-    if mode & 0o022 and not (value.st_uid == 0 and mode & stat.S_ISVTX):
-        _refuse("node-snapshot-source-permissions")
+    if mode & 0o022:
+        ancestor_path = Path(path)
+        safe_sticky = (
+            ancestor_path not in (Path("/"), SHARED_TOOLCHAIN_ANCHOR)
+            and value.st_uid == 0 and bool(mode & stat.S_ISVTX)
+        )
+        shared_toolchain_parent = _trusted_shared_anchor_group_write(
+            value, ancestor_path, trusted_source_group_gid,
+        )
+        if not (safe_sticky or shared_toolchain_parent):
+            if ancestor_path == Path("/"):
+                _refuse("node-toolchain-source-root-anchor-write-mode")
+            if ancestor_path == SHARED_TOOLCHAIN_ANCHOR:
+                _refuse("node-toolchain-source-opt-anchor-write-mode")
+            _refuse("node-snapshot-source-permissions")
+
+
+def _opened_directory_path(opened, index):
+    parts = [name for name, _descriptor, _token in opened[1:index + 1]]
+    return Path("/").joinpath(*parts)
 
 
 def _open_absolute_directory(path):
@@ -119,7 +151,7 @@ def _close_chain(opened):
             pass
 
 
-def _check_source_chain(path, opened, allowed_uids):
+def _check_source_chain(path, opened, allowed_uids, *, trusted_source_group_gid=None):
     try:
         _current, fresh = _open_absolute_directory(path)
     except (OSError, SnapshotRefusal):
@@ -127,11 +159,16 @@ def _check_source_chain(path, opened, allowed_uids):
     try:
         if len(fresh) != len(opened):
             _refuse("node-snapshot-source-changed")
-        for (left_name, left_fd, left_token), (right_name, right_fd, right_token) in zip(opened, fresh):
+        for index, ((left_name, left_fd, left_token), (right_name, right_fd, right_token)) in enumerate(
+                zip(opened, fresh)):
             if (left_name != right_name
                     or left_token[:5] != right_token[:5]):
                 _refuse("node-snapshot-source-changed")
-            _secure_source_ancestor(os.fstat(right_fd), allowed_uids)
+            _secure_source_ancestor(
+                os.fstat(right_fd), allowed_uids,
+                path=_opened_directory_path(fresh, index),
+                trusted_source_group_gid=trusted_source_group_gid,
+            )
     finally:
         _close_chain(fresh)
 
@@ -603,23 +640,25 @@ def _confirm_snapshot_base_absent(base, control_uid):
 
 
 def _validate_source_layout(paths, owner_uid, cache_root=None, node_root=None, system_anchors=None,
-                           deadline_file=None):
+                           deadline_file=None, trusted_source_group_gid=None):
     import prepare
 
     return prepare.validate_node_toolchain(
         paths, owner_uid, tool_cache_root=cache_root, node_root=node_root,
         system_anchors=system_anchors, deadline_file=deadline_file,
+        trusted_source_group_gid=trusted_source_group_gid,
     )
 
 
 def _snapshot_source(root, runner_uid, deadline_file, *, control_uid, snapshot_base, snapshot_id,
                      source_paths=None,
                      source_cache_root=None, source_node_root=None, source_anchors=None,
+                     trusted_source_group_gid=None,
                      test_checkpoint=None):
     paths = source_paths or {"node": str(Path(root) / "bin/node"), "npm": str(Path(root) / "bin/npm")}
     validated = _validate_source_layout(
         paths, runner_uid, source_cache_root, source_node_root, source_anchors,
-        deadline_file=deadline_file,
+        deadline_file=deadline_file, trusted_source_group_gid=trusted_source_group_gid,
     )
     source_root = Path(validated["root"])
     if test_checkpoint is not None:
@@ -634,9 +673,13 @@ def _snapshot_source(root, runner_uid, deadline_file, *, control_uid, snapshot_b
     base_fd = None
     base_chain = None
     try:
-        for _name, descriptor, _token in chain:
+        for index, (_name, descriptor, _token) in enumerate(chain):
             metadata = os.fstat(descriptor)
-            _secure_source_ancestor(metadata, allowed_uids)
+            _secure_source_ancestor(
+                metadata, allowed_uids,
+                path=_opened_directory_path(chain, index),
+                trusted_source_group_gid=trusted_source_group_gid,
+            )
         _secure_directory(source_fd, allowed_uids)
         base_fd, base_chain = _open_snapshot_base(
             snapshot_base, control_uid, create=True, trusted_chain=snapshot_base == PROTECTED_SNAPSHOT_BASE,
@@ -665,7 +708,10 @@ def _snapshot_source(root, runner_uid, deadline_file, *, control_uid, snapshot_b
                             source_tokens, test_checkpoint, checkpoint_state)
             if test_checkpoint is not None:
                 test_checkpoint("after-copy")
-            _check_source_chain(source_root, chain, allowed_uids)
+            _check_source_chain(
+                source_root, chain, allowed_uids,
+                trusted_source_group_gid=trusted_source_group_gid,
+            )
             expected = {row["path"]: row for row in rows}
             expected_children = {}
             for index, path in enumerate(expected):
@@ -711,7 +757,10 @@ def _snapshot_source(root, runner_uid, deadline_file, *, control_uid, snapshot_b
         finally:
             os.close(stage_fd)
         _time_check(deadline_file)
-        _check_source_chain(source_root, chain, allowed_uids)
+        _check_source_chain(
+            source_root, chain, allowed_uids,
+            trusted_source_group_gid=trusted_source_group_gid,
+        )
         try:
             os.stat(snapshot_id, dir_fd=base_fd, follow_symlinks=False)
         except FileNotFoundError:
@@ -782,10 +831,16 @@ def _seal_directories(root_fd, control_uid, deadline_file):
 
 def create_snapshot(paths, snapshot_id, owner_uid, deadline_file, *, snapshot_base=None,
                     source_cache_root=None, source_node_root=None, source_anchors=None,
+                    trusted_source_group_gid=None,
                     test_checkpoint=None):
     if not valid_snapshot_id(snapshot_id):
         _refuse("node-snapshot-id")
     if type(owner_uid) is not int or owner_uid < 1 or owner_uid > 60000:
+        _refuse("node-toolchain-owner")
+    if (trusted_source_group_gid is not None
+            and (type(trusted_source_group_gid) is not int
+                 or trusted_source_group_gid < 1 or trusted_source_group_gid > 60000
+                 or trusted_source_group_gid == 65534)):
         _refuse("node-toolchain-owner")
     base = DEFAULT_SNAPSHOT_BASE if snapshot_base is None else Path(snapshot_base)
     return _snapshot_source(
@@ -796,7 +851,9 @@ def create_snapshot(paths, snapshot_id, owner_uid, deadline_file, *, snapshot_ba
         snapshot_id=snapshot_id,
         source_paths=paths,
         source_cache_root=source_cache_root, source_node_root=source_node_root,
-        source_anchors=source_anchors, test_checkpoint=test_checkpoint,
+        source_anchors=source_anchors,
+        trusted_source_group_gid=trusted_source_group_gid,
+        test_checkpoint=test_checkpoint,
     )
 
 
