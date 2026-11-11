@@ -83,10 +83,12 @@ def _fifo_snapshot_child(kind, fixture, deadline_file, snapshot_base, snapshot_i
     real_open = os.open
     open_count = 0
     observed_nonblock = False
+    opened_fifo = False
     target_name = node_tool_snapshot.MANIFEST_NAME if kind == "manifest" else "node"
 
     def open_with_fifo_swap(path, flags, *args, **kwargs):
-        nonlocal open_count, observed_nonblock
+        nonlocal open_count, observed_nonblock, opened_fifo
+        triggered = False
         directory_fd = kwargs.get("dir_fd")
         if path == target_name and directory_fd is not None and not flags & node_tool_snapshot._O_DIRECTORY:
             try:
@@ -96,13 +98,21 @@ def _fifo_snapshot_child(kind, fixture, deadline_file, snapshot_base, snapshot_i
             if (metadata is not None and metadata.st_dev == parent_device
                     and metadata.st_ino == parent_inode):
                 open_count += 1
-                if open_count == trigger_count:
+                triggered = open_count == trigger_count
+                if triggered:
                     observed_nonblock = bool(flags & getattr(os, "O_NONBLOCK", 0))
                     if kind in ("manifest", "snapshot-content"):
                         os.fchmod(directory_fd, 0o755)
-                    os.unlink(path, dir_fd=directory_fd)
-                    os.mkfifo(path, 0o600, dir_fd=directory_fd)
-        return real_open(path, flags, *args, **kwargs)
+                    try:
+                        os.unlink(path, dir_fd=directory_fd)
+                        os.mkfifo(path, 0o600, dir_fd=directory_fd)
+                    finally:
+                        if kind in ("manifest", "snapshot-content"):
+                            os.fchmod(directory_fd, 0o555)
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if triggered:
+            opened_fifo = stat.S_ISFIFO(os.fstat(descriptor).st_mode)
+        return descriptor
 
     os.open = open_with_fifo_swap
     try:
@@ -122,11 +132,11 @@ def _fifo_snapshot_child(kind, fixture, deadline_file, snapshot_base, snapshot_i
                 snapshot_id, str(deadline_file), snapshot_base=snapshot_base,
                 owner_uid=os.getuid(),
             )
-        result = ("accepted", "", open_count, observed_nonblock)
+        result = ("accepted", "", open_count, observed_nonblock, opened_fifo)
     except node_tool_snapshot.SnapshotRefusal as error:
-        result = ("refused", error.code, open_count, observed_nonblock)
+        result = ("refused", error.code, open_count, observed_nonblock, opened_fifo)
     except BaseException as error:
-        result = ("error", type(error).__name__, open_count, observed_nonblock)
+        result = ("error", type(error).__name__, open_count, observed_nonblock, opened_fifo)
     finally:
         os.open = real_open
         result_connection.send(result)
@@ -806,7 +816,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 state = test_e2e._DiagnosticState()
                 state.capture("variant-startup-refusal-check", caught.exception)
                 line = state.refusal_line(caught.exception)
-                self.assertRegex(line, r"stage=variant-startup-refusal-check exception=[a-z0-9-]{1,32}$")
+                self.assertRegex(line, r"stage=variant-startup-refusal-check exception=[a-z0-9-]{1,48}$")
                 for marker in ("private-path", "private-canary", "KEYCANARY-73A10X", "unknown-private-code"):
                     self.assertNotIn(marker, line)
 
@@ -864,7 +874,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 state = test_e2e._DiagnosticState()
                 state.capture("variant-supervisor-start-check", caught.exception)
                 line = state.refusal_line(caught.exception)
-                self.assertRegex(line, r"stage=variant-supervisor-start-check exception=[a-z0-9-]{1,32}$")
+                self.assertRegex(line, r"stage=variant-supervisor-start-check exception=[a-z0-9-]{1,48}$")
                 for marker in ("private path", "private diagnostic", "KEYCANARY-73A10X", "unknown-private-code"):
                     self.assertNotIn(marker, line)
 
@@ -1453,6 +1463,132 @@ class RustMatrixRunnerTests(unittest.TestCase):
                     snapshot_id, str(deadline_path), snapshot_base=snapshot_base, owner_uid=os.getuid(),
                 )
 
+    def test_readonly_node_snapshot_validates_versions_and_mount_source_end_to_end(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
+            root = Path(temporary).resolve()
+            fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+            deadline_path = root / "deadline.json"
+            deadline_budget.create(deadline_path, 120, 10, 130)
+            source_members = list(fixture["node_root"].rglob("*"))
+            for member in reversed(source_members):
+                if member.is_symlink():
+                    continue
+                if member.is_dir():
+                    member.chmod(0o555)
+                else:
+                    current_mode = stat.S_IMODE(member.stat().st_mode)
+                    member.chmod(0o555 if current_mode & 0o111 else 0o444)
+            fixture["node_root"].chmod(0o555)
+
+            sealed_cache = root / "sealed-tool-cache"
+            snapshot_base = sealed_cache / "node" / "24.22.1"
+            snapshot_id = "x64"
+            snapshot = None
+            service_root = root / "service"
+            service_root.mkdir()
+            startup = self._write_projection_startup_fixture(service_root)
+            projection, _payload = test_e2e._node_projection(
+                test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
+            )
+            self._bind_projection_payload(startup, projection)
+            service = supervisor.Service(
+                startup.state_dir, startup.context, startup.workspace, startup.prepared,
+                startup.bundle, startup.projection, 193847, os.getuid(),
+                {"node_snapshot_id": snapshot_id, "cargo": None, "rustc": None}, startup.deadline_file,
+            )
+            mount_sources = []
+            calls = []
+            real_run = subprocess.run
+            previous_deadline_file = supervisor.ACTIVE_DEADLINE_FILE
+            try:
+                with self._node_fixture_policy(fixture):
+                    source_validation = supervisor.node_tool_prepare.validate_node_toolchain(
+                        fixture["paths"], os.getuid(), tool_cache_root=fixture["cache"],
+                        node_root=fixture["node_root"],
+                        system_anchors=((fixture["anchor"], os.getuid()),),
+                        deadline_file=str(deadline_path),
+                    )
+                    snapshot = node_tool_snapshot.create_snapshot(
+                        fixture["paths"], snapshot_id, os.getuid(), str(deadline_path),
+                        snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
+                        source_node_root=fixture["node_root"],
+                        source_anchors=((fixture["anchor"], os.getuid()),),
+                    )
+                with patch.object(node_tool_snapshot, "DEFAULT_SNAPSHOT_BASE", snapshot_base), \
+                        patch.object(supervisor.node_tool_prepare, "DEADLINE_FILE", str(deadline_path)), \
+                        patch.object(supervisor, "ACTIVE_DEADLINE_FILE", str(deadline_path)):
+                    validated = node_tool_snapshot.validate_snapshot(
+                        snapshot_id, str(deadline_path), snapshot_base=snapshot_base, owner_uid=os.getuid(),
+                    )
+                    snapshot_validation = supervisor.node_tool_prepare.validate_node_toolchain(
+                        {"node": validated["node"], "npm": validated["npm"]}, os.getuid(),
+                        tool_cache_root=sealed_cache, node_root=Path(validated["root"]),
+                        system_anchors=((root, os.getuid()),), deadline_file=str(deadline_path),
+                    )
+                    prepared_results = supervisor.node_tool_prepare.run_node_versions(
+                        validated, supervisor.node_tool_prepare._prepare_node_version_process,
+                    )
+                    with patch.object(supervisor.subprocess, "run", side_effect=lambda argv, **kwargs: (
+                            calls.append(list(argv)) or real_run(argv, **kwargs))), \
+                            patch.object(supervisor, "_require_linux_root"), \
+                            patch.object(supervisor, "_require_swap_disabled"), \
+                            patch.object(supervisor, "_mount_private"), \
+                            patch.object(supervisor, "_configure_firewall"), \
+                            patch.object(supervisor, "_mount_minimal_root"), \
+                            patch.object(supervisor, "_mount_bind",
+                                         side_effect=lambda source, _target, **_kwargs:
+                                         mount_sources.append(Path(source).resolve())), \
+                            patch.object(supervisor, "_read_profiles", return_value={"schema": 1}):
+                        self.assertTrue(service.prepare())
+
+                snapshot_root = Path(snapshot["root"])
+                node = snapshot_root / "bin/node"
+                npm_cli = snapshot_root / "lib/node_modules/npm/bin/npm-cli.js"
+                npm_shared = snapshot_root / "lib/node_modules/npm/node_modules/shared.js"
+                npm_link = snapshot_root / "bin/npm"
+                self.assertEqual(source_validation["root"], str(fixture["node_root"]))
+                self.assertEqual(snapshot_validation["root"], str(snapshot_root))
+                self.assertEqual((stat.S_IMODE(snapshot_root.stat().st_mode),
+                                  stat.S_IMODE(node.stat().st_mode),
+                                  stat.S_IMODE(npm_cli.stat().st_mode),
+                                  stat.S_IMODE(npm_shared.stat().st_mode)),
+                                 (0o555, 0o555, 0o555, 0o444))
+                self.assertEqual(os.readlink(npm_link), "../lib/node_modules/npm/bin/npm-cli.js")
+                self.assertEqual(prepared_results["node"].stdout.strip(), b"v24.22.1")
+                self.assertEqual(prepared_results["npm"].stdout.strip(), b"11.19.1")
+                self.assertEqual(calls, [
+                    [str(node), "--version"],
+                    [str(node), str(npm_cli), "--version"],
+                    [str(node), "--version"],
+                    [str(node), str(npm_cli), "--version"],
+                ])
+                self.assertEqual(mount_sources.count(snapshot_root.resolve()), 1)
+                self.assertNotIn(fixture["node_root"].resolve(), mount_sources)
+                fixture_rows = [json.loads(line) for line in fixture["log"].read_text().splitlines()]
+                self.assertEqual(len(fixture_rows), 6)
+                self.assertTrue(all(row["executable"] == str(node) for row in fixture_rows))
+                self.assertEqual([row["argv"] for row in fixture_rows], [
+                    ["--version"], [str(npm_cli), "--version"],
+                    ["--version"], [str(npm_cli), "--version"],
+                    ["--version"], [str(npm_cli), "--version"],
+                ])
+            finally:
+                supervisor.ACTIVE_DEADLINE_FILE = previous_deadline_file
+                if snapshot is not None:
+                    node_tool_snapshot.remove_snapshot(
+                        snapshot_id, str(deadline_path), snapshot_base=snapshot_base,
+                        owner_uid=os.getuid(),
+                    )
+                for member in source_members:
+                    if member.is_symlink():
+                        continue
+                    if member.is_dir():
+                        member.chmod(0o755)
+                    else:
+                        current_mode = stat.S_IMODE(member.stat().st_mode)
+                        member.chmod(0o755 if current_mode & 0o111 else 0o644)
+                fixture["node_root"].chmod(0o755)
+
     def test_node_snapshot_is_the_only_tree_checked_and_mounted_after_source_replacement(self):
         with tempfile.TemporaryDirectory() as source_tmp, tempfile.TemporaryDirectory() as snapshot_tmp:
             source_root = Path(source_tmp).resolve()
@@ -1600,7 +1736,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                     kind, fixture, deadline_path, snapshot_base,
                     "test-fifo-" + kind, fixture["node"].parent, trigger_count,
                 )
-                self.assertEqual(result, ("refused", "node-snapshot-source-changed", trigger_count, True))
+                self.assertEqual(result, ("refused", "node-snapshot-source-changed", trigger_count, True, True))
                 self.assertTrue(snapshot_base.is_dir())
                 self.assertEqual(list(snapshot_base.iterdir()), [])
 
@@ -1621,7 +1757,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 )
                 expected_code = "node-snapshot-manifest-invalid" if kind == "manifest" \
                     else "node-snapshot-content-changed"
-                self.assertEqual(result, ("refused", expected_code, 1, True))
+                self.assertEqual(result, ("refused", expected_code, 1, True, True))
 
     def test_late_composed_link_escapes_are_refused_before_external_canary_open(self):
         for shape in ("short", "long"):
@@ -2137,10 +2273,10 @@ class RustMatrixRunnerTests(unittest.TestCase):
 
     def test_node_toolchain_rejects_untrusted_owners_permissions_and_layouts_before_execution(self):
         cases = (
-            ("world-writable-cache", "node-toolchain-permissions"),
-            ("world-writable-bin", "node-toolchain-permissions"),
-            ("world-writable-node", "node-toolchain-permissions"),
-            ("world-writable-npm-parent", "node-toolchain-permissions"),
+            ("world-writable-cache", "node-toolchain-directory-write-mode"),
+            ("world-writable-bin", "node-toolchain-directory-write-mode"),
+            ("world-writable-node", "node-toolchain-file-write-mode"),
+            ("world-writable-npm-parent", "node-toolchain-directory-write-mode"),
             ("bad-owner-cache", "node-toolchain-owner"),
             ("bad-owner-bin", "node-toolchain-owner"),
             ("bad-owner-node", "node-toolchain-owner"),
@@ -2149,17 +2285,19 @@ class RustMatrixRunnerTests(unittest.TestCase):
             ("bad-owner-npm-dependency", "node-toolchain-owner"),
             ("missing-node", "node-toolchain-missing"),
             ("missing-npm-cli", "node-toolchain-missing"),
+            ("owner-inaccessible-node", "node-toolchain-file-control-access"),
+            ("owner-inaccessible-npm-directory", "node-toolchain-directory-control-access"),
             ("non-executable-node", "node-toolchain-executable"),
             ("owner-only-node", "node-toolchain-executable"),
-            ("owner-only-npm-cli", "node-toolchain-permissions"),
-            ("owner-only-npm-dependency-dir", "node-toolchain-permissions"),
+            ("owner-only-npm-cli", "node-toolchain-file-worker-access"),
+            ("owner-only-npm-dependency-dir", "node-toolchain-directory-worker-access"),
             ("symlinked-node", "node-tool-layout"),
             ("alternate-node-name", "node-tool-layout"),
             ("npm-escape-link", "node-tool-layout"),
             ("npm-nested-escape-link", "node-tool-layout"),
-            ("world-writable-npm-dependency-dir", "node-toolchain-permissions"),
-            ("world-writable-npm-dependency-file", "node-toolchain-permissions"),
-            ("npm-cli-writable", "node-toolchain-permissions"),
+            ("world-writable-npm-dependency-dir", "node-toolchain-directory-write-mode"),
+            ("world-writable-npm-dependency-file", "node-toolchain-file-write-mode"),
+            ("npm-cli-writable", "node-toolchain-file-write-mode"),
         )
         for label, expected_code in cases:
             with self.subTest(case=label), tempfile.TemporaryDirectory() as temporary:
@@ -2194,6 +2332,10 @@ class RustMatrixRunnerTests(unittest.TestCase):
                     fixture["node"].unlink()
                 elif label == "missing-npm-cli":
                     fixture["npm_cli"].unlink()
+                elif label == "owner-inaccessible-node":
+                    fixture["node"].chmod(0o000)
+                elif label == "owner-inaccessible-npm-directory":
+                    (fixture["npm_root"] / "node_modules").chmod(0o300)
                 elif label == "non-executable-node":
                     fixture["node"].chmod(0o644)
                 elif label == "owner-only-node":
@@ -2265,6 +2407,41 @@ class RustMatrixRunnerTests(unittest.TestCase):
                                     source_anchors=((fixture["anchor"], os.getuid()),),
                                 )
                 self.assertEqual(caught.exception.args[0], expected_code)
+                self.assertFalse(snapshot_base.exists())
+                if label == "owner-inaccessible-node":
+                    fixture["node"].chmod(0o755)
+                elif label == "owner-inaccessible-npm-directory":
+                    (fixture["npm_root"] / "node_modules").chmod(0o755)
+
+    def test_node_toolchain_scan_permission_failures_have_finite_refusal(self):
+        for denied_directory in ("npm_root", "npm_node_modules"):
+            with self.subTest(directory=denied_directory), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+                deadline_path = root / "deadline.json"
+                deadline_budget.create(deadline_path, 60, 5, 65)
+                snapshot_base = root / "snapshot-base"
+                denied_path = (fixture["npm_root"] if denied_directory == "npm_root"
+                               else fixture["npm_root"] / "node_modules")
+                real_scandir = os.scandir
+
+                def refuse_scandir(path, *args, **kwargs):
+                    if Path(path) == denied_path:
+                        raise PermissionError("synthetic permission fixture")
+                    return real_scandir(path, *args, **kwargs)
+
+                with self._node_fixture_policy(fixture), \
+                        patch.object(supervisor.subprocess, "run",
+                                     side_effect=AssertionError("version command ran before scan refusal")), \
+                        patch.object(supervisor.node_tool_prepare.os, "scandir", side_effect=refuse_scandir):
+                    with self.assertRaises(supervisor.bundle.Refusal) as caught:
+                        node_tool_snapshot.create_snapshot(
+                            fixture["paths"], "test-scan-access", os.getuid(), str(deadline_path),
+                            snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
+                            source_node_root=fixture["node_root"],
+                            source_anchors=((fixture["anchor"], os.getuid()),),
+                        )
+                self.assertEqual(caught.exception.args[0], "node-toolchain-directory-scan-access")
                 self.assertFalse(snapshot_base.exists())
 
     def test_root_owned_path_ancestors_and_runner_owned_node_tree_use_only_snapshot(self):

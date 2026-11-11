@@ -327,7 +327,7 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
                     line = state.refusal_line(error)
                 self.assertRegex(
                     line,
-                    r"devlane_production_e2e=refused stage=[a-z0-9-]{1,48} exception=[a-z0-9-]{1,32}",
+                    r"devlane_production_e2e=refused stage=[a-z0-9-]{1,48} exception=[a-z0-9-]{1,48}",
                 )
                 self.assertLessEqual(len(line), 160)
                 for forbidden in ("SYNTHETIC_SOURCE_CANARY", "KEYCANARY-73A10X", private_path, "candidate"):

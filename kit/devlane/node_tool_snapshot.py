@@ -876,7 +876,9 @@ def _snapshot_entries(root_fd, prefix, deadline_file, rows, totals, control_uid,
             size = 0
             try:
                 opened = os.fstat(fd)
-                if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != control_uid
+                        or opened.st_nlink != 1 or stat.S_IMODE(opened.st_mode) != mode
+                        or _metadata_token(opened) != _metadata_token(metadata)):
                     _refuse("node-snapshot-content-changed")
                 while True:
                     _time_check(deadline_file, cleanup=cleanup)

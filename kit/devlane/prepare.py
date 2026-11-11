@@ -102,9 +102,12 @@ def _node_directory(path, owner_uids, *, worker_access=False):
     if metadata.st_uid not in owner_uids:
         _node_refuse("node-toolchain-owner")
     mode = stat.S_IMODE(metadata.st_mode)
-    if (mode & 0o022 or not mode & stat.S_IRUSR or not mode & stat.S_IXUSR
-            or worker_access and (not mode & stat.S_IROTH or not mode & stat.S_IXOTH)):
-        _node_refuse("node-toolchain-permissions")
+    if mode & 0o022:
+        _node_refuse("node-toolchain-directory-write-mode")
+    if not mode & stat.S_IRUSR or not mode & stat.S_IXUSR:
+        _node_refuse("node-toolchain-directory-control-access")
+    if worker_access and (not mode & stat.S_IROTH or not mode & stat.S_IXOTH):
+        _node_refuse("node-toolchain-directory-worker-access")
 
 
 def _node_regular_file(path, owner_uids, *, executable):
@@ -118,13 +121,13 @@ def _node_regular_file(path, owner_uids, *, executable):
         _node_refuse("node-toolchain-owner")
     mode = stat.S_IMODE(metadata.st_mode)
     if mode & (0o022 | stat.S_ISUID | stat.S_ISGID):
-        _node_refuse("node-toolchain-permissions")
+        _node_refuse("node-toolchain-file-write-mode")
     if not mode & stat.S_IRUSR:
-        _node_refuse("node-toolchain-permissions")
+        _node_refuse("node-toolchain-file-control-access")
     if executable and (not mode & stat.S_IXUSR or not mode & stat.S_IXOTH):
         _node_refuse("node-toolchain-executable")
     if not executable and not mode & stat.S_IROTH:
-        _node_refuse("node-toolchain-permissions")
+        _node_refuse("node-toolchain-file-worker-access")
 
 
 def _validate_npm_tree(root, owner_uids, deadline_file=None):
@@ -181,7 +184,7 @@ def _validate_npm_tree(root, owner_uids, deadline_file=None):
                     else:
                         _node_refuse("node-tool-layout")
         except PermissionError:
-            _node_refuse("node-toolchain-permissions")
+            _node_refuse("node-toolchain-directory-scan-access")
         except OSError:
             _node_refuse("node-toolchain-missing")
 

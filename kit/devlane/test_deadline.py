@@ -249,8 +249,10 @@ class DeadlineTests(unittest.TestCase):
                         self.assertEqual(deadline.run(path, ["fixed-command"]), 124)
                         self.assertEqual([call.args[1] for call in kill.call_args_list],
                                          [signal.SIGTERM, signal.SIGKILL])
-                        self.assertEqual([call.kwargs["timeout"] for call in process.wait.call_args_list],
-                                         [9, 0, 2])
+                        wait_timeouts = [call.kwargs["timeout"] for call in process.wait.call_args_list]
+                        self.assertEqual(len(wait_timeouts), 3)
+                        self.assertAlmostEqual(wait_timeouts[0], 9)
+                        self.assertEqual(wait_timeouts[1:], [0, 2])
 
     def test_default_watchdog_exits_quickly_so_encrypted_host_cleanup_can_use_its_reserve(self):
         with tempfile.TemporaryDirectory() as temporary:
