@@ -1002,6 +1002,25 @@ def validate_tool_version_output(tool: str, output: bytes, error: bytes, returnc
     _fail("resolver-" + tool + "-version-" + reason)
 
 
+def validate_tool_execution_access(executable: str) -> None:
+    path = Path(executable)
+    role = path.name if path.name in {"cargo", "rustc"} else "tool"
+    prefix = "resolver-" + role + "-execute-"
+    try:
+        metadata = path.stat(follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode) or not metadata.st_mode & 0o111:
+            _fail(prefix + "file-mode")
+        if os.statvfs(path).f_flag & os.ST_NOEXEC:
+            _fail(prefix + "mount-noexec")
+        for parent in path.parents:
+            if not os.access(parent, os.X_OK, effective_ids=True):
+                _fail(prefix + "ancestor-access")
+        if not os.access(path, os.X_OK, effective_ids=True):
+            _fail(prefix + "file-access")
+    except OSError:
+        _fail(prefix + "inspection")
+
+
 def run_cargo_fixed_point(envelope: dict[str, Any], *, expected_source_sha: str,
                           expected_control_sha: str, cargo: str, rustc: str,
                           scratch_parent: str | Path, deadline_file: str | Path,
@@ -1034,6 +1053,7 @@ def run_cargo_fixed_point(envelope: dict[str, Any], *, expected_source_sha: str,
         path = Path(executable)
         if not path.is_absolute() or path.is_symlink() or not path.is_file():
             _fail("resolver-tool-path")
+        validate_tool_execution_access(executable)
     try:
         outer = deadline_budget._read(deadline_file)
         if phase_budget is None:

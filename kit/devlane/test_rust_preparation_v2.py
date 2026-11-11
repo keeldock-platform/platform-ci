@@ -20,6 +20,31 @@ CONTROL_SHA = acceptance.CONTROL_SHA
 
 
 class PreparationTests(unittest.TestCase):
+    def test_execution_preflight_distinguishes_permission_boundaries(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(os, "ST_NOEXEC", 8, create=True):
+            tool = Path(temporary) / "cargo"
+            tool.write_bytes(b"public-fixture")
+            tool.chmod(0o644)
+            with self.assertRaisesRegex(constraint_resolver.Refusal, "execute-file-mode$"):
+                constraint_resolver.validate_tool_execution_access(str(tool))
+            tool.chmod(0o755)
+            for flags, access, expected in (
+                (os.ST_NOEXEC, True, "mount-noexec"),
+                (0, False, "ancestor-access"),
+            ):
+                with self.subTest(expected=expected), \
+                        patch.object(constraint_resolver.os, "statvfs") as filesystem, \
+                        patch.object(constraint_resolver.os, "access", return_value=access):
+                    filesystem.return_value.f_flag = flags
+                    with self.assertRaisesRegex(constraint_resolver.Refusal, "execute-" + expected + "$"):
+                        constraint_resolver.validate_tool_execution_access(str(tool))
+            with patch.object(constraint_resolver.os, "statvfs") as filesystem, \
+                    patch.object(constraint_resolver.os, "access", side_effect=lambda path, *a, **k: path != tool):
+                filesystem.return_value.f_flag = 0
+                with self.assertRaisesRegex(constraint_resolver.Refusal, "execute-file-access$"):
+                    constraint_resolver.validate_tool_execution_access(str(tool))
+
     def test_process_start_errors_report_only_fixed_categories(self):
         categories = {
             errno.EACCES: "permission", errno.ENOENT: "missing-file",
