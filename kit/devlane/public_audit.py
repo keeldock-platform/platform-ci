@@ -18,6 +18,7 @@ from macos_public_audit import (
     _read_annotations,
     cache_inventory_digest,
 )
+import diagnostic_contract
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -331,6 +332,11 @@ class _Grammar:
         if line in exact:
             public_counts[line] = public_counts.get(line, 0) + 1
             return public_counts[line] == 1
+        if step_name == "Run full source-free production-path acceptance":
+            if line.startswith("devlane_acceptance=refused stage="):
+                stage = line.removeprefix("devlane_acceptance=refused stage=")
+                return stage in diagnostic_contract.ACCEPTANCE_FAILURE_STAGES
+            return diagnostic_contract.public_preparation_diagnostic(line)
         if step_name == "Fetch ciphertext and sanitized dependency projection":
             if GITHUB_ASSET_LINE.fullmatch(line) or line == "fetch_projection_valid=true":
                 return True

@@ -393,6 +393,14 @@ class NetworkProbeAcceptanceTests(unittest.TestCase):
 
 
 class SupervisorOrderAcceptanceTests(unittest.TestCase):
+    def setUp(self):
+        supervisor.CANCEL_REQUESTED.clear()
+        supervisor.ACTIVE_DEADLINE_FILE = ""
+
+    def tearDown(self):
+        supervisor.CANCEL_REQUESTED.clear()
+        supervisor.ACTIVE_DEADLINE_FILE = ""
+
     def test_decrypt_request_is_rejected_until_probe_passes(self):
         service = supervisor.Service.__new__(supervisor.Service)
         service.probe_passed = False
@@ -499,7 +507,7 @@ class SupervisorOrderAcceptanceTests(unittest.TestCase):
             "state_dir": tempfile.mkdtemp(), "context": "context", "workspace": "workspace",
             "prepared": "prepared", "bundle": "bundle", "projection": "projection",
             "deadline_file": "deadline",
-            "host_net_inode": 1, "owner_uid": os.getuid(), "node_path": "", "npm_path": "",
+            "host_net_inode": 1, "owner_uid": os.getuid(), "node_snapshot_id": "",
             "cargo_path": "", "rustc_path": "",
         })()
         service = type("Service", (), {

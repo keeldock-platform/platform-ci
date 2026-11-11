@@ -5,6 +5,7 @@ no private source or decryption key is available in this phase.
 """
 
 import argparse
+import json
 import os
 import resource
 import shutil
@@ -19,6 +20,8 @@ from pathlib import Path
 import bundle
 import fetch
 import deadline as deadline_budget
+import diagnostic_contract
+import node_tool_snapshot
 
 
 UID = 65534
@@ -38,20 +41,65 @@ NODE_VERSION_ENVIRONMENT = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
 NODE_VERSION = "24.22.1"
 NPM_VERSION = "11.19.1"
 MAX_NPM_TOOL_ENTRIES = 100_000
+TRUSTED_TOOLCHAIN_SYSTEM_UID = 0
+PREPARATION_STAGE = "prepare-argument-parse"
+
+_PREPARATION_EXCEPTION_CATEGORIES = {
+    AssertionError: "assertion-error",
+    AttributeError: "attribute-error",
+    FileExistsError: "file-exists",
+    FileNotFoundError: "file-not-found",
+    IndexError: "index-error",
+    IsADirectoryError: "is-directory",
+    KeyError: "key-error",
+    MemoryError: "memory-error",
+    NameError: "name-error",
+    NotADirectoryError: "not-directory",
+    OSError: "os-error",
+    OverflowError: "overflow-error",
+    PermissionError: "permission-denied",
+    RecursionError: "recursion-error",
+    RuntimeError: "runtime-error",
+    TimeoutError: "timeout-error",
+    TypeError: "type-error",
+    UnicodeError: "unicode-error",
+    UnicodeDecodeError: "unicode-decode-error",
+    ValueError: "value-error",
+    json.JSONDecodeError: "json-decode-error",
+    subprocess.CalledProcessError: "process-exit-error",
+    subprocess.SubprocessError: "process-error",
+    subprocess.TimeoutExpired: "process-timeout",
+}
+
+
+def _set_preparation_stage(stage):
+    global PREPARATION_STAGE
+    PREPARATION_STAGE = stage if stage in diagnostic_contract.PREPARATION_STAGES else "prepare-protocol"
+
+
+class _PreparationArgumentParser(argparse.ArgumentParser):
+    def error(self, _message):
+        refuse("preparation-parser-refusal")
+
+
+def _trusted_toolchain_owner_uids(owner_uid):
+    if type(owner_uid) is not int or owner_uid < 1 or owner_uid > 60000 or owner_uid == UID:
+        _node_refuse("node-toolchain-owner")
+    return frozenset((TRUSTED_TOOLCHAIN_SYSTEM_UID, owner_uid))
 
 
 def _node_refuse(code):
     raise bundle.Refusal(code)
 
 
-def _node_directory(path, owner_uid, *, worker_access=False):
+def _node_directory(path, owner_uids, *, worker_access=False):
     try:
         metadata = os.lstat(path)
     except OSError:
         _node_refuse("node-toolchain-missing")
     if not stat.S_ISDIR(metadata.st_mode):
         _node_refuse("node-tool-layout")
-    if metadata.st_uid != owner_uid:
+    if metadata.st_uid not in owner_uids:
         _node_refuse("node-toolchain-owner")
     mode = stat.S_IMODE(metadata.st_mode)
     if (mode & 0o022 or not mode & stat.S_IRUSR or not mode & stat.S_IXUSR
@@ -59,14 +107,14 @@ def _node_directory(path, owner_uid, *, worker_access=False):
         _node_refuse("node-toolchain-permissions")
 
 
-def _node_regular_file(path, owner_uid, *, executable):
+def _node_regular_file(path, owner_uids, *, executable):
     try:
         metadata = os.lstat(path)
     except OSError:
         _node_refuse("node-toolchain-missing")
     if not stat.S_ISREG(metadata.st_mode):
         _node_refuse("node-tool-layout")
-    if metadata.st_uid != owner_uid:
+    if metadata.st_uid not in owner_uids:
         _node_refuse("node-toolchain-owner")
     mode = stat.S_IMODE(metadata.st_mode)
     if mode & (0o022 | stat.S_ISUID | stat.S_ISGID):
@@ -79,7 +127,7 @@ def _node_regular_file(path, owner_uid, *, executable):
         _node_refuse("node-toolchain-permissions")
 
 
-def _validate_npm_tree(root, owner_uid):
+def _validate_npm_tree(root, owner_uids, deadline_file=None):
     root = Path(root)
     try:
         canonical_root = root.resolve(strict=True)
@@ -87,57 +135,67 @@ def _validate_npm_tree(root, owner_uid):
         _node_refuse("node-toolchain-missing")
     pending = [root]
     seen = 0
+
+    def check_deadline():
+        if deadline_file:
+            try:
+                deadline_budget.remaining(deadline_file)
+            except deadline_budget.DeadlineRefusal:
+                _node_refuse("total-deadline-exhausted")
+
     while pending:
+        check_deadline()
         directory = pending.pop()
         try:
             with os.scandir(directory) as scan:
-                entries = list(scan)
+                for entry in scan:
+                    seen += 1
+                    if seen > MAX_NPM_TOOL_ENTRIES:
+                        _node_refuse("node-tool-layout")
+                    if seen % 128 == 0:
+                        check_deadline()
+                    path = Path(entry.path)
+                    try:
+                        metadata = os.lstat(path)
+                    except OSError:
+                        _node_refuse("node-toolchain-missing")
+                    if stat.S_ISDIR(metadata.st_mode):
+                        _node_directory(path, owner_uids, worker_access=True)
+                        pending.append(path)
+                    elif stat.S_ISREG(metadata.st_mode):
+                        _node_regular_file(path, owner_uids, executable=False)
+                    elif stat.S_ISLNK(metadata.st_mode):
+                        if metadata.st_uid not in owner_uids:
+                            _node_refuse("node-toolchain-owner")
+                        try:
+                            target = os.readlink(path)
+                            lexical_target = Path(os.path.normpath(os.path.join(str(path.parent), target)))
+                            resolved_target = path.resolve(strict=True)
+                            target_mode = resolved_target.stat().st_mode
+                        except (OSError, RuntimeError):
+                            _node_refuse("node-tool-layout")
+                        if (Path(target).is_absolute() or not lexical_target.is_relative_to(root)
+                                or not resolved_target.is_relative_to(canonical_root)
+                                or not (stat.S_ISDIR(target_mode) or stat.S_ISREG(target_mode))):
+                            _node_refuse("node-tool-layout")
+                    else:
+                        _node_refuse("node-tool-layout")
         except PermissionError:
             _node_refuse("node-toolchain-permissions")
         except OSError:
             _node_refuse("node-toolchain-missing")
-        for entry in entries:
-            seen += 1
-            if seen > MAX_NPM_TOOL_ENTRIES:
-                _node_refuse("node-tool-layout")
-            path = Path(entry.path)
-            try:
-                metadata = os.lstat(path)
-            except OSError:
-                _node_refuse("node-toolchain-missing")
-            if stat.S_ISDIR(metadata.st_mode):
-                _node_directory(path, owner_uid, worker_access=True)
-                pending.append(path)
-            elif stat.S_ISREG(metadata.st_mode):
-                _node_regular_file(path, owner_uid, executable=False)
-            elif stat.S_ISLNK(metadata.st_mode):
-                if metadata.st_uid != owner_uid:
-                    _node_refuse("node-toolchain-owner")
-                try:
-                    target = os.readlink(path)
-                    lexical_target = Path(os.path.normpath(os.path.join(str(path.parent), target)))
-                    resolved_target = path.resolve(strict=True)
-                    target_mode = resolved_target.stat().st_mode
-                except (OSError, RuntimeError):
-                    _node_refuse("node-tool-layout")
-                if (Path(target).is_absolute() or not lexical_target.is_relative_to(root)
-                        or not resolved_target.is_relative_to(canonical_root)
-                        or not (stat.S_ISDIR(target_mode) or stat.S_ISREG(target_mode))):
-                    _node_refuse("node-tool-layout")
-            else:
-                _node_refuse("node-tool-layout")
 
 
-def validate_node_toolchain(paths, owner_uid, *, tool_cache_root=None, node_root=None, system_anchors=None):
-    """Bind Node and npm to the runner-owned pinned toolcache tree before privileged use."""
+def validate_node_toolchain(paths, owner_uid, *, tool_cache_root=None, node_root=None, system_anchors=None,
+                            deadline_file=None):
+    """Bind Node/npm to a pinned tree owned only by root or the invoking control runner."""
     cache_root = Path(tool_cache_root) if tool_cache_root is not None else NODE_TOOL_CACHE_ROOT
     root = Path(node_root) if node_root is not None else NODE_TOOL_ROOT
     anchors = tuple(system_anchors) if system_anchors is not None else NODE_TOOL_SYSTEM_ANCHORS
     expected_root = cache_root / "node" / NODE_VERSION / "x64"
     if type(paths) is not dict or not paths.get("node") or not paths.get("npm"):
         _node_refuse("node-toolchain-missing")
-    if type(owner_uid) is not int or owner_uid < 0:
-        _node_refuse("node-toolchain-owner")
+    owner_uids = _trusted_toolchain_owner_uids(owner_uid)
     if root != expected_root:
         _node_refuse("node-tool-layout")
     if not anchors:
@@ -146,10 +204,10 @@ def validate_node_toolchain(paths, owner_uid, *, tool_cache_root=None, node_root
         anchor = Path(anchor)
         if index and anchor.parent != Path(anchors[index - 1][0]):
             _node_refuse("node-tool-layout")
-        _node_directory(anchor, anchor_uid)
+        _node_directory(anchor, frozenset((anchor_uid,)))
     if cache_root.parent != Path(anchors[-1][0]):
         _node_refuse("node-tool-layout")
-    _node_directory(cache_root, owner_uid)
+    _node_directory(cache_root, owner_uids)
 
     relative_directories = (
         Path("node"), Path("node") / NODE_VERSION, Path("node") / NODE_VERSION / "x64",
@@ -159,14 +217,14 @@ def validate_node_toolchain(paths, owner_uid, *, tool_cache_root=None, node_root
         Path("node") / NODE_VERSION / "x64/lib/node_modules/npm/bin",
     )
     for relative in relative_directories:
-        _node_directory(cache_root / relative, owner_uid, worker_access=True)
+        _node_directory(cache_root / relative, owner_uids, worker_access=True)
 
     node = root / "bin/node"
     npm_launcher = root / "bin/npm"
     npm_cli = root / "lib/node_modules/npm/bin/npm-cli.js"
     if paths.get("node") != str(node) or paths.get("npm") != str(npm_launcher):
         _node_refuse("node-tool-layout")
-    _node_regular_file(node, owner_uid, executable=True)
+    _node_regular_file(node, owner_uids, executable=True)
     try:
         launcher_metadata = os.lstat(npm_launcher)
         launcher_target = os.readlink(npm_launcher)
@@ -175,10 +233,10 @@ def validate_node_toolchain(paths, owner_uid, *, tool_cache_root=None, node_root
     if (not stat.S_ISLNK(launcher_metadata.st_mode)
             or launcher_target != "../lib/node_modules/npm/bin/npm-cli.js"):
         _node_refuse("node-tool-layout")
-    if launcher_metadata.st_uid != owner_uid:
+    if launcher_metadata.st_uid not in owner_uids:
         _node_refuse("node-toolchain-owner")
-    _node_regular_file(npm_cli, owner_uid, executable=False)
-    _validate_npm_tree(root / "lib/node_modules/npm", owner_uid)
+    _node_regular_file(npm_cli, owner_uids, executable=False)
+    _validate_npm_tree(root / "lib/node_modules/npm", owner_uids, deadline_file=deadline_file)
     return {"node": str(node), "npm": str(npm_launcher), "npm_cli": str(npm_cli), "root": str(root)}
 
 
@@ -190,26 +248,18 @@ def node_version_commands(validated):
     }
 
 
-def run_node_version_checks(paths, owner_uid, run):
-    validated = validate_node_toolchain(paths, owner_uid)
+def run_node_versions(validated, run):
     results = {
         name: run(argv, env=dict(NODE_VERSION_ENVIRONMENT))
         for name, argv in node_version_commands(validated).items()
     }
-    return validated, results
+    return results
 
 
 def _prepare_node_version_process(argv, *, env):
-    try:
-        return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                              stderr=subprocess.DEVNULL, timeout=_bounded_timeout(10),
-                              check=False, env=env)
-    except (OSError, subprocess.SubprocessError):
-        refuse("node-toolchain-version" if len(argv) == 2 else "npm-toolchain-version")
-
-
-def verify_node_toolchain_versions(paths, owner_uid):
-    return run_node_version_checks(paths, owner_uid, _prepare_node_version_process)
+    return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, timeout=_bounded_timeout(10),
+                          check=False, env=env)
 
 
 def refuse(code):
@@ -298,9 +348,9 @@ def _mount(source, target):
     source = Path(source).resolve(strict=True)
     subprocess.run(["mount", "--bind", str(source), str(target)], check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=_bounded_timeout(10))
+    MOUNT_TARGETS.append(Path(target))
     subprocess.run(["mount", "-o", "remount,bind,ro,nosuid,nodev", str(target)], check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=_bounded_timeout(10))
-    MOUNT_TARGETS.append(Path(target))
 
 
 def _mount_fs(argv, target):
@@ -404,6 +454,7 @@ def _write_resolver(root):
 
 
 def _prepare_root(root, tool_roots):
+    _set_preparation_stage("prepare-root-mounts")
     root = Path(root)
     if root.is_symlink() or (root.exists() and (not root.is_dir() or any(root.iterdir()))):
         refuse("preparation-root-invalid")
@@ -442,6 +493,7 @@ def _prepare_root(root, tool_roots):
 
 
 def _run_worker(root, projection, profile, output_root, tool_paths, owner_uid, owner_gid):
+    _set_preparation_stage("prepare-worker-setup")
     work = root / "work"
     project = work / "project"
     prepared = work / "prepared"
@@ -484,10 +536,12 @@ def _run_worker(root, projection, profile, output_root, tool_paths, owner_uid, o
         "/bin/sh", "-c", 'cd /work/project && exec "$@"', "devlane-prepare",
     ]
     if profile == "core-node":
+        _set_preparation_stage("prepare-dependency-install")
         command = command_prefix + ["npm", "--prefix", "/work/project", *NPM_CI_ARGUMENTS]
         run(command, timeout=3600, log=work / "prepare-npm.log", environment=environment,
             cwd="/")
         if projection["playwright"]:
+            _set_preparation_stage("prepare-playwright-install")
             candidates = (
                 root / "work/project/node_modules/playwright/cli.js",
                 root / "work/project/node_modules/@playwright/test/cli.js",
@@ -500,6 +554,7 @@ def _run_worker(root, projection, profile, output_root, tool_paths, owner_uid, o
             run(command, timeout=1800, log=work / "prepare-playwright.log", environment=environment,
                 cwd="/")
     else:
+        _set_preparation_stage("prepare-cargo-vendor")
         """cargo vendor creates its destination as the unprivileged worker; it vendors every locked package, so feature flags are neither needed nor accepted by this command."""
         command = command_prefix + ["cargo", "vendor", "--locked",
                                     "--manifest-path", "/work/project/Cargo.toml"]
@@ -521,10 +576,12 @@ def _run_worker(root, projection, profile, output_root, tool_paths, owner_uid, o
         if not (prepared / "cargo-vendor").is_dir():
             refuse("cargo-vendor-missing")
     if projection["playwright"]:
+        _set_preparation_stage("prepare-prepared-output-copy")
         """Browsers are installed directly under prepared/ (PLAYWRIGHT_BROWSERS_PATH)."""
         if not (prepared / "ms-playwright").is_dir() or (prepared / "ms-playwright").is_symlink():
             refuse("playwright-browsers-missing")
     destination = Path(output_root)
+    _set_preparation_stage("prepare-prepared-output-copy")
     if destination.exists() or destination.is_symlink():
         refuse("prepared-output-exists")
     destination.mkdir(mode=0o700, parents=True)
@@ -545,46 +602,101 @@ def _run_worker(root, projection, profile, output_root, tool_paths, owner_uid, o
     os.chmod(destination, 0o755)
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser()
+def _failure_from_exception(error):
+    if type(error) is node_tool_snapshot.SnapshotRefusal:
+        code = error.code
+        return "refusal", code if code in diagnostic_contract.PREPARATION_REFUSAL_CODES else "preparation-refusal-unlisted"
+    if type(error) in (bundle.Refusal, deadline_budget.DeadlineRefusal):
+        code = error.args[0] if len(error.args) == 1 and type(error.args[0]) is str else ""
+        return "refusal", code if code in diagnostic_contract.PREPARATION_REFUSAL_CODES else "preparation-refusal-unlisted"
+    label = _PREPARATION_EXCEPTION_CATEGORIES.get(type(error), "unclassified")
+    return "exception", label if label in diagnostic_contract.PREPARATION_EXCEPTION_LABELS else "unclassified"
+
+
+def _emit_failure(failure, cleanup, stage=None):
+    kind, value = failure
+    stage = stage or PREPARATION_STAGE
+    stage = stage if stage in diagnostic_contract.PREPARATION_STAGES else "prepare-protocol"
+    if kind == "refusal":
+        code = value if value in diagnostic_contract.PREPARATION_REFUSAL_CODES else "preparation-refusal-unlisted"
+        print("dependency_preparation_refusal=stage=%s code=%s cleanup=%s" % (stage, code, cleanup),
+              file=sys.stderr)
+        return
+    label = value if value in diagnostic_contract.PREPARATION_EXCEPTION_LABELS else "unclassified"
+    print("dependency_preparation_exception=stage=%s class=%s cleanup=%s" % (stage, label, cleanup),
+          file=sys.stderr)
+
+
+def _argument_parser():
+    parser = _PreparationArgumentParser()
     parser.add_argument("--projection", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--profile", choices=("core-node", "core-rust"), required=True)
     parser.add_argument("--owner-uid", type=int, required=True)
     parser.add_argument("--owner-gid", type=int, required=True)
     parser.add_argument("--deadline-file", required=True)
+    parser.add_argument("--node-snapshot-id", default="")
     for name in ("node", "npm", "cargo", "rustc"):
         parser.add_argument("--" + name + "-path", default="")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv=None):
     global DEADLINE_FILE
-    DEADLINE_FILE = args.deadline_file
-    try:
-        deadline_budget.remaining(DEADLINE_FILE)
-    except deadline_budget.DeadlineRefusal:
-        print("dependency_preparation_refusal=total-deadline-exhausted", file=sys.stderr)
-        return 2
-    if not sys.platform.startswith("linux") or os.geteuid() != 0:
-        print("dependency_preparation_refusal=linux-root-required", file=sys.stderr)
-        return 2
+    MOUNT_TARGETS.clear()
+    _set_preparation_stage("prepare-argument-parse")
+    parser = _argument_parser()
     root = None
+    node_snapshot_id = ""
+    node_snapshot_created = False
+    failure = None
+    failure_stage = None
+    cleanup = "not-needed"
     result = 2
     try:
-        if args.owner_uid < 1 or args.owner_gid < 1 or args.owner_uid > 60000 or args.owner_gid > 60000:
+        args = parser.parse_args(argv)
+        DEADLINE_FILE = args.deadline_file
+        _set_preparation_stage("prepare-deadline-check")
+        deadline_budget.remaining(DEADLINE_FILE)
+        _set_preparation_stage("prepare-platform-check")
+        if not sys.platform.startswith("linux") or os.geteuid() != 0:
+            refuse("linux-root-required")
+        _set_preparation_stage("prepare-owner-identity")
+        if (args.owner_uid < 1 or args.owner_gid < 1 or args.owner_uid > 60000 or args.owner_gid > 60000
+                or args.owner_uid == UID or args.owner_gid == GID):
             refuse("owner-identity")
+        _set_preparation_stage("prepare-projection-validation")
         projection_path = Path(args.projection)
         projection = fetch.validate_projection(projection_path.read_bytes(), args.profile)
         if projection["tools"] != ({"node": NODE_VERSION, "npm": NPM_VERSION} if args.profile == "core-node" else projection["tools"]):
             refuse("toolchain-version")
+        _set_preparation_stage("prepare-toolchain-selection")
         if args.profile == "core-node":
+            if not node_tool_snapshot.valid_snapshot_id(args.node_snapshot_id):
+                refuse("node-snapshot-id")
+            node_snapshot_id = args.node_snapshot_id
             paths = {"node": args.node_path, "npm": args.npm_path, "cargo": "", "rustc": ""}
         else:
+            if args.node_snapshot_id:
+                refuse("node-snapshot-id")
             paths = {name: getattr(args, name + "_path") or shutil.which(name) or ""
                      for name in ("node", "npm", "cargo", "rustc")}
         if args.profile == "core-rust":
+            _set_preparation_stage("prepare-rust-toolchain-validation")
             for name in ("cargo", "rustc"):
                 paths[name] = _resolve_rust_tool(paths[name], name)
         if args.profile == "core-node":
-            node_tools, node_results = verify_node_toolchain_versions(paths, args.owner_uid)
+            _set_preparation_stage("prepare-node-toolchain-snapshot")
+            node_tools = node_tool_snapshot.create_snapshot(
+                paths, node_snapshot_id, args.owner_uid, DEADLINE_FILE,
+            )
+            node_snapshot_created = True
+            _set_preparation_stage("prepare-node-snapshot-verification")
+            node_tools = node_tool_snapshot.validate_snapshot(
+                node_snapshot_id, DEADLINE_FILE, owner_uid=args.owner_uid,
+            )
+            _set_preparation_stage("prepare-node-version-verification")
+            node_results = run_node_versions(node_tools, _prepare_node_version_process)
             for name, expected in (("node", NODE_VERSION), ("npm", NPM_VERSION)):
                 expected_text = ("v" + expected) if name == "node" else expected
                 try:
@@ -598,6 +710,7 @@ def main(argv=None):
         elif not paths["cargo"] or not paths["rustc"]:
             refuse("rust-toolchain-missing")
         if args.profile == "core-rust":
+            _set_preparation_stage("prepare-rust-version-verification")
             for name in ("cargo", "rustc"):
                 version_result = subprocess.run([paths[name], "--version"], stdout=subprocess.PIPE,
                                                 stderr=subprocess.DEVNULL, timeout=_bounded_timeout(10), check=False,
@@ -606,6 +719,7 @@ def main(argv=None):
                 if version_result.returncode != 0 or len(words) < 2 or words[1] != projection["tools"][name]:
                     refuse("rust-toolchain-version")
         if args.profile == "core-node":
+            _set_preparation_stage("prepare-tool-root-selection")
             tool_roots = {"node": Path(node_tools["root"]), "rust": None}
         else:
             cargo_root = Path(paths["cargo"]).resolve(strict=True).parent.parent
@@ -613,37 +727,70 @@ def main(argv=None):
             if not rustc_path.is_relative_to(cargo_root):
                 refuse("rust-tool-layout")
             tool_roots = {"node": None, "rust": cargo_root}
+            _set_preparation_stage("prepare-tool-root-selection")
         root = Path(tempfile.mkdtemp(prefix="kd-devlane-prep-", dir="/tmp"))
+        cleanup = "confirmed"
+        _set_preparation_stage("prepare-namespace-isolation")
         subprocess.run(["mount", "--make-rprivate", "/"], check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=_bounded_timeout(10))
         _prepare_root(root, tool_roots)
         _run_worker(root, projection, args.profile, args.output, paths, args.owner_uid, args.owner_gid)
-        print("dependency_preparation=complete")
         result = 0
-    except (bundle.Refusal, fetch.Refusal) as error:
-        print("dependency_preparation_refusal=" + str(error), file=sys.stderr)
-        result = 2
-    except Exception:
-        print("dependency_preparation_refusal=preparation-failed", file=sys.stderr)
+    except Exception as error:
+        failure = _failure_from_exception(error)
+        failure_stage = PREPARATION_STAGE
+        if getattr(error, "cleanup_unconfirmed", False):
+            cleanup = "unconfirmed"
+        elif getattr(error, "cleanup_confirmed", False):
+            cleanup = "confirmed"
         result = 2
     finally:
-        _kill_children()
         clean = True
-        for target in reversed(MOUNT_TARGETS):
-            try:
-                subprocess.run(["umount", str(target)], check=True, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, timeout=_bounded_timeout(5, cleanup=True))
-            except (OSError, subprocess.SubprocessError):
-                clean = False
-        MOUNT_TARGETS.clear()
         if root is not None:
+            _set_preparation_stage("prepare-cleanup")
+            try:
+                _kill_children()
+            except Exception:
+                clean = False
+            for target in reversed(MOUNT_TARGETS):
+                try:
+                    subprocess.run(["umount", str(target)], check=True, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=_bounded_timeout(5, cleanup=True))
+                except Exception:
+                    clean = False
+            MOUNT_TARGETS.clear()
             try:
                 root.rmdir()
-            except OSError:
+            except Exception:
+                clean = False
+        if node_snapshot_created and failure is not None:
+            if clean:
+                try:
+                    node_tool_snapshot.remove_snapshot(
+                        node_snapshot_id, DEADLINE_FILE, owner_uid=args.owner_uid,
+                    )
+                    cleanup = "confirmed"
+                except Exception:
+                    clean = False
+            else:
                 clean = False
         if not clean:
-            print("dependency_preparation_refusal=cleanup-incomplete", file=sys.stderr)
+            cleanup = "unconfirmed"
+            if failure is None:
+                failure = ("refusal", "cleanup-incomplete")
+                failure_stage = "prepare-cleanup"
+                result = 2
+        elif root is not None and cleanup != "unconfirmed":
+            cleanup = "confirmed"
+        if result != 0 and failure is None:
+            _set_preparation_stage("prepare-protocol")
+            failure = ("refusal", "preparation-refusal-unlisted")
+            failure_stage = "prepare-protocol"
             result = 2
+    if result == 0:
+        print("dependency_preparation=complete")
+        return 0
+    _emit_failure(failure, cleanup, failure_stage)
     return result
 
 

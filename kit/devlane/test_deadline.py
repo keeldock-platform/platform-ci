@@ -383,8 +383,9 @@ class DeadlineTests(unittest.TestCase):
         self.assertIn('"--cleanup-reserve-seconds", "300"', workflow)
         self.assertIn('"--job-seconds", "5400"', workflow)
         self.assertEqual(workflow.count("deadline.py run"), 5)
-        self.assertEqual(workflow.count("quiet bounded "), 9)
+        self.assertEqual(len(re.findall(r"(?m)^\s+quiet [a-z0-9-]+ bounded ", workflow)), 9)
         self.assertIn('test_e2e.py --deadline-file "$RUNNER_TEMP/devlane-deadline.json"', workflow)
+        self.assertIn('--report-diagnostic-file "$RUNNER_TEMP/devlane-acceptance-diagnostic-$GITHUB_RUN_ID"', workflow)
         self.assertIn('bounded() { python3 -B kit/devlane/deadline.py run', workflow)
         self.assertIn("--timeout-cleanup-reserve-seconds 300", workflow)
         harness = (WORKFLOW_ROOT / "kit/devlane/test_e2e.py").read_text(encoding="utf-8")
@@ -521,7 +522,7 @@ class DeadlineTests(unittest.TestCase):
             ("devlane-synthetic.yml", "devlane-synthetic", "test_acceptance.py"): 1,
             ("devlane-synthetic.yml", "devlane-synthetic", "test_audit_contracts.py"): 1,
             ("devlane-synthetic.yml", "devlane-synthetic", "test_coordinator.py"): 1,
-            ("devlane-synthetic.yml", "devlane-synthetic", "test_e2e.py"): 2,
+            ("devlane-synthetic.yml", "devlane-synthetic", "test_e2e.py"): 3,
             ("devlane-synthetic.yml", "devlane-synthetic", "test_linux_runtime.py"): 1,
             ("devlane-synthetic.yml", "devlane-synthetic", "test_rehearsal.py"): 1,
             ("devlane-synthetic.yml", "devlane-synthetic", "test_rust_report.py"): 1,
@@ -567,6 +568,20 @@ class DeadlineTests(unittest.TestCase):
                 elif script == "test_e2e.py":
                     self.assertIn("--deadline-file", arguments)
                     self._assert_required_argument(test_e2e.main, arguments, "--deadline-file")
+                    if "--report-diagnostic-file" in arguments:
+                        self.assertEqual(
+                            arguments[arguments.index("--report-diagnostic-file") + 1],
+                            "$RUNNER_TEMP/devlane-acceptance-diagnostic-$GITHUB_RUN_ID",
+                        )
+                        output = io.StringIO()
+                        with patch.object(test_e2e, "_read_reportable_diagnostic_file", return_value=None), \
+                                contextlib.redirect_stdout(output):
+                            self.assertEqual(test_e2e.main(arguments), 0)
+                        self.assertEqual(
+                            output.getvalue(),
+                            "devlane_acceptance=refused stage=production-path-e2e\n",
+                        )
+                        continue
                     with patch.object(test_e2e, "DEADLINE_FILE", ""), \
                             patch.object(deadline, "remaining",
                                          side_effect=deadline.DeadlineRefusal("total-deadline-exhausted")):
@@ -579,13 +594,24 @@ class DeadlineTests(unittest.TestCase):
                                       .replace("$owner_gid", "1000") for value in arguments]
                     for option in ("--projection", "--output", "--profile", "--owner-uid", "--owner-gid",
                                    "--deadline-file"):
-                        self._assert_required_argument(prepare.main, safe_arguments, option)
+                        errors = io.StringIO()
+                        with contextlib.redirect_stderr(errors):
+                            self.assertEqual(prepare.main(_without_option(safe_arguments, option)), 2)
+                        self.assertEqual(
+                            errors.getvalue(),
+                            "dependency_preparation_refusal=stage=prepare-argument-parse "
+                            "code=preparation-parser-refusal cleanup=not-needed\n",
+                        )
                     errors = io.StringIO()
                     with patch.object(prepare.deadline_budget, "remaining",
                                       side_effect=deadline.DeadlineRefusal("total-deadline-exhausted")), \
                             contextlib.redirect_stderr(errors):
                         self.assertEqual(prepare.main(safe_arguments), 2)
-                    self.assertIn("dependency_preparation_refusal=total-deadline-exhausted", errors.getvalue())
+                    self.assertEqual(
+                        errors.getvalue(),
+                        "dependency_preparation_refusal=stage=prepare-deadline-check "
+                        "code=total-deadline-exhausted cleanup=not-needed\n",
+                    )
                 elif script == "rust_tooling.py":
                     self.assertIn("--deadline-file", arguments)
                     required = (("--output", "--deadline-file") if arguments[0] == "fetch" else
@@ -605,15 +631,18 @@ class DeadlineTests(unittest.TestCase):
                         run_id = "parser-run-0001"
                         run_root = base / ("devlane-" + run_id)
                         safe_arguments = [value.replace("$RUN_ROOT", str(run_root)).replace(
-                            "$RUNNER_TEMP", str(base)) for value in arguments]
+                            "$RUNNER_TEMP", str(base)).replace("$node_snapshot_id", "devlane-run-1")
+                            for value in arguments]
                         for option in ("--root", "--runner-temp", "--deadline-file"):
                             self._assert_required_argument(host_cleanup.main, safe_arguments, option)
                         output = io.StringIO()
                         with patch.dict(os.environ, {"GITHUB_RUN_ID": run_id}), \
                                 patch.object(host_cleanup, "_confirm_supervisor_absent"), \
+                                patch.object(host_cleanup, "clean_node_snapshot", return_value=True) as remove_snapshot, \
                                 contextlib.redirect_stdout(output):
                             self.assertEqual(host_cleanup.main(safe_arguments), 0)
                         self.assertEqual(output.getvalue().strip(), "cleanup_receipt=confirmed")
+                        remove_snapshot.assert_called_once_with("devlane-run-1", str(run_root / "deadline.json"))
                         self.assertFalse(run_root.exists())
                 elif script == "supervisor.py":
                     required = {

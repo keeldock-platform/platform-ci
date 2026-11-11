@@ -920,6 +920,8 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/control_audit.py',
             'kit/devlane/coordinator.py',
             'kit/devlane/decrypt_once.py',
+            'kit/devlane/diagnostic_contract.py',
+            'kit/devlane/node_tool_snapshot.py',
             'kit/devlane/fetch.py',
             'kit/devlane/filter.py',
             'kit/devlane/host_cleanup.py',

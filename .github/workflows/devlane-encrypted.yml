@@ -336,8 +336,12 @@ jobs:
           owner_gid="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- id -g)"
           node_path="$(command -v node || true)"
           npm_path="$(command -v npm || true)"
+          node_snapshot_id=""
           cargo_path=""
           rustc_path=""
+          if [[ "$DEVLANE_PROFILE" == "core-node" ]]; then
+            node_snapshot_id="devlane-${CI_RUN_ID}-${CI_RUN_ATTEMPT}"
+          fi
           if [[ "$DEVLANE_PROFILE" == "core-rust" ]]; then
             rust_version="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
               python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tools"]["cargo"])' "$RUN_ROOT/projection.json")"
@@ -353,6 +357,7 @@ jobs:
               --projection "$RUN_ROOT/projection.json" --output "$RUN_ROOT/prepared" \
               --profile "$DEVLANE_PROFILE" --owner-uid "$owner_uid" --owner-gid "$owner_gid" \
               --node-path "$node_path" --npm-path "$npm_path" --cargo-path "$cargo_path" --rustc-path "$rustc_path" \
+              --node-snapshot-id "$node_snapshot_id" \
               --deadline-file "$RUN_ROOT/deadline.json"
           if [[ "$DEVLANE_PROFILE" == "core-rust" ]]; then
             python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
@@ -367,10 +372,12 @@ jobs:
       - name: Cut network and start the isolated supervisor
         run: |
           set -euo pipefail
-          node_path="$(command -v node || true)"
-          npm_path="$(command -v npm || true)"
+          node_snapshot_id=""
           cargo_path=""
           rustc_path=""
+          if [[ "$DEVLANE_PROFILE" == "core-node" ]]; then
+            node_snapshot_id="devlane-${CI_RUN_ID}-${CI_RUN_ATTEMPT}"
+          fi
           if [[ "$DEVLANE_PROFILE" == "core-rust" ]]; then
             rust_version="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
               python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tools"]["cargo"])' "$RUN_ROOT/projection.json")"
@@ -387,7 +394,7 @@ jobs:
               --bundle "$RUN_ROOT/bundle.enc" --projection "$RUN_ROOT/projection.json" \
               --deadline-file "$RUN_ROOT/deadline.json" \
               --positive-control "$RUN_ROOT/positive-control.json" \
-              --node-path "$node_path" --npm-path "$npm_path" --cargo-path "$cargo_path" --rustc-path "$rustc_path"
+              --node-snapshot-id "$node_snapshot_id" --cargo-path "$cargo_path" --rustc-path "$rustc_path"
       - name: Probe isolation before decryption
         run: |
           set -euo pipefail
@@ -415,8 +422,13 @@ jobs:
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
           set -euo pipefail
+          node_snapshot_id=""
+          if [[ "$DEVLANE_PROFILE" == "core-node" ]]; then
+            node_snapshot_id="devlane-${CI_RUN_ID}-${CI_RUN_ATTEMPT}"
+          fi
           python3 -B kit/devlane/host_cleanup.py --root "$RUN_ROOT" --runner-temp "$RUNNER_TEMP" \
-            --deadline-file "$RUN_ROOT/deadline.json"
+            --deadline-file "$RUN_ROOT/deadline.json" \
+            --node-snapshot-id "$node_snapshot_id"
           printf 'devlane_job=completed public_output=filtered cleanup=confirmed\n'
   devlane-encrypted-audit:
     name: devlane-encrypted-audit

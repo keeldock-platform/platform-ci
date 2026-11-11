@@ -413,6 +413,47 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             with self.subTest(label), self.assertRaises(control_audit.ControlAuditRefusal):
                 control_audit.validate_synthetic_log(payload, identity)
 
+    def test_preparation_refusal_diagnostics_are_allowlisted_and_never_count_as_acceptance(self):
+        root = Path(__file__).resolve().parents[2]
+        grammar = audit._Grammar(
+            root / ".github/workflows/devlane-synthetic.yml", "devlane-synthetic",
+            {"run_id": "12345", "control_sha": SHA}, "synthetic",
+        )
+        line = (
+            "devlane_production_e2e=refused stage=prepare-node-toolchain-validation "
+            "exception=node-toolchain-owner"
+        )
+        self.assertTrue(grammar.step_output_ok(
+            "Run full source-free production-path acceptance", line, {},
+        ))
+        self.assertTrue(grammar.step_output_ok(
+            "Run full source-free production-path acceptance",
+            "devlane_acceptance=refused stage=production-path-e2e", {},
+        ))
+        for invalid in (
+            line.replace("node-toolchain-owner", "private-path"),
+            line.replace("prepare-node-toolchain-validation", "private-path"),
+            line + " cleanup=confirmed",
+            line.replace("node-toolchain-owner", "node-toolchain-owner") + " KEYCANARY-73A10X",
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertFalse(grammar.step_output_ok(
+                    "Run full source-free production-path acceptance", invalid, {},
+                ))
+        self.assertFalse(grammar.step_output_ok(
+            "Set up pinned Node toolchain", line, {},
+        ))
+
+        synthetic = _render_log(
+            "devlane-synthetic", dict(IDENTITY), kind="synthetic",
+            skip=("Install fixed Rust acceptance toolchain",),
+        )
+        refused = synthetic.replace(
+            b"devlane_acceptance=pass", line.encode("ascii"), 1,
+        )
+        with self.assertRaises(control_audit.ControlAuditRefusal):
+            control_audit.validate_synthetic_log(refused, {"run_id": "12345", "control_sha": SHA})
+
     def test_reviewed_step_name_lists_match_the_workflow_files(self):
         root = Path(__file__).resolve().parents[2]
         encrypted = audit.parse_workflow(root / ".github/workflows/devlane-encrypted.yml")

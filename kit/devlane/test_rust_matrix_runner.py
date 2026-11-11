@@ -2,13 +2,16 @@
 
 import argparse
 import ast
+import builtins
 import contextlib
 import io
 import json
 import inspect
+import multiprocessing
 import os
 import re
 import signal
+import stat
 import sys
 import subprocess
 import tempfile
@@ -24,6 +27,9 @@ import filter as output_filter
 import rust_matrix_runner
 import rust_tooling
 import deadline as deadline_budget
+import diagnostic_contract
+import node_tool_snapshot
+import host_cleanup
 import supervisor
 import test_e2e
 
@@ -72,6 +78,128 @@ def _assert_pid_gone(test, pid):
     test.fail("TERM-ignoring descendant survived group cleanup")
 
 
+def _fifo_snapshot_child(kind, fixture, deadline_file, snapshot_base, snapshot_id,
+                         parent_device, parent_inode, trigger_count, result_connection):
+    real_open = os.open
+    open_count = 0
+    observed_nonblock = False
+    target_name = node_tool_snapshot.MANIFEST_NAME if kind == "manifest" else "node"
+
+    def open_with_fifo_swap(path, flags, *args, **kwargs):
+        nonlocal open_count, observed_nonblock
+        directory_fd = kwargs.get("dir_fd")
+        if path == target_name and directory_fd is not None and not flags & node_tool_snapshot._O_DIRECTORY:
+            try:
+                metadata = os.fstat(directory_fd)
+            except OSError:
+                metadata = None
+            if (metadata is not None and metadata.st_dev == parent_device
+                    and metadata.st_ino == parent_inode):
+                open_count += 1
+                if open_count == trigger_count:
+                    observed_nonblock = bool(flags & getattr(os, "O_NONBLOCK", 0))
+                    if kind in ("manifest", "snapshot-content"):
+                        os.fchmod(directory_fd, 0o755)
+                    os.unlink(path, dir_fd=directory_fd)
+                    os.mkfifo(path, 0o600, dir_fd=directory_fd)
+        return real_open(path, flags, *args, **kwargs)
+
+    os.open = open_with_fifo_swap
+    try:
+        if kind in ("copy", "source-verification"):
+            preparation = supervisor.node_tool_prepare
+            preparation.NODE_TOOL_CACHE_ROOT = fixture["cache"]
+            preparation.NODE_TOOL_ROOT = fixture["node_root"]
+            preparation.NODE_TOOL_SYSTEM_ANCHORS = ((fixture["anchor"], os.getuid()),)
+            node_tool_snapshot.create_snapshot(
+                fixture["paths"], snapshot_id, os.getuid(), str(deadline_file),
+                snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
+                source_node_root=fixture["node_root"],
+                source_anchors=((fixture["anchor"], os.getuid()),),
+            )
+        else:
+            node_tool_snapshot.validate_snapshot(
+                snapshot_id, str(deadline_file), snapshot_base=snapshot_base,
+                owner_uid=os.getuid(),
+            )
+        result = ("accepted", "", open_count, observed_nonblock)
+    except node_tool_snapshot.SnapshotRefusal as error:
+        result = ("refused", error.code, open_count, observed_nonblock)
+    except BaseException as error:
+        result = ("error", type(error).__name__, open_count, observed_nonblock)
+    finally:
+        os.open = real_open
+        result_connection.send(result)
+        result_connection.close()
+
+
+class _RootEffectiveUIDProxy:
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    @staticmethod
+    def geteuid():
+        return 0
+
+
+class _MixedOwnerMetadataProxy:
+    """Present one synthetic source file as root-owned while its siblings stay runner-owned."""
+
+    _STAT_FIELDS = (
+        "st_dev", "st_ino", "st_mode", "st_nlink", "st_uid", "st_gid", "st_size",
+        "st_atime", "st_mtime", "st_ctime", "st_atime_ns", "st_mtime_ns", "st_ctime_ns",
+    )
+
+    def __init__(self, root_owned_path):
+        self.root_owned_path = Path(root_owned_path).absolute()
+        self.fd_paths = {}
+        self.source_owners = []
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    def open(self, path, flags, *args, **kwargs):
+        directory_fd = kwargs.get("dir_fd")
+        if directory_fd is None:
+            absolute = Path(path)
+            if not absolute.is_absolute():
+                absolute = Path.cwd() / absolute
+        else:
+            absolute = self.fd_paths.get(directory_fd, Path.cwd()) / os.fsdecode(path)
+        descriptor = os.open(path, flags, *args, **kwargs)
+        self.fd_paths[descriptor] = Path(os.path.normpath(str(absolute)))
+        return descriptor
+
+    def close(self, descriptor):
+        self.fd_paths.pop(descriptor, None)
+        return os.close(descriptor)
+
+    def _absolute(self, path, directory_fd):
+        if directory_fd is None:
+            absolute = Path(path)
+            return absolute if absolute.is_absolute() else Path.cwd() / absolute
+        return self.fd_paths.get(directory_fd, Path.cwd()) / os.fsdecode(path)
+
+    def _reported(self, metadata, absolute):
+        absolute = Path(os.path.normpath(str(absolute)))
+        owner = 0 if absolute == self.root_owned_path else metadata.st_uid
+        if absolute == self.root_owned_path:
+            self.source_owners.append((str(absolute), owner))
+        values = {name: getattr(metadata, name) for name in self._STAT_FIELDS
+                  if hasattr(metadata, name)}
+        values["st_uid"] = owner
+        return SimpleNamespace(**values)
+
+    def stat(self, path, *args, **kwargs):
+        metadata = os.stat(path, *args, **kwargs)
+        return self._reported(metadata, self._absolute(path, kwargs.get("dir_fd")))
+
+    def fstat(self, descriptor):
+        metadata = os.fstat(descriptor)
+        absolute = self.fd_paths.get(descriptor)
+        return self._reported(metadata, absolute) if absolute is not None else metadata
+
+
 def _coverage(records, suite):
     total = 1
     records.append({
@@ -113,7 +241,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
         return rows
 
     def _write_node_toolchain_fixture(self, root):
-        root = Path(root)
+        root = Path(root).resolve()
         anchor = root / "trusted-system-anchor"
         cache = anchor / "hostedtoolcache"
         node_root = cache / "node" / "24.22.1" / "x64"
@@ -171,6 +299,146 @@ class RustMatrixRunnerTests(unittest.TestCase):
                              ((fixture["anchor"], os.getuid()),)):
             yield
 
+    def _create_node_snapshot(self, fixture, snapshot_base, snapshot_id, deadline_path):
+        snapshot_base = Path(snapshot_base).resolve()
+        with self._node_fixture_policy(fixture):
+            snapshot = node_tool_snapshot.create_snapshot(
+                fixture["paths"], snapshot_id, os.getuid(), str(deadline_path),
+                snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
+                source_node_root=fixture["node_root"],
+                source_anchors=((fixture["anchor"], os.getuid()),),
+            )
+        return snapshot_base, snapshot
+
+    def _run_fifo_snapshot_child(self, kind, fixture, deadline_path, snapshot_base,
+                                 snapshot_id, parent, trigger_count):
+        context_name = "fork" if "fork" in multiprocessing.get_all_start_methods() else "spawn"
+        context = multiprocessing.get_context(context_name)
+        receiver, sender = context.Pipe(duplex=False)
+        metadata = Path(parent).stat()
+        process = context.Process(
+            target=_fifo_snapshot_child,
+            args=(kind, fixture, str(deadline_path), str(snapshot_base), snapshot_id,
+                  metadata.st_dev, metadata.st_ino, trigger_count, sender),
+        )
+        process.start()
+        sender.close()
+        try:
+            if not receiver.poll(3):
+                if process.is_alive():
+                    process.terminate()
+                    process.join(0.25)
+                if process.is_alive():
+                    process.kill()
+                    process.join(1)
+                self.fail("FIFO race child exceeded its bounded wait")
+            result = receiver.recv()
+            process.join(1)
+            if process.is_alive():
+                process.kill()
+                process.join(1)
+                self.fail("FIFO race child did not exit after reporting")
+            self.assertEqual(process.exitcode, 0)
+            return result
+        finally:
+            receiver.close()
+
+    def _rewrite_snapshot_manifest_for_fixture(self, snapshot_root, deadline_path):
+        root = Path(snapshot_root)
+        root.chmod(0o700)
+        root_fd = os.open(root, os.O_RDONLY | node_tool_snapshot._O_DIRECTORY
+                          | node_tool_snapshot._O_NOFOLLOW)
+        try:
+            manifest = json.loads((root / node_tool_snapshot.MANIFEST_NAME).read_text(encoding="utf-8"))
+            rows = []
+            totals = {"entries": 0, "bytes": 0, "manifest_rows_bytes": 0}
+            node_tool_snapshot._snapshot_entries(
+                root_fd, "", str(deadline_path), rows, totals, os.getuid(),
+            )
+            rows.sort(key=lambda row: row["path"])
+            core = {key: value for key, value in manifest.items() if key != "content_sha256"}
+            core["entries"] = rows
+            core["entry_count"] = totals["entries"]
+            core["expanded_bytes"] = totals["bytes"]
+            rewritten = dict(core)
+            rewritten["content_sha256"] = node_tool_snapshot._entry_digest(core)
+            payload = supervisor.bundle.canonical_json(rewritten) + b"\n"
+            os.unlink(node_tool_snapshot.MANIFEST_NAME, dir_fd=root_fd)
+            descriptor = os.open(
+                node_tool_snapshot.MANIFEST_NAME,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | node_tool_snapshot._O_NOFOLLOW,
+                0o444, dir_fd=root_fd,
+            )
+            try:
+                view = memoryview(payload)
+                while view:
+                    count = os.write(descriptor, view)
+                    view = view[count:]
+                os.fchmod(descriptor, 0o444)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.fchmod(root_fd, 0o555)
+        finally:
+            os.close(root_fd)
+
+    @contextlib.contextmanager
+    def _forbid_external_canary_open(self, canary):
+        canary = Path(canary).absolute()
+        canary_stat = canary.stat()
+        parent_stat = canary.parent.stat()
+        attempts = []
+        real_os_open = os.open
+        real_builtin_open = builtins.open
+        real_io_open = io.open
+
+        def matches(path, directory_fd=None):
+            try:
+                decoded = os.fsdecode(path)
+                if directory_fd is not None:
+                    parent = os.fstat(directory_fd)
+                    if ((parent.st_dev, parent.st_ino) == (parent_stat.st_dev, parent_stat.st_ino)
+                            and decoded == canary.name):
+                        return True
+                candidate = Path(decoded)
+                if not candidate.is_absolute():
+                    candidate = Path.cwd() / candidate
+                return candidate.resolve(strict=False) == canary
+            except (OSError, TypeError, ValueError):
+                return False
+
+        def guarded_os_open(path, flags, *args, **kwargs):
+            if matches(path, kwargs.get("dir_fd")):
+                attempts.append("os.open")
+                raise AssertionError("control attempted to open the external canary")
+            descriptor = real_os_open(path, flags, *args, **kwargs)
+            try:
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino) == (canary_stat.st_dev, canary_stat.st_ino):
+                    attempts.append("os.open")
+                    os.close(descriptor)
+                    raise AssertionError("control opened the external canary")
+            except OSError:
+                pass
+            return descriptor
+
+        def guarded_io_open(file, *args, **kwargs):
+            if matches(file):
+                attempts.append("io.open")
+                raise AssertionError("control attempted to read the external canary")
+            return real_io_open(file, *args, **kwargs)
+
+        def guarded_builtin_open(file, *args, **kwargs):
+            if matches(file):
+                attempts.append("builtins.open")
+                raise AssertionError("control attempted to read the external canary")
+            return real_builtin_open(file, *args, **kwargs)
+
+        with patch.object(os, "open", side_effect=guarded_os_open), \
+                patch.object(io, "open", side_effect=guarded_io_open), \
+                patch.object(builtins, "open", side_effect=guarded_builtin_open):
+            yield attempts
+
     def test_harness_parses_complete_producer_shaped_rust_summary(self):
         payload = self._summary_payload(self._coverage_rows())
         records = test_e2e._summary_records(payload, self._summary_scenario())
@@ -206,6 +474,289 @@ class RustMatrixRunnerTests(unittest.TestCase):
                     continue
                 with self.assertRaises((RuntimeError, output_filter.FilterRefusal)):
                     test_e2e._summary_records(payload, self._summary_scenario())
+
+    def test_preparation_cli_reports_only_finite_codes_classes_and_parser_failures(self):
+        for code in diagnostic_contract.PREPARATION_REFUSAL_CODES:
+            line = ("dependency_preparation_refusal=stage=prepare-node-toolchain-validation "
+                    "code=" + code + " cleanup=confirmed\n").encode("ascii")
+            self.assertEqual(
+                diagnostic_contract.parse_preparation_result(2, b"", line),
+                ("prepare-node-toolchain-validation", code, "confirmed"),
+            )
+        for label in diagnostic_contract.PREPARATION_EXCEPTION_LABELS:
+            line = ("dependency_preparation_exception=stage=prepare-node-version-verification "
+                    "class=" + label + " cleanup=not-needed\n").encode("ascii")
+            self.assertEqual(
+                diagnostic_contract.parse_preparation_result(2, b"", line),
+                ("prepare-node-version-verification", "prepare-" + label, "not-needed"),
+            )
+        self.assertIsNone(diagnostic_contract.parse_preparation_result(
+            0, b"dependency_preparation=complete\n", b"",
+        ))
+        negative = (
+            (2, b"", b"usage: prepare.py --projection private-path\n"),
+            (2, b"unexpected", b"dependency_preparation_refusal=stage=prepare-node-toolchain-validation "
+             b"code=node-toolchain-owner cleanup=not-needed\n"),
+            (2, b"", b"dependency_preparation_refusal=stage=prepare-node-toolchain-validation "
+             b"code=unknown-private-code cleanup=not-needed\n"),
+            (2, b"", b"dependency_preparation_exception=stage=prepare-node-toolchain-validation "
+             b"class=UnknownPrivateError cleanup=not-needed\n"),
+            (2, b"", b"dependency_preparation_refusal=stage=private-path "
+             b"code=node-toolchain-owner cleanup=not-needed\n"),
+            (2, b"", b"dependency_preparation_refusal=stage=prepare-node-toolchain-validation "
+             b"code=node-toolchain-owner cleanup=not-needed\nprivate-path\n"),
+            (0, b"dependency_preparation=complete\nprivate-canary\n", b""),
+            (2, b"", b"dependency_preparation_refusal=stage=prepare-node-toolchain-validation "
+             b"code=node-toolchain-owner cleanup=unconfirmed\n" * 80),
+            (1, b"", b"sudo: private-runner-path\n"),
+        )
+        for returncode, stdout, stderr in negative:
+            with self.subTest(returncode=returncode, stderr=stderr[:40]):
+                parsed = diagnostic_contract.parse_preparation_result(returncode, stdout, stderr)
+                self.assertIsNotNone(parsed)
+                self.assertIn(parsed[1], diagnostic_contract.PREPARATION_E2E_CATEGORIES)
+                self.assertNotIn("private-path", parsed[1])
+                self.assertNotIn("private-canary", parsed[1])
+
+    def test_preparation_diagnostic_allowlists_cover_the_actual_validator_call_graph(self):
+        root = Path(__file__).resolve().parents[2] / "kit/devlane"
+        preparation = supervisor.node_tool_prepare
+
+        def result_strings(expression):
+            if isinstance(expression, ast.Constant) and type(expression.value) is str:
+                return {expression.value}
+            if isinstance(expression, ast.IfExp):
+                return result_strings(expression.body) | result_strings(expression.orelse)
+            return set()
+
+        def functions(filename):
+            tree = ast.parse((root / filename).read_text(encoding="utf-8"))
+            return {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+
+        prepare_functions = functions("prepare.py")
+        direct_codes = set()
+        stages = set()
+        for function in prepare_functions.values():
+            for node in ast.walk(function):
+                if isinstance(node, ast.Call) and node.args:
+                    name = node.func.id if isinstance(node.func, ast.Name) else (
+                        node.func.attr if isinstance(node.func, ast.Attribute) else ""
+                    )
+                    if name in ("refuse", "_node_refuse"):
+                        direct_codes.update(result_strings(node.args[0]))
+                    if name == "_set_preparation_stage":
+                        stages.update(item.value for item in ast.walk(node.args[0])
+                                      if isinstance(item, ast.Constant) and type(item.value) is str)
+
+        fetch_functions = functions("fetch.py")
+        bundle_functions = functions("bundle.py")
+        queue = [
+            (fetch_functions, "validate_projection"), (bundle_functions, "strict_json"),
+            (bundle_functions, "_pairs_no_duplicates"),
+        ]
+        seen = set()
+        reachable_codes = set()
+        while queue:
+            table, name = queue.pop()
+            key = (id(table), name)
+            if key in seen or name not in table:
+                continue
+            seen.add(key)
+            function = table[name]
+            local_calls = set()
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Call):
+                    continue
+                called = node.func.id if isinstance(node.func, ast.Name) else (
+                    node.func.attr if isinstance(node.func, ast.Attribute) else ""
+                )
+                if called in table:
+                    local_calls.add(called)
+                if called in ("_fail", "_refuse") and node.args:
+                    reachable_codes.update(result_strings(node.args[0]))
+                if called == "_validate_npm_dependency_map" and len(node.args) > 1:
+                    reachable_codes.update(item.value for item in ast.walk(node.args[1])
+                                           if isinstance(item, ast.Constant) and type(item.value) is str)
+            queue.extend((table, called) for called in local_calls)
+
+        reachable_codes.update(("deadline-file-invalid", "total-deadline-exhausted"))
+        self.assertTrue(direct_codes <= diagnostic_contract.PREPARATION_REFUSAL_CODES,
+                        sorted(direct_codes - diagnostic_contract.PREPARATION_REFUSAL_CODES))
+        self.assertTrue(reachable_codes <= diagnostic_contract.PREPARATION_REFUSAL_CODES,
+                        sorted(reachable_codes - diagnostic_contract.PREPARATION_REFUSAL_CODES))
+        self.assertTrue(stages <= diagnostic_contract.PREPARATION_STAGES,
+                        sorted(stages - diagnostic_contract.PREPARATION_STAGES))
+        self.assertTrue(
+            set(preparation._PREPARATION_EXCEPTION_CATEGORIES.values())
+            <= diagnostic_contract.PREPARATION_EXCEPTION_LABELS,
+        )
+
+    def test_preparation_cli_parser_refusal_has_no_argparse_text(self):
+        preparation = supervisor.node_tool_prepare
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            result = preparation.main([])
+        self.assertEqual(result, 2)
+        self.assertEqual(
+            stderr.getvalue(),
+            "dependency_preparation_refusal=stage=prepare-argument-parse "
+            "code=preparation-parser-refusal cleanup=not-needed\n",
+        )
+
+    def test_prepare_main_emits_each_allowlisted_refusal_and_exact_exception_without_reflection(self):
+        preparation = supervisor.node_tool_prepare
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projection_path = root / "projection.json"
+            projection_path.write_bytes(b"synthetic projection placeholder")
+            deadline_path = root / "deadline.json"
+            deadline_budget.create(deadline_path, 1800, 10, 1810)
+            arguments = [
+                "--projection", str(projection_path), "--output", str(root / "prepared"),
+                "--profile", "core-node", "--owner-uid", str(os.getuid()),
+                "--owner-gid", str(os.getgid()), "--deadline-file", str(deadline_path),
+                "--node-path", "/synthetic/node", "--npm-path", "/synthetic/npm",
+            ]
+
+            for code in sorted(diagnostic_contract.PREPARATION_REFUSAL_CODES):
+                with self.subTest(code=code):
+                    stderr = io.StringIO()
+                    with patch.object(preparation.sys, "platform", "linux"), \
+                            patch.object(preparation.os, "geteuid", return_value=0), \
+                            patch.object(preparation.fetch, "validate_projection",
+                                         side_effect=supervisor.bundle.Refusal(code)), \
+                            contextlib.redirect_stdout(io.StringIO()), \
+                            contextlib.redirect_stderr(stderr):
+                        self.assertEqual(preparation.main(arguments), 2)
+                    expected = (
+                        "dependency_preparation_refusal=stage=prepare-projection-validation "
+                        "code=" + code + " cleanup=not-needed\n"
+                    )
+                    self.assertEqual(stderr.getvalue(), expected)
+                    self.assertEqual(
+                        diagnostic_contract.parse_preparation_result(2, b"", stderr.getvalue().encode("ascii")),
+                        ("prepare-projection-validation", code, "not-needed"),
+                    )
+
+            def exception_for(exception_type):
+                private = "private-path KEYCANARY-73A10X"
+                if exception_type is json.JSONDecodeError:
+                    return exception_type(private, "synthetic", 0)
+                if exception_type is UnicodeDecodeError:
+                    return exception_type("ascii", b"x", 0, 1, private)
+                if exception_type is subprocess.TimeoutExpired:
+                    return exception_type([private], 1)
+                if exception_type is subprocess.CalledProcessError:
+                    return exception_type(7, [private])
+                return exception_type(private)
+
+            for exception_type, label in preparation._PREPARATION_EXCEPTION_CATEGORIES.items():
+                with self.subTest(exception=exception_type.__name__):
+                    stderr = io.StringIO()
+                    with patch.object(preparation.sys, "platform", "linux"), \
+                            patch.object(preparation.os, "geteuid", return_value=0), \
+                            patch.object(preparation.fetch, "validate_projection",
+                                         side_effect=exception_for(exception_type)), \
+                            contextlib.redirect_stdout(io.StringIO()), \
+                            contextlib.redirect_stderr(stderr):
+                        self.assertEqual(preparation.main(arguments), 2)
+                    expected = (
+                        "dependency_preparation_exception=stage=prepare-projection-validation "
+                        "class=" + label + " cleanup=not-needed\n"
+                    )
+                    self.assertEqual(stderr.getvalue(), expected)
+                    self.assertNotIn("private-path", stderr.getvalue())
+                    self.assertNotIn("KEYCANARY-73A10X", stderr.getvalue())
+                    self.assertEqual(
+                        diagnostic_contract.parse_preparation_result(2, b"", stderr.getvalue().encode("ascii")),
+                        ("prepare-projection-validation", "prepare-" + label, "not-needed"),
+                    )
+
+            stderr = io.StringIO()
+            with patch.object(preparation.sys, "platform", "linux"), \
+                    patch.object(preparation.os, "geteuid", return_value=0), \
+                    patch.object(preparation.fetch, "validate_projection",
+                                 side_effect=RuntimeError("private-path KEYCANARY-73A10X")), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                self.assertEqual(preparation.main(arguments), 2)
+            self.assertEqual(
+                stderr.getvalue(),
+                "dependency_preparation_exception=stage=prepare-projection-validation "
+                "class=runtime-error cleanup=not-needed\n",
+            )
+            self.assertNotIn("private-path", stderr.getvalue())
+            self.assertNotIn("KEYCANARY-73A10X", stderr.getvalue())
+
+    def test_harness_preserves_preparation_stage_and_cleanup_state_without_output_reflection(self):
+        state = test_e2e._DiagnosticState()
+        mismatch = test_e2e.PreparationRefusalMismatch(
+            "prepare-node-toolchain-validation", "node-toolchain-owner", "unconfirmed",
+        )
+        state.capture("scenario-dependency-prepare", mismatch)
+        line = state.refusal_line(RuntimeError("private path KEYCANARY-73A10X"))
+        self.assertEqual(
+            line,
+            "devlane_production_e2e=refused stage=prepare-node-toolchain-validation "
+            "exception=node-toolchain-owner cleanup=unconfirmed",
+        )
+        self.assertTrue(diagnostic_contract.public_preparation_diagnostic(line))
+        self.assertNotIn("private path", line)
+        self.assertNotIn("KEYCANARY-73A10X", line)
+
+        with patch.object(test_e2e, "_process_run", return_value=subprocess.CompletedProcess(
+                ["prepare.py"], 2, b"", b"dependency_preparation_exception=stage=prepare-protocol "
+                b"class=unclassified cleanup=not-needed\n")):
+            with self.assertRaises(test_e2e.PreparationRefusalMismatch) as caught:
+                test_e2e._run_preparation(["prepare.py"])
+        self.assertEqual(caught.exception.category, "prepare-unclassified")
+
+        with patch.object(test_e2e, "_process_run", return_value=subprocess.CompletedProcess(
+                ["prepare.py"], 2, b"", b"private path KEYCANARY-73A10X\n")):
+            with self.assertRaises(test_e2e.PreparationRefusalMismatch) as caught:
+                test_e2e._run_preparation(["prepare.py"])
+        self.assertEqual(caught.exception.category, "preparation-output-canary")
+
+    def test_preparation_diagnostic_report_file_is_private_write_once_and_allowlisted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "diagnostic"
+            state = test_e2e._DiagnosticState()
+            error = test_e2e.PreparationRefusalMismatch(
+                "prepare-node-toolchain-validation", "node-toolchain-owner",
+            )
+            state.capture("scenario-dependency-prepare", error)
+            line = state.refusal_line(error)
+            self.assertTrue(test_e2e._write_diagnostic_file(str(path), line))
+            self.assertFalse(test_e2e._write_diagnostic_file(str(path), line))
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            with patch.object(diagnostic_contract, "MAX_PUBLIC_DIAGNOSTIC_BYTES", len(line)):
+                self.assertEqual(test_e2e._read_reportable_diagnostic_file(str(path)), line)
+
+            invalid_path = Path(temporary) / "invalid"
+            invalid_path.write_text(
+                "devlane_production_e2e=refused stage=prepare-node-toolchain-validation "
+                "exception=private-path\n", encoding="ascii",
+            )
+            invalid_path.chmod(0o600)
+            self.assertIsNone(test_e2e._read_reportable_diagnostic_file(str(invalid_path)))
+
+    def test_failed_readonly_remount_keeps_the_successful_bind_mount_in_cleanup_set(self):
+        preparation = supervisor.node_tool_prepare
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, target = root / "source", root / "target"
+            source.mkdir()
+            target.mkdir()
+            calls = [
+                subprocess.CompletedProcess(["mount"], 0),
+                subprocess.CalledProcessError(32, ["mount"]),
+            ]
+            with patch.object(preparation, "MOUNT_TARGETS", []), \
+                    patch.object(preparation, "_bounded_timeout", return_value=5), \
+                    patch.object(preparation.subprocess, "run", side_effect=calls) as run:
+                with self.assertRaises(subprocess.CalledProcessError):
+                    preparation._mount(source, target)
+                self.assertEqual(preparation.MOUNT_TARGETS, [target])
+                self.assertEqual(run.call_count, 2)
 
     def test_startup_negative_requires_the_intended_projection_refusal(self):
         good = subprocess.CompletedProcess(
@@ -422,9 +973,6 @@ class RustMatrixRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             args = self._write_projection_startup_fixture(root)
-            node_fixture = self._write_node_toolchain_fixture(root / "node-fixture")
-            args.node_path = node_fixture["paths"]["node"]
-            args.npm_path = node_fixture["paths"]["npm"]
             projection, _payload = test_e2e._node_projection(
                 test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
             )
@@ -433,7 +981,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
             for name in ("state_dir", "context", "workspace", "prepared", "bundle", "projection",
                          "positive_control", "deadline_file"):
                 command.extend(("--" + name.replace("_", "-"), getattr(args, name)))
-            command.extend(("--node-path", args.node_path, "--npm-path", args.npm_path))
+            command.extend(("--node-snapshot-id", "test-parent-refusal"))
             real_stat = os.stat
 
             def stat_with_control_namespace(path, *positional, **keywords):
@@ -458,8 +1006,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                         return SimpleNamespace(pid=48124, poll=lambda: 0)
 
                     stdout, stderr = io.StringIO(), io.StringIO()
-                    with self._node_fixture_policy(node_fixture), \
-                            patch.object(supervisor.sys, "platform", "linux"), \
+                    with patch.object(supervisor.sys, "platform", "linux"), \
                             patch.object(supervisor.os, "stat", side_effect=stat_with_control_namespace), \
                             patch.object(supervisor.subprocess, "Popen", side_effect=fake_spawn), \
                             contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
@@ -481,9 +1028,6 @@ class RustMatrixRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             args = self._write_projection_startup_fixture(root)
-            node_fixture = self._write_node_toolchain_fixture(root / "node-fixture")
-            args.node_path = node_fixture["paths"]["node"]
-            args.npm_path = node_fixture["paths"]["npm"]
             projection, _payload = test_e2e._node_projection(
                 test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
             )
@@ -492,7 +1036,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
             for name in ("state_dir", "context", "workspace", "prepared", "bundle", "projection",
                          "positive_control", "deadline_file"):
                 command.extend(("--" + name.replace("_", "-"), getattr(args, name)))
-            command.extend(("--node-path", args.node_path, "--npm-path", args.npm_path))
+            command.extend(("--node-snapshot-id", "test-parent-ready"))
             spawned = []
 
             def fake_spawn(argv, **kwargs):
@@ -509,8 +1053,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 return real_stat(path, *positional, **keywords)
 
             stdout, stderr = io.StringIO(), io.StringIO()
-            with self._node_fixture_policy(node_fixture), \
-                    patch.object(supervisor.sys, "platform", "linux"), \
+            with patch.object(supervisor.sys, "platform", "linux"), \
                     patch.object(supervisor.os, "stat", side_effect=stat_with_control_namespace), \
                     patch.object(supervisor.subprocess, "Popen", side_effect=fake_spawn), \
                     contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
@@ -528,8 +1071,9 @@ class RustMatrixRunnerTests(unittest.TestCase):
             self.assertEqual(argv[11], str(Path(supervisor.__file__).resolve()))
             self.assertEqual(argv[12], "_serve")
             self.assertEqual(argv[argv.index("--deadline-file") + 1], str(Path(args.deadline_file).resolve()))
-            self.assertEqual(argv[argv.index("--node-path") + 1], args.node_path)
-            self.assertEqual(argv[argv.index("--npm-path") + 1], args.npm_path)
+            self.assertEqual(argv[argv.index("--node-snapshot-id") + 1], "test-parent-ready")
+            self.assertNotIn("--node-path", argv)
+            self.assertNotIn("--npm-path", argv)
             self.assertEqual(options["stdin"], subprocess.DEVNULL)
             self.assertEqual(options["stdout"], subprocess.DEVNULL)
             self.assertEqual(options["stderr"], subprocess.DEVNULL)
@@ -544,6 +1088,10 @@ class RustMatrixRunnerTests(unittest.TestCase):
             root = Path(temporary)
             args = self._write_projection_startup_fixture(root)
             node_fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+            snapshot_id = "test-service-positive"
+            snapshot_base, snapshot = self._create_node_snapshot(
+                node_fixture, root / "snapshot-base", snapshot_id, args.deadline_file,
+            )
             projection, _payload = test_e2e._node_projection(
                 test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
             )
@@ -567,10 +1115,10 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 service = supervisor.Service(
                     args.state_dir, args.context, args.workspace, args.prepared, args.bundle,
                     args.projection, 193847, os.getuid(),
-                    node_fixture["paths"],
+                    {"node_snapshot_id": snapshot_id, "cargo": "", "rustc": ""},
                     args.deadline_file,
                 )
-                with self._node_fixture_policy(node_fixture), \
+                with patch.object(node_tool_snapshot, "DEFAULT_SNAPSHOT_BASE", snapshot_base), \
                         patch.dict(os.environ, {"PATH": "/ambient-poison", "NODE_OPTIONS": "--require ignored",
                                                 "NPM_CONFIG_USERCONFIG": "/ambient-poison/npmrc"}), \
                         patch.object(supervisor, "_require_linux_root", side_effect=record("root")), \
@@ -586,33 +1134,44 @@ class RustMatrixRunnerTests(unittest.TestCase):
                                           "bundle-bind", "bundle-bind", "profile-read"])
                 self.assertEqual(service.projection_value, projection)
                 self.assertEqual(service.startup_phase, "ready")
-                self.assertEqual(service.tool_info["node_root"], str(node_fixture["node_root"]))
+                self.assertEqual(service.tool_info["node_root"], snapshot["root"])
                 self.assertEqual(supervisor._worker_environment("unit", service.root, service.tool_info)["PATH"],
                                  "/tools/node/bin:/usr/bin:/bin")
+                snapshot_node = str(Path(snapshot["root"]) / "bin/node")
+                snapshot_cli = str(Path(snapshot["root"]) / "lib/node_modules/npm/bin/npm-cli.js")
                 expected_commands = [
-                    [str(node_fixture["node"]), "--version"],
-                    [str(node_fixture["node"]), str(node_fixture["npm_cli"]), "--version"],
+                    [snapshot_node, "--version"],
+                    [snapshot_node, snapshot_cli, "--version"],
                 ] * 2
                 self.assertEqual([call[0] for call in version_calls], expected_commands)
                 for _argv, kwargs in version_calls:
                     self.assertEqual(kwargs["env"], {"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
                 fixture_rows = [json.loads(line) for line in node_fixture["log"].read_text().splitlines()]
                 self.assertEqual([(row["executable"], row["argv"]) for row in fixture_rows], [
-                    (str(node_fixture["node"]), ["--version"]),
-                    (str(node_fixture["node"]), [str(node_fixture["npm_cli"]), "--version"]),
-                    (str(node_fixture["node"]), ["--version"]),
-                    (str(node_fixture["node"]), [str(node_fixture["npm_cli"]), "--version"]),
+                    (snapshot_node, ["--version"]),
+                    (snapshot_node, [snapshot_cli, "--version"]),
+                    (snapshot_node, ["--version"]),
+                    (snapshot_node, [snapshot_cli, "--version"]),
                 ])
                 self.assertTrue(all(row["path"] == "/usr/bin:/bin" for row in fixture_rows))
                 self.assertTrue(all(row["node_options"] == "" and row["npm_userconfig"] == ""
                                     for row in fixture_rows))
             finally:
                 supervisor.ACTIVE_DEADLINE_FILE = previous_deadline_file
+                node_tool_snapshot.remove_snapshot(
+                    snapshot_id, args.deadline_file, snapshot_base=snapshot_base, owner_uid=os.getuid(),
+                )
 
     def test_node_preflight_uses_exact_node_for_resolved_npm_cli_without_ambient_path(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+            deadline_path = root / "deadline.json"
+            deadline_budget.create(deadline_path, 120, 10, 130)
+            snapshot_id = "test-node-preflight"
+            snapshot_base, snapshot = self._create_node_snapshot(
+                fixture, root / "snapshot-base", snapshot_id, deadline_path,
+            )
             poison = root / "ambient-poison"
             poison.mkdir()
             poison_node = poison / "node"
@@ -626,34 +1185,51 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 calls.append((list(argv), dict(kwargs)))
                 return real_run(argv, **kwargs)
 
-            with self._node_fixture_policy(fixture), \
+            previous_deadline_file = supervisor.ACTIVE_DEADLINE_FILE
+            try:
+                with patch.object(node_tool_snapshot, "DEFAULT_SNAPSHOT_BASE", snapshot_base), \
+                    patch.object(supervisor, "ACTIVE_DEADLINE_FILE", str(deadline_path)), \
                     patch.object(supervisor.subprocess, "run", side_effect=recording_run), \
                     patch.dict(os.environ, {"PATH": str(poison), "NODE_OPTIONS": "--require ambient-canary",
                                             "NPM_CONFIG_USERCONFIG": str(poison / "npmrc")}):
-                info = supervisor._preflight_tools("core-node", projection, fixture["paths"], os.getuid())
-            self.assertEqual([argv for argv, _kwargs in calls], [
-                [str(fixture["node"]), "--version"],
-                [str(fixture["node"]), str(fixture["npm_cli"]), "--version"],
-            ])
-            for _argv, kwargs in calls:
-                self.assertEqual(kwargs["env"], {"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
-            self.assertEqual(info["node_root"], str(fixture["node_root"]))
-            self.assertEqual(info["paths"]["npm"], str(fixture["npm"]))
-            self.assertEqual(info["paths"]["npm_cli"], str(fixture["npm_cli"]))
-            fixture_rows = [json.loads(line) for line in fixture["log"].read_text().splitlines()]
-            self.assertEqual([(row["executable"], row["argv"]) for row in fixture_rows], [
-                (str(fixture["node"]), ["--version"]),
-                (str(fixture["node"]), [str(fixture["npm_cli"]), "--version"]),
-            ])
-            self.assertTrue(all(row["path"] == "/usr/bin:/bin" for row in fixture_rows))
-            self.assertTrue(all(row["node_options"] == "" and row["npm_userconfig"] == ""
-                                for row in fixture_rows))
+                    info = supervisor._preflight_tools(
+                        "core-node", projection,
+                        {"node_snapshot_id": snapshot_id, "cargo": None, "rustc": None}, os.getuid(),
+                    )
+                snapshot_node = str(Path(snapshot["root"]) / "bin/node")
+                snapshot_cli = str(Path(snapshot["root"]) / "lib/node_modules/npm/bin/npm-cli.js")
+                self.assertEqual([argv for argv, _kwargs in calls], [
+                    [snapshot_node, "--version"],
+                    [snapshot_node, snapshot_cli, "--version"],
+                ])
+                for _argv, kwargs in calls:
+                    self.assertEqual(kwargs["env"], {"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+                self.assertEqual(info["node_root"], snapshot["root"])
+                self.assertEqual(info["paths"]["npm"], str(Path(snapshot["root"]) / "bin/npm"))
+                self.assertEqual(info["paths"]["npm_cli"], snapshot_cli)
+                fixture_rows = [json.loads(line) for line in fixture["log"].read_text().splitlines()]
+                self.assertEqual([(row["executable"], row["argv"]) for row in fixture_rows], [
+                    (snapshot_node, ["--version"]),
+                    (snapshot_node, [snapshot_cli, "--version"]),
+                ])
+                self.assertTrue(all(row["path"] == "/usr/bin:/bin" for row in fixture_rows))
+                self.assertTrue(all(row["node_options"] == "" and row["npm_userconfig"] == ""
+                                    for row in fixture_rows))
+            finally:
+                supervisor.ACTIVE_DEADLINE_FILE = previous_deadline_file
+                node_tool_snapshot.remove_snapshot(
+                    snapshot_id, str(deadline_path), snapshot_base=snapshot_base, owner_uid=os.getuid(),
+                )
 
-    def test_service_prepare_rechecks_tool_permissions_before_second_version_call(self):
+    def test_service_prepare_keeps_using_snapshot_after_source_permissions_change(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             args = self._write_projection_startup_fixture(root)
             fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+            snapshot_id = "test-service-source-change"
+            snapshot_base, snapshot = self._create_node_snapshot(
+                fixture, root / "snapshot-base", snapshot_id, args.deadline_file,
+            )
             projection, _payload = test_e2e._node_projection(
                 test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
             )
@@ -675,9 +1251,10 @@ class RustMatrixRunnerTests(unittest.TestCase):
             try:
                 service = supervisor.Service(
                     args.state_dir, args.context, args.workspace, args.prepared, args.bundle,
-                    args.projection, 193847, os.getuid(), fixture["paths"], args.deadline_file,
+                    args.projection, 193847, os.getuid(),
+                    {"node_snapshot_id": snapshot_id, "cargo": "", "rustc": ""}, args.deadline_file,
                 )
-                with self._node_fixture_policy(fixture), \
+                with patch.object(node_tool_snapshot, "DEFAULT_SNAPSHOT_BASE", snapshot_base), \
                         patch.object(supervisor, "_require_linux_root"), \
                         patch.object(supervisor, "_require_swap_disabled"), \
                         patch.object(supervisor, "_mount_private"), \
@@ -687,24 +1264,39 @@ class RustMatrixRunnerTests(unittest.TestCase):
                         patch.object(supervisor, "_preflight_tools", side_effect=preflight_then_make_bin_untrusted), \
                         patch.object(supervisor, "_read_profiles", return_value={"schema": 1}), \
                         patch.object(supervisor.subprocess, "run", side_effect=recording_run):
-                    with self.assertRaises(supervisor.SupervisorRefusal) as caught:
-                        service.prepare()
-                self.assertEqual(caught.exception.code, "node-toolchain-permissions")
+                    self.assertTrue(service.prepare())
+                snapshot_node = str(Path(snapshot["root"]) / "bin/node")
+                snapshot_cli = str(Path(snapshot["root"]) / "lib/node_modules/npm/bin/npm-cli.js")
                 self.assertEqual(calls, [
-                    [str(fixture["node"]), "--version"],
-                    [str(fixture["node"]), str(fixture["npm_cli"]), "--version"],
+                    [snapshot_node, "--version"],
+                    [snapshot_node, snapshot_cli, "--version"],
+                    [snapshot_node, "--version"],
+                    [snapshot_node, snapshot_cli, "--version"],
                 ])
-                self.assertEqual(len(fixture["log"].read_text().splitlines()), 2)
+                fixture_rows = [json.loads(line) for line in fixture["log"].read_text().splitlines()]
+                self.assertEqual(len(fixture_rows), 4)
+                self.assertTrue(all(row["executable"] == snapshot_node for row in fixture_rows))
             finally:
                 supervisor.ACTIVE_DEADLINE_FILE = previous_deadline_file
                 (fixture["node_root"] / "bin").chmod(0o755)
+                node_tool_snapshot.remove_snapshot(
+                    snapshot_id, args.deadline_file, snapshot_base=snapshot_base, owner_uid=os.getuid(),
+                )
 
-    def test_prepare_node_version_path_uses_the_validated_node_and_npm_cli(self):
+    def test_prepare_node_version_path_executes_only_from_the_sealed_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             fixture = self._write_node_toolchain_fixture(root / "node-fixture")
             deadline_path = root / "deadline.json"
             deadline_budget.create(deadline_path, 60, 5, 65)
+            snapshot_id = "test-npm-shebang"
+            snapshot_base, snapshot = self._create_node_snapshot(
+                fixture, root / "snapshot-base", snapshot_id, deadline_path,
+            )
+            snapshot_id = "test-prepare-version"
+            snapshot_base, snapshot = self._create_node_snapshot(
+                fixture, root / "snapshot-base", snapshot_id, deadline_path,
+            )
             real_run = subprocess.run
             calls = []
 
@@ -712,29 +1304,39 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 calls.append((list(argv), dict(kwargs)))
                 return real_run(argv, **kwargs)
 
-            with self._node_fixture_policy(fixture), \
-                    patch.object(supervisor.node_tool_prepare, "DEADLINE_FILE", str(deadline_path)), \
+            try:
+                with patch.object(supervisor.node_tool_prepare, "DEADLINE_FILE", str(deadline_path)), \
                     patch.object(supervisor.subprocess, "run", side_effect=recording_run):
-                validated, results = supervisor.node_tool_prepare.verify_node_toolchain_versions(
-                    fixture["paths"], os.getuid(),
+                    validated = node_tool_snapshot.validate_snapshot(
+                        snapshot_id, str(deadline_path), snapshot_base=snapshot_base,
+                        owner_uid=os.getuid(),
+                    )
+                    results = supervisor.node_tool_prepare.run_node_versions(
+                        validated, supervisor.node_tool_prepare._prepare_node_version_process,
+                    )
+                snapshot_node = str(Path(snapshot["root"]) / "bin/node")
+                snapshot_cli = str(Path(snapshot["root"]) / "lib/node_modules/npm/bin/npm-cli.js")
+                self.assertEqual(validated["node"], snapshot_node)
+                self.assertEqual(validated["npm_cli"], snapshot_cli)
+                self.assertEqual(results["node"].stdout.strip(), b"v24.22.1")
+                self.assertEqual(results["npm"].stdout.strip(), b"11.19.1")
+                self.assertEqual([argv for argv, _kwargs in calls], [
+                    [snapshot_node, "--version"], [snapshot_node, snapshot_cli, "--version"],
+                ])
+                self.assertTrue(all(kwargs["env"] == {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+                                    for _argv, kwargs in calls))
+                fixture_rows = [json.loads(line) for line in fixture["log"].read_text().splitlines()]
+                self.assertTrue(all(row["executable"] == snapshot_node for row in fixture_rows))
+                self.assertTrue(all(row["node_options"] == "" and row["npm_userconfig"] == ""
+                                    for row in fixture_rows))
+            finally:
+                node_tool_snapshot.remove_snapshot(
+                    snapshot_id, str(deadline_path), snapshot_base=snapshot_base, owner_uid=os.getuid(),
                 )
-            self.assertEqual(validated["node"], str(fixture["node"]))
-            self.assertEqual(validated["npm_cli"], str(fixture["npm_cli"]))
-            self.assertEqual(results["node"].stdout.strip(), b"v24.22.1")
-            self.assertEqual(results["npm"].stdout.strip(), b"11.19.1")
-            self.assertEqual([argv for argv, _kwargs in calls], [
-                [str(fixture["node"]), "--version"],
-                [str(fixture["node"]), str(fixture["npm_cli"]), "--version"],
-            ])
-            self.assertTrue(all(kwargs["env"] == {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
-                                for _argv, kwargs in calls))
-            fixture_rows = [json.loads(line) for line in fixture["log"].read_text().splitlines()]
-            self.assertTrue(all(row["node_options"] == "" and row["npm_userconfig"] == ""
-                                for row in fixture_rows))
 
-    def test_prepare_main_parser_uses_explicit_node_paths_before_mount_setup(self):
+    def test_prepare_main_parser_uses_snapshot_for_both_version_checks_before_mount_setup(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             fixture = self._write_node_toolchain_fixture(root / "node-fixture")
             _projection, payload = test_e2e._node_projection(
                 test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
@@ -744,9 +1346,12 @@ class RustMatrixRunnerTests(unittest.TestCase):
             deadline_path = root / "deadline.json"
             deadline_budget.create(deadline_path, 60, 5, 65)
             preparation = supervisor.node_tool_prepare
+            snapshot_id = "test-prepare-main"
+            snapshot_base = root / "snapshot-base"
             expected = [
-                [str(fixture["node"]), "--version"],
-                [str(fixture["node"]), str(fixture["npm_cli"]), "--version"],
+                [str(snapshot_base / snapshot_id / "bin/node"), "--version"],
+                [str(snapshot_base / snapshot_id / "bin/node"),
+                 str(snapshot_base / snapshot_id / "lib/node_modules/npm/bin/npm-cli.js"), "--version"],
             ]
             real_run = subprocess.run
             calls = []
@@ -757,17 +1362,19 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 calls.append((command, dict(kwargs)))
                 if command in expected:
                     return real_run(argv, **kwargs)
-                raise supervisor.bundle.Refusal("synthetic-preparation-stop")
+                raise supervisor.bundle.Refusal("preparation-failed")
 
             arguments = [
                 "--projection", str(projection_path), "--output", str(root / "prepared"),
                 "--profile", "core-node", "--owner-uid", str(os.getuid()),
                 "--owner-gid", str(os.getgid()), "--deadline-file", str(deadline_path),
+                "--node-snapshot-id", snapshot_id,
                 "--node-path", str(fixture["node"]), "--npm-path", str(fixture["npm"]),
             ]
             with self._node_fixture_policy(fixture), \
                     patch.object(preparation.sys, "platform", "linux"), \
-                    patch.object(preparation.os, "geteuid", return_value=0), \
+                    patch.object(preparation, "os", _RootEffectiveUIDProxy()), \
+                    patch.object(node_tool_snapshot, "DEFAULT_SNAPSHOT_BASE", snapshot_base), \
                     patch.object(preparation.subprocess, "run", side_effect=record_then_stop), \
                     patch.object(preparation, "_kill_children"), \
                     patch.object(preparation, "MOUNT_TARGETS", []), \
@@ -776,21 +1383,25 @@ class RustMatrixRunnerTests(unittest.TestCase):
 
             self.assertEqual(result, 2)
             self.assertEqual(stderr.getvalue(),
-                             "dependency_preparation_refusal=synthetic-preparation-stop\n", calls)
+                             "dependency_preparation_refusal=stage=prepare-namespace-isolation "
+                             "code=preparation-failed cleanup=confirmed\n", calls)
             self.assertEqual([command for command, _kwargs in calls], expected + [[
                 "mount", "--make-rprivate", "/",
             ]])
             self.assertTrue(all(kwargs.get("env") == {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
                                 for _command, kwargs in calls[:2]))
             fixture_rows = [json.loads(line) for line in fixture["log"].read_text().splitlines()]
+            snapshot_node = str(snapshot_base / snapshot_id / "bin/node")
+            snapshot_cli = str(snapshot_base / snapshot_id / "lib/node_modules/npm/bin/npm-cli.js")
             self.assertEqual([(row["executable"], row["argv"]) for row in fixture_rows], [
-                (str(fixture["node"]), ["--version"]),
-                (str(fixture["node"]), [str(fixture["npm_cli"]), "--version"]),
+                (snapshot_node, ["--version"]),
+                (snapshot_node, [snapshot_cli, "--version"]),
             ])
+            self.assertEqual(list(snapshot_base.iterdir()), [])
 
     def test_npm_shebang_sibling_is_not_used_by_fixed_node_version_commands(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             fixture = self._write_node_toolchain_fixture(root / "node-fixture")
             poison = root / "ambient-poison"
             poison.mkdir()
@@ -800,6 +1411,10 @@ class RustMatrixRunnerTests(unittest.TestCase):
             (poison / "node").chmod(0o755)
             deadline_path = root / "deadline.json"
             deadline_budget.create(deadline_path, 60, 5, 65)
+            snapshot_id = "test-snapshot-shebang"
+            snapshot_base, snapshot = self._create_node_snapshot(
+                fixture, root / "snapshot-base", snapshot_id, deadline_path,
+            )
 
             sibling_result = subprocess.run(
                 [str(fixture["npm"]), "--version"],
@@ -811,22 +1426,714 @@ class RustMatrixRunnerTests(unittest.TestCase):
             self.assertEqual(sibling_result.returncode, 0)
             self.assertEqual(sibling_result.stdout.strip(), b"wrong-sibling-node")
 
-            with self._node_fixture_policy(fixture), \
-                    patch.object(supervisor.node_tool_prepare, "DEADLINE_FILE", str(deadline_path)), \
-                    patch.dict(os.environ, {"PATH": str(poison), "NODE_OPTIONS": "--require ambient-canary"}):
-                validated, results = supervisor.node_tool_prepare.verify_node_toolchain_versions(
-                    fixture["paths"], os.getuid(),
+            try:
+                with patch.object(supervisor.node_tool_prepare, "DEADLINE_FILE", str(deadline_path)), \
+                        patch.object(node_tool_snapshot, "DEFAULT_SNAPSHOT_BASE", snapshot_base), \
+                        patch.dict(os.environ, {"PATH": str(poison), "NODE_OPTIONS": "--require ambient-canary"}):
+                    validated = node_tool_snapshot.validate_snapshot(
+                        snapshot_id, str(deadline_path), snapshot_base=snapshot_base, owner_uid=os.getuid(),
+                    )
+                    results = supervisor.node_tool_prepare.run_node_versions(
+                        validated, supervisor.node_tool_prepare._prepare_node_version_process,
+                    )
+                snapshot_node = str(Path(snapshot["root"]) / "bin/node")
+                snapshot_cli = str(Path(snapshot["root"]) / "lib/node_modules/npm/bin/npm-cli.js")
+                self.assertEqual(validated["node"], snapshot_node)
+                self.assertEqual(results["node"].stdout.strip(), b"v24.22.1")
+                self.assertEqual(results["npm"].stdout.strip(), b"11.19.1")
+                fixture_rows = [json.loads(line) for line in fixture["log"].read_text().splitlines()]
+                self.assertEqual([(row["executable"], row["argv"]) for row in fixture_rows], [
+                    (snapshot_node, ["--version"]),
+                    (snapshot_node, [snapshot_cli, "--version"]),
+                ])
+                self.assertTrue(all(row["path"] == "/usr/bin:/bin" for row in fixture_rows))
+                self.assertTrue(all(row["node_options"] == "" for row in fixture_rows))
+            finally:
+                node_tool_snapshot.remove_snapshot(
+                    snapshot_id, str(deadline_path), snapshot_base=snapshot_base, owner_uid=os.getuid(),
                 )
-            self.assertEqual(validated["node"], str(fixture["node"]))
-            self.assertEqual(results["node"].stdout.strip(), b"v24.22.1")
-            self.assertEqual(results["npm"].stdout.strip(), b"11.19.1")
-            fixture_rows = [json.loads(line) for line in fixture["log"].read_text().splitlines()]
-            self.assertEqual([(row["executable"], row["argv"]) for row in fixture_rows], [
-                (str(fixture["node"]), ["--version"]),
-                (str(fixture["node"]), [str(fixture["npm_cli"]), "--version"]),
+
+    def test_node_snapshot_is_the_only_tree_checked_and_mounted_after_source_replacement(self):
+        with tempfile.TemporaryDirectory() as source_tmp, tempfile.TemporaryDirectory() as snapshot_tmp:
+            source_root = Path(source_tmp).resolve()
+            snapshot_base = Path(snapshot_tmp).resolve() / "snapshots"
+            fixture = self._write_node_toolchain_fixture(source_root / "node-fixture")
+            deadline_path = source_root / "deadline.json"
+            deadline_budget.create(deadline_path, 120, 10, 130)
+            snapshot_id = "test-r10-stable"
+            with self._node_fixture_policy(fixture):
+                snapshot = node_tool_snapshot.create_snapshot(
+                    fixture["paths"], snapshot_id, os.getuid(), str(deadline_path),
+                    snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
+                    source_node_root=fixture["node_root"], source_anchors=((fixture["anchor"], os.getuid()),),
+                )
+            snapshot_root = Path(snapshot["root"])
+            snapshot_node = snapshot_root / "bin/node"
+            snapshot_cli = snapshot_root / "lib/node_modules/npm/bin/npm-cli.js"
+            saved_node = snapshot_node.read_bytes()
+            saved_cli = snapshot_cli.read_bytes()
+            marker = source_root / "mutable-tool-ran"
+            original_root = fixture["node_root"]
+            saved_root = original_root.with_name("x64-saved")
+            outside_root = original_root.with_name("x64-outside")
+            outside_root.mkdir()
+            sentinel = outside_root / "sentinel"
+            sentinel.write_text("preserve", encoding="ascii")
+            before_mode = stat.S_IMODE(sentinel.stat().st_mode)
+            (outside_root / "node").write_text("synthetic outside replacement\n", encoding="ascii")
+            service_root = source_root / "service"
+            service_root.mkdir()
+            startup = self._write_projection_startup_fixture(service_root)
+            projection, _projection_bytes = test_e2e._node_projection(
+                test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
+            )
+            self._bind_projection_payload(startup, projection)
+            service = supervisor.Service(
+                startup.state_dir, startup.context, startup.workspace, startup.prepared,
+                startup.bundle, startup.projection, 193847, os.getuid(),
+                {"node_snapshot_id": snapshot_id, "cargo": None, "rustc": None}, startup.deadline_file,
+            )
+            mount_sources = []
+            real_run = subprocess.run
+            calls = []
+            source_replaced = False
+
+            def mutate_source_after_snapshot_validation():
+                fixture["node"].write_text(
+                    chr(35) + "!" + sys.executable + "\nfrom pathlib import Path\n"
+                    "Path(" + repr(str(marker)) + ").write_text('replacement')\n"
+                    "print('v24.22.1')\n",
+                    encoding="utf-8",
+                )
+                fixture["node"].chmod(0o755)
+                fixture["npm_cli"].write_text("replacement npm command\n", encoding="ascii")
+                fixture["npm_cli"].chmod(0o755)
+                original_root.rename(saved_root)
+                original_root.symlink_to(outside_root, target_is_directory=True)
+
+            def recording_run(argv, **kwargs):
+                nonlocal source_replaced
+                calls.append(list(argv))
+                result = real_run(argv, **kwargs)
+                if not source_replaced and list(argv) == [str(snapshot_node), "--version"]:
+                    mutate_source_after_snapshot_validation()
+                    source_replaced = True
+                return result
+
+            try:
+                with patch.object(supervisor.node_tool_snapshot, "DEFAULT_SNAPSHOT_BASE", snapshot_base), \
+                        patch.object(supervisor.subprocess, "run", side_effect=recording_run), \
+                        patch.object(supervisor, "_require_linux_root"), \
+                        patch.object(supervisor, "_require_swap_disabled"), \
+                        patch.object(supervisor, "_mount_private"), \
+                        patch.object(supervisor, "_configure_firewall"), \
+                        patch.object(supervisor, "_mount_minimal_root"), \
+                        patch.object(supervisor, "_mount_bind",
+                                     side_effect=lambda source, _target, **_kwargs: mount_sources.append(Path(source).resolve())), \
+                        patch.object(supervisor, "_read_profiles", return_value={"schema": 1}):
+                    service.prepare()
+                self.assertEqual(snapshot_node.read_bytes(), saved_node)
+                self.assertEqual(snapshot_cli.read_bytes(), saved_cli)
+                self.assertFalse(marker.exists())
+                self.assertTrue(source_replaced)
+                self.assertEqual(calls, [
+                    [str(snapshot_node), "--version"],
+                    [str(snapshot_node), str(snapshot_cli), "--version"],
+                    [str(snapshot_node), "--version"],
+                    [str(snapshot_node), str(snapshot_cli), "--version"],
+                ])
+                self.assertEqual(mount_sources.count(snapshot_root.resolve()), 1)
+                self.assertNotIn(original_root.resolve(), mount_sources)
+                self.assertEqual(sentinel.read_text(encoding="ascii"), "preserve")
+                self.assertEqual(stat.S_IMODE(sentinel.stat().st_mode), before_mode)
+                rows = [json.loads(line) for line in fixture["log"].read_text().splitlines()]
+                self.assertEqual(len(rows), 4)
+                self.assertTrue(all(row["executable"] == str(snapshot_node) for row in rows))
+                self.assertEqual(
+                    [row["argv"][0] for row in rows if len(row["argv"]) == 2],
+                    [str(snapshot_cli), str(snapshot_cli)],
+                )
+            finally:
+                if original_root.is_symlink():
+                    original_root.unlink()
+                if saved_root.exists():
+                    saved_root.rename(original_root)
+                node_tool_snapshot.remove_snapshot(
+                    snapshot_id, str(deadline_path), snapshot_base=snapshot_base, owner_uid=os.getuid(),
+                )
+
+    def test_node_snapshot_detects_source_change_during_copy_and_removes_partial_tree(self):
+        with tempfile.TemporaryDirectory() as source_tmp, tempfile.TemporaryDirectory() as snapshot_tmp:
+            source_root = Path(source_tmp).resolve()
+            fixture = self._write_node_toolchain_fixture(source_root / "node-fixture")
+            deadline_path = source_root / "deadline.json"
+            deadline_budget.create(deadline_path, 120, 10, 130)
+            snapshot_base = Path(snapshot_tmp).resolve() / "snapshots"
+            changing_file = fixture["npm_root"] / "bin/zz-large-fixture.js"
+            changing_file.write_bytes(b"A" * (node_tool_snapshot.CHUNK_SIZE * 2 + 17))
+            changing_file.chmod(0o644)
+
+            def mutate_during_copy(checkpoint):
+                if checkpoint == "during-copy:lib/node_modules/npm/bin/zz-large-fixture.js":
+                    changing_file.write_bytes(b"B" * (node_tool_snapshot.CHUNK_SIZE * 2 + 17))
+
+            with self._node_fixture_policy(fixture), self.assertRaises(node_tool_snapshot.SnapshotRefusal) as caught:
+                node_tool_snapshot.create_snapshot(
+                    fixture["paths"], "test-r10-change", os.getuid(), str(deadline_path),
+                    snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
+                    source_node_root=fixture["node_root"], source_anchors=((fixture["anchor"], os.getuid()),),
+                    test_checkpoint=mutate_during_copy,
+                )
+            self.assertEqual(caught.exception.code, "node-snapshot-source-changed")
+            self.assertTrue(caught.exception.cleanup_confirmed)
+            self.assertEqual(list(snapshot_base.iterdir()), [])
+
+    def test_fifo_replacements_during_copy_and_second_source_verification_are_bounded(self):
+        for kind, trigger_count in (("copy", 1), ("source-verification", 2)):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(dir="/tmp") as temporary:
+                root = Path(temporary).resolve()
+                fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+                deadline_path = root / "deadline.json"
+                deadline_budget.create(deadline_path, 60, 10, 70)
+                snapshot_base = root / "snapshots"
+                result = self._run_fifo_snapshot_child(
+                    kind, fixture, deadline_path, snapshot_base,
+                    "test-fifo-" + kind, fixture["node"].parent, trigger_count,
+                )
+                self.assertEqual(result, ("refused", "node-snapshot-source-changed", trigger_count, True))
+                self.assertTrue(snapshot_base.is_dir())
+                self.assertEqual(list(snapshot_base.iterdir()), [])
+
+    def test_fifo_replacements_during_snapshot_and_manifest_reads_are_bounded(self):
+        for kind, parent_name in (("snapshot-content", "bin"), ("manifest", ".")):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(dir="/tmp") as temporary:
+                root = Path(temporary).resolve()
+                fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+                deadline_path = root / "deadline.json"
+                deadline_budget.create(deadline_path, 60, 10, 70)
+                snapshot_base, snapshot = self._create_node_snapshot(
+                    fixture, root / "snapshots", "test-fifo-read-" + kind, deadline_path,
+                )
+                parent = Path(snapshot["root"]) / parent_name
+                result = self._run_fifo_snapshot_child(
+                    kind, fixture, deadline_path, snapshot_base,
+                    "test-fifo-read-" + kind, parent, 1,
+                )
+                expected_code = "node-snapshot-manifest-invalid" if kind == "manifest" \
+                    else "node-snapshot-content-changed"
+                self.assertEqual(result, ("refused", expected_code, 1, True))
+
+    def test_late_composed_link_escapes_are_refused_before_external_canary_open(self):
+        for shape in ("short", "long"):
+            with self.subTest(shape=shape), tempfile.TemporaryDirectory(dir="/tmp") as temporary:
+                root = Path(temporary).resolve()
+                fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+                deadline_path = root / "deadline.json"
+                deadline_budget.create(deadline_path, 60, 10, 70)
+                snapshot_base = root / "snapshots"
+                snapshot_id = "test-link-escape-" + shape
+                outside = root / "outside"
+                outside.write_bytes(b"external-canary\n")
+                outside.chmod(0o440)
+                before = outside.stat()
+                before_bytes = outside.read_bytes()
+                snapshot_path = snapshot_base / snapshot_id
+                hops = len(snapshot_path.parts)
+                self.assertLessEqual(hops, node_tool_snapshot.MAX_LINK_HOPS)
+                long_target = "/".join(
+                    ["a"] + ["b"] * (hops - 1) + [".."] * hops + list(outside.parts[1:])
+                )
+                target = "a/b/../../outside" if shape == "short" else long_target
+                self.assertTrue(node_tool_snapshot._safe_relative_link("escape", target))
+
+                def introduce_after_validation(checkpoint):
+                    if checkpoint == "after-source-validation":
+                        link_parent = fixture["node_root"] / "a"
+                        link_parent.mkdir()
+                        (link_parent / "b").symlink_to(".")
+                        (fixture["node_root"] / "escape").symlink_to(target)
+
+                with self._node_fixture_policy(fixture), self._forbid_external_canary_open(outside) as opens, \
+                        patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected process")), \
+                        patch.object(subprocess, "run", side_effect=AssertionError("unexpected process")), \
+                        self.assertRaises(node_tool_snapshot.SnapshotRefusal) as caught:
+                    node_tool_snapshot.create_snapshot(
+                        fixture["paths"], snapshot_id, os.getuid(), str(deadline_path),
+                        snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
+                        source_node_root=fixture["node_root"],
+                        source_anchors=((fixture["anchor"], os.getuid()),),
+                        test_checkpoint=introduce_after_validation,
+                    )
+                self.assertEqual(caught.exception.code, "node-snapshot-link-invalid")
+                self.assertTrue(caught.exception.cleanup_confirmed)
+                self.assertEqual(opens, [])
+                self.assertEqual(list(snapshot_base.iterdir()), [])
+                after = outside.stat()
+                self.assertEqual(outside.read_bytes(), before_bytes)
+                self.assertEqual((after.st_dev, after.st_ino, after.st_mode, after.st_size,
+                                  after.st_mtime_ns, after.st_ctime_ns),
+                                 (before.st_dev, before.st_ino, before.st_mode, before.st_size,
+                                  before.st_mtime_ns, before.st_ctime_ns))
+
+    def test_snapshot_graph_rejects_cycles_dangling_links_hop_limit_and_absolute_targets(self):
+        cases = ("cycle", "dangling", "hop-limit", "absolute")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory(dir="/tmp") as temporary:
+                root = Path(temporary).resolve()
+                fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+                deadline_path = root / "deadline.json"
+                deadline_budget.create(deadline_path, 60, 10, 70)
+                snapshot_base = root / "snapshots"
+                snapshot_id = "test-link-" + case
+
+                def introduce_after_validation(checkpoint):
+                    if checkpoint != "after-source-validation":
+                        return
+                    node_root = fixture["node_root"]
+                    if case == "cycle":
+                        (node_root / "links").mkdir()
+                        (node_root / "links/one").symlink_to("two")
+                        (node_root / "links/two").symlink_to("one")
+                    elif case == "dangling":
+                        (node_root / "dangling").symlink_to("missing-target")
+                    elif case == "hop-limit":
+                        link_root = node_root / "links"
+                        link_root.mkdir()
+                        count = node_tool_snapshot.MAX_LINK_HOPS + 2
+                        for index in range(count):
+                            name = "chain-" + str(index)
+                            target = ("chain-" + str(index + 1) if index + 1 < count
+                                      else "../bin/node")
+                            (link_root / name).symlink_to(target)
+                    else:
+                        (node_root / "absolute").symlink_to(str(root / "outside"))
+
+                with self._node_fixture_policy(fixture), \
+                        self.assertRaises(node_tool_snapshot.SnapshotRefusal) as caught:
+                    node_tool_snapshot.create_snapshot(
+                        fixture["paths"], snapshot_id, os.getuid(), str(deadline_path),
+                        snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
+                        source_node_root=fixture["node_root"],
+                        source_anchors=((fixture["anchor"], os.getuid()),),
+                        test_checkpoint=introduce_after_validation,
+                    )
+                self.assertEqual(caught.exception.code, "node-snapshot-link-invalid")
+                self.assertTrue(caught.exception.cleanup_confirmed)
+                self.assertEqual(list(snapshot_base.iterdir()), [])
+
+    def test_validate_snapshot_rejects_rehashed_composed_escape_without_external_access(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
+            root = Path(temporary).resolve()
+            fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+            deadline_path = root / "deadline.json"
+            deadline_budget.create(deadline_path, 60, 10, 70)
+            snapshot_base = root / "snapshots"
+            snapshot_id = "test-link-revalidation"
+            outside = root / "outside"
+            outside.write_bytes(b"external-canary\n")
+            outside.chmod(0o440)
+            before = outside.stat()
+            before_bytes = outside.read_bytes()
+
+            def add_valid_graph_after_source_validation(checkpoint):
+                if checkpoint == "after-source-validation":
+                    link_parent = fixture["node_root"] / "a"
+                    link_parent.mkdir()
+                    (link_parent / "b").symlink_to(".")
+                    (fixture["node_root"] / "escape").symlink_to("a/b")
+
+            with self._node_fixture_policy(fixture):
+                snapshot = node_tool_snapshot.create_snapshot(
+                    fixture["paths"], snapshot_id, os.getuid(), str(deadline_path),
+                    snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
+                    source_node_root=fixture["node_root"],
+                    source_anchors=((fixture["anchor"], os.getuid()),),
+                    test_checkpoint=add_valid_graph_after_source_validation,
+                )
+            snapshot_root = Path(snapshot["root"])
+            snapshot_root.chmod(0o700)
+            root_fd = os.open(snapshot_root, os.O_RDONLY | node_tool_snapshot._O_DIRECTORY
+                               | node_tool_snapshot._O_NOFOLLOW)
+            try:
+                os.unlink("escape", dir_fd=root_fd)
+                os.symlink("a/b/../../outside", "escape", dir_fd=root_fd)
+            finally:
+                os.close(root_fd)
+            self._rewrite_snapshot_manifest_for_fixture(snapshot_root, deadline_path)
+            try:
+                with self._forbid_external_canary_open(outside) as opens, \
+                        self.assertRaises(node_tool_snapshot.SnapshotRefusal) as caught:
+                    node_tool_snapshot.validate_snapshot(
+                        snapshot_id, str(deadline_path), snapshot_base=snapshot_base,
+                        owner_uid=os.getuid(),
+                    )
+                self.assertEqual(caught.exception.code, "node-snapshot-link-invalid")
+                self.assertEqual(opens, [])
+                after = outside.stat()
+                self.assertEqual(outside.read_bytes(), before_bytes)
+                self.assertEqual((after.st_dev, after.st_ino, after.st_mode, after.st_size,
+                                  after.st_mtime_ns, after.st_ctime_ns),
+                                 (before.st_dev, before.st_ino, before.st_mode, before.st_size,
+                                  before.st_mtime_ns, before.st_ctime_ns))
+            finally:
+                snapshot_root.chmod(0o700)
+                root_fd = os.open(snapshot_root, os.O_RDONLY | node_tool_snapshot._O_DIRECTORY
+                                  | node_tool_snapshot._O_NOFOLLOW)
+                try:
+                    os.unlink("escape", dir_fd=root_fd)
+                    os.symlink("a/b", "escape", dir_fd=root_fd)
+                finally:
+                    os.close(root_fd)
+                self._rewrite_snapshot_manifest_for_fixture(snapshot_root, deadline_path)
+                node_tool_snapshot.remove_snapshot(
+                    snapshot_id, str(deadline_path), snapshot_base=snapshot_base,
+                    owner_uid=os.getuid(),
+                )
+
+    def test_node_snapshot_manifest_budget_refuses_and_removes_partial_tree(self):
+        with tempfile.TemporaryDirectory() as source_tmp, tempfile.TemporaryDirectory() as snapshot_tmp:
+            source_root = Path(source_tmp).resolve()
+            fixture = self._write_node_toolchain_fixture(source_root / "node-fixture")
+            deadline_path = source_root / "deadline.json"
+            deadline_budget.create(deadline_path, 120, 10, 130)
+            snapshot_base = Path(snapshot_tmp).resolve() / "snapshots"
+            with self._node_fixture_policy(fixture), \
+                    patch.object(node_tool_snapshot, "MAX_MANIFEST_BYTES", 1024), \
+                    self.assertRaises(node_tool_snapshot.SnapshotRefusal) as caught:
+                node_tool_snapshot.create_snapshot(
+                    fixture["paths"], "test-r10-manifest-limit", os.getuid(), str(deadline_path),
+                    snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
+                    source_node_root=fixture["node_root"],
+                    source_anchors=((fixture["anchor"], os.getuid()),),
+                )
+            self.assertEqual(caught.exception.code, "node-snapshot-limit")
+            self.assertTrue(caught.exception.cleanup_confirmed)
+            self.assertEqual(list(snapshot_base.iterdir()), [])
+
+    def test_node_snapshot_refuses_source_root_symlink_swap_after_validation(self):
+        with tempfile.TemporaryDirectory() as source_tmp, tempfile.TemporaryDirectory() as snapshot_tmp:
+            source_root = Path(source_tmp).resolve()
+            fixture = self._write_node_toolchain_fixture(source_root / "node-fixture")
+            deadline_path = source_root / "deadline.json"
+            deadline_budget.create(deadline_path, 120, 10, 130)
+            snapshot_base = Path(snapshot_tmp).resolve() / "snapshots"
+            original_root = fixture["node_root"]
+            saved_root = original_root.with_name("x64-saved")
+            outside_root = original_root.with_name("x64-outside")
+            outside_root.mkdir()
+            sentinel = outside_root / "sentinel"
+            sentinel.write_text("preserve", encoding="ascii")
+            before_mode = stat.S_IMODE(sentinel.stat().st_mode)
+
+            def swap_after_validation(checkpoint):
+                if checkpoint == "after-source-validation":
+                    original_root.rename(saved_root)
+                    original_root.symlink_to(outside_root, target_is_directory=True)
+
+            try:
+                with self._node_fixture_policy(fixture), self.assertRaises(node_tool_snapshot.SnapshotRefusal) as caught:
+                    node_tool_snapshot.create_snapshot(
+                        fixture["paths"], "test-r10-precopy-swap", os.getuid(), str(deadline_path),
+                        snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
+                        source_node_root=fixture["node_root"],
+                        source_anchors=((fixture["anchor"], os.getuid()),), test_checkpoint=swap_after_validation,
+                    )
+                self.assertEqual(caught.exception.code, "node-snapshot-source-changed")
+                self.assertFalse(snapshot_base.exists())
+                self.assertEqual(sentinel.read_text(encoding="ascii"), "preserve")
+                self.assertEqual(stat.S_IMODE(sentinel.stat().st_mode), before_mode)
+            finally:
+                if original_root.is_symlink():
+                    original_root.unlink()
+                if saved_root.exists():
+                    saved_root.rename(original_root)
+
+    def test_node_snapshot_refuses_root_symlink_swap_during_copy(self):
+        with tempfile.TemporaryDirectory() as source_tmp, tempfile.TemporaryDirectory() as snapshot_tmp:
+            source_root = Path(source_tmp).resolve()
+            fixture = self._write_node_toolchain_fixture(source_root / "node-fixture")
+            deadline_path = source_root / "deadline.json"
+            deadline_budget.create(deadline_path, 120, 10, 130)
+            snapshot_base = Path(snapshot_tmp).resolve() / "snapshots"
+            original_root = fixture["node_root"]
+            saved_root = original_root.with_name("x64-saved")
+            outside_root = original_root.with_name("x64-outside")
+            outside_root.mkdir()
+            sentinel = outside_root / "sentinel"
+            sentinel.write_text("preserve", encoding="ascii")
+            before_mode = stat.S_IMODE(sentinel.stat().st_mode)
+
+            def swap_after_copy(checkpoint):
+                if checkpoint == "after-copy":
+                    original_root.rename(saved_root)
+                    original_root.symlink_to(outside_root, target_is_directory=True)
+
+            try:
+                with self._node_fixture_policy(fixture), self.assertRaises(node_tool_snapshot.SnapshotRefusal) as caught:
+                    node_tool_snapshot.create_snapshot(
+                        fixture["paths"], "test-r10-swap", os.getuid(), str(deadline_path),
+                        snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
+                        source_node_root=fixture["node_root"],
+                        source_anchors=((fixture["anchor"], os.getuid()),), test_checkpoint=swap_after_copy,
+                    )
+                self.assertEqual(caught.exception.code, "node-snapshot-source-changed")
+                self.assertEqual(list(snapshot_base.iterdir()), [])
+                self.assertTrue(caught.exception.cleanup_confirmed)
+                self.assertEqual(sentinel.read_text(encoding="ascii"), "preserve")
+                self.assertEqual(stat.S_IMODE(sentinel.stat().st_mode), before_mode)
+            finally:
+                if original_root.is_symlink():
+                    original_root.unlink()
+                if saved_root.exists():
+                    saved_root.rename(original_root)
+
+    def test_node_snapshot_refuses_source_symlink_escape_without_changing_target(self):
+        with tempfile.TemporaryDirectory() as source_tmp, tempfile.TemporaryDirectory() as snapshot_tmp:
+            source_root = Path(source_tmp).resolve()
+            fixture = self._write_node_toolchain_fixture(source_root / "node-fixture")
+            deadline_path = source_root / "deadline.json"
+            deadline_budget.create(deadline_path, 120, 10, 130)
+            snapshot_base = Path(snapshot_tmp).resolve() / "snapshots"
+            outside = source_root / "outside"
+            outside.mkdir(mode=0o700)
+            sentinel = outside / "sentinel"
+            sentinel.write_text("preserve", encoding="ascii")
+            before_mode = stat.S_IMODE(sentinel.stat().st_mode)
+            (fixture["npm_root"] / "outside-link").symlink_to(sentinel)
+            with self._node_fixture_policy(fixture), self.assertRaises(supervisor.bundle.Refusal) as caught:
+                node_tool_snapshot.create_snapshot(
+                    fixture["paths"], "test-r10-escape", os.getuid(), str(deadline_path),
+                    snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
+                    source_node_root=fixture["node_root"], source_anchors=((fixture["anchor"], os.getuid()),),
+                )
+            self.assertEqual(caught.exception.args[0], "node-tool-layout")
+            self.assertEqual(sentinel.read_text(encoding="ascii"), "preserve")
+            self.assertEqual(stat.S_IMODE(sentinel.stat().st_mode), before_mode)
+            self.assertFalse(snapshot_base.exists())
+
+    def test_node_snapshot_accepts_mixed_root_and_runner_owned_tool_content(self):
+        with tempfile.TemporaryDirectory() as source_tmp, tempfile.TemporaryDirectory() as snapshot_tmp:
+            source_root = Path(source_tmp).resolve()
+            fixture = self._write_node_toolchain_fixture(source_root / "node-fixture")
+            deadline_path = source_root / "deadline.json"
+            deadline_budget.create(deadline_path, 120, 10, 130)
+            snapshot_base = Path(snapshot_tmp).resolve() / "snapshots"
+            self.assertEqual(
+                supervisor.node_tool_prepare._trusted_toolchain_owner_uids(os.getuid()),
+                frozenset((0, os.getuid())),
+            )
+            mixed_owner_view = _MixedOwnerMetadataProxy(fixture["node"])
+            with self._node_fixture_policy(fixture), patch.object(node_tool_snapshot, "os", mixed_owner_view):
+                snapshot = node_tool_snapshot.create_snapshot(
+                    fixture["paths"], "test-r10-mixed", os.getuid(), str(deadline_path),
+                    snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
+                    source_node_root=fixture["node_root"], source_anchors=((fixture["anchor"], os.getuid()),),
+                )
+            self.assertIn((str(fixture["node"]), 0), mixed_owner_view.source_owners)
+            self.assertEqual(fixture["npm_cli"].stat().st_uid, os.getuid())
+            self.assertEqual(Path(snapshot["root"]).stat().st_uid, os.getuid())
+            manifest = json.loads((Path(snapshot["root"]) / node_tool_snapshot.MANIFEST_NAME).read_text())
+            self.assertEqual(manifest["preparation"], node_tool_snapshot.PREPARATION_ID)
+            self.assertEqual(manifest["runner_uid"], os.getuid())
+            self.assertEqual(manifest["node_version"], "24.22.1")
+            self.assertEqual(manifest["npm_version"], "11.19.1")
+            run_job = public_audit.parse_workflow(".github/workflows/devlane-encrypted.yml")[public_audit.RUN_JOB]
+            setup = next(step for step in run_job["steps"] if step["name"] == "Set up pinned Node toolchain")
+            self.assertEqual(setup["uses"], node_tool_snapshot.PREPARATION_ID)
+            self.assertEqual(setup["with"]["node-version"], "24.22.1")
+            self.assertEqual(
+                node_tool_snapshot.validate_snapshot(
+                    "test-r10-mixed", str(deadline_path), snapshot_base=snapshot_base,
+                    owner_uid=os.getuid(),
+                )["content_sha256"],
+                snapshot["content_sha256"],
+            )
+            node_tool_snapshot.remove_snapshot(
+                "test-r10-mixed", str(deadline_path), snapshot_base=snapshot_base, owner_uid=os.getuid(),
+            )
+            self.assertFalse(Path(snapshot["root"]).exists())
+
+    def test_node_snapshot_cleanup_refuses_symlinked_snapshot_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as source_tmp, tempfile.TemporaryDirectory() as snapshot_tmp:
+            source_root = Path(source_tmp).resolve()
+            snapshot_base = Path(snapshot_tmp).resolve() / "snapshots"
+            fixture = self._write_node_toolchain_fixture(source_root / "node-fixture")
+            deadline_path = source_root / "deadline.json"
+            deadline_budget.create(deadline_path, 120, 10, 130)
+            outside = source_root / "outside"
+            outside.mkdir(mode=0o700)
+            sentinel = outside / "sentinel"
+            sentinel.write_text("preserve", encoding="ascii")
+            before_mode = stat.S_IMODE(sentinel.stat().st_mode)
+            with self._node_fixture_policy(fixture):
+                snapshot = node_tool_snapshot.create_snapshot(
+                    fixture["paths"], "test-r10-cleanup", os.getuid(), str(deadline_path),
+                    snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
+                    source_node_root=fixture["node_root"], source_anchors=((fixture["anchor"], os.getuid()),),
+                )
+            saved_root = snapshot_base / "test-r10-cleanup-saved"
+            Path(snapshot["root"]).rename(saved_root)
+            (snapshot_base / "test-r10-cleanup").symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(node_tool_snapshot.SnapshotRefusal):
+                node_tool_snapshot.remove_snapshot(
+                    "test-r10-cleanup", str(deadline_path), snapshot_base=snapshot_base,
+                    owner_uid=os.getuid(),
+                )
+            self.assertEqual(sentinel.read_text(encoding="ascii"), "preserve")
+            self.assertEqual(stat.S_IMODE(sentinel.stat().st_mode), before_mode)
+
+    def test_node_snapshot_cleanup_confirms_safely_absent_base_without_creating_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            deadline_path = root / "deadline.json"
+            deadline_budget.create(deadline_path, 120, 10, 130)
+            absent_base = root / "not-created" / "snapshots"
+            self.assertTrue(node_tool_snapshot.remove_snapshot(
+                "test-r10-absent", str(deadline_path), snapshot_base=absent_base,
+                control_uid=os.geteuid(), owner_uid=os.getuid(),
+            ))
+            self.assertFalse(absent_base.exists())
+
+    def test_node_snapshot_cleanup_uses_the_reserved_deadline_after_work_expires(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+            deadline_path = root / "deadline.json"
+            deadline_budget.create(deadline_path, 120, 120, 240)
+            snapshot_base, snapshot = self._create_node_snapshot(
+                fixture, root / "snapshot-base", "test-cleanup-reserve", deadline_path,
+            )
+            deadline = deadline_budget._read(deadline_path)
+            deadline["work_deadline"] = time.monotonic() - 1
+            deadline_path.write_text(json.dumps(deadline, sort_keys=True, separators=(",", ":")) + "\n")
+            with self.assertRaises(deadline_budget.DeadlineRefusal):
+                deadline_budget.remaining(deadline_path)
+            self.assertGreater(deadline_budget.cleanup_remaining(deadline_path), 0)
+            self.assertTrue(node_tool_snapshot.remove_snapshot(
+                "test-cleanup-reserve", str(deadline_path), snapshot_base=snapshot_base,
+                owner_uid=os.getuid(),
+            ))
+            self.assertFalse(Path(snapshot["root"]).exists())
+
+    def test_node_snapshot_parser_ids_cannot_escape_the_controlled_base(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            deadline_path = root / "deadline.json"
+            deadline_budget.create(deadline_path, 120, 10, 130)
+            snapshot_base = root / "snapshots"
+            outside = root / "outside"
+            outside.mkdir()
+            sentinel = outside / "sentinel"
+            sentinel.write_text("preserve", encoding="ascii")
+            for operation in (node_tool_snapshot.validate_snapshot, node_tool_snapshot.remove_snapshot):
+                with self.subTest(operation=operation.__name__), self.assertRaises(node_tool_snapshot.SnapshotRefusal) as caught:
+                    operation("../outside", str(deadline_path), snapshot_base=snapshot_base)
+                self.assertEqual(caught.exception.code, "node-snapshot-id")
+            self.assertEqual(sentinel.read_text(encoding="ascii"), "preserve")
+            self.assertFalse(snapshot_base.exists())
+
+    def test_node_snapshot_workflow_arguments_match_the_real_cli_parsers(self):
+        prepare = supervisor.node_tool_prepare
+        prepared_args = prepare._argument_parser().parse_args([
+            "--projection", "projection", "--output", "prepared", "--profile", "core-node",
+            "--owner-uid", "501", "--owner-gid", "20", "--node-path", "/opt/node/bin/node",
+            "--npm-path", "/opt/node/bin/npm", "--node-snapshot-id", "devlane-123-1",
+            "--deadline-file", "deadline",
+        ])
+        self.assertEqual(prepared_args.deadline_file, "deadline")
+        self.assertEqual(prepared_args.node_snapshot_id, "devlane-123-1")
+        with self.assertRaises(supervisor.bundle.Refusal):
+            prepare._argument_parser().parse_args([
+                "--projection", "projection", "--output", "prepared", "--profile", "core-node",
+                "--owner-uid", "501", "--owner-gid", "20", "--node-snapshot-id", "devlane-123-1",
             ])
-            self.assertTrue(all(row["path"] == "/usr/bin:/bin" for row in fixture_rows))
-            self.assertTrue(all(row["node_options"] == "" for row in fixture_rows))
+        supervisor_args = supervisor._argument_parser().parse_args([
+            "start", "--state-dir", "state", "--context", "context", "--workspace", "workspace",
+            "--prepared", "prepared", "--bundle", "bundle", "--projection", "projection",
+            "--positive-control", "positive", "--node-snapshot-id", "devlane-123-1",
+            "--deadline-file", "deadline",
+        ])
+        self.assertEqual(supervisor_args.node_snapshot_id, "devlane-123-1")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            supervisor._argument_parser().parse_args([
+                "start", "--state-dir", "state", "--context", "context", "--workspace", "workspace",
+                "--prepared", "prepared", "--bundle", "bundle", "--projection", "projection",
+                "--positive-control", "positive", "--node-snapshot-id", "devlane-123-1",
+            ])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            supervisor._argument_parser().parse_args([
+                "start", "--state-dir", "state", "--context", "context", "--workspace", "workspace",
+                "--prepared", "prepared", "--bundle", "bundle", "--projection", "projection",
+                "--positive-control", "positive", "--deadline-file", "deadline", "--node-path", "unsafe",
+            ])
+        cleanup_args = host_cleanup._argument_parser().parse_args([
+            "--root", "root", "--runner-temp", "temp", "--deadline-file", "deadline",
+            "--node-snapshot-id", "devlane-123-1",
+        ])
+        self.assertEqual(cleanup_args.deadline_file, "deadline")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            host_cleanup._argument_parser().parse_args([
+                "--root", "root", "--runner-temp", "temp", "--node-snapshot-id", "devlane-123-1",
+            ])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            host_cleanup.main([
+                "--snapshot-only", "--owner-uid", "501", "--deadline-file", "deadline",
+            ])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            host_cleanup.main([
+                "--snapshot-only", "--node-snapshot-id", "devlane-123-1", "--deadline-file", "deadline",
+            ])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            deadline_path = root / "deadline.json"
+            deadline_budget.create(deadline_path, 60, 10, 70)
+            observed = []
+
+            def record_snapshot_cleanup(argv, **kwargs):
+                observed.append((list(argv), dict(kwargs)))
+                return subprocess.CompletedProcess(argv, 0, b"node_snapshot_cleanup=confirmed\n", b"")
+
+            with patch.object(host_cleanup.subprocess, "run", side_effect=record_snapshot_cleanup), \
+                    patch.object(host_cleanup, "_cleanup_timeout", return_value=10):
+                self.assertTrue(host_cleanup.clean_node_snapshot("devlane-123-1", str(deadline_path)))
+            command, options = observed[0]
+            self.assertEqual(command[:3], ["sudo", "-n", sys.executable])
+            parser_args = host_cleanup._argument_parser().parse_args(command[command.index("--snapshot-only"):])
+            self.assertTrue(parser_args.snapshot_only)
+            self.assertEqual(parser_args.node_snapshot_id, "devlane-123-1")
+            self.assertEqual(parser_args.owner_uid, os.getuid())
+            self.assertEqual(parser_args.deadline_file, str(deadline_path))
+            self.assertEqual(options["env"], {
+                "PATH": "/usr/bin:/bin", "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1",
+            })
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml").read_text()
+        prepare_step = workflow.split("- name: Prepare dependencies before the cut", 1)[1].split("- name:", 1)[0]
+        start_step = workflow.split("- name: Cut network and start the isolated supervisor", 1)[1].split("- name:", 1)[0]
+        cleanup_step = workflow.split("- name: Shred runner-local workspace", 1)[1].split("  devlane-encrypted-audit:", 1)[0]
+        self.assertIn("--deadline-file", prepare_step)
+        self.assertIn("--node-snapshot-id", prepare_step)
+        self.assertIn("--deadline-file", start_step)
+        self.assertIn("--node-snapshot-id", start_step)
+        self.assertNotIn("--node-path", start_step)
+        self.assertNotIn("--npm-path", start_step)
+        self.assertIn("--deadline-file", cleanup_step)
+        self.assertIn("--node-snapshot-id", cleanup_step)
+        self.assertNotIn("/opt/hostedtoolcache", inspect.getsource(supervisor._mount_minimal_root))
+        run_job = public_audit.parse_workflow(".github/workflows/devlane-encrypted.yml")[public_audit.RUN_JOB]
+        steps = run_job["steps"]
+        setup_index = next(i for i, step in enumerate(steps) if step["name"] == "Set up pinned Node toolchain")
+        prepare_index = next(i for i, step in enumerate(steps)
+                             if step["name"] == "Prepare dependencies before the cut")
+        self.assertLess(setup_index, prepare_index)
+        intervening = steps[setup_index + 1:prepare_index]
+        self.assertEqual([step["name"] for step in intervening], ["Install pinned Rust toolchain"])
+        rust_step = workflow.split("- name: Install pinned Rust toolchain", 1)[1].split("- name:", 1)[0]
+        self.assertIn("if: ${{ inputs.profile == 'core-rust' }}", rust_step)
+        setup = steps[setup_index]
+        self.assertEqual(setup["uses"], node_tool_snapshot.PREPARATION_ID)
+        self.assertEqual(setup["with"]["node-version"], "24.22.1")
+        self.assertEqual(setup["with"]["check-latest"], "false")
+        self.assertEqual(setup["with"]["package-manager-cache"], "false")
 
     def test_node_toolchain_rejects_untrusted_owners_permissions_and_layouts_before_execution(self):
         cases = (
@@ -858,6 +2165,9 @@ class RustMatrixRunnerTests(unittest.TestCase):
             with self.subTest(case=label), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+                deadline_path = root / "deadline.json"
+                deadline_budget.create(deadline_path, 60, 5, 65)
+                snapshot_base = root / "snapshot-base"
                 paths = dict(fixture["paths"])
                 owner_target = None
                 if label == "world-writable-cache":
@@ -927,10 +2237,12 @@ class RustMatrixRunnerTests(unittest.TestCase):
                     if owner_target is None:
                         with patch.object(supervisor.subprocess, "run",
                                           side_effect=AssertionError("version command ran before trust refusal")):
-                            with self.assertRaises(supervisor.SupervisorRefusal) as caught:
-                                supervisor._preflight_tools(
-                                    "core-node", {"tools": {"node": "24.22.1", "npm": "11.19.1"}},
-                                    paths, os.getuid(),
+                            with self.assertRaises(supervisor.bundle.Refusal) as caught:
+                                node_tool_snapshot.create_snapshot(
+                                    paths, "test-invalid-layout", os.getuid(), str(deadline_path),
+                                    snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
+                                    source_node_root=fixture["node_root"],
+                                    source_anchors=((fixture["anchor"], os.getuid()),),
                                 )
                     else:
                         original_lstat = os.lstat
@@ -945,29 +2257,177 @@ class RustMatrixRunnerTests(unittest.TestCase):
                                           side_effect=lstat_with_untrusted_owner), \
                                 patch.object(supervisor.subprocess, "run",
                                              side_effect=AssertionError("version command ran before owner refusal")):
-                            with self.assertRaises(supervisor.SupervisorRefusal) as caught:
-                                supervisor._preflight_tools(
-                                    "core-node", {"tools": {"node": "24.22.1", "npm": "11.19.1"}},
-                                    paths, os.getuid(),
+                            with self.assertRaises(supervisor.bundle.Refusal) as caught:
+                                node_tool_snapshot.create_snapshot(
+                                    paths, "test-invalid-owner", os.getuid(), str(deadline_path),
+                                    snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
+                                    source_node_root=fixture["node_root"],
+                                    source_anchors=((fixture["anchor"], os.getuid()),),
                                 )
-                self.assertEqual(caught.exception.code, expected_code)
+                self.assertEqual(caught.exception.args[0], expected_code)
+                self.assertFalse(snapshot_base.exists())
 
-    def test_actual_start_requires_explicit_canonical_node_paths_without_system_fallback(self):
-        for case in ("missing-node", "alternate-node-name"):
+    def test_root_owned_path_ancestors_and_runner_owned_node_tree_use_only_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+            deadline_path = root / "deadline.json"
+            deadline_budget.create(deadline_path, 60, 5, 65)
+            snapshot_id = "test-mixed-owner-snapshot"
+            snapshot_base, snapshot = self._create_node_snapshot(
+                fixture, root / "snapshot-base", snapshot_id, deadline_path,
+            )
+            preparation = supervisor.node_tool_prepare
+            supervisor_paths = {"node_snapshot_id": snapshot_id, "cargo": None, "rustc": None}
+            previous_deadline_file = supervisor.ACTIVE_DEADLINE_FILE
+            real_run = subprocess.run
+            calls = []
+
+            def recording_run(argv, **kwargs):
+                calls.append((list(argv), dict(kwargs)))
+                return real_run(argv, **kwargs)
+
+            try:
+                with patch.object(node_tool_snapshot, "DEFAULT_SNAPSHOT_BASE", snapshot_base), \
+                        patch.object(preparation, "DEADLINE_FILE", str(deadline_path)), \
+                        patch.object(supervisor, "ACTIVE_DEADLINE_FILE", str(deadline_path)), \
+                        patch.object(supervisor.subprocess, "run", side_effect=recording_run):
+                    validated = node_tool_snapshot.validate_snapshot(
+                        snapshot_id, str(deadline_path), snapshot_base=snapshot_base, owner_uid=os.getuid(),
+                    )
+                    prepared_results = preparation.run_node_versions(
+                        validated, preparation._prepare_node_version_process,
+                    )
+                    supervisor_info = supervisor._preflight_tools(
+                        "core-node", {"tools": {"node": "24.22.1", "npm": "11.19.1"}},
+                        supervisor_paths, os.getuid(),
+                    )
+                self.assertEqual(preparation._trusted_toolchain_owner_uids(os.getuid()),
+                                 frozenset((0, os.getuid())))
+                with self.assertRaises(supervisor.bundle.Refusal) as worker_owner:
+                    preparation._trusted_toolchain_owner_uids(preparation.UID)
+                self.assertEqual(str(worker_owner.exception), "node-toolchain-owner")
+                snapshot_node = str(Path(snapshot["root"]) / "bin/node")
+                snapshot_cli = str(Path(snapshot["root"]) / "lib/node_modules/npm/bin/npm-cli.js")
+                self.assertEqual(validated["node"], snapshot_node)
+                self.assertEqual(prepared_results["node"].stdout.strip(), b"v24.22.1")
+                self.assertEqual(prepared_results["npm"].stdout.strip(), b"11.19.1")
+                self.assertEqual(supervisor_info["paths"]["node"], snapshot_node)
+                rows = [json.loads(line) for line in fixture["log"].read_text().splitlines()]
+                self.assertEqual(len(rows), 4)
+                self.assertEqual([row["argv"] for row in rows], [
+                    ["--version"], [snapshot_cli, "--version"],
+                    ["--version"], [snapshot_cli, "--version"],
+                ])
+                self.assertTrue(all(row["executable"] == snapshot_node for row in rows))
+                self.assertTrue(all(row["path"] == "/usr/bin:/bin" and row["node_options"] == "" for row in rows))
+                self.assertEqual([argv for argv, _kwargs in calls], [
+                    [snapshot_node, "--version"], [snapshot_node, snapshot_cli, "--version"],
+                    [snapshot_node, "--version"], [snapshot_node, snapshot_cli, "--version"],
+                ])
+            finally:
+                supervisor.ACTIVE_DEADLINE_FILE = previous_deadline_file
+                node_tool_snapshot.remove_snapshot(
+                    snapshot_id, str(deadline_path), snapshot_base=snapshot_base, owner_uid=os.getuid(),
+                )
+
+    def test_encrypted_workflow_supplies_runner_uid_before_privileged_prepare(self):
+        root = Path(__file__).resolve().parents[2]
+        job = public_audit.parse_workflow(root / ".github/workflows/devlane-encrypted.yml")[
+            public_audit.RUN_JOB
+        ]
+        source = "\n".join(next(
+            step["run"] for step in job["steps"] if step["name"] == "Prepare dependencies before the cut"
+        ))
+        owner_capture = source.index('owner_uid="$EUID"')
+        privileged_call = source.index("sudo -n unshare")
+        self.assertLess(owner_capture, privileged_call)
+        self.assertIn('--owner-uid "$owner_uid"', source)
+        self.assertIn('node_path="$(command -v node || true)"', source)
+        self.assertIn('npm_path="$(command -v npm || true)"', source)
+        self.assertIn('"$node_path" --npm-path "$npm_path"', source)
+
+        preparation = supervisor.node_tool_prepare
+        self.assertEqual(preparation.TRUSTED_TOOLCHAIN_SYSTEM_UID, 0)
+        self.assertEqual(preparation._trusted_toolchain_owner_uids(os.getuid()),
+                         frozenset((0, os.getuid())))
+        self.assertNotIn(preparation.UID, preparation._trusted_toolchain_owner_uids(os.getuid()))
+
+    def test_prepare_main_reports_exact_owner_and_exception_categories_without_reflection(self):
+        preparation = supervisor.node_tool_prepare
+        for failure_kind in ("foreign-owner", "version-permission"):
+            with self.subTest(failure_kind=failure_kind), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+                lock = test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
+                _projection, payload = test_e2e._node_projection(lock)
+                projection_path = root / "projection.json"
+                projection_path.write_bytes(payload)
+                deadline_path = root / "deadline.json"
+                deadline_budget.create(deadline_path, 60, 5, 65)
+                snapshot_id = "test-prepare-failure"
+                snapshot_base = root / "snapshot-base"
+                arguments = [
+                    "--projection", str(projection_path), "--output", str(root / "prepared"),
+                    "--profile", "core-node", "--owner-uid", str(os.getuid()),
+                    "--owner-gid", str(os.getgid()), "--deadline-file", str(deadline_path),
+                    "--node-snapshot-id", snapshot_id,
+                    "--node-path", str(fixture["node"]), "--npm-path", str(fixture["npm"]),
+                ]
+                real_lstat = os.lstat
+
+                def lstat_with_foreign_owner(path, *args, **kwargs):
+                    metadata = real_lstat(path, *args, **kwargs)
+                    if failure_kind == "foreign-owner" and Path(path) == fixture["cache"]:
+                        return SimpleNamespace(st_mode=metadata.st_mode, st_uid=os.getuid() + 1)
+                    return metadata
+
+                stderr = io.StringIO()
+                command_calls = []
+
+                def refuse_version_or_mount(argv, **kwargs):
+                    command_calls.append(list(argv))
+                    if failure_kind == "version-permission":
+                        raise PermissionError("private path KEYCANARY-73A10X")
+                    raise AssertionError("version command ran before owner refusal")
+
+                snapshot_node = str(snapshot_base / snapshot_id / "bin/node")
+
+                previous_deadline = preparation.DEADLINE_FILE
+                try:
+                    with self._node_fixture_policy(fixture), \
+                            patch.object(preparation.sys, "platform", "linux"), \
+                            patch.object(preparation, "os", _RootEffectiveUIDProxy()), \
+                            patch.object(node_tool_snapshot, "DEFAULT_SNAPSHOT_BASE", snapshot_base), \
+                            patch.object(preparation.os, "lstat", side_effect=lstat_with_foreign_owner), \
+                            patch.object(preparation.subprocess, "run", side_effect=refuse_version_or_mount), \
+                            patch.object(preparation, "_kill_children"), \
+                            patch.object(preparation, "MOUNT_TARGETS", []), \
+                            contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                        result = preparation.main(arguments)
+                finally:
+                    preparation.DEADLINE_FILE = previous_deadline
+
+                self.assertEqual(result, 2)
+                self.assertEqual(command_calls, [] if failure_kind == "foreign-owner" else [
+                    [snapshot_node, "--version"],
+                ])
+                expected = (
+                    "dependency_preparation_refusal=stage=prepare-node-toolchain-snapshot "
+                    "code=node-toolchain-owner cleanup=not-needed\n"
+                    if failure_kind == "foreign-owner" else
+                    "dependency_preparation_exception=stage=prepare-node-version-verification "
+                    "class=permission-denied cleanup=confirmed\n"
+                )
+                self.assertEqual(stderr.getvalue(), expected)
+                self.assertNotIn("private path", stderr.getvalue())
+                self.assertNotIn("KEYCANARY-73A10X", stderr.getvalue())
+
+    def test_actual_start_requires_snapshot_identity_without_system_fallback(self):
+        for case in ("missing-snapshot", "invalid-snapshot"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 args = self._write_projection_startup_fixture(root)
-                fixture = self._write_node_toolchain_fixture(root / "node-fixture")
-                args.npm_path = fixture["paths"]["npm"]
-                if case == "alternate-node-name":
-                    alternate = fixture["node_root"] / "bin/validated-node"
-                    alternate.write_bytes(fixture["node"].read_bytes())
-                    alternate.chmod(0o755)
-                    args.node_path = str(alternate)
-                    expected = "node-tool-layout"
-                else:
-                    args.node_path = ""
-                    expected = "node-toolchain-missing"
                 projection, _payload = test_e2e._node_projection(
                     test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
                 )
@@ -976,12 +2436,11 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 for name in ("state_dir", "context", "workspace", "prepared", "bundle", "projection",
                              "positive_control", "deadline_file"):
                     command.extend(("--" + name.replace("_", "-"), getattr(args, name)))
-                command.extend(("--npm-path", args.npm_path))
-                if args.node_path:
-                    command.extend(("--node-path", args.node_path))
+                expected = "node-snapshot-id"
+                if case == "invalid-snapshot":
+                    command.extend(("--node-snapshot-id", "../outside"))
                 stdout, stderr = io.StringIO(), io.StringIO()
-                with self._node_fixture_policy(fixture), \
-                        patch.object(supervisor.sys, "platform", "linux"), \
+                with patch.object(supervisor.sys, "platform", "linux"), \
                         patch.object(supervisor.shutil, "which") as which, \
                         patch.object(supervisor.subprocess, "Popen") as spawn, \
                         contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
@@ -992,6 +2451,14 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 which.assert_not_called()
                 spawn.assert_not_called()
                 Path(args.state_dir).rmdir()
+
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+            supervisor._argument_parser().parse_args([
+                "start", "--state-dir", "state", "--context", "context", "--workspace", "workspace",
+                "--prepared", "prepared", "--bundle", "bundle", "--projection", "projection",
+                "--positive-control", "positive", "--deadline-file", "deadline", "--node-path", "unsafe",
+            ])
+        self.assertEqual(caught.exception.code, 2)
 
     def test_actual_supervisor_probe_and_decrypt_clients_emit_only_fixed_success_markers(self):
         with patch.object(supervisor, "_rpc", return_value={"ok": True}) as rpc:

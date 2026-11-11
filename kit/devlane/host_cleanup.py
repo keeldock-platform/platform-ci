@@ -13,6 +13,7 @@ from pathlib import Path
 import isolated_cleanup
 import owned_tree_cleanup
 import deadline as deadline_budget
+import node_tool_snapshot
 
 
 """The client must always be able to finish its bounded recovery path before this deadline."""
@@ -80,7 +81,24 @@ def _confirm_supervisor_absent(state):
         _fail()
 
 
-def clean(root_arg, runner_temp, deadline_file):
+def clean_node_snapshot(snapshot_id, deadline_file):
+    if not node_tool_snapshot.valid_snapshot_id(snapshot_id):
+        _fail()
+    control = Path(__file__).resolve(strict=True)
+    result = subprocess.run(
+        ["sudo", "-n", sys.executable, "-B", str(control), "--snapshot-only",
+         "--node-snapshot-id", snapshot_id, "--owner-uid", str(os.getuid()),
+         "--deadline-file", str(Path(deadline_file).resolve(strict=True))],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        timeout=_cleanup_timeout(deadline_file, HOST_DEADLINE_SECONDS), check=False,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    if result.returncode != 0 or result.stdout != b"node_snapshot_cleanup=confirmed\n":
+        _fail()
+    return True
+
+
+def clean(root_arg, runner_temp, deadline_file, node_snapshot_id=""):
     root = Path(root_arg)
     base = Path(runner_temp)
     if not root.is_absolute() or not base.is_absolute() or root.parent != base:
@@ -91,6 +109,8 @@ def clean(root_arg, runner_temp, deadline_file):
         _fail()
     if not root.exists():
         _confirm_supervisor_absent(root / "state")
+        if node_snapshot_id:
+            clean_node_snapshot(node_snapshot_id, deadline_file)
         print("cleanup_receipt=confirmed")
         return
     try:
@@ -126,6 +146,8 @@ def clean(root_arg, runner_temp, deadline_file):
         owned_tree_cleanup.remove_owned_tree(prepared, root, prefix="prepared-cleanup-")
     if prepared.exists() or prepared.is_symlink():
         _fail()
+    if node_snapshot_id:
+        clean_node_snapshot(node_snapshot_id, deadline_file)
     try:
         shutil.rmtree(root)
     except OSError:
@@ -135,14 +157,42 @@ def clean(root_arg, runner_temp, deadline_file):
     print("cleanup_receipt=confirmed")
 
 
-def main(argv=None):
+def _argument_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", required=True)
-    parser.add_argument("--runner-temp", required=True)
+    parser.add_argument("--root", default="")
+    parser.add_argument("--runner-temp", default="")
     parser.add_argument("--deadline-file", required=True)
+    parser.add_argument("--node-snapshot-id", default="")
+    parser.add_argument("--owner-uid", type=int)
+    parser.add_argument("--snapshot-only", action="store_true")
+    return parser
+
+
+def main(argv=None):
+    parser = _argument_parser()
     args = parser.parse_args(argv)
+    if args.snapshot_only:
+        if not args.node_snapshot_id:
+            parser.error("the following arguments are required: --node-snapshot-id")
+        if args.owner_uid is None:
+            parser.error("the following arguments are required: --owner-uid")
+    else:
+        if not args.root:
+            parser.error("the following arguments are required: --root")
+        if not args.runner_temp:
+            parser.error("the following arguments are required: --runner-temp")
     try:
-        clean(args.root, args.runner_temp, args.deadline_file)
+        if args.snapshot_only:
+            if os.geteuid() != 0:
+                _fail()
+            node_tool_snapshot.remove_snapshot(
+                args.node_snapshot_id, args.deadline_file, owner_uid=args.owner_uid,
+            )
+            print("node_snapshot_cleanup=confirmed")
+            return 0
+        if not args.root or not args.runner_temp:
+            _fail()
+        clean(args.root, args.runner_temp, args.deadline_file, args.node_snapshot_id)
         return 0
     except Exception:
         print("cleanup_receipt=unconfirmed", file=sys.stderr)

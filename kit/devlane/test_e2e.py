@@ -32,6 +32,7 @@ import os
 import re
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -49,6 +50,7 @@ import owned_tree_cleanup
 import rust_matrix_runner
 import rust_tooling
 import deadline as deadline_budget
+import diagnostic_contract
 import filter as output_filter
 import supervisor
 
@@ -56,7 +58,9 @@ import supervisor
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER_TEMP = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir())).resolve()
 DEADLINE_FILE = ""
+DIAGNOSTIC_FILE = ""
 RUN_ID = os.environ.get("GITHUB_RUN_ID", "")
+RUN_ATTEMPT = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
 CONTROL_SHA = os.environ.get("CI_SHA", "")
 CONTROL_RUN_ID = RUN_ID
 SOURCE_CANARY = "SYNTHETIC_SOURCE_CANARY_7f8c"
@@ -83,6 +87,7 @@ DIAGNOSTIC_PHASES = frozenset((
     "tool-cargo-vet-download", "tool-cargo-vet-extract", "tool-cargo-vet-version", "tool-cargo-vet-copy",
     "scenario-projection-write", "scenario-dependency-prepare", "scenario-tool-install",
     "scenario-tool-verify", "scenario-after-prepare-hook", "scenario-variant-run",
+    "scenario-node-snapshot-cleanup",
     "scenario-prepared-tree-cleanup", "scenario-projection-cleanup", "variant-root-setup",
     "variant-projection-write", "variant-source-build", "variant-archive-build", "variant-rust-archive-verify",
     "variant-envelope-build", "variant-context-build", "variant-context-validate", "variant-context-write",
@@ -93,7 +98,7 @@ DIAGNOSTIC_PHASES = frozenset((
     "variant-key-create", "variant-decrypt", "variant-decrypt-check", "variant-key-cleanup", "variant-execute",
     "variant-summary-validate", "variant-host-cleanup", "variant-teardown-confirm",
     "variant-host-cleanup-finally", "variant-teardown-confirm-finally",
-))
+)) | diagnostic_contract.PREPARATION_STAGES | frozenset(("production-e2e-diagnostic-file",))
 
 _EXCEPTION_CATEGORIES = {
     AssertionError: "assertion-error",
@@ -160,19 +165,37 @@ class StartupRefusalMismatch(RuntimeError):
         super().__init__("startup-refusal-contract-mismatch")
 
 
+class PreparationRefusalMismatch(RuntimeError):
+    """A preparation CLI result outside its exact finite success/refusal contract."""
+
+    def __init__(self, phase, category, cleanup_state="not-needed"):
+        self.phase = phase if phase in DIAGNOSTIC_PHASES else "prepare-protocol"
+        if category not in diagnostic_contract.PREPARATION_E2E_CATEGORIES:
+            category = "preparation-output-invalid"
+        self.category = category
+        self.cleanup_state = cleanup_state if cleanup_state == "unconfirmed" else ""
+        super().__init__("preparation-result-contract-mismatch")
+
+
 class _DiagnosticState:
     """Keep one bounded trusted phase and exception category for the first failure."""
 
     def __init__(self):
         self.first_failure = None
+        self.cleanup_state = ""
 
     def reset(self):
         self.first_failure = None
+        self.cleanup_state = ""
 
     def capture(self, phase, error):
         if self.first_failure is None:
-            category = (error.category if type(error) is StartupRefusalMismatch
-                        else _EXCEPTION_CATEGORIES.get(type(error), "unclassified"))
+            if type(error) is PreparationRefusalMismatch:
+                phase, category = error.phase, error.category
+                self.cleanup_state = error.cleanup_state
+            else:
+                category = (error.category if type(error) is StartupRefusalMismatch
+                            else _EXCEPTION_CATEGORIES.get(type(error), "unclassified"))
             self.first_failure = (phase, category)
 
     @contextmanager
@@ -189,7 +212,10 @@ class _DiagnosticState:
         if self.first_failure is None:
             self.capture("harness-startup", error)
         phase, category = self.first_failure
-        return "devlane_production_e2e=refused stage=" + phase + " exception=" + category
+        line = "devlane_production_e2e=refused stage=" + phase + " exception=" + category
+        if self.cleanup_state == "unconfirmed":
+            line += " cleanup=unconfirmed"
+        return line
 
 
 DIAGNOSTICS = _DiagnosticState()
@@ -198,6 +224,72 @@ DIAGNOSTICS = _DiagnosticState()
 def _phase_call(name, callback, *args, **kwargs):
     with DIAGNOSTICS.phase(name):
         return callback(*args, **kwargs)
+
+
+def _run_preparation(argv, timeout=60 * 60):
+    try:
+        result = _process_run(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            close_fds=True, check=False, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise PreparationRefusalMismatch("prepare-launch", "preparation-process-timeout") from None
+    except subprocess.SubprocessError:
+        raise PreparationRefusalMismatch("prepare-launch", "preparation-process-error") from None
+    except deadline_budget.DeadlineRefusal:
+        raise PreparationRefusalMismatch("prepare-deadline-check", "total-deadline-exhausted") from None
+    except OSError as error:
+        category = ("preparation-process-start-error" if type(error) in (FileNotFoundError, PermissionError)
+                    else "preparation-process-error")
+        raise PreparationRefusalMismatch("prepare-launch", category) from None
+    if _contains_output_canary(result.stdout + result.stderr):
+        raise PreparationRefusalMismatch("prepare-protocol", "preparation-output-canary")
+    failure = diagnostic_contract.parse_preparation_result(
+        result.returncode, result.stdout, result.stderr,
+    )
+    if failure is not None:
+        raise PreparationRefusalMismatch(*failure)
+    return result
+
+
+def _write_diagnostic_file(path, line):
+    if not path:
+        return False
+    payload = (line + "\n").encode("ascii", "strict")
+    if len(payload) > diagnostic_contract.MAX_PUBLIC_DIAGNOSTIC_BYTES + 1:
+        return False
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        return True
+    except OSError:
+        return False
+
+
+def _read_reportable_diagnostic_file(path):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+                or metadata.st_nlink != 1
+                or metadata.st_size > diagnostic_contract.MAX_PUBLIC_DIAGNOSTIC_BYTES + 1):
+            return None
+        payload = os.read(descriptor, diagnostic_contract.MAX_PUBLIC_DIAGNOSTIC_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    if len(payload) != metadata.st_size or not payload.endswith(b"\n"):
+        return None
+    try:
+        line = payload[:-1].decode("ascii", "strict")
+    except UnicodeDecodeError:
+        return None
+    return line if diagnostic_contract.public_preparation_diagnostic(line) else None
 
 
 def _require(condition, code):
@@ -963,7 +1055,12 @@ def _tool_paths(profile):
 
 
 def _prepare(profile, projection_path, prepared_path):
-    paths = _tool_paths(profile)
+    try:
+        paths = _tool_paths(profile)
+    except Exception as error:
+        category = _EXCEPTION_CATEGORIES.get(type(error), "unclassified")
+        category = "prepare-" + category if category in diagnostic_contract.PREPARATION_EXCEPTION_LABELS else "preparation-exception-unlisted"
+        raise PreparationRefusalMismatch("prepare-toolchain-selection", category) from None
     command = [
         "sudo", "-n", "unshare", "--mount", "--pid", "--ipc", "--fork", "--mount-proc", "--kill-child", "--",
         sys.executable, "-B", str(ROOT / "kit/devlane/prepare.py"),
@@ -971,10 +1068,33 @@ def _prepare(profile, projection_path, prepared_path):
         "--owner-uid", str(os.getuid()), "--owner-gid", str(os.getgid()),
         "--deadline-file", DEADLINE_FILE,
     ]
+    snapshot_id = ""
+    if profile == "core-node":
+        if RUN_ID.isdecimal() and RUN_ATTEMPT.isdecimal() and RUN_ATTEMPT != "0":
+            snapshot_id = "devlane-" + RUN_ID + "-" + RUN_ATTEMPT
+        else:
+            snapshot_id = "test-" + hashlib.sha256(
+                (str(Path(prepared_path).absolute()) + str(os.getpid())).encode("utf-8")
+            ).hexdigest()[:24]
+        command.extend(("--node-snapshot-id", snapshot_id))
     for name, path in paths.items():
         command.extend(("--" + name + "-path", path))
-    _run(command, timeout=60 * 60)
-    _require(prepared_path.is_dir() and not prepared_path.is_symlink(), "prepared-tree-missing")
+    try:
+        _run_preparation(command)
+        if not prepared_path.is_dir() or prepared_path.is_symlink():
+            raise PreparationRefusalMismatch("prepare-prepared-output-copy", "prepared-tree-missing")
+    except Exception as error:
+        if snapshot_id:
+            try:
+                host_cleanup.clean_node_snapshot(snapshot_id, DEADLINE_FILE)
+            except Exception:
+                DIAGNOSTICS.cleanup_state = "unconfirmed"
+                if type(error) is PreparationRefusalMismatch:
+                    error.cleanup_state = "unconfirmed"
+                print("node_snapshot_cleanup=unconfirmed", file=sys.stderr)
+        raise
+    if snapshot_id:
+        paths["node_snapshot_id"] = snapshot_id
     return paths
 
 
@@ -1216,7 +1336,8 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
                                 "--workspace", str(ROOT), "--prepared", str(prepared_path),
                                 "--bundle", str(bundle_path), "--projection", str(projection_path),
                                 "--positive-control", str(positive_path), "--deadline-file", DEADLINE_FILE)
-            for name in ("node", "npm", "cargo", "rustc"):
+            start.extend(("--node-snapshot-id", tool_paths.get("node_snapshot_id", "")))
+            for name in ("cargo", "rustc"):
                 start.extend(("--" + name + "-path", tool_paths[name]))
             lifecycle.note_start_attempt()
         if variant == "startup-refusal":
@@ -1347,6 +1468,7 @@ def _run_scenario(scenario, rust_tool_cache=None):
     prepared = RUNNER_TEMP / ("devlane-e2e-" + RUN_ID + "-" + scenario["name"])
     projection_path = RUNNER_TEMP / ("devlane-e2e-projection-" + RUN_ID + "-" + scenario["name"])
     lifecycle = _SupervisorLifecycle(RUNNER_TEMP / ("devlane-" + RUN_ID))
+    tool_paths = {}
     try:
         _phase_call("scenario-projection-write", projection_path.write_bytes, scenario["payload"])
         tool_paths = _phase_call("scenario-dependency-prepare", _prepare,
@@ -1364,6 +1486,7 @@ def _run_scenario(scenario, rust_tool_cache=None):
                         prepared, tool_paths, key_bytes, variant, lifecycle)
     finally:
         previous_error = sys.exc_info()[1]
+        cleanup_unconfirmed = False
         try:
             try:
                 with DIAGNOSTICS.phase("scenario-prepared-tree-cleanup"):
@@ -1372,22 +1495,30 @@ def _run_scenario(scenario, rust_tool_cache=None):
                         _remove_owned_prepared_tree(prepared)
                     _require(not prepared.exists() and not prepared.is_symlink(), "prepared-cleanup-tree-remains")
             except Exception:
-                if previous_error is None:
-                    raise
+                cleanup_unconfirmed = True
             if prepared.exists() or prepared.is_symlink():
-                if previous_error is None:
-                    raise RuntimeError("prepared-cleanup-tree-remains")
-                print("prepared_cleanup=unconfirmed", file=sys.stderr)
+                cleanup_unconfirmed = True
         finally:
+            snapshot_id = tool_paths.get("node_snapshot_id", "")
+            if snapshot_id:
+                try:
+                    with DIAGNOSTICS.phase("scenario-node-snapshot-cleanup"):
+                        _require(lifecycle.permits_prepared_cleanup(), "node-snapshot-supervisor-unconfirmed")
+                        host_cleanup.clean_node_snapshot(snapshot_id, DEADLINE_FILE)
+                except Exception:
+                    cleanup_unconfirmed = True
             try:
                 with DIAGNOSTICS.phase("scenario-projection-cleanup"):
                     projection_path.unlink(missing_ok=True)
                     if projection_path.exists() or projection_path.is_symlink():
                         raise RuntimeError("projection-cleanup-remains")
             except Exception:
-                if previous_error is None:
-                    raise
-                print("projection_cleanup=unconfirmed", file=sys.stderr)
+                cleanup_unconfirmed = True
+        if cleanup_unconfirmed:
+            DIAGNOSTICS.cleanup_state = "unconfirmed"
+            if previous_error is None:
+                raise RuntimeError("scenario-cleanup-unconfirmed")
+            print("scenario_cleanup=unconfirmed", file=sys.stderr)
 
 
 def _deadline_termination(signum, _frame):
@@ -1401,9 +1532,24 @@ def main(argv=None):
         parser.add_argument("--generate-rust-fixture", default="")
         parser.add_argument("--rust-fixture", default="")
         parser.add_argument("--deadline-file", required=True)
+        parser.add_argument("--diagnostic-file", default="")
+        parser.add_argument("--report-diagnostic-file", default="")
         args = parser.parse_args(argv)
+    if args.report_diagnostic_file:
+        try:
+            with DIAGNOSTICS.phase("production-e2e-diagnostic-file"):
+                line = _read_reportable_diagnostic_file(args.report_diagnostic_file)
+        except Exception:
+            line = None
+        if line is None:
+            print("devlane_acceptance=refused stage=production-path-e2e")
+        else:
+            print(line)
+        return 0
     global DEADLINE_FILE
+    global DIAGNOSTIC_FILE
     DEADLINE_FILE = args.deadline_file
+    DIAGNOSTIC_FILE = args.diagnostic_file
     _phase_call("deadline-validate", deadline_budget.remaining, DEADLINE_FILE)
     if args.generate_rust_fixture:
         with DIAGNOSTICS.phase("fixture-toolchain-discovery"):
@@ -1466,5 +1612,7 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as error:
-        print(DIAGNOSTICS.refusal_line(error), file=sys.stderr)
+        line = DIAGNOSTICS.refusal_line(error)
+        _write_diagnostic_file(DIAGNOSTIC_FILE, line)
+        print(line, file=sys.stderr)
         raise SystemExit(1)

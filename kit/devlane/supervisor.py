@@ -28,6 +28,7 @@ import fetch
 import filter as output_filter
 import network_probe
 import prepare as node_tool_prepare
+import node_tool_snapshot
 
 
 MAX_RPC = 32 * 1024
@@ -59,6 +60,10 @@ REFUSAL_CODES = frozenset((
     "firewall-unavailable", "input-size", "input-unavailable", "key-invalid", "linux-root-required",
     "linux-runner-required", "mount-source-unavailable", "network-namespace-changed",
     "network-namespace-not-isolated", "network-probe-failed", "node-tool-layout",
+    "node-snapshot-base-invalid", "node-snapshot-base-owner", "node-snapshot-base-unavailable",
+    "node-snapshot-content-changed", "node-snapshot-content-invalid", "node-snapshot-deadline",
+    "node-snapshot-id", "node-snapshot-layout", "node-snapshot-limit", "node-snapshot-link-invalid",
+    "node-snapshot-manifest-invalid", "node-snapshot-missing", "node-snapshot-seal-invalid",
     "node-toolchain-executable", "node-toolchain-missing", "node-toolchain-owner",
     "node-toolchain-permissions", "node-toolchain-version", "npm-lock-binding-missing",
     "npm-lock-projection-invalid", "npm-projection-mismatch", "positive-control-failed",
@@ -80,7 +85,12 @@ REFUSAL_CODES = frozenset((
 STARTUP_REFUSAL_CODES = frozenset((
     "deadline-file-invalid", "dispatch-context-invalid", "dispatch-context-unavailable",
     "firewall-unavailable", "input-size", "input-unavailable", "linux-root-required",
-    "linux-runner-required", "mount-source-unavailable", "node-tool-layout", "node-toolchain-executable",
+    "linux-runner-required", "mount-source-unavailable", "node-tool-layout",
+    "node-snapshot-base-invalid", "node-snapshot-base-owner", "node-snapshot-base-unavailable",
+    "node-snapshot-content-changed", "node-snapshot-content-invalid", "node-snapshot-deadline",
+    "node-snapshot-id", "node-snapshot-layout", "node-snapshot-limit", "node-snapshot-link-invalid",
+    "node-snapshot-manifest-invalid", "node-snapshot-missing", "node-snapshot-seal-invalid",
+    "node-toolchain-executable",
     "node-toolchain-missing", "node-toolchain-owner", "node-toolchain-permissions", "node-toolchain-version",
     "positive-control-failed", "positive-control-unavailable",
     "profile-config-invalid", "profile-config-unavailable", "profile-unknown",
@@ -327,9 +337,6 @@ def _mount_minimal_root(root, workspace, prepared, control_root):
     for host, guest in (("/usr", root / "usr"), ("/lib", root / "lib"), ("/lib64", root / "lib64")):
         if Path(host).exists():
             _mount_bind(host, guest, readonly=True)
-    if Path("/opt/hostedtoolcache").is_dir():
-        _ensure_directory(root / "opt/hostedtoolcache")
-        _mount_bind("/opt/hostedtoolcache", root / "opt/hostedtoolcache", readonly=True)
     for name in ("bin", "sbin"):
         target = "usr/bin" if name == "bin" else "usr/sbin"
         link = root / name
@@ -783,7 +790,16 @@ def _summary_failed(summary):
     return False
 
 
-def _node_tool_versions(paths, owner_uid):
+def _node_snapshot_versions(snapshot_id, owner_uid):
+    if not node_tool_snapshot.valid_snapshot_id(snapshot_id):
+        _refuse("node-snapshot-id")
+    try:
+        validated = node_tool_snapshot.validate_snapshot(
+            snapshot_id, ACTIVE_DEADLINE_FILE, owner_uid=owner_uid,
+        )
+    except node_tool_snapshot.SnapshotRefusal as error:
+        _refuse(error.code)
+
     def run(argv, *, env):
         try:
             return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -793,7 +809,7 @@ def _node_tool_versions(paths, owner_uid):
             _refuse("tool-version-unavailable")
 
     try:
-        validated, results = node_tool_prepare.run_node_version_checks(paths, owner_uid, run)
+        results = node_tool_prepare.run_node_versions(validated, run)
     except bundle.Refusal as error:
         _refuse(str(error))
     versions = {}
@@ -810,8 +826,8 @@ def _node_tool_versions(paths, owner_uid):
 def _preflight_tools(profile, projection, tool_paths, owner_uid=None):
     """Keep the selected profile pinned to already prepared executable paths."""
     paths = dict(tool_paths)
-    if profile == "core-node" and (not paths.get("node") or not paths.get("npm")):
-        _refuse("node-toolchain-missing")
+    if profile == "core-node" and not node_tool_snapshot.valid_snapshot_id(paths.get("node_snapshot_id")):
+        _refuse("node-snapshot-id")
     if profile == "core-rust" and (not paths["cargo"] or not paths["rustc"]):
         _refuse("rust-toolchain-missing")
     if type(projection) is not dict or type(projection.get("tools")) is not dict:
@@ -822,7 +838,7 @@ def _preflight_tools(profile, projection, tool_paths, owner_uid=None):
     node_root = None
     node_versions = None
     if profile == "core-node":
-        node_tool_info, node_versions = _node_tool_versions(paths, owner_uid)
+        node_tool_info, node_versions = _node_snapshot_versions(paths["node_snapshot_id"], owner_uid)
         node_root = Path(node_tool_info["root"])
         paths.update({name: node_tool_info[name] for name in ("node", "npm", "npm_cli")})
     for name in ("node", "npm", "cargo", "rustc"):
@@ -873,6 +889,7 @@ def _preflight_tools(profile, projection, tool_paths, owner_uid=None):
         "rust_dir": "/tools/rust/bin" if rust_root else None,
         "paths": paths,
         "node_root": node_root,
+        "node_snapshot_id": paths.get("node_snapshot_id", ""),
         "rust_root": rust_root,
     }
 
@@ -1092,7 +1109,7 @@ class Service:
         self.mounts = [
             self.root / "proc", self.root / "dev/shm", self.root / "dev", self.root / "workspace",
             self.root / "scratch", self.root / "prepared", self.root / "control/profiles.json",
-            self.root / "control/devlane", self.root / "etc/ssl/certs", self.root / "opt/hostedtoolcache",
+            self.root / "control/devlane", self.root / "etc/ssl/certs",
             self.root / "tools/rust", self.root / "tools/node", self.root / "lib64", self.root / "lib",
             self.root / "usr", self.root,
         ]
@@ -1101,7 +1118,7 @@ class Service:
         self.projection_value = projection_value
         if self.context["profile"] == "core-node":
             self.startup_phase = "versions"
-            _node_info, versions = _node_tool_versions(self.tool_info["paths"], self.owner_uid)
+            _node_info, versions = _node_snapshot_versions(self.tool_info["node_snapshot_id"], self.owner_uid)
             if versions != {"node": "v" + node_tool_prepare.NODE_VERSION,
                             "npm": node_tool_prepare.NPM_VERSION}:
                 _refuse("node-toolchain-version")
@@ -1463,7 +1480,7 @@ def _serve(args):
         service = Service(
             args.state_dir, args.context, args.workspace, args.prepared,
             args.bundle, args.projection, args.host_net_inode, args.owner_uid,
-            {"node": args.node_path or None, "npm": args.npm_path or None,
+            {"node_snapshot_id": args.node_snapshot_id or "",
              "cargo": args.cargo_path or None, "rustc": args.rustc_path or None}, args.deadline_file,
         )
         startup_phase = "prepare"
@@ -1596,19 +1613,15 @@ def _start(args):
     if positive != {"connected": True, "target": "public-tls-control"}:
         _refuse("positive-control-failed")
     if context["profile"] == "core-node":
+        if not node_tool_snapshot.valid_snapshot_id(args.node_snapshot_id):
+            _refuse("node-snapshot-id")
         tool_paths = {
-            "node": getattr(args, "node_path") or "", "npm": getattr(args, "npm_path") or "",
-            "cargo": "", "rustc": "",
+            "node_snapshot_id": args.node_snapshot_id, "cargo": "", "rustc": "",
         }
-        try:
-            node_tool_info = node_tool_prepare.validate_node_toolchain(tool_paths, os.getuid())
-        except bundle.Refusal as error:
-            _refuse(str(error))
-        tool_paths["node"] = node_tool_info["node"]
-        tool_paths["npm"] = node_tool_info["npm"]
     else:
+        if args.node_snapshot_id:
+            _refuse("node-snapshot-id")
         tool_paths = {
-            "node": "", "npm": "",
             "cargo": getattr(args, "cargo_path") or shutil.which("cargo") or "",
             "rustc": getattr(args, "rustc_path") or shutil.which("rustc") or "",
         }
@@ -1636,7 +1649,7 @@ def _start(args):
         "--projection", str(Path(args.projection).absolute()),
         "--deadline-file", str(Path(args.deadline_file).resolve(strict=True)),
         "--host-net-inode", str(host_net_inode), "--owner-uid", str(os.getuid()),
-        "--node-path", tool_paths["node"], "--npm-path", tool_paths["npm"],
+        "--node-snapshot-id", tool_paths.get("node_snapshot_id", ""),
         "--cargo-path", tool_paths["cargo"], "--rustc-path", tool_paths["rustc"],
     ]
     try:
@@ -1783,7 +1796,7 @@ def _validate_host_records(payload, allowlists, profile):
         _refuse("summary-response-invalid")
 
 
-def main(argv=None):
+def _argument_parser():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="operation", required=True)
     start = sub.add_parser("start")
@@ -1791,7 +1804,8 @@ def main(argv=None):
         start.add_argument("--" + name, required=True)
     start.add_argument("--positive-control", required=True)
     start.add_argument("--deadline-file", required=True)
-    for name in ("node-path", "npm-path", "cargo-path", "rustc-path"):
+    start.add_argument("--node-snapshot-id", default="")
+    for name in ("cargo-path", "rustc-path"):
         start.add_argument("--" + name, default="")
     client = sub.add_parser("_serve")
     for name in ("state-dir", "context", "workspace", "prepared", "bundle", "projection"):
@@ -1799,14 +1813,19 @@ def main(argv=None):
     client.add_argument("--deadline-file", required=True)
     client.add_argument("--host-net-inode", type=int, required=True)
     client.add_argument("--owner-uid", type=int, required=True)
-    for name in ("node-path", "npm-path", "cargo-path", "rustc-path"):
+    client.add_argument("--node-snapshot-id", default="")
+    for name in ("cargo-path", "rustc-path"):
         client.add_argument("--" + name, default="")
     for operation in ("probe", "decrypt", "execute", "cleanup"):
         command = sub.add_parser(operation)
         command.add_argument("--state-dir", required=True)
         if operation == "execute":
             command.add_argument("--context", required=True)
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv=None):
+    args = _argument_parser().parse_args(argv)
     try:
         if args.operation == "start":
             return _start(args)

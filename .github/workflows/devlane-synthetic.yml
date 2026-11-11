@@ -210,18 +210,39 @@ jobs:
       - name: Run full source-free production-path acceptance
         run: |
           set -euo pipefail
-          quiet() { local out="$RUNNER_TEMP/devlane-acceptance.log"; if "$@" >"$out" 2>&1; then return 0; fi; cat "$out"; return 1; }
+          quiet() {
+            local stage="$1"; shift
+            local out="$RUNNER_TEMP/devlane-acceptance.log"
+            if "$@" >"$out" 2>&1; then rm -f -- "$out"; return 0; fi
+            rm -f -- "$out"
+            if [[ "$stage" == "production-path-e2e" ]]; then
+              local report="$RUNNER_TEMP/devlane-acceptance-diagnostic-output"
+              if python3 -B kit/devlane/test_e2e.py --deadline-file "$RUNNER_TEMP/devlane-deadline.json" \
+                  --report-diagnostic-file "$RUNNER_TEMP/devlane-acceptance-diagnostic-$GITHUB_RUN_ID" \
+                  >"$report" 2>/dev/null; then
+                cat "$report"
+                rm -f -- "$report" "$RUNNER_TEMP/devlane-acceptance-diagnostic-$GITHUB_RUN_ID"
+              else
+                rm -f -- "$report" "$RUNNER_TEMP/devlane-acceptance-diagnostic-$GITHUB_RUN_ID"
+                printf 'devlane_acceptance=refused stage=production-path-e2e\n'
+              fi
+            else
+              printf 'devlane_acceptance=refused stage=%s\n' "$stage"
+            fi
+            return 1
+          }
           bounded() { python3 -B kit/devlane/deadline.py run --file "$RUNNER_TEMP/devlane-deadline.json" \
             --timeout-cleanup-reserve-seconds 300 -- "$@"; }
-          quiet bounded python3 -B -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; assert AESGCM is not None'
-          quiet bounded python3 -B kit/devlane/test_acceptance.py
-          quiet bounded python3 -B kit/devlane/test_coordinator.py
-          quiet bounded python3 -B kit/devlane/test_rust_test_runner.py
-          quiet bounded python3 -B kit/devlane/test_rust_report.py
-          quiet bounded node --test kit/devlane/test_adapters.mjs
-          quiet bounded python3 -B kit/devlane/test_audit_contracts.py
-          quiet bounded python3 -B kit/devlane/test_rehearsal.py
-          quiet bounded python3 -B kit/devlane/test_e2e.py --deadline-file "$RUNNER_TEMP/devlane-deadline.json" \
+          quiet crypto-dependency-probe bounded python3 -B -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; assert AESGCM is not None'
+          quiet acceptance-unit-tests bounded python3 -B kit/devlane/test_acceptance.py
+          quiet coordinator-contract-tests bounded python3 -B kit/devlane/test_coordinator.py
+          quiet rust-matrix-runner-tests bounded python3 -B kit/devlane/test_rust_test_runner.py
+          quiet rust-report-tests bounded python3 -B kit/devlane/test_rust_report.py
+          quiet node-adapter-tests bounded node --test kit/devlane/test_adapters.mjs
+          quiet audit-contract-tests bounded python3 -B kit/devlane/test_audit_contracts.py
+          quiet rehearsal-tests bounded python3 -B kit/devlane/test_rehearsal.py
+          quiet production-path-e2e bounded python3 -B kit/devlane/test_e2e.py --deadline-file "$RUNNER_TEMP/devlane-deadline.json" \
+            --diagnostic-file "$RUNNER_TEMP/devlane-acceptance-diagnostic-$GITHUB_RUN_ID" \
             --rust-fixture "$RUNNER_TEMP/devlane-rust-fixture"
           printf 'devlane_acceptance=pass\n'
       - name: Probe the loopback-only Linux network boundary
