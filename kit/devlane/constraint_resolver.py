@@ -984,6 +984,24 @@ def resolve_feature_fixed_point(envelope: dict[str, Any], resolver,
     _fail("resolver-fixed-point-exhausted")
 
 
+def validate_tool_version_output(tool: str, output: bytes, error: bytes, returncode: int,
+                                 prefix: bytes, required_line: bytes | None) -> None:
+    if tool not in ("cargo", "rustc"):
+        _fail("resolver-toolchain-name")
+    if returncode != 0:
+        reason = ("shared-library" if b"error while loading shared libraries" in error
+                  else "execution")
+    elif len(output) > 4096:
+        reason = "size"
+    elif not output.startswith(prefix):
+        reason = "release"
+    elif required_line is not None and required_line not in output.splitlines():
+        reason = "host"
+    else:
+        return
+    _fail("resolver-" + tool + "-version-" + reason)
+
+
 def run_cargo_fixed_point(envelope: dict[str, Any], *, expected_source_sha: str,
                           expected_control_sha: str, cargo: str, rustc: str,
                           scratch_parent: str | Path, deadline_file: str | Path,
@@ -1139,23 +1157,30 @@ def run_cargo_fixed_point(envelope: dict[str, Any], *, expected_source_sha: str,
     def tool_version(executable: str, args: list[str], prefix: bytes,
                      required_line: bytes | None = None) -> None:
         output_path = scratch / ("version-" + Path(executable).name)
+        error_path = output_path.with_name(output_path.name + "-error")
         try:
-            with output_path.open("xb") as output:
-                bounded_registry_io.run_bounded_process(
+            with output_path.open("xb") as output, error_path.open("xb") as error:
+                code = bounded_registry_io.run_bounded_process(
                     [executable, *args], budget, cwd=root,
-                    env={"PATH": str(Path(executable).parent) + ":/usr/bin:/bin", "LC_ALL": "C"},
-                    stdout=output,
+                    env={"PATH": str(Path(executable).parent) + ":/usr/bin:/bin", "LC_ALL": "C",
+                         "LD_LIBRARY_PATH": str(Path(executable).parent.parent / "lib")},
+                    stdout=output, stderr=error, max_output_bytes=8192,
                 )
             version_output = output_path.read_bytes()
-            if (output_path.stat().st_size > 1024 or not version_output.startswith(prefix)
-                    or required_line is not None and required_line not in version_output.splitlines()):
-                _fail("resolver-toolchain-version")
+            validate_tool_version_output(Path(executable).name, version_output, error_path.read_bytes(),
+                                         code, prefix, required_line)
             tool_version_hashes[Path(executable).name] = sha256(version_output)
-        except (OSError, bounded_registry_io.Refusal):
-            _fail("resolver-toolchain-version")
+        except bounded_registry_io.Refusal as error:
+            reason = error.args[0] if error.args and error.args[0] in {
+                "phase-deadline", "cleanup-deadline", "process-output-limit", "process-start", "cancelled",
+            } else "process"
+            _fail("resolver-" + Path(executable).name + "-version-" + reason)
+        except OSError:
+            _fail("resolver-" + Path(executable).name + "-version-io")
         finally:
             try:
                 output_path.unlink(missing_ok=True)
+                error_path.unlink(missing_ok=True)
             except OSError:
                 _fail("resolver-version-cleanup")
 
@@ -1211,6 +1236,7 @@ def run_cargo_fixed_point(envelope: dict[str, Any], *, expected_source_sha: str,
                     (cargo_home / "config.toml").write_bytes(config)
                     env = {
                         "PATH": str(Path(cargo).parent) + ":/usr/bin:/bin",
+                        "LD_LIBRARY_PATH": str(Path(rustc).parent.parent / "lib"),
                         "HOME": str(scratch),
                         "CARGO_HOME": str(cargo_home),
                         "CARGO_TERM_COLOR": "never",

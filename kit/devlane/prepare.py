@@ -607,7 +607,8 @@ def _run_rust_v2_worker(root, projection, output_root, owner_uid, owner_gid):
     try:
         run(command, timeout=3600, log=work / "prepare-rust-v2.log", cwd="/",
             environment={"PATH": "/tools/rust/bin:/usr/bin:/bin", "HOME": "/devlane-home",
-                         "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1"})
+                         "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1",
+                         "LD_LIBRARY_PATH": "/tools/rust/lib"})
     except bundle.Refusal:
         try:
             code = rust_preparation_v2.diagnostic_code(
@@ -656,6 +657,8 @@ def _run_worker(root, projection, profile, output_root, tool_paths, owner_uid, o
         "PLAYWRIGHT_BROWSERS_PATH": "/work/prepared/ms-playwright",
         "XDG_CACHE_HOME": "/work/cache", "PYTHONDONTWRITEBYTECODE": "1",
     }
+    if profile == "core-rust":
+        environment["LD_LIBRARY_PATH"] = "/tools/rust/lib"
     (work / "tmp").mkdir(mode=0o700, exist_ok=True)
     (work / "cache").mkdir(mode=0o700, exist_ok=True)
     for path in (work / "tmp", work / "cache"):

@@ -95,6 +95,7 @@ def smoke(args, root):
                "--config", "net.offline=true", "--config", "net.retry=0"]
     run(command, root, "offline", args.deadline_file,
         dict(env, CARGO_HOME=str(home), HOME=str(home), RUSTC=str(tools / "bin/rustc"),
+             LD_LIBRARY_PATH=str(tools / "lib"),
              CARGO_NET_OFFLINE="true"))
     record = bundle.strict_json((prepared / "registry-preparation.json").read_bytes(), 4 * 1024 * 1024)
     available = {tuple(row[key] for key in ("name", "version", "checksum")) for row in record["packages"]}

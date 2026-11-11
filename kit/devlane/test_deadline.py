@@ -26,6 +26,7 @@ import permit
 import prepare
 import public_audit
 import rust_tooling
+import rust_preparation_smoke
 import supervisor
 import test_e2e
 
@@ -385,7 +386,12 @@ class DeadlineTests(unittest.TestCase):
         self.assertIn('"--cleanup-reserve-seconds", "300"', workflow)
         self.assertIn('"--job-seconds", "5400"', workflow)
         self.assertEqual(workflow.count("deadline.py run"), 5)
-        self.assertEqual(len(re.findall(r"(?m)^\s+quiet [a-z0-9-]+ bounded ", workflow)), 9)
+        self.assertEqual(Counter(re.findall(r"(?m)^\s+quiet ([a-z0-9-]+) bounded ", workflow)),
+                         Counter(("crypto-dependency-probe", "rust-v2-preparation-tests",
+                                  "rust-v2-lock-tests", "rust-v2-source-tests", "rust-v2-public-runtime",
+                                  "acceptance-unit-tests", "coordinator-contract-tests",
+                                  "rust-matrix-runner-tests", "rust-report-tests", "node-adapter-tests",
+                                  "audit-contract-tests", "rehearsal-tests", "production-path-e2e")))
         self.assertIn('test_e2e.py --deadline-file "$RUNNER_TEMP/devlane-deadline.json"', workflow)
         self.assertIn('--report-diagnostic-file "$RUNNER_TEMP/devlane-acceptance-diagnostic-$GITHUB_RUN_ID"', workflow)
         self.assertIn('bounded() { python3 -B kit/devlane/deadline.py run', workflow)
@@ -528,6 +534,10 @@ class DeadlineTests(unittest.TestCase):
             ("devlane-synthetic.yml", "devlane-synthetic", "test_rehearsal.py"): 1,
             ("devlane-synthetic.yml", "devlane-synthetic", "test_rust_report.py"): 1,
             ("devlane-synthetic.yml", "devlane-synthetic", "test_rust_test_runner.py"): 1,
+            ("devlane-synthetic.yml", "devlane-synthetic", "test_rust_preparation_v2.py"): 1,
+            ("devlane-synthetic.yml", "devlane-synthetic", "test_rust_lock_generation.py"): 1,
+            ("devlane-synthetic.yml", "devlane-synthetic", "test_source_projection.py"): 1,
+            ("devlane-synthetic.yml", "devlane-synthetic", "rust_preparation_smoke.py"): 1,
             ("devlane-encrypted.yml", "devlane-encrypted-run", "deadline.py"): 25,
             ("devlane-encrypted.yml", "devlane-encrypted-audit", "deadline.py"): 1,
             ("devlane-encrypted.yml", "devlane-encrypted-run", "fetch.py"): 4,
@@ -588,6 +598,18 @@ class DeadlineTests(unittest.TestCase):
                                          side_effect=deadline.DeadlineRefusal("total-deadline-exhausted")):
                         with self.assertRaisesRegex(deadline.DeadlineRefusal, "total-deadline-exhausted"):
                             test_e2e.main(arguments)
+                elif script == "rust_preparation_smoke.py":
+                    safe_arguments = [value.replace("$(id -u)", "1001").replace("$(id -g)", "1001")
+                                      for value in arguments]
+                    for option in ("--cargo-path", "--rustc-path", "--control-sha", "--deadline-file",
+                                   "--owner-uid", "--owner-gid"):
+                        self._assert_required_argument(rust_preparation_smoke.main, safe_arguments, option)
+                    with patch.object(rust_preparation_smoke.sys, "platform", "linux"), \
+                            patch.object(rust_preparation_smoke.os, "geteuid", return_value=0), \
+                            patch.object(deadline, "remaining", side_effect=deadline.DeadlineRefusal(
+                                "total-deadline-exhausted")):
+                        with self.assertRaisesRegex(deadline.DeadlineRefusal, "total-deadline-exhausted"):
+                            rust_preparation_smoke.main(safe_arguments)
                 elif script == "prepare.py":
                     self.assertIn("--deadline-file", arguments)
                     safe_arguments = [value.replace("$DEVLANE_PROFILE", "core-node")

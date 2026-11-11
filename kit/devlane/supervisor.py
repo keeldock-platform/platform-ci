@@ -468,6 +468,8 @@ def _worker_environment(stage, root, tools):
         "PLAYWRIGHT_BROWSERS_PATH": "/prepared/ms-playwright",
         "DEVLANE_STAGE": stage,
     }
+    if rust_path:
+        env["LD_LIBRARY_PATH"] = "/tools/rust/lib"
     return env
 
 

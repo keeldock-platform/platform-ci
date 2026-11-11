@@ -12,6 +12,7 @@ import project
 import rust_preparation_v2 as worker
 import rust_preparation_smoke as smoke
 import test_acceptance as acceptance
+import supervisor
 
 CONTROL_SHA = acceptance.CONTROL_SHA
 
@@ -102,6 +103,32 @@ class PreparationTests(unittest.TestCase):
                          "resolver-toolchain-file")
         self.assertEqual(worker.failure_code(ValueError("private-canary")), "unexpected-value")
         self.assertEqual(worker.failure_code(bundle.Refusal("private-canary\nsecond-line")), "unclassified")
+
+    def test_tool_identity_refusals_distinguish_release_host_size_and_loader(self):
+        prefix = b"cargo 1.99.1 "
+        host = b"host: x86_64-unknown-linux-gnu"
+        valid = prefix + b"(public-build)\nrelease: 1.99.1\n" + host + b"\n"
+        constraint_resolver.validate_tool_version_output("cargo", valid, b"", 0, prefix, host)
+        cases = ((valid.replace(b"1.99.1", b"1.99.0"), b"", 0, "release"),
+                 (valid.replace(host, b"host: other"), b"", 0, "host"),
+                 (valid + b"x" * 4096, b"", 0, "size"),
+                 (b"", b"error while loading shared libraries: private-canary", 127, "shared-library"),
+                 (b"", b"private-canary", 1, "execution"))
+        for output, error, status, reason in cases:
+            with self.subTest(reason=reason):
+                with self.assertRaisesRegex(constraint_resolver.Refusal,
+                                            "^resolver-cargo-version-" + reason + "$"):
+                    constraint_resolver.validate_tool_version_output("cargo", output, error, status, prefix, host)
+
+    def test_worker_loader_uses_only_the_control_mounted_rust_library_path(self):
+        with patch.dict(os.environ, {"LD_LIBRARY_PATH": "private-canary"}):
+            rust = supervisor._worker_environment("rust", Path("/unused"),
+                                                  {"rust_dir": "/tools/rust/bin"})
+            node = supervisor._worker_environment("node", Path("/unused"),
+                                                  {"node_dir": "/tools/node/bin"})
+        self.assertEqual(rust["LD_LIBRARY_PATH"], "/tools/rust/lib")
+        self.assertNotIn("LD_LIBRARY_PATH", node)
+        self.assertNotIn("private-canary", str(rust))
 
     def test_diagnostics_prefer_worker_refusal_over_generic_parent_failure(self):
         payload = (b"rust_preparation_worker_refusal=code=resolver-toolchain-file\n"
