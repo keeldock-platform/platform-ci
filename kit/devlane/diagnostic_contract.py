@@ -252,12 +252,12 @@ _E2E_COMMAND_ADAPTER_REFUSAL = re.compile(
     r"reporter-failed|json-size|json-string|json-escape|json-control|json-depth|duplicate-json-key|"
     r"json-colon|json-object|json-array|json-value|json-trailing-data)\Z"
 )
-_E2E_VITEST_DIAGNOSTIC = re.compile(
-    r"devlane_e2e_vitest_diag=log name=[A-Za-z0-9][A-Za-z0-9._-]{0,63} "
+_E2E_FAILURE_DIAGNOSTIC = re.compile(
+    r"devlane_e2e_(?:vitest|failure)_diag=log name=[A-Za-z0-9][A-Za-z0-9._-]{0,63} "
     r"line=[1-9][0-9]{0,2} text=(?:[A-Za-z0-9._~:/,=@+!?(){} -]|%[0-9A-F]{2}){0,384}\Z"
 )
-_E2E_REPORT_DIAGNOSTIC = re.compile(
-    r"devlane_e2e_vitest_diag=report name=[A-Za-z0-9][A-Za-z0-9._-]{0,63} "
+_E2E_FAILURE_REPORT_DIAGNOSTIC = re.compile(
+    r"devlane_e2e_(?:vitest|failure)_diag=report name=[A-Za-z0-9][A-Za-z0-9._-]{0,63} "
     r"kind=(directory|file|symlink|other|missing) bytes=(?:0|[1-9][0-9]{0,11})\Z"
 )
 
@@ -274,7 +274,12 @@ def public_e2e_command_diagnostic(line):
 
 
 def public_e2e_vitest_diagnostic(line):
-    """Accept only the bounded, escaped raw-log and report-listing lines from synthetic E2E."""
+    """Accept the legacy Vitest and profile-neutral bounded E2E diagnostics."""
+    return public_e2e_failure_diagnostic(line)
+
+
+def public_e2e_failure_diagnostic(line):
+    """Accept only bounded, escaped raw-log and report-listing lines from synthetic E2E."""
     if type(line) is not str:
         return False
     try:
@@ -288,8 +293,8 @@ def public_e2e_vitest_diagnostic(line):
                 "SYNTHETIC_KEY_CANARY", "PRIVATE_KEY_CANARY",
             ))):
         return False
-    return (_E2E_VITEST_DIAGNOSTIC.fullmatch(line) is not None
-            or _E2E_REPORT_DIAGNOSTIC.fullmatch(line) is not None)
+    return (_E2E_FAILURE_DIAGNOSTIC.fullmatch(line) is not None
+            or _E2E_FAILURE_REPORT_DIAGNOSTIC.fullmatch(line) is not None)
 
 
 def public_e2e_command_summary_record(line):

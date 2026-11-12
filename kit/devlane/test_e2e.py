@@ -84,11 +84,11 @@ SYNTHETIC_LOCK = ROOT / "kit/confinement/synthetic_project/package-lock.json"
 
 DIAGNOSTIC_PHASES = diagnostic_contract.E2E_PROGRESS_PHASES
 PROGRESS_ENABLED = False
-MAX_VITEST_RAW_LOGS = 16
-MAX_VITEST_RAW_LOG_TAIL_LINES = 120
-MAX_VITEST_RAW_LOG_TAIL_BYTES = 128 * 1024
-MAX_VITEST_RAW_LOG_LINE_BYTES = 128
-MAX_VITEST_REPORT_ENTRIES = 64
+MAX_E2E_RAW_DIAGNOSTIC_LOGS = 16
+MAX_E2E_RAW_DIAGNOSTIC_TAIL_LINES = 120
+MAX_E2E_RAW_DIAGNOSTIC_TAIL_BYTES = 128 * 1024
+MAX_E2E_RAW_DIAGNOSTIC_LINE_BYTES = 128
+MAX_E2E_REPORT_ENTRIES = 64
 _DIAGNOSTIC_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 
 EXECUTE_EXIT_EXPECTATIONS = {
@@ -492,18 +492,34 @@ def _report_command_failure(callsite, result):
             break
 
 
-def _unit_failure_subreason(summary):
+def _synthetic_failure_subreason(summary, profile="core-node"):
     if type(summary) is not bytes or _contains_output_canary(summary):
+        return ""
+    if profile not in ("core-node", "core-rust"):
         return ""
     for line in summary.splitlines():
         try:
             record = output_filter._parse_record(line)
         except output_filter.FilterRefusal:
             continue
-        if (record.get("kind") == "control" and record.get("stage") == "unit"
-                and record.get("status") == "fail"
-                and record.get("subreason") in ("vitest-failed", "report-missing", "adapter-failed")):
-            return record["subreason"]
+        if (record.get("kind") == "control" and record.get("status") == "fail"
+                and record.get("code") == "DEVLANE_FAILURE"):
+            subreason = record.get("subreason")
+            if (profile == "core-node" and record.get("stage") == "unit"
+                    and subreason in ("vitest-failed", "report-missing", "adapter-failed")):
+                return subreason
+            if (profile == "core-rust" and record.get("stage") != "semver"
+                    and subreason in ("report-missing", "adapter-failed")):
+                return "rust-matrix-" + subreason
+        if profile == "core-rust":
+            if record.get("kind") == "test" and record.get("stage") == "unit":
+                return "rust-matrix-failed"
+            if (record.get("kind") == "coverage" and record.get("stage") != "semver"
+                    and type(record.get("failed")) is int and record["failed"] > 0):
+                return "rust-matrix-failed"
+            if (record.get("kind") == "diagnostic" and record.get("stage") != "semver"
+                    and record.get("level") == "error"):
+                return "rust-matrix-failed"
     return ""
 
 
@@ -514,7 +530,7 @@ def _safe_diagnostic_name(value, fallback):
     return fallback
 
 
-def _read_vitest_failure_diagnostics(path, expected_subreason):
+def _read_synthetic_failure_diagnostics(path, expected_subreason):
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
@@ -539,19 +555,19 @@ def _read_vitest_failure_diagnostics(path, expected_subreason):
     if (type(document) is not dict or set(document) != {"schema", "wave_class", "subreason", "logs", "reports"}
             or document["schema"] != 1 or document["wave_class"] != fetch.SOURCE_FREE_WAVE_CLASS
             or document["subreason"] != expected_subreason
-            or type(document["logs"]) is not list or len(document["logs"]) > MAX_VITEST_RAW_LOGS
+            or type(document["logs"]) is not list or len(document["logs"]) > MAX_E2E_RAW_DIAGNOSTIC_LOGS
             or type(document["reports"]) is not list
-            or len(document["reports"]) > MAX_VITEST_REPORT_ENTRIES + 1):
+            or len(document["reports"]) > MAX_E2E_REPORT_ENTRIES + 1):
         return None
     return document
 
 
-def _print_vitest_failure_diagnostics(document):
+def _print_synthetic_failure_diagnostics(document):
     for log in document["logs"]:
         if type(log) is not dict or set(log) != {"name", "lines"}:
             continue
         name = _safe_diagnostic_name(log["name"], "raw-log")
-        if type(log["lines"]) is not list or len(log["lines"]) > MAX_VITEST_RAW_LOG_TAIL_LINES:
+        if type(log["lines"]) is not list or len(log["lines"]) > MAX_E2E_RAW_DIAGNOSTIC_TAIL_LINES:
             continue
         for index, encoded_line in enumerate(log["lines"], 1):
             if type(encoded_line) is not str:
@@ -560,17 +576,17 @@ def _print_vitest_failure_diagnostics(document):
                 raw_line = base64.b64decode(encoded_line, validate=True)
             except (ValueError, binascii.Error):
                 continue
-            if len(raw_line) > MAX_VITEST_RAW_LOG_TAIL_BYTES or _contains_output_canary(raw_line):
+            if len(raw_line) > MAX_E2E_RAW_DIAGNOSTIC_TAIL_BYTES or _contains_output_canary(raw_line):
                 continue
             text = raw_line.decode("utf-8", "replace").rstrip("\r\n")
             hash_marker = chr(35) * 2
             text = text.replace("::", ": :").replace(hash_marker + "[", hash_marker + " [")
             text = "".join(character if ord(character) >= 32 and ord(character) != 127 else " "
                            for character in text)
-            text = text.encode("utf-8")[:MAX_VITEST_RAW_LOG_LINE_BYTES].decode("utf-8", "ignore")
+            text = text.encode("utf-8")[:MAX_E2E_RAW_DIAGNOSTIC_LINE_BYTES].decode("utf-8", "ignore")
             encoded = quote(text, safe="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~:/,=@+!?(){} -")
-            line = "devlane_e2e_vitest_diag=log name=%s line=%d text=%s" % (name, index, encoded)
-            if diagnostic_contract.public_e2e_vitest_diagnostic(line):
+            line = "devlane_e2e_failure_diag=log name=%s line=%d text=%s" % (name, index, encoded)
+            if diagnostic_contract.public_e2e_failure_diagnostic(line):
                 print(line, flush=True)
 
     for index, report in enumerate(document["reports"], 1):
@@ -579,22 +595,22 @@ def _print_vitest_failure_diagnostics(document):
                 or type(report["bytes"]) is not int or not 0 <= report["bytes"] <= 999_999_999_999):
             continue
         name = _safe_diagnostic_name(report["name"], "entry-%02d" % index)
-        line = "devlane_e2e_vitest_diag=report name=%s kind=%s bytes=%d" % (
+        line = "devlane_e2e_failure_diag=report name=%s kind=%s bytes=%d" % (
             name, report["kind"], report["bytes"],
         )
-        if diagnostic_contract.public_e2e_vitest_diagnostic(line):
+        if diagnostic_contract.public_e2e_failure_diagnostic(line):
             print(line, flush=True)
 
 
-def _emit_vitest_failure_diagnostics(path, summary):
-    """Print sanitized tails copied by the supervisor for one source-free unit failure."""
+def _emit_synthetic_failure_diagnostics(path, summary, profile="core-node"):
+    """Print sanitized tails copied by the supervisor for one source-free profile failure."""
     try:
-        subreason = _unit_failure_subreason(summary)
+        subreason = _synthetic_failure_subreason(summary, profile)
         if not subreason:
             return
-        document = _read_vitest_failure_diagnostics(path, subreason)
+        document = _read_synthetic_failure_diagnostics(path, subreason)
         if document is not None:
-            _print_vitest_failure_diagnostics(document)
+            _print_synthetic_failure_diagnostics(document)
     finally:
         try:
             Path(path).unlink()
@@ -1536,7 +1552,9 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
         lifecycle.begin_variant(root)
         _require(not root.exists() and not root.is_symlink(), "runner-root-already-exists")
         root.mkdir(mode=0o700)
-    diagnostic_name = "devlane-vitest-%s-%s-%s.json" % (
+    diagnostic_kind = "vitest" if profile == "core-node" else "rust-matrix"
+    diagnostic_name = "devlane-%s-%s-%s-%s.json" % (
+        diagnostic_kind,
         RUN_ID or "local", scenario["name"], variant,
     )
     diagnostic_path = RUNNER_TEMP / diagnostic_name
@@ -1689,8 +1707,8 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
                 expected = _expected_execute_status(scenario, variant)
                 result = _run(execute, timeout=60 * 40, expected=expected,
                               diagnostic_callsite="supervisor-client:execute",
-                              on_result=(lambda completed: _emit_vitest_failure_diagnostics(
-                                  diagnostic_path, completed.stdout))
+                              on_result=(lambda completed: _emit_synthetic_failure_diagnostics(
+                                  diagnostic_path, completed.stdout, profile))
                               if scenario["name"] in diagnostic_contract.E2E_PROGRESS_SCENARIOS else None)
                 with DIAGNOSTICS.phase("variant-summary-validate"):
                     _require(_summary_has_valid_terminator(result.stdout), "summary-schema-invalid")

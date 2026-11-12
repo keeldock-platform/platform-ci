@@ -377,11 +377,13 @@ def _context_from_file(path):
     return value
 
 
-SYNTHETIC_UNIT_DIAGNOSTIC_REASONS = frozenset(("report-missing", "adapter-failed", "vitest-failed"))
+SYNTHETIC_NODE_UNIT_DIAGNOSTIC_REASONS = frozenset(("report-missing", "adapter-failed", "vitest-failed"))
 
 
-def _synthetic_unit_failure_reason(summary):
+def _synthetic_failure_reason(summary, profile):
     if type(summary) is not bytes or len(summary) > MAX_SUMMARY:
+        return ""
+    if profile not in ("core-node", "core-rust"):
         return ""
     for line in summary.splitlines():
         try:
@@ -390,10 +392,69 @@ def _synthetic_unit_failure_reason(summary):
             continue
         if (type(record) is dict and record.get("kind") == "control"
                 and record.get("stage") == "unit" and record.get("status") == "fail"
-                and record.get("code") == "DEVLANE_FAILURE"
-                and record.get("subreason") in SYNTHETIC_UNIT_DIAGNOSTIC_REASONS):
-            return record["subreason"]
+                and record.get("code") == "DEVLANE_FAILURE"):
+            subreason = record.get("subreason")
+            if (profile == "core-node" and subreason in SYNTHETIC_NODE_UNIT_DIAGNOSTIC_REASONS):
+                return subreason
+            if (profile == "core-rust" and subreason in ("report-missing", "adapter-failed")):
+                return "rust-matrix-" + subreason
+        if profile == "core-rust" and type(record) is dict:
+            if (record.get("kind") == "control" and record.get("status") == "fail"
+                    and record.get("stage") != "semver"):
+                return "rust-matrix-failed"
+            if record.get("kind") == "test" and record.get("stage") == "unit":
+                return "rust-matrix-failed"
+            if (record.get("kind") == "coverage" and record.get("stage") != "semver"
+                    and type(record.get("failed")) is int and record["failed"] > 0):
+                return "rust-matrix-failed"
+            if (record.get("kind") == "diagnostic" and record.get("stage") != "semver"
+                    and record.get("level") == "error"):
+                return "rust-matrix-failed"
     return ""
+
+
+def _synthetic_rust_diagnostic_log_stems(summary):
+    stems = set()
+    if type(summary) is not bytes or len(summary) > MAX_SUMMARY:
+        return stems
+    for line in summary.splitlines():
+        try:
+            record = bundle.strict_json(line, output_filter.MAX_RAW_RECORD_BYTES)
+        except bundle.Refusal:
+            continue
+        if type(record) is not dict:
+            continue
+        if (record.get("kind") == "control" and record.get("status") == "fail"
+                and record.get("stage") != "semver"):
+            stems.add("rust-matrix-adapter")
+            continue
+        if record.get("kind") != "coverage":
+            continue
+        suite = record.get("suite")
+        if (record.get("stage") == "semver" or type(suite) is not str
+                or type(record.get("failed")) is not int or record["failed"] <= 0):
+            continue
+        if re.fullmatch(r"(?:fmt|deny|audit|vet)-(?:root|runtime|fuzz)", suite):
+            stems.add(suite)
+        elif re.fullmatch(r"fuzz-replay-(?:default|all-features)", suite):
+            stems.add("replay-" + suite)
+        elif re.fullmatch(r"(?:root|runtime|fuzz|listener)-(?:default|all-features)", suite):
+            stems.add("compile-" + suite)
+    return stems
+
+
+def _synthetic_rust_adapter_log_requested(summary):
+    if type(summary) is not bytes or len(summary) > MAX_SUMMARY:
+        return False
+    for line in summary.splitlines():
+        try:
+            record = bundle.strict_json(line, output_filter.MAX_RAW_RECORD_BYTES)
+        except bundle.Refusal:
+            continue
+        if (type(record) is dict and record.get("kind") == "control"
+                and record.get("status") == "fail" and record.get("stage") != "semver"):
+            return True
+    return False
 
 
 def _synthetic_diagnostic_log_tail(path):
@@ -458,31 +519,57 @@ def _synthetic_diagnostic_reports(root):
     return result
 
 
-def _capture_source_free_unit_diagnostics(root, destination, owner_uid, wave_class, profile, summary):
+def _capture_source_free_failure_diagnostics(root, destination, owner_uid, wave_class, profile, summary):
     """Copy bounded synthetic-only diagnostics before the private namespace is shredded."""
-    if (wave_class != fetch.SOURCE_FREE_WAVE_CLASS or profile != "core-node"
-            or not _synthetic_unit_failure_reason(summary) or not destination):
+    subreason = _synthetic_failure_reason(summary, profile)
+    if (wave_class != fetch.SOURCE_FREE_WAVE_CLASS or not subreason or not destination):
         return False
     path = Path(destination)
     if (not path.is_absolute()
-            or re.fullmatch(r"devlane-vitest-[A-Za-z0-9_-]{1,128}\.json", path.name) is None):
+            or re.fullmatch(r"devlane-(?:vitest|rust-matrix)-[A-Za-z0-9_-]{1,128}\.json", path.name) is None):
         return False
     logs = []
-    raw_root = Path(root) / "workspace/raw"
-    try:
-        metadata = raw_root.lstat()
-        if stat.S_ISDIR(metadata.st_mode):
-            for log_path in sorted(raw_root.glob("*.log"), key=lambda item: item.name)[:MAX_SYNTHETIC_DIAGNOSTIC_LOGS]:
-                tail = _synthetic_diagnostic_log_tail(log_path)
-                if tail is not None:
-                    logs.append({"name": log_path.name,
-                                 "lines": [base64.b64encode(line).decode("ascii") for line in tail]})
-    except OSError:
-        pass
+    if profile == "core-node":
+        raw_root = Path(root) / "workspace/raw"
+        patterns = ("*.log",)
+        candidates = []
+        try:
+            if stat.S_ISDIR(raw_root.lstat().st_mode):
+                candidates = sorted(
+                    (path for pattern in patterns for path in raw_root.glob(pattern)),
+                    key=lambda item: item.name,
+                )
+        except OSError:
+            pass
+    else:
+        raw_root = Path(root) / "scratch/raw"
+        candidates = []
+        adapter_requested = _synthetic_rust_adapter_log_requested(summary)
+        try:
+            raw_root_available = stat.S_ISDIR(raw_root.lstat().st_mode)
+        except OSError:
+            raw_root_available = False
+        if raw_root_available:
+            preferred_stems = sorted(_synthetic_rust_diagnostic_log_stems(summary))
+            matrix_log_limit = (MAX_SYNTHETIC_DIAGNOSTIC_LOGS - int(adapter_requested)) // 2
+            for stem in preferred_stems[:matrix_log_limit]:
+                candidates.extend((raw_root / (stem + ".stdout"), raw_root / (stem + ".stderr")))
+        adapter_log = Path(root) / "workspace/raw/rust-matrix-adapter.log"
+        if adapter_requested:
+            try:
+                if stat.S_ISDIR(adapter_log.parent.lstat().st_mode):
+                    candidates.insert(0, adapter_log)
+            except OSError:
+                pass
+    for log_path in candidates[:MAX_SYNTHETIC_DIAGNOSTIC_LOGS]:
+        tail = _synthetic_diagnostic_log_tail(log_path)
+        if tail is not None:
+            logs.append({"name": log_path.name,
+                         "lines": [base64.b64encode(line).decode("ascii") for line in tail]})
     document = {
         "schema": 1,
         "wave_class": fetch.SOURCE_FREE_WAVE_CLASS,
-        "subreason": _synthetic_unit_failure_reason(summary),
+        "subreason": subreason,
         "logs": logs,
         "reports": _synthetic_diagnostic_reports(root),
     }
@@ -1517,7 +1604,7 @@ class Service:
         self.mounts = []
 
     def _capture_failure_diagnostics(self):
-        return _capture_source_free_unit_diagnostics(
+        return _capture_source_free_failure_diagnostics(
             self.root, self.failure_diagnostics_file, self.owner_uid,
             self.context.get("wave_class"), self.context.get("profile"), self.summary,
         )
@@ -2067,6 +2154,7 @@ class Service:
             except output_filter.FilterRefusal:
                 filter_failed = True
                 self.summary = _filter_failure_summary()
+            self._capture_failure_diagnostics()
             self.execution_done = True
             status = "pass" if result == 0 and not filter_failed and not _summary_failed(self.summary) else "fail"
             catalogs = {
@@ -3255,6 +3343,12 @@ def _serve(args):
     return result
 
 
+def _source_free_diagnostics_context(context):
+    return (type(context) is dict
+            and context.get("wave_class") == fetch.SOURCE_FREE_WAVE_CLASS
+            and context.get("profile") in ("core-node", "core-rust"))
+
+
 def _start(args):
     if not sys.platform.startswith("linux"):
         _refuse("linux-runner-required")
@@ -3267,7 +3361,7 @@ def _start(args):
     failure_diagnostics_file = ""
     runner_temp_path = None
     if getattr(args, "failure_diagnostics_file", ""):
-        if context.get("wave_class") != fetch.SOURCE_FREE_WAVE_CLASS or context["profile"] != "core-node":
+        if not _source_free_diagnostics_context(context):
             _refuse("source-free-diagnostics-context")
         diagnostic_path = Path(args.failure_diagnostics_file)
         runner_temp = os.environ.get("RUNNER_TEMP", "")
@@ -3277,7 +3371,8 @@ def _start(args):
             parent_metadata = parent.stat()
             if (not diagnostic_path.is_absolute() or parent != runner_temp_path
                     or not stat.S_ISDIR(parent_metadata.st_mode) or parent_metadata.st_uid != os.getuid()
-                    or re.fullmatch(r"devlane-vitest-[A-Za-z0-9_-]{1,128}\.json", diagnostic_path.name) is None
+                    or re.fullmatch(r"devlane-(?:vitest|rust-matrix)-[A-Za-z0-9_-]{1,128}\.json",
+                                    diagnostic_path.name) is None
                     or os.path.lexists(diagnostic_path)):
                 _refuse("source-free-diagnostics-path")
         except OSError:

@@ -649,11 +649,16 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             "text=Error%3A%20spawn%20EPERM"
         )
         report_line = "devlane_e2e_vitest_diag=report name=vitest.json kind=file bytes=2048"
+        rust_log_line = "devlane_e2e_failure_diag=log name=compile-root-default.stdout line=1 text=cargo%20test%20failed"
+        rust_report_line = "devlane_e2e_failure_diag=report name=rust-matrix.jsonl kind=file bytes=128"
         self.assertTrue(diagnostic_contract.public_e2e_vitest_diagnostic(log_line))
         self.assertTrue(diagnostic_contract.public_e2e_vitest_diagnostic(report_line))
+        self.assertTrue(diagnostic_contract.public_e2e_failure_diagnostic(rust_log_line))
+        self.assertTrue(diagnostic_contract.public_e2e_failure_diagnostic(rust_report_line))
         self.assertEqual(acceptance_diagnostics.failure_tail(
-            "production-path-e2e", (log_line + "\n" + report_line + "\n").encode("ascii"),
-        ), [log_line, report_line])
+            "production-path-e2e", (log_line + "\n" + report_line + "\n"
+                                     + rust_log_line + "\n" + rust_report_line + "\n").encode("ascii"),
+        ), [log_line, report_line, rust_log_line, rust_report_line])
         root = Path(__file__).resolve().parents[2]
         synthetic = audit._Grammar(
             root / ".github/workflows/devlane-synthetic.yml", "devlane-synthetic",
@@ -665,6 +670,12 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         ))
         self.assertTrue(synthetic.step_output_ok(
             "Run full source-free production-path acceptance", report_line, counts,
+        ))
+        self.assertTrue(synthetic.step_output_ok(
+            "Run full source-free production-path acceptance", rust_log_line, counts,
+        ))
+        self.assertTrue(synthetic.step_output_ok(
+            "Run full source-free production-path acceptance", rust_report_line, counts,
         ))
         for invalid in (
             log_line.replace("line=120", "line=0120"),
