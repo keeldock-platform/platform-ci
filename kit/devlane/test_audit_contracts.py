@@ -1079,6 +1079,30 @@ class ControlAuditorMutationTests(unittest.TestCase):
                 with self.assertRaises(audit.AuditRefusal):
                     audit.validate_summary_records([changed], "core-node")
 
+    def test_control_audit_final_step_may_still_be_pending_while_the_audit_runs(self):
+        """GitHub reports a later step as pending until the runner reaches it."""
+        cases = (
+            ("refs/heads/main", "pending", None, True), ("refs/heads/main", "queued", None, True),
+            ("refs/heads/main", "completed", "skipped", False), ("refs/heads/main", "completed", "success", False),
+            ("refs/heads/devlane/x", "pending", None, True), ("refs/heads/devlane/x", "queued", None, True),
+            ("refs/heads/devlane/x", "completed", "skipped", True),
+            ("refs/heads/devlane/x", "completed", "success", False),
+            ("refs/heads/devlane/x", "in_progress", None, False), ("refs/heads/devlane/x", "pending", "skipped", False),
+        )
+        for ref, status, conclusion, accepted in cases:
+            with self.subTest(ref=ref, status=status, conclusion=conclusion):
+                identity = dict(self.identity, ref=ref)
+                jobs = _control_jobs()
+                audit_job = next(job for job in jobs if job["name"] == control_audit.RUN_JOB)
+                final = [step for step in audit_job["steps"]
+                         if step["name"] == control_audit.CONTROL_AUDIT_FINAL_STEPS[2]][0]
+                final.update({"status": status, "conclusion": conclusion})
+                if accepted:
+                    self.assertEqual(len(control_audit.validate_jobs(jobs, identity)), 18)
+                else:
+                    with self.assertRaises(control_audit.ControlAuditRefusal):
+                        control_audit.validate_jobs(jobs, identity)
+
     def test_control_graph_mutations_are_rejected(self):
         jobs = _control_jobs()
         with self.assertRaises(control_audit.ControlAuditRefusal):

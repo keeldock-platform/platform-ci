@@ -215,10 +215,12 @@ def validate_jobs(jobs, identity):
                     or steps[0].get("status") != "completed" or steps[0].get("conclusion") != "success"
                     or steps[1].get("status") != "in_progress" or steps[1].get("conclusion") is not None):
                 _refuse()
+            not_reached = steps[2].get("status") in ("pending", "queued") and steps[2].get("conclusion") is None
             if identity["ref"] == "refs/heads/main":
-                if steps[2].get("status") != "queued" or steps[2].get("conclusion") is not None:
+                if not not_reached:
                     _refuse()
-            elif steps[2].get("status") != "completed" or steps[2].get("conclusion") != "skipped":
+            elif not (not_reached or (steps[2].get("status") == "completed"
+                                      and steps[2].get("conclusion") == "skipped")):
                 _refuse()
         elif (name == SYNTHETIC_JOB and job.get("status") == "completed"
               and job.get("conclusion") == "failure"):
