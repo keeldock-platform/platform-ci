@@ -27,7 +27,7 @@ NPM_VERSION = "11.19.1"
 DEFAULT_REHEARSAL_PROFILE = "core-node"
 RUST_TOOLCHAIN = "1.99.1"
 REHEARSAL_TEST = {"synthetic canary suite accepted test": "case_0001"}
-REHEARSAL_FILE = {"src/example.ts": "file_0001"}
+REHEARSAL_FILE = {"packages/kernel-ui-kit/src/example.ts": "file_0001"}
 DECIMAL = re.compile(r"[1-9][0-9]{0,18}\Z")
 
 

@@ -188,6 +188,11 @@ _E2E_REFUSAL = re.compile(
     r"(?: reason=([a-z0-9-]{1,48})(?: version=\"([A-Za-z0-9._+-][A-Za-z0-9 ._+-]{0,31})\")?)?"
     r"(?: cleanup=(unconfirmed))?\Z"
 )
+_E2E_RUNTIME_ERROR = re.compile(
+    r"devlane_production_e2e=refused stage=variant-execute exception=runtime-error "
+    r"class=RuntimeError frame=([A-Za-z0-9_-]{1,48}\.py):([1-9][0-9]{0,7}):"
+    r"([A-Za-z_][A-Za-z0-9_]{0,63})\Z"
+)
 TOOLING_REFUSAL_CODES = frozenset((
     "deadline-file-required", "tool-download-failed", "tool-archive-size",
     "tool-digest-mismatch", "tool-archive-members", "tool-archive-path",
@@ -290,6 +295,13 @@ def public_preparation_diagnostic(line):
     elif version is not None:
         return False
     return cleanup is None or cleanup == "unconfirmed"
+
+
+def public_e2e_runtime_diagnostic(line):
+    """Accept the fixed, source-free RuntimeError frame used for execute debugging."""
+    if type(line) is not str or len(line.encode("ascii", "ignore")) > MAX_PUBLIC_DIAGNOSTIC_BYTES:
+        return False
+    return _E2E_RUNTIME_ERROR.fullmatch(line) is not None
 
 
 _E2E_PROGRESS_LINE = re.compile(r"devlane_e2e_progress=(phase|scenario)=([a-z0-9-]{1,64})\Z")

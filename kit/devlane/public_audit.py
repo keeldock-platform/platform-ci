@@ -372,7 +372,8 @@ class _Grammar:
                     return True
                 if line.startswith("devlane_acceptance_detail "):
                     return False
-            return diagnostic_contract.public_preparation_diagnostic(line)
+            return (diagnostic_contract.public_preparation_diagnostic(line)
+                    or diagnostic_contract.public_e2e_runtime_diagnostic(line))
         if step_name == "Fetch ciphertext and sanitized dependency projection":
             if GITHUB_ASSET_LINE.fullmatch(line) or line == "fetch_projection_valid=true":
                 return True

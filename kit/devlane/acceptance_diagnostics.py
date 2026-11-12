@@ -80,7 +80,8 @@ def failure_tail(stage, payload, *, earlier_bytes_omitted=False):
         lines = ["<empty output>"]
     for index, line in enumerate(lines, start=1):
         if (stage == "production-path-e2e"
-                and diagnostic_contract.public_preparation_diagnostic(line)):
+                and (diagnostic_contract.public_preparation_diagnostic(line)
+                     or diagnostic_contract.public_e2e_runtime_diagnostic(line))):
             output.append(line)
         else:
             output.append(_format_line(stage, index, _safe_text(line)))

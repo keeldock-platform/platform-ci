@@ -152,7 +152,7 @@ class RehearsalBuilderTests(unittest.TestCase):
             with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as opened:
                 names = set(opened.getnames())
             self.assertIn(".devlane/manifest.json", names)
-            self.assertIn("src/example.ts", names)
+            self.assertIn("packages/kernel-ui-kit/src/example.ts", names)
             self.assertNotIn(".git", " ".join(names))
 
             rehearsal.build_staged(owner)
@@ -348,6 +348,70 @@ class ProcedureDocumentTests(unittest.TestCase):
                         synthetic_names.index("Run full source-free production-path acceptance"))
 
 
+class ProductionExecuteFixtureTests(unittest.TestCase):
+    root = Path(__file__).resolve().parents[2]
+    profiles = bundle.strict_json((root / "ci/devlane-profiles.json").read_bytes())
+
+    def _assert_node_profile_targets(self, files):
+        profile = self.profiles["profiles"]["core-node"]
+        for command in profile["commands"]:
+            self.assertEqual(command[0:2], ["npm", "--prefix"])
+            package_directory = Path(command[2]).relative_to("/workspace/source")
+            package_path = (package_directory / "package.json").as_posix()
+            self.assertIn(package_path, files)
+            package = bundle.strict_json(files[package_path])
+            scripts = package.get("scripts", {})
+            script = "test" if command[3] == "test" else command[4]
+            self.assertIn(script, scripts, (package_path, command))
+            if command[3] == "test" and scripts[script].startswith("node "):
+                runner = (package_directory / scripts[script].split()[1]).as_posix()
+                self.assertIn(runner, files)
+        self.assertIn("packages/kernel-ui-kit/src/example.ts", files)
+
+    def test_node_execute_fixtures_match_every_profile_package_and_allowed_source_path(self):
+        synthetic_lock = test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
+        real_lock = test_e2e._node_lock_from_reviewed(
+            {"typescript": "6.0.3", "vite": "8.3.5", "vitest": "5.0.5"},
+        )
+        browser_lock = {"packages": {"": {"devDependencies": {"@playwright/test": "1.54.2"}}}}
+        fixtures = (
+            test_e2e._node_source(synthetic_lock),
+            test_e2e._real_node_source(real_lock),
+            test_e2e._browser_source(browser_lock),
+        )
+        for files in fixtures:
+            with self.subTest(files=sorted(files)):
+                self._assert_node_profile_targets(files)
+                self.assertTrue({"packages/kernel-ui-kit/src/example.ts"}.issubset(files))
+
+        browser = fixtures[-1]
+        browser_command = self.profiles["profiles"]["core-node"]["browser_command"]
+        config_argument = next(item for item in browser_command if item.startswith("--config="))
+        config_path = Path(config_argument.partition("=")[2]).relative_to("/workspace/source").as_posix()
+        self.assertIn(config_path, browser)
+        self.assertIn("packages/kernel-ui-kit/browser/frame.spec.mjs", browser)
+        self.assertNotIn("packages/kernel-ui-kit/browser/frame.spec.ts", browser)
+
+        scenarios = test_e2e.scenarios()
+        for scenario in scenarios:
+            source = scenario["files"]()
+            self.assertTrue(set(scenario["allowed_files"]).issubset(source))
+
+    def test_rust_execute_fixture_matches_the_fixed_matrix_paths_and_supervised_runner(self):
+        matrix = test_e2e.rust_matrix_runner.EXPECTED_MATRIX
+        self.assertEqual(self.profiles["profiles"]["core-rust"]["rust_matrix"], matrix)
+        fixture_root = self.root / "kit/devlane/fixtures/core-rust-rehearsal"
+        for row in [*matrix["workspaces"], matrix["listener"]]:
+            manifest = Path(row["manifest"]).relative_to("/workspace/source")
+            lockfile = Path(row["lock"]).relative_to("/workspace/source")
+            self.assertTrue((fixture_root / manifest).is_file(), str(manifest))
+            self.assertTrue((fixture_root / lockfile).is_file(), str(lockfile))
+
+        execute = test_e2e.supervisor.Service._execute.__code__.co_consts
+        self.assertIn("/control/devlane/rust_matrix_runner.py", execute)
+        self.assertIn("/scratch/reports/rust-matrix.jsonl", execute)
+
+
 def bundle_request_digest(owner):
     return json.loads((owner / "bundle-request.json").read_text(encoding="utf-8"))["fetch_sha256"]
 
@@ -420,6 +484,33 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
                 raise NameError("private-canary-must-not-be-rendered")
         self.assertEqual(state.refusal_line(NameError()),
                          "devlane_production_e2e=refused stage=fixture-load exception=name-error")
+
+    def test_variant_execute_runtime_error_reports_only_its_innermost_devlane_frame(self):
+        state = test_e2e._DiagnosticState()
+
+        def throw_runtime_error():
+            raise RuntimeError("private /runner/source KEYCANARY-73A10X")
+
+        try:
+            with state.phase("variant-execute"):
+                throw_runtime_error()
+        except RuntimeError as error:
+            line = state.refusal_line(error)
+        self.assertRegex(
+            line,
+            r"^devlane_production_e2e=refused stage=variant-execute exception=runtime-error "
+            r"class=RuntimeError frame=test_rehearsal\.py:[1-9][0-9]*:throw_runtime_error$",
+        )
+        for private in ("/runner", "/source", "KEYCANARY-73A10X", "private"):
+            self.assertNotIn(private, line)
+        self.assertTrue(test_e2e.diagnostic_contract.public_e2e_runtime_diagnostic(line))
+
+        outside_frame = test_e2e._DiagnosticState()
+        error = RuntimeError("detail")
+        outside_frame.capture("variant-execute", error)
+        self.assertIsNone(outside_frame.runtime_frame)
+        self.assertEqual(outside_frame.refusal_line(error),
+                         "devlane_production_e2e=refused stage=variant-execute exception=runtime-error")
 
     def test_tooling_refusal_reports_allowlisted_reason_and_sanitized_version_probe(self):
         state = test_e2e._DiagnosticState()

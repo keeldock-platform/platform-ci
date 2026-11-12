@@ -567,6 +567,36 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             "Prepare dependencies before the cut", "devlane_e2e_progress=phase=fixture-load", {},
         ))
 
+    def test_variant_execute_runtime_frame_uses_a_fixed_audited_grammar(self):
+        line = ("devlane_production_e2e=refused stage=variant-execute exception=runtime-error "
+                "class=RuntimeError frame=supervisor.py:1824:_execute")
+        self.assertTrue(diagnostic_contract.public_e2e_runtime_diagnostic(line))
+        self.assertFalse(diagnostic_contract.public_preparation_diagnostic(line))
+        details = acceptance_diagnostics.failure_tail("production-path-e2e", (line + "\n").encode("ascii"))
+        self.assertEqual(details, [line])
+
+        root = Path(__file__).resolve().parents[2]
+        grammar = audit._Grammar(
+            root / ".github/workflows/devlane-synthetic.yml", "devlane-synthetic",
+            {"run_id": "12345", "control_sha": SHA}, "synthetic",
+        )
+        self.assertTrue(grammar.step_output_ok(
+            "Run full source-free production-path acceptance", line, {},
+        ))
+        for invalid in (
+            line.replace("supervisor.py", "/private/supervisor.py"),
+            line.replace("supervisor.py", "../supervisor.py"),
+            line.replace("runtime-error", "type-error"),
+            line.replace("variant-execute", "variant-decrypt"),
+            line.replace(":1824:", ":0:"),
+            line + " KEYCANARY-73A10X",
+        ):
+            with self.subTest(line=invalid):
+                self.assertFalse(diagnostic_contract.public_e2e_runtime_diagnostic(invalid))
+                self.assertFalse(grammar.step_output_ok(
+                    "Run full source-free production-path acceptance", invalid, {},
+                ))
+
     def test_cleanup_incomplete_diagnostic_requires_a_fixed_subreason(self):
         for reason in diagnostic_contract.CLEANUP_SUBREASONS:
             line = ("devlane_production_e2e=refused stage=prepare-cleanup "

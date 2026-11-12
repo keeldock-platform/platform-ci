@@ -59,6 +59,7 @@ import supervisor
 
 
 ROOT = Path(__file__).resolve().parents[2]
+DEVLANE_ROOT = (ROOT / "kit/devlane").resolve()
 RUNNER_TEMP = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir())).resolve()
 DEADLINE_FILE = ""
 DIAGNOSTIC_FILE = ""
@@ -84,6 +85,29 @@ PROGRESS_ENABLED = False
 def _progress(line):
     if PROGRESS_ENABLED:
         print("devlane_e2e_progress=" + line, flush=True)
+
+
+def _innermost_devlane_frame(error):
+    """Return only the innermost trusted frame as basename, line, and function."""
+    frames = []
+    current = error.__traceback__
+    while current is not None:
+        frame = current.tb_frame
+        try:
+            relative = Path(frame.f_code.co_filename).resolve().relative_to(DEVLANE_ROOT)
+        except (OSError, RuntimeError, ValueError):
+            current = current.tb_next
+            continue
+        basename = relative.name
+        function = frame.f_code.co_name
+        line = current.tb_lineno
+        if (re.fullmatch(r"[A-Za-z0-9_-]{1,48}\.py", basename)
+                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", function)
+                and type(line) is int and line > 0):
+            frames.append((basename, line, function))
+        current = current.tb_next
+    return frames[-1] if frames else None
+
 
 _EXCEPTION_CATEGORIES = {
     AssertionError: "assertion-error",
@@ -183,6 +207,7 @@ class _DiagnosticState:
         self.tooling_reason = ""
         self.tooling_version = ""
         self.cleanup_reason = ""
+        self.runtime_frame = None
 
     def reset(self):
         self.first_failure = None
@@ -190,6 +215,7 @@ class _DiagnosticState:
         self.tooling_reason = ""
         self.tooling_version = ""
         self.cleanup_reason = ""
+        self.runtime_frame = None
 
     def capture(self, phase, error):
         cleanup_reason = getattr(error, "cleanup_reason", "")
@@ -213,6 +239,8 @@ class _DiagnosticState:
                     )
                     if self.tooling_reason == "tool-version-mismatch":
                         self.tooling_version = _public_tool_version_line(error.version_output)
+                if phase == "variant-execute" and type(error) is RuntimeError:
+                    self.runtime_frame = _innermost_devlane_frame(error)
             self.first_failure = (phase, category)
 
     @contextmanager
@@ -232,7 +260,11 @@ class _DiagnosticState:
             self.capture("harness-startup", error)
         phase, category = self.first_failure
         line = "devlane_production_e2e=refused stage=" + phase + " exception=" + category
-        if category == "tooling-refusal":
+        if phase == "variant-execute" and category == "runtime-error" and self.runtime_frame is not None:
+            basename, line_number, function = self.runtime_frame
+            line += (" class=RuntimeError frame=" + basename + ":" + str(line_number)
+                     + ":" + function)
+        elif category == "tooling-refusal":
             reason = self.tooling_reason or "tooling-refusal-unlisted"
             line += " reason=" + reason
             if reason == "tool-version-mismatch" and self.tooling_version:
@@ -336,7 +368,8 @@ def _read_reportable_diagnostic_file(path):
         line = payload[:-1].decode("ascii", "strict")
     except UnicodeDecodeError:
         return None
-    return line if diagnostic_contract.public_preparation_diagnostic(line) else None
+    return line if (diagnostic_contract.public_preparation_diagnostic(line)
+                    or diagnostic_contract.public_e2e_runtime_diagnostic(line)) else None
 
 
 def _require(condition, code):
@@ -766,7 +799,17 @@ def _node_source(lock, *, failing_test=False, hang=False, package_name="typescri
     package = {
         "name": "synthetic-private-canary", "version": "0.0.0", "private": True,
         "type": "module", "devDependencies": {package_name: version},
-        "scripts": {"typecheck": "node -e \"process.exit(0)\"", "test": "node tests/write-report.mjs"},
+    }
+    ui_package = {
+        "name": "@keeldock/kernel-ui-kit-fixture", "version": "0.0.0", "private": True,
+        "type": "module", "scripts": {
+            "typecheck": "node -e \"process.exit(0)\"",
+            "test": "node tests/write-report.mjs",
+        },
+    }
+    tokens_package = {
+        "name": "@keeldock/kernel-tokens-fixture", "version": "0.0.0", "private": True,
+        "type": "module", "scripts": {"check:generated": "node -e \"process.exit(0)\""},
     }
     tsconfig = {"compilerOptions": {"strict": True, "noEmit": True, "target": "ES2020", "module": "ESNext",
                                     "moduleResolution": "bundler", "skipLibCheck": True}}
@@ -790,8 +833,10 @@ spawn(process.execPath, ['-e', 'setTimeout(() => {}, 900000) /* __BACKGROUND_MAR
         "package.json": bundle.canonical_json(package) + b"\n",
         "package-lock.json": bundle.canonical_json(lock) + b"\n",
         "tsconfig.json": bundle.canonical_json(tsconfig) + b"\n",
-        "src/example.ts": source.encode("ascii"),
-        "tests/write-report.mjs": script.encode("ascii"),
+        "packages/kernel-ui-kit/package.json": bundle.canonical_json(ui_package) + b"\n",
+        "packages/kernel-tokens/package.json": bundle.canonical_json(tokens_package) + b"\n",
+        "packages/kernel-ui-kit/src/example.ts": source.encode("ascii"),
+        "packages/kernel-ui-kit/tests/write-report.mjs": script.encode("ascii"),
     }
 
 
@@ -800,7 +845,17 @@ def _real_node_source(lock):
     package = {
         "name": "synthetic-private-canary", "version": "0.0.0", "private": True, "type": "module",
         "devDependencies": dev,
-        "scripts": {"typecheck": "tsc --noEmit -p tsconfig.json", "test": "vitest"},
+    }
+    ui_package = {
+        "name": "@keeldock/kernel-ui-kit-fixture", "version": "0.0.0", "private": True,
+        "type": "module", "scripts": {
+            "typecheck": "tsc --noEmit -p /workspace/source/tsconfig.json",
+            "test": "vitest",
+        },
+    }
+    tokens_package = {
+        "name": "@keeldock/kernel-tokens-fixture", "version": "0.0.0", "private": True,
+        "type": "module", "scripts": {"check:generated": "node -e \"process.exit(0)\""},
     }
     tsconfig = {"compilerOptions": {"strict": True, "noEmit": True, "target": "ES2022", "module": "ESNext",
                                     "moduleResolution": "bundler", "skipLibCheck": True}}
@@ -819,8 +874,10 @@ def _real_node_source(lock):
         "package.json": bundle.canonical_json(package) + b"\n",
         "package-lock.json": bundle.canonical_json(lock) + b"\n",
         "tsconfig.json": bundle.canonical_json(tsconfig) + b"\n",
-        "src/example.ts": source.encode("ascii"),
-        "tests/example.test.ts": tests.encode("ascii"),
+        "packages/kernel-ui-kit/package.json": bundle.canonical_json(ui_package) + b"\n",
+        "packages/kernel-tokens/package.json": bundle.canonical_json(tokens_package) + b"\n",
+        "packages/kernel-ui-kit/src/example.ts": source.encode("ascii"),
+        "packages/kernel-ui-kit/tests/example.test.ts": tests.encode("ascii"),
     }
 
 
@@ -828,10 +885,19 @@ def _browser_source(lock):
     package = {
         "name": "synthetic-private-canary", "version": "0.0.0", "private": True, "type": "module",
         "devDependencies": lock["packages"][""]["devDependencies"],
-        "scripts": {"typecheck": "node -e \"process.exit(0)\"", "test": "node tests/write-report.mjs"},
     }
-    config = ("import { defineConfig } from '@playwright/test';\n"
-              "export default defineConfig({ testDir: './browser', reporter: 'json', workers: 1 });\n")
+    ui_package = {
+        "name": "@keeldock/kernel-ui-kit-fixture", "version": "0.0.0", "private": True,
+        "type": "module", "scripts": {
+            "typecheck": "node -e \"process.exit(0)\"",
+            "test": "node tests/write-report.mjs",
+        },
+    }
+    tokens_package = {
+        "name": "@keeldock/kernel-tokens-fixture", "version": "0.0.0", "private": True,
+        "type": "module", "scripts": {"check:generated": "node -e \"process.exit(0)\""},
+    }
+    config = "export default { testDir: '.', reporter: 'json', workers: 1 };\n"
     spec = (
         "import { test, expect } from '@playwright/test';\n"
         "test('browser frame accepted', async ({ page }) => {\n"
@@ -851,10 +917,12 @@ def _browser_source(lock):
         "tsconfig.json": bundle.canonical_json({"compilerOptions": {"noEmit": True, "skipLibCheck": True,
                                                                      "target": "ES2022", "module": "ESNext",
                                                                      "moduleResolution": "bundler"}}) + b"\n",
-        "src/example.ts": ("export const planted = '" + SOURCE_CANARY + "';\n").encode("ascii"),
-        "playwright.config.ts": config.encode("ascii"),
-        "browser/frame.spec.ts": spec.encode("ascii"),
-        "tests/write-report.mjs": report.encode("ascii"),
+        "packages/kernel-ui-kit/package.json": bundle.canonical_json(ui_package) + b"\n",
+        "packages/kernel-tokens/package.json": bundle.canonical_json(tokens_package) + b"\n",
+        "packages/kernel-ui-kit/src/example.ts": ("export const planted = '" + SOURCE_CANARY + "';\n").encode("ascii"),
+        "packages/kernel-ui-kit/browser/playwright.config.ts": config.encode("ascii"),
+        "packages/kernel-ui-kit/browser/frame.spec.mjs": spec.encode("ascii"),
+        "packages/kernel-ui-kit/tests/write-report.mjs": report.encode("ascii"),
     }
 
 
@@ -909,7 +977,7 @@ def scenarios():
     result.append({
         "name": "synthetic-node", "profile": "core-node", "projection": projection, "payload": payload,
         "files": lambda **kw: _node_source(node_lock, **kw),
-        "allowed_files": {"src/example.ts": "file_0001"},
+        "allowed_files": {"packages/kernel-ui-kit/src/example.ts": "file_0001"},
         "allowed_tests": {"synthetic canary suite accepted test": "case_0001"}, "frames": {},
         "variants": ("startup-refusal", "accept", "wrong-key", "failing-test", "cancel"),
     })
@@ -918,7 +986,7 @@ def scenarios():
     result.append({
         "name": "real-node", "profile": "core-node", "projection": projection, "payload": payload,
         "files": lambda **kw: _real_node_source(real_lock),
-        "allowed_files": {"src/example.ts": "file_0001"},
+        "allowed_files": {"packages/kernel-ui-kit/src/example.ts": "file_0001"},
         "allowed_tests": {"real vitest accepted test": "case_0001", "real vitest failing test": "case_0002"},
         "frames": {}, "variants": ("accept-with-failure",),
     })
@@ -954,7 +1022,7 @@ def late_scenarios():
     result.append({
         "name": "install-script-canary", "profile": "core-node", "projection": projection, "payload": payload,
         "files": lambda **kw: _node_source(canary_lock, package_name=INSTALL_SCRIPT_PACKAGE, **kw),
-        "allowed_files": {"src/example.ts": "file_0001"},
+        "allowed_files": {"packages/kernel-ui-kit/src/example.ts": "file_0001"},
         "allowed_tests": {"synthetic canary suite accepted test": "case_0001"}, "frames": {},
         "variants": ("accept",), "after_prepare": _install_script_canary_check,
     })
@@ -965,7 +1033,7 @@ def late_scenarios():
     result.append({
         "name": "real-browser", "profile": "core-node", "projection": projection, "payload": payload,
         "files": lambda **kw: _browser_source(browser_lock),
-        "allowed_files": {"src/example.ts": "file_0001"},
+        "allowed_files": {"packages/kernel-ui-kit/src/example.ts": "file_0001"},
         "allowed_tests": {"browser lane unit placeholder": "case_0001"},
         "frames": {"browser frame accepted": "frame_0001"}, "variants": ("accept",),
     })
