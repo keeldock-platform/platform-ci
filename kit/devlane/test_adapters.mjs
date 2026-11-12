@@ -4,10 +4,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { parseStrictJson } from './safe_json.mjs';
 import { compileForTest, runTypeScriptReporter } from './typescript_reporter.mjs';
 
 const idPattern = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const BROWSER_SMOKE_TIMEOUT_MS = 20000;
+const BROWSER_SMOKE_STDERR_BYTES = 8192;
 
 function fixedFailure(stage) {
   return [{ kind: 'control', stage, status: 'fail', code: 'DEVLANE_FAILURE' }];
@@ -95,7 +98,48 @@ function normalizePlaywright(report, expectedFrames) {
 
 export { normalizePlaywright, normalizeVitest };
 
+function runBrowserSmoke(executable, spawn = spawnSync) {
+  if (typeof executable !== 'string' || !path.posix.isAbsolute(executable) || executable.includes('\0')) {
+    return { code: 125, output: 'browser_smoke_exit=unavailable\n' };
+  }
+  const args = [
+    '--no-sandbox', '--no-zygote', '--enable-logging=stderr', '--v=1',
+    '--headless', '--dump-dom', 'about:blank',
+  ];
+  let result;
+  try {
+    result = spawn(executable, args, {
+      timeout: BROWSER_SMOKE_TIMEOUT_MS,
+      maxBuffer: 524288,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'buffer',
+    });
+  } catch {
+    return { code: 125, output: 'browser_smoke_exit=spawn-error\n' };
+  }
+  const timedOut = result?.error?.code === 'ETIMEDOUT';
+  const code = timedOut ? 124 : Number.isInteger(result?.status) ? result.status : 125;
+  const label = timedOut ? 'timeout' : Number.isInteger(result?.status) ? String(result.status) : 'signal';
+  let output = `browser_smoke_exit=${label}\n`;
+  if (code !== 0) {
+    const stderr = Buffer.isBuffer(result?.stderr) ? result.stderr
+      : Buffer.from(typeof result?.stderr === 'string' ? result.stderr : '');
+    const tail = stderr.subarray(Math.max(0, stderr.length - BROWSER_SMOKE_STDERR_BYTES));
+    const errorCode = result?.error?.code;
+    if (typeof errorCode === 'string' && /^[A-Z0-9_]{1,32}$/.test(errorCode)) {
+      output += `browser_smoke_error=${errorCode}\n`;
+    }
+    if (tail.length > 0) output += `browser_smoke_stderr_begin\n${tail.toString('utf8')}\n`;
+  }
+  return { code: code === 0 ? 0 : code === 124 ? 124 : 1, output };
+}
+
 async function main(argv) {
+  if (argv.length === 2 && argv[0] === 'browser-smoke') {
+    const result = runBrowserSmoke(argv[1]);
+    process.stdout.write(result.output);
+    return result.code;
+  }
   if (argv.length !== 3 || !['vitest', 'playwright'].includes(argv[0])) return 2;
   try {
     const report = parseReport(argv[1]);
@@ -173,6 +217,25 @@ if (process.env.NODE_TEST_CONTEXT) {
     assert.deepEqual(result, [{ kind: 'frame', frame: 'frame_0012', status: 'fail' }]);
     assert.equal(JSON.stringify(result).includes('SYNTHETIC_SECRET_CANARY'), false);
   });
+  test('browser smoke uses bounded headless Chromium logging and stderr', () => {
+    let observed;
+    const result = runBrowserSmoke('/prepared/ms-playwright/chromium_headless_shell-1248/chrome-linux/headless_shell',
+      (executable, args, options) => {
+        observed = { executable, args, options };
+        return { status: 1, stderr: Buffer.alloc(BROWSER_SMOKE_STDERR_BYTES + 100, 120) };
+      });
+    assert.equal(result.code, 1);
+    assert.equal(observed.executable,
+      '/prepared/ms-playwright/chromium_headless_shell-1248/chrome-linux/headless_shell');
+    assert.deepEqual(observed.args, [
+      '--no-sandbox', '--no-zygote', '--enable-logging=stderr', '--v=1',
+      '--headless', '--dump-dom', 'about:blank',
+    ]);
+    assert.equal(observed.options.timeout, BROWSER_SMOKE_TIMEOUT_MS);
+    assert.equal(Buffer.byteLength(result.output.split('browser_smoke_stderr_begin\n')[1].split('\n')[0]),
+      BROWSER_SMOKE_STDERR_BYTES);
+    assert.match(result.output, /^browser_smoke_exit=1\n/);
+  });
   test('TypeScript reporter converts tsconfig enum strings and reads only source plus trusted default libraries', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devlane-ts-'));
     const library = fs.mkdtempSync(path.join(os.tmpdir(), 'devlane-ts-lib-'));
@@ -224,3 +287,4 @@ if (process.env.NODE_TEST_CONTEXT) {
 
 if (!isMainThread) process.exitCode = 2;
 else if (['vitest', 'playwright'].includes(process.argv[2])) process.exitCode = await main(process.argv.slice(2));
+else if (process.argv[2] === 'browser-smoke') process.exitCode = await main(process.argv.slice(2));

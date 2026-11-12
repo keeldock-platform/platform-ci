@@ -50,6 +50,13 @@ MAX_SYNTHETIC_DIAGNOSTIC_LINE_BYTES = 128
 MAX_SYNTHETIC_BROWSER_DIAGNOSTIC_LINE_BYTES = 1024
 MAX_SYNTHETIC_DIAGNOSTIC_REPORTS = 64
 MAX_SYNTHETIC_DIAGNOSTIC_FILE_BYTES = 4 * 1024 * 1024
+MAX_BROWSER_CGROUP_VALUE_BYTES = 1024
+MAX_BROWSER_FAILURE_DIAGNOSTIC_BYTES = 8 * 1024
+CHROMIUM_RENDERER_FAILURE = re.compile(
+    rb"(?:renderer|render) process.{0,160}(?:exit|crash|gone|signal|terminat|kill)|"
+    rb"(?:exit|crash|gone|signal|terminat|kill).{0,160}(?:renderer|render) process",
+    re.IGNORECASE,
+)
 SOCKET_NAME = "control.sock"
 READY_NAME = "ready.json"
 PID_NAME = "host-pid"
@@ -833,7 +840,7 @@ def _mount_minimal_root(root, workspace, prepared, control_root):
     _mount_bind(control_root / "kit/devlane", root / "control/devlane", readonly=True)
     (root / "control/profiles.json").write_text("{}", encoding="ascii")
     _mount_bind(control_root / "ci/devlane-profiles.json", root / "control/profiles.json", readonly=True)
-    _mount_fs(["mount", "-t", "proc", "-o", "ro,hidepid=2,subset=pid", "proc", str(root / "proc")],
+    _mount_fs(["mount", "-t", "proc", "-o", "ro,hidepid=2", "proc", str(root / "proc")],
               root / "proc")
     _mount_fs(["mount", "-t", "sysfs", "-o", "ro,nosuid,nodev,noexec", "sysfs", str(root / "sys")],
               root / "sys")
@@ -1113,6 +1120,146 @@ def _run_control_adapter(root, command, stage, tools, log_name, timeout=60, dead
     if target.stat().st_size > 1024 * 1024:
         return 125
     return code
+
+
+def _browser_smoke_command(root):
+    browser_root = Path(root) / "prepared/ms-playwright"
+    candidates = []
+    try:
+        directories = sorted(browser_root.iterdir(), key=lambda item: item.name)
+    except OSError:
+        return None
+    for directory in directories:
+        if (re.fullmatch(r"chromium_headless_shell-[0-9]+", directory.name) is None
+                or directory.is_symlink() or not directory.is_dir()):
+            continue
+        for relative in (
+            "chrome-linux/headless_shell",
+            "chrome-linux64/headless_shell",
+            "chrome-headless-shell-linux64/chrome-headless-shell",
+        ):
+            executable = directory / relative
+            try:
+                metadata = executable.lstat()
+            except OSError:
+                continue
+            if stat.S_ISREG(metadata.st_mode) and metadata.st_mode & 0o111:
+                guest_path = "/prepared/ms-playwright/" + directory.name + "/" + relative
+                candidates.append(guest_path)
+    if len(candidates) != 1:
+        return None
+    return ["node", "/control/devlane/test_adapters.mjs", "browser-smoke", candidates[0]]
+
+
+def _run_browser_smoke(root, tools, deadline=None):
+    command = _browser_smoke_command(root)
+    target = Path(root) / "workspace/raw/browser-smoke.log"
+    if command is None:
+        try:
+            descriptor = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                 | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(b"browser_smoke=unavailable\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.chmod(target, 0o444)
+        except OSError:
+            pass
+        return 125
+    return _run_control_adapter(
+        root, command, "browser", tools, "browser-smoke.log", timeout=24,
+        deadline=deadline,
+    )
+
+
+def _read_bounded_diagnostic_file(path, maximum):
+    descriptor = None
+    try:
+        descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                             | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            return None
+        output = bytearray()
+        while True:
+            chunk = os.read(descriptor, min(4096, maximum + 1 - len(output)))
+            if not chunk:
+                return bytes(output)
+            output.extend(chunk)
+            if len(output) > maximum:
+                return None
+    except OSError:
+        return None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _browser_cgroup_diagnostics(cgroup_root=Path("/sys/fs/cgroup"),
+                                membership_file=Path("/proc/self/cgroup")):
+    names = ("memory.max", "memory.swap.max", "pids.max", "memory.events", "pids.events")
+    directory = None
+    try:
+        membership = _read_bounded_diagnostic_file(membership_file, 4096)
+        root = Path(cgroup_root).resolve(strict=True)
+        if membership is not None:
+            for row in membership.decode("ascii", "replace").splitlines():
+                fields = row.split(":", 2)
+                if len(fields) != 3 or fields[0] != "0" or fields[1] != "":
+                    continue
+                relative = fields[2]
+                if not relative.startswith("/"):
+                    break
+                parts = relative[1:].split("/") if relative != "/" else ()
+                if any(part in ("", ".", "..") for part in parts):
+                    break
+                candidate = root.joinpath(*parts).resolve(strict=True)
+                if candidate.is_relative_to(root):
+                    directory = candidate
+                break
+    except (OSError, RuntimeError):
+        directory = None
+    values = []
+    for name in names:
+        payload = _read_bounded_diagnostic_file(directory / name, MAX_BROWSER_CGROUP_VALUE_BYTES) if directory else None
+        value = "unavailable" if payload is None else " ".join(payload.decode("ascii", "replace").split())
+        values.append((name + "=" + value).encode("ascii", "replace"))
+    return values
+
+
+def _write_browser_failure_diagnostics(root):
+    raw = Path(root) / "workspace/raw"
+    output = raw / "browser-diagnostics.log"
+    lines = []
+    for name in ("browser.stderr.log", "browser-smoke.log"):
+        for line in _synthetic_diagnostic_log_tail(raw / name) or ():
+            if CHROMIUM_RENDERER_FAILURE.search(line):
+                lines.append(b"renderer_event=" + line[:MAX_SYNTHETIC_BROWSER_DIAGNOSTIC_LINE_BYTES])
+    lines.extend(b"cgroup_" + line for line in _browser_cgroup_diagnostics())
+    payload = b"\n".join(lines[:32]) + (b"\n" if lines else b"")
+    if len(payload) > MAX_BROWSER_FAILURE_DIAGNOSTIC_BYTES:
+        payload = payload[:MAX_BROWSER_FAILURE_DIAGNOSTIC_BYTES]
+    try:
+        descriptor = os.open(str(output), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                             | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), 0o600)
+        with os.fdopen(descriptor, "wb") as destination:
+            destination.write(payload)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.chmod(output, 0o444)
+    except OSError:
+        pass
+
+
+def _browser_stage_failed(outcomes, records):
+    if any(stage == "browser" and code != 0 for stage, code in outcomes):
+        return True
+    return any(
+        record.get("kind") == "frame" and record.get("status") == "fail"
+        or record.get("kind") == "control" and record.get("stage") == "browser"
+        and record.get("status") == "fail"
+        for record in records if type(record) is dict
+    )
 
 
 def _manifest_allowlists(manifest, profile, source_root):
@@ -2322,10 +2469,9 @@ class Service:
             except deadline_budget.DeadlineRefusal:
                 result = 124
             else:
-                browser_debug = (
-                    stage == "browser"
-                    and self.context.get("wave_class") == fetch.SOURCE_FREE_WAVE_CLASS
-                )
+                if stage == "browser" and self.manifest["frames"]:
+                    _run_browser_smoke(self.root, self.tool_info, deadline=self.deadline_file)
+                browser_debug = stage == "browser"
                 result = _run_profile_command(self.root, command, stage, "/workspace/raw/" + stage + ".log",
                                               self.tool_info, timeout=phase_timeout, deadline=self.deadline_file,
                                               browser_debug=browser_debug)
@@ -2357,6 +2503,8 @@ class Service:
         allowlists = _manifest_allowlists(self.manifest, profile, source_root)
         records = _adapter_records(self.root, profile_name, self.manifest, outcomes, self.tool_info,
                                    adapter_results)
+        if self.manifest["frames"] and _browser_stage_failed(outcomes, records):
+            _write_browser_failure_diagnostics(self.root)
         filter_failed = False
         try:
             self.summary = output_filter.filter_records(records, allowlists, self.manifest["frames"].values())

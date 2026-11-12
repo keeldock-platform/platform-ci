@@ -186,7 +186,8 @@ def _snapshot(*, links=None, routes4=None, probes=None):
 class NetworkProbeTests(unittest.TestCase):
     def test_supervisor_mounts_proc_and_sys_for_worker_read_only(self):
         source = Path(network_probe.__file__).with_name("supervisor.py").read_text(encoding="utf-8")
-        self.assertIn('"ro,hidepid=2,subset=pid"', source)
+        self.assertIn('"ro,hidepid=2"', source)
+        self.assertNotIn("subset=pid", source)
         self.assertIn('"ro,nosuid,nodev,noexec"', source)
         self.assertIn('str(root / "sys")', source)
         self.assertIn('_mount_fs(["mount", "-t", "proc"', source)

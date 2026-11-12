@@ -1148,7 +1148,8 @@ def _browser_source(lock):
     }
     config = ("export default { testDir: '.', reporter: 'json', workers: 1, use: { "
               "screenshot: 'off', video: 'off', trace: 'off', "
-              "launchOptions: { chromiumSandbox: false, args: ['--no-sandbox', '--no-zygote'] } } };\n")
+              "launchOptions: { chromiumSandbox: false, args: ['--no-sandbox', '--no-zygote', "
+              "'--enable-logging=stderr', '--v=1'] } } };\n")
     spec = (
         "import { test, expect } from '@playwright/test';\n"
         "test('browser frame accepted', async ({ page }) => {\n"

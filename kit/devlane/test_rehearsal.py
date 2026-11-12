@@ -404,7 +404,10 @@ class ProductionExecuteFixtureTests(unittest.TestCase):
         self.assertIn("video: 'off'", browser_config)
         self.assertIn("trace: 'off'", browser_config)
         self.assertIn("chromiumSandbox: false", browser_config)
-        self.assertIn("args: ['--no-sandbox', '--no-zygote']", browser_config)
+        self.assertIn(
+            "args: ['--no-sandbox', '--no-zygote', '--enable-logging=stderr', '--v=1']",
+            browser_config,
+        )
         self.assertIn("packages/kernel-ui-kit/browser/frame.spec.mjs", browser)
         self.assertNotIn("packages/kernel-ui-kit/browser/frame.spec.ts", browser)
 

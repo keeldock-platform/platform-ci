@@ -1001,6 +1001,60 @@ class SupervisorOrderAcceptanceTests(unittest.TestCase):
                 self.assertEqual(popen.call_args.kwargs["cwd"], "/")
                 self.assertIn('cd /workspace/source && exec "$@"', popen.call_args.args[0])
 
+    def test_browser_smoke_selects_only_a_prepared_headless_shell(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            browser = Path(temporary) / "prepared/ms-playwright/chromium_headless_shell-1248/chrome-linux/headless_shell"
+            browser.parent.mkdir(parents=True)
+            browser.write_bytes(b"browser")
+            browser.chmod(0o755)
+            self.assertEqual(supervisor._browser_smoke_command(temporary), [
+                "node", "/control/devlane/test_adapters.mjs", "browser-smoke",
+                "/prepared/ms-playwright/chromium_headless_shell-1248/chrome-linux/headless_shell",
+            ])
+            browser.unlink()
+            browser.symlink_to(browser.parent / "missing_shell")
+            self.assertIsNone(supervisor._browser_smoke_command(temporary))
+
+    def test_browser_cgroup_diagnostics_are_bounded_and_reject_membership_traversal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "cgroup"
+            group = root / "worker"
+            group.mkdir(parents=True)
+            membership = Path(temporary) / "membership"
+            membership.write_text("0::/worker\n", encoding="ascii")
+            expected = {
+                "memory.max": "1048576",
+                "memory.swap.max": "0",
+                "pids.max": "128",
+                "memory.events": "low 0\nhigh 0\nmax 2\noom 1\noom_kill 1\n",
+                "pids.events": "max 3\n",
+            }
+            for name, value in expected.items():
+                (group / name).write_text(value, encoding="ascii")
+            lines = supervisor._browser_cgroup_diagnostics(root, membership)
+            self.assertIn(b"memory.max=1048576", lines)
+            self.assertIn(b"memory.events=low 0 high 0 max 2 oom 1 oom_kill 1", lines)
+            self.assertIn(b"pids.events=max 3", lines)
+            membership.write_text("0::/../../outside\n", encoding="ascii")
+            self.assertTrue(all(line.endswith(b"=unavailable") for line in
+                                supervisor._browser_cgroup_diagnostics(root, membership)))
+
+    def test_browser_failure_diagnostics_keep_renderer_events_and_cgroup_counters_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            raw = Path(temporary) / "workspace/raw"
+            raw.mkdir(parents=True)
+            (raw / "browser.stderr.log").write_bytes(
+                b"browser startup\nRenderer process 47 crashed with code 1\n"
+                b"SYNTHETIC_SOURCE_CANARY secret\n"
+            )
+            with patch.object(supervisor, "_browser_cgroup_diagnostics",
+                              return_value=[b"memory.events=oom 1 oom_kill 1", b"pids.events=max 0"]):
+                supervisor._write_browser_failure_diagnostics(temporary)
+            payload = (raw / "browser-diagnostics.log").read_bytes()
+            self.assertIn(b"renderer_event=Renderer process 47 crashed with code 1", payload)
+            self.assertIn(b"cgroup_memory.events=oom 1 oom_kill 1", payload)
+            self.assertNotIn(b"SYNTHETIC_SOURCE_CANARY", payload)
+
     def test_child_timeout_and_cancellation_are_bounded_and_kill_the_process_group(self):
         class Process:
             pid = 401
@@ -1507,7 +1561,8 @@ class PreparationDefectTests(unittest.TestCase):
         self.assertIn('_mount_tmpfs(root / "tmp", "512m", "01777", "nosuid,nodev")', mount_source)
         self.assertIn('_mount_tmpfs(root / "workspace", "4g", "0755", "nosuid,nodev")', mount_source)
         self.assertIn('_mount_tmpfs(root / "scratch", "4g", "0755", "nosuid,nodev")', mount_source)
-        self.assertIn('"proc", str(root / "proc")', mount_source)
+        self.assertIn('"ro,hidepid=2"', mount_source)
+        self.assertNotIn("subset=pid", mount_source)
         self.assertIn('_make_worker_devices(root / "dev")', mount_source)
         self.assertIn('("null", 0o666, 1, 3)', device_source)
         self.assertIn("os.chmod(device, mode)", device_source)
@@ -1537,7 +1592,8 @@ class PreparationDefectTests(unittest.TestCase):
         ))
         execute_source = inspect.getsource(supervisor.Service._execute)
         self.assertIn('stage == "browser"', execute_source)
-        self.assertIn('self.context.get("wave_class") == fetch.SOURCE_FREE_WAVE_CLASS', execute_source)
+        self.assertIn("_run_browser_smoke(self.root, self.tool_info", execute_source)
+        self.assertIn("browser_debug = stage == \"browser\"", execute_source)
 
         host_mount_source = inspect.getsource(supervisor._host_toolchain_mounts)
         self.assertIn('fonts = Path("/etc/fonts")', host_mount_source)
