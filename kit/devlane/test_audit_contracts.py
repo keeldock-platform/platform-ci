@@ -501,6 +501,23 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         self.assertTrue(all(diagnostic_contract.public_e2e_vitest_diagnostic(line)
                             or diagnostic_contract.public_acceptance_detail(line) for line in details))
 
+    def test_production_failure_tail_keeps_only_the_current_scenario_raw_logs(self):
+        previous = "devlane_e2e_failure_diag=log name=unit.log line=1 text=previous-node-output"
+        current = (
+            "devlane_e2e_failure_diag=log name=compile-listener-all-features.stdout "
+            "line=1 text=current-rust-output"
+        )
+        payload = (previous + "\n"
+                   "devlane_e2e_progress=scenario=synthetic-rust-v1-refusal\n"
+                   + current + "\n"
+                   + "ordinary diagnostic\n" * 250).encode("ascii")
+        details = acceptance_diagnostics.failure_tail("production-path-e2e", payload)
+        self.assertIn(current, details)
+        self.assertNotIn(previous, details)
+        self.assertLessEqual(len(details), 202)
+        self.assertTrue(all(diagnostic_contract.public_e2e_vitest_diagnostic(line)
+                            or diagnostic_contract.public_acceptance_detail(line) for line in details))
+
     def test_preparation_refusal_diagnostics_are_allowlisted_and_never_count_as_acceptance(self):
         root = Path(__file__).resolve().parents[2]
         grammar = audit._Grammar(

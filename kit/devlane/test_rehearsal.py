@@ -566,6 +566,30 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
             self.assertNotIn(marker, rendered)
         self.assertFalse(destination.exists())
 
+    def test_node_failure_diagnostics_keep_their_original_log_count_bound(self):
+        summary = (b'{"code":"DEVLANE_FAILURE","kind":"control","stage":"unit",'
+                   b'"status":"fail","subreason":"vitest-failed"}\n')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "workspace/raw"
+            raw.mkdir(parents=True)
+            (root / "scratch/reports").mkdir(parents=True)
+            for index in range(20):
+                (raw / ("unit-%02d.log" % index)).write_text("source-free log\n", encoding="ascii")
+            destination = root / "devlane-vitest-local-synthetic-node-accept.json"
+            service = object.__new__(supervisor.Service)
+            service.root = root
+            service.failure_diagnostics_file = destination
+            service.owner_uid = os.getuid()
+            service.context = {
+                "wave_class": supervisor.fetch.SOURCE_FREE_WAVE_CLASS,
+                "profile": "core-node",
+            }
+            service.summary = summary
+            self.assertTrue(service._capture_failure_diagnostics())
+            document = bundle.strict_json(destination.read_bytes())
+            self.assertEqual(len(document["logs"]), supervisor.MAX_SYNTHETIC_NODE_DIAGNOSTIC_LOGS)
+
     def test_supervisor_devices_keep_worker_writable_modes_under_private_umask(self):
         with tempfile.TemporaryDirectory() as temporary:
             dev = Path(temporary) / "dev"
@@ -692,9 +716,6 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
                    b'"status":"fail","subreason":"vitest-failed"}\n')
         for wave_class, profile, payload in (
                 ("encrypted", "core-node", summary),
-                (supervisor.fetch.SOURCE_FREE_WAVE_CLASS, "core-rust",
-                 b'{"code":"DEVLANE_SEMVER_EXECUTION","kind":"control","stage":"semver",'
-                 b'"status":"fail"}\n'),
                 (supervisor.fetch.SOURCE_FREE_WAVE_CLASS, "core-node",
                  b'{"kind":"control","stage":"unit","status":"fail","subreason":"typecheck-failed"}\n')):
             with self.subTest(wave_class=wave_class, profile=profile), tempfile.TemporaryDirectory() as temporary:
@@ -711,6 +732,29 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
                 self.assertFalse(service._capture_failure_diagnostics())
                 self.assertFalse(destination.exists())
 
+        semver_summary = (b'{"code":"DEVLANE_SEMVER_EXECUTION","kind":"control",'
+                          b'"stage":"semver","status":"fail"}\n')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "workspace/raw").mkdir(parents=True)
+            (root / "workspace/raw/semver-analyzer.log").write_text(
+                "semver current scenario log\n", encoding="ascii",
+            )
+            (root / "scratch/reports").mkdir(parents=True)
+            destination = root / "devlane-rust-matrix-local-synthetic-rust-accept.json"
+            service = object.__new__(supervisor.Service)
+            service.root = root
+            service.failure_diagnostics_file = destination
+            service.owner_uid = os.getuid()
+            service.context = {
+                "wave_class": supervisor.fetch.SOURCE_FREE_WAVE_CLASS,
+                "profile": "core-rust",
+            }
+            service.summary = semver_summary
+            self.assertTrue(service._capture_failure_diagnostics())
+            document = bundle.strict_json(destination.read_bytes())
+            self.assertEqual([item["name"] for item in document["logs"]], ["semver-analyzer.log"])
+
     def test_source_free_diagnostics_context_allows_both_synthetic_profiles_only(self):
         for profile in ("core-node", "core-rust"):
             context = {"wave_class": supervisor.fetch.SOURCE_FREE_WAVE_CLASS, "profile": profile}
@@ -720,6 +764,11 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
         self.assertFalse(supervisor._source_free_diagnostics_context({
             "wave_class": supervisor.fetch.SOURCE_FREE_WAVE_CLASS, "profile": "synthetic",
         }))
+
+    def test_e2e_marks_the_current_scenario_before_building_its_projection(self):
+        source = inspect.getsource(test_e2e._run_scenario)
+        self.assertLess(source.index('_progress("scenario="'),
+                        source.index('_phase_call("scenario-projection-write"'))
 
     def test_rust_matrix_failure_diagnostics_capture_the_failing_arm_logs(self):
         summary = (b'{"failed":1,"ignored":0,"kind":"coverage","passed":0,'
@@ -748,6 +797,9 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
             }
             service.summary = summary
             self.assertTrue(service._capture_failure_diagnostics())
+            captured = bundle.strict_json(destination.read_bytes())
+            self.assertTrue(all(len(item["lines"]) <= supervisor.MAX_SYNTHETIC_RUST_DIAGNOSTIC_TAIL_LINES
+                                for item in captured["logs"]))
             self.assertEqual(test_e2e._synthetic_failure_subreason(summary, "core-rust"), "rust-matrix-failed")
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
@@ -760,6 +812,151 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("SYNTHETIC_SOURCE_CANARY", rendered)
         self.assertNotIn("KEYCANARY-73A10X", rendered)
         self.assertTrue(all(test_e2e.diagnostic_contract.public_e2e_failure_diagnostic(line) for line in lines))
+
+    def test_rust_matrix_runner_refusal_captures_bounded_current_arm_logs(self):
+        summary = (b'{"code":"DEVLANE_FAILURE","kind":"control","stage":"unit",'
+                   b'"status":"fail","subreason":"report-missing"}\n')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "scratch/raw"
+            workspace_raw = root / "workspace/raw"
+            reports = root / "scratch/reports"
+            raw.mkdir(parents=True)
+            workspace_raw.mkdir(parents=True)
+            reports.mkdir(parents=True)
+            for stem in supervisor._SYNTHETIC_RUST_MATRIX_LOG_STEMS:
+                for stream in ("stdout", "stderr"):
+                    path = raw / (stem + "." + stream)
+                    path.write_text("matrix arm " + stem + " " + stream + "\n", encoding="ascii")
+            (raw / "compile-root-default.stdout").write_text(
+                "compile-root-default safe tail\nSYNTHETIC_SOURCE_CANARY_7f8c\n", encoding="ascii",
+            )
+            (raw / "compile-listener-all-features.stderr").write_text(
+                "listener safe tail\nKEYCANARY-73A10X must be skipped\n", encoding="ascii",
+            )
+            (workspace_raw / "rust-matrix-adapter.log").write_text(
+                "rust_matrix=refused code=matrix-runner-failed\n", encoding="ascii",
+            )
+            (workspace_raw / "semver-analyzer.log").write_text(
+                "semver tool exited 101\n", encoding="ascii",
+            )
+            (workspace_raw / "style.log").write_text("previous node scenario\n", encoding="ascii")
+            (workspace_raw / "unit.log").write_text("previous node unit log\n", encoding="ascii")
+            (reports / "rust-matrix.jsonl").write_text("{}\n", encoding="ascii")
+            destination = root / "devlane-rust-matrix-local-synthetic-rust-accept.json"
+            service = object.__new__(supervisor.Service)
+            service.root = root
+            service.failure_diagnostics_file = destination
+            service.owner_uid = os.getuid()
+            service.context = {
+                "wave_class": supervisor.fetch.SOURCE_FREE_WAVE_CLASS,
+                "profile": "core-rust",
+            }
+            service.summary = summary
+            self.assertTrue(service._capture_failure_diagnostics())
+            document = bundle.strict_json(destination.read_bytes())
+            self.assertEqual(len(document["logs"]), 46)
+            self.assertEqual(supervisor.MAX_SYNTHETIC_DIAGNOSTIC_LOGS, 48)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                test_e2e._emit_synthetic_failure_diagnostics(destination, summary, "core-rust")
+            lines = output.getvalue().splitlines()
+
+        rendered = "\n".join(lines)
+        self.assertIn("name=fmt-root.stdout", rendered)
+        self.assertIn("name=deny-runtime.stderr", rendered)
+        self.assertIn("name=audit-fuzz.stdout", rendered)
+        self.assertIn("name=vet-fuzz.stderr", rendered)
+        self.assertIn("name=compile-listener-all-features.stderr", rendered)
+        self.assertIn("name=replay-fuzz-replay-default.stderr", rendered)
+        self.assertIn("name=rust-matrix-adapter.log", rendered)
+        self.assertIn("name=semver-analyzer.log", rendered)
+        self.assertNotIn("name=style.log", rendered)
+        self.assertNotIn("name=unit.log", rendered)
+        self.assertNotIn("SYNTHETIC_SOURCE_CANARY", rendered)
+        self.assertNotIn("KEYCANARY-73A10X", rendered)
+        self.assertTrue(all(test_e2e.diagnostic_contract.public_e2e_failure_diagnostic(line) for line in lines))
+
+    def test_rust_matrix_diagnostics_survive_real_quiet_capture_without_prior_node_logs(self):
+        summary = (b'{"code":"DEVLANE_FAILURE","kind":"control","stage":"unit",'
+                   b'"status":"fail","subreason":"report-missing"}\n')
+        with tempfile.TemporaryDirectory() as temporary:
+            runner_temp = Path(temporary)
+            root = runner_temp / "namespace-root"
+            raw = root / "scratch/raw"
+            reports = root / "scratch/reports"
+            workspace_raw = root / "workspace/raw"
+            raw.mkdir(parents=True)
+            reports.mkdir(parents=True)
+            workspace_raw.mkdir(parents=True)
+            for stem in ("fmt-root", "deny-root", "compile-listener-all-features"):
+                (raw / (stem + ".stdout")).write_text(stem + " current rust log\n", encoding="ascii")
+            (raw / "compile-listener-all-features.stderr").write_text(
+                "current rust log\nPRIVATE_KEY_CANARY must be skipped\n", encoding="ascii",
+            )
+            (workspace_raw / "rust-matrix-adapter.log").write_text(
+                "rust_matrix=refused code=matrix-runner-failed\n", encoding="ascii",
+            )
+            (workspace_raw / "semver-analyzer.log").write_text("semver current log\n", encoding="ascii")
+            (reports / "rust-matrix.jsonl").write_text("{}\n", encoding="ascii")
+            destination = runner_temp / "devlane-rust-matrix-local-synthetic-rust-accept.json"
+            service = object.__new__(supervisor.Service)
+            service.root = root
+            service.failure_diagnostics_file = destination
+            service.owner_uid = os.getuid()
+            service.context = {
+                "wave_class": supervisor.fetch.SOURCE_FREE_WAVE_CLASS,
+                "profile": "core-rust",
+            }
+            service.summary = summary
+            with mock.patch.dict(os.environ, {"RUNNER_TEMP": str(runner_temp)}):
+                self.assertTrue(service._capture_failure_diagnostics())
+
+            driver = runner_temp / "harness-rust-failure.py"
+            command_source = (
+                "import sys; sys.stdout.buffer.write(" + repr(summary) + "); sys.exit(1)"
+            )
+            previous_node_line = (
+                "devlane_e2e_failure_diag=log name=unit.log line=1 text=previous-node-output"
+            )
+            driver.write_text(
+                "import sys\n"
+                "import test_e2e\n"
+                "print(" + repr(previous_node_line) + ", flush=True)\n"
+                "print('devlane_e2e_progress=scenario=synthetic-rust-v1-refusal', flush=True)\n"
+                "command = [sys.executable, '-c', " + repr(command_source) + "]\n"
+                "test_e2e._run(command, expected=0, diagnostic_callsite='supervisor-client:execute', "
+                "on_result=lambda completed: test_e2e._emit_synthetic_failure_diagnostics("
+                "sys.argv[1], completed.stdout, 'core-rust'))\n",
+                encoding="ascii",
+            )
+            workflow = (test_e2e.ROOT / ".github/workflows/devlane-synthetic.yml").read_text(encoding="utf-8")
+            workflow_lines = workflow.splitlines()
+            start = next(index for index, line in enumerate(workflow_lines) if line.strip() == "quiet() {")
+            end = next(index for index in range(start + 1, len(workflow_lines))
+                       if workflow_lines[index].strip() == "}")
+            quiet_function = textwrap.dedent("\n".join(workflow_lines[start:end + 1]))
+            shell = (quiet_function + "\nquiet production-path-e2e python3 -B "
+                     + shlex.quote(str(driver)) + " " + shlex.quote(str(destination)))
+            environment = os.environ.copy()
+            environment["RUNNER_TEMP"] = str(runner_temp)
+            environment["PYTHONPATH"] = str(Path(test_e2e.__file__).resolve().parent)
+            result = subprocess.run(
+                ["/bin/bash", "-c", shell], cwd=test_e2e.ROOT, env=environment,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                close_fds=True, check=False,
+            )
+
+        self.assertEqual(result.returncode, 1, result.stderr.decode("utf-8", "replace"))
+        lines = result.stdout.decode("utf-8", "replace").splitlines()
+        diagnostics = [line for line in lines if line.startswith("devlane_e2e_failure_diag=")]
+        self.assertTrue(any("name=fmt-root.stdout" in line for line in diagnostics))
+        self.assertTrue(any("name=compile-listener-all-features.stdout" in line for line in diagnostics))
+        self.assertTrue(any("name=rust-matrix-adapter.log" in line for line in diagnostics))
+        self.assertFalse(any("name=unit.log" in line for line in diagnostics))
+        self.assertNotIn("PRIVATE_KEY_CANARY", "\n".join(lines))
+        self.assertTrue(all(test_e2e.diagnostic_contract.public_e2e_failure_diagnostic(line)
+                            for line in diagnostics))
 
     def test_unit_failure_raw_diagnostics_only_run_for_the_fixed_failure_reasons(self):
         for subreason in ("vitest-failed", "report-missing", "adapter-failed"):

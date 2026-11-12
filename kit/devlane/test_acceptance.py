@@ -1513,6 +1513,32 @@ class PreparationDefectTests(unittest.TestCase):
         self.assertEqual(requested[supervisor.resource.RLIMIT_CPU], (1200, 1200))
         self.assertNotIn(supervisor.resource.RLIMIT_AS, requested)
 
+    def test_rust_matrix_worker_gets_writable_raw_logs_and_vendor_cargo_home(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ownership = []
+            with patch.object(supervisor.os, "chown",
+                              side_effect=lambda path, uid, gid: ownership.append((path, uid, gid))):
+                supervisor._prepare_writable_scratch(root)
+
+            for relative in ("scratch/raw", "scratch/target", "scratch/cargo-home"):
+                path = root / relative
+                self.assertTrue(path.is_dir())
+                self.assertIn((str(path), supervisor.WORKER_UID, supervisor.WORKER_GID), ownership)
+            self.assertEqual((root / "scratch/raw").stat().st_mode & 0o777, 0o700)
+            cargo_config = (root / "scratch/cargo-home/config.toml").read_text(encoding="ascii")
+            self.assertIn('[source.crates-io]\nreplace-with = "vendored-sources"', cargo_config)
+            self.assertIn('[source.vendored-sources]\ndirectory = "/prepared/cargo-vendor"', cargo_config)
+            self.assertIn("[net]\noffline = true", cargo_config)
+
+        rust_environment = supervisor._worker_environment(
+            "unit", Path("/unused"), {"rust_dir": "/tools/rust/bin"},
+        )
+        self.assertEqual(rust_environment["HOME"], "/devlane-home")
+        self.assertEqual(rust_environment["CARGO_HOME"], "/scratch/cargo-home")
+        self.assertEqual(rust_environment["CARGO_TARGET_DIR"], "/scratch/target")
+        self.assertEqual(rust_environment["LD_LIBRARY_PATH"], "/tools/rust/lib")
+
 
 class RealLockfileAndFixtureTests(unittest.TestCase):
     def test_every_e2e_node_fixture_passes_the_production_projection_validators(self):

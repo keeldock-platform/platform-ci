@@ -41,9 +41,12 @@ import node_tool_snapshot
 
 MAX_RPC = 32 * 1024
 MAX_SUMMARY = output_filter.MAX_SUMMARY_BYTES
-MAX_SYNTHETIC_DIAGNOSTIC_LOGS = 16
+MAX_SYNTHETIC_DIAGNOSTIC_LOGS = 48
+MAX_SYNTHETIC_NODE_DIAGNOSTIC_LOGS = 16
 MAX_SYNTHETIC_DIAGNOSTIC_TAIL_LINES = 120
-MAX_SYNTHETIC_DIAGNOSTIC_TAIL_BYTES = 128 * 1024
+MAX_SYNTHETIC_RUST_DIAGNOSTIC_TAIL_LINES = 40
+MAX_SYNTHETIC_DIAGNOSTIC_TAIL_BYTES = 64 * 1024
+MAX_SYNTHETIC_DIAGNOSTIC_LINE_BYTES = 128
 MAX_SYNTHETIC_DIAGNOSTIC_REPORTS = 64
 MAX_SYNTHETIC_DIAGNOSTIC_FILE_BYTES = 4 * 1024 * 1024
 SOCKET_NAME = "control.sock"
@@ -404,13 +407,41 @@ def _synthetic_failure_reason(summary, profile):
                 return "rust-matrix-failed"
             if record.get("kind") == "test" and record.get("stage") == "unit":
                 return "rust-matrix-failed"
-            if (record.get("kind") == "coverage" and record.get("stage") != "semver"
+            if (record.get("kind") == "control" and record.get("status") == "fail"
+                    and record.get("stage") == "semver"):
+                return "rust-matrix-failed"
+            if (record.get("kind") == "coverage"
                     and type(record.get("failed")) is int and record["failed"] > 0):
                 return "rust-matrix-failed"
-            if (record.get("kind") == "diagnostic" and record.get("stage") != "semver"
+            if (record.get("kind") == "diagnostic"
                     and record.get("level") == "error"):
                 return "rust-matrix-failed"
     return ""
+
+
+_SYNTHETIC_RUST_MATRIX_LOG_STEMS = tuple(
+    [prefix + "-" + workspace for prefix in ("fmt", "deny", "audit", "vet")
+     for workspace in ("root", "runtime", "fuzz")]
+    + ["compile-" + scope + "-" + feature for scope in ("root", "runtime", "fuzz", "listener")
+       for feature in ("default", "all-features")]
+    + ["replay-fuzz-replay-default", "replay-fuzz-replay-all-features"]
+)
+
+
+_SYNTHETIC_DIAGNOSTIC_CANARIES = (
+    b"SYNTHETIC_SOURCE_CANARY", b"PRIVATE_SOURCE_CANARY",
+    b"SYNTHETIC_KEY_CANARY", b"PRIVATE_KEY_CANARY", b"KEYCANARY-73A10X",
+    (b"KEYCANARY-73A10X" + bytes(range(16))).hex().encode("ascii"),
+    (b"KEYCANARY-73A10X" + bytes(range(16))).hex().upper().encode("ascii"),
+    b"::add-mask::SYNTHETIC_SOURCE_CANARY_7f8c",
+    b"::error::SYNTHETIC_SOURCE_CANARY_7f8c",
+    b"##[group]SYNTHETIC_SOURCE_CANARY_7f8c",
+    b"::set-output name=x::SYNTHETIC_SOURCE_CANARY_7f8c",
+)
+
+
+def _synthetic_diagnostic_line_safe(line):
+    return not any(canary in line for canary in _SYNTHETIC_DIAGNOSTIC_CANARIES)
 
 
 def _synthetic_rust_diagnostic_log_stems(summary):
@@ -426,13 +457,20 @@ def _synthetic_rust_diagnostic_log_stems(summary):
             continue
         if (record.get("kind") == "control" and record.get("status") == "fail"
                 and record.get("stage") != "semver"):
-            stems.add("rust-matrix-adapter")
+            continue
+        if (record.get("kind") == "control" and record.get("status") == "fail"
+                and record.get("stage") == "semver"):
+            stems.add("semver-analyzer")
             continue
         if record.get("kind") != "coverage":
             continue
         suite = record.get("suite")
-        if (record.get("stage") == "semver" or type(suite) is not str
-                or type(record.get("failed")) is not int or record["failed"] <= 0):
+        if type(record.get("failed")) is not int or record["failed"] <= 0:
+            continue
+        if record.get("stage") == "semver":
+            stems.add("semver-analyzer")
+            continue
+        if type(suite) is not str:
             continue
         if re.fullmatch(r"(?:fmt|deny|audit|vet)-(?:root|runtime|fuzz)", suite):
             stems.add(suite)
@@ -457,7 +495,7 @@ def _synthetic_rust_adapter_log_requested(summary):
     return False
 
 
-def _synthetic_diagnostic_log_tail(path):
+def _synthetic_diagnostic_log_tail(path, max_lines=MAX_SYNTHETIC_DIAGNOSTIC_TAIL_LINES):
     try:
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
                              | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
@@ -483,7 +521,11 @@ def _synthetic_diagnostic_log_tail(path):
         lines = lines[1:]
     if lines and lines[-1] == b"":
         lines.pop()
-    return lines[-MAX_SYNTHETIC_DIAGNOSTIC_TAIL_LINES:]
+    selected = []
+    for line in lines[-max_lines:]:
+        if _synthetic_diagnostic_line_safe(line):
+            selected.append(line[:MAX_SYNTHETIC_DIAGNOSTIC_LINE_BYTES])
+    return selected
 
 
 def _synthetic_diagnostic_reports(root):
@@ -545,14 +587,17 @@ def _capture_source_free_failure_diagnostics(root, destination, owner_uid, wave_
         raw_root = Path(root) / "scratch/raw"
         candidates = []
         adapter_requested = _synthetic_rust_adapter_log_requested(summary)
+        stems = _synthetic_rust_diagnostic_log_stems(summary)
+        if adapter_requested:
+            stems.update(_SYNTHETIC_RUST_MATRIX_LOG_STEMS)
         try:
             raw_root_available = stat.S_ISDIR(raw_root.lstat().st_mode)
         except OSError:
             raw_root_available = False
         if raw_root_available:
-            preferred_stems = sorted(_synthetic_rust_diagnostic_log_stems(summary))
-            matrix_log_limit = (MAX_SYNTHETIC_DIAGNOSTIC_LOGS - int(adapter_requested)) // 2
-            for stem in preferred_stems[:matrix_log_limit]:
+            for stem in sorted(stems):
+                if stem == "semver-analyzer":
+                    continue
                 candidates.extend((raw_root / (stem + ".stdout"), raw_root / (stem + ".stderr")))
         adapter_log = Path(root) / "workspace/raw/rust-matrix-adapter.log"
         if adapter_requested:
@@ -561,8 +606,19 @@ def _capture_source_free_failure_diagnostics(root, destination, owner_uid, wave_
                     candidates.insert(0, adapter_log)
             except OSError:
                 pass
-    for log_path in candidates[:MAX_SYNTHETIC_DIAGNOSTIC_LOGS]:
-        tail = _synthetic_diagnostic_log_tail(log_path)
+        if "semver-analyzer" in stems or adapter_requested:
+            semver_log = Path(root) / "workspace/raw/semver-analyzer.log"
+            try:
+                if stat.S_ISDIR(semver_log.parent.lstat().st_mode):
+                    candidates.append(semver_log)
+            except OSError:
+                pass
+    max_logs = (MAX_SYNTHETIC_NODE_DIAGNOSTIC_LOGS
+                if profile == "core-node" else MAX_SYNTHETIC_DIAGNOSTIC_LOGS)
+    for log_path in candidates[:max_logs]:
+        max_tail_lines = (MAX_SYNTHETIC_RUST_DIAGNOSTIC_TAIL_LINES
+                          if profile == "core-rust" else MAX_SYNTHETIC_DIAGNOSTIC_TAIL_LINES)
+        tail = _synthetic_diagnostic_log_tail(log_path, max_tail_lines)
         if tail is not None:
             logs.append({"name": log_path.name,
                          "lines": [base64.b64encode(line).decode("ascii") for line in tail]})
@@ -1212,7 +1268,7 @@ def _prepare_trusted_files(root, manifest):
 
 
 def _prepare_writable_scratch(root, *, registry_v2=False):
-    for relative in ("scratch/reports", "scratch/target", "scratch/tmp", "scratch/tmp/vitest-cache",
+    for relative in ("scratch/reports", "scratch/raw", "scratch/target", "scratch/tmp", "scratch/tmp/vitest-cache",
                      "scratch/npm-cache", "scratch/cargo-home"):
         path = root / relative
         path.mkdir(mode=0o700, parents=True, exist_ok=True)

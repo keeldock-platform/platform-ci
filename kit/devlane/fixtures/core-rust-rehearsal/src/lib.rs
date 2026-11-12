@@ -118,10 +118,7 @@ fn assert_isolation_boundaries() {
         }
 
         let proc_runner_home = "/proc/1/root/ho".to_owned() + "me/runner";
-        assert!(
-            !Path::new(&proc_runner_home).exists(),
-            "host-path-boundary"
-        );
+        assert!(!Path::new(&proc_runner_home).exists(), "host-path-boundary");
 
         let process_count = fs::read_dir("/proc")
             .expect("proc-root")

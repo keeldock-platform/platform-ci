@@ -84,7 +84,7 @@ SYNTHETIC_LOCK = ROOT / "kit/confinement/synthetic_project/package-lock.json"
 
 DIAGNOSTIC_PHASES = diagnostic_contract.E2E_PROGRESS_PHASES
 PROGRESS_ENABLED = False
-MAX_E2E_RAW_DIAGNOSTIC_LOGS = 16
+MAX_E2E_RAW_DIAGNOSTIC_LOGS = 48
 MAX_E2E_RAW_DIAGNOSTIC_TAIL_LINES = 120
 MAX_E2E_RAW_DIAGNOSTIC_TAIL_BYTES = 128 * 1024
 MAX_E2E_RAW_DIAGNOSTIC_LINE_BYTES = 128
@@ -515,10 +515,13 @@ def _synthetic_failure_subreason(summary, profile="core-node"):
         if profile == "core-rust":
             if record.get("kind") == "test" and record.get("stage") == "unit":
                 return "rust-matrix-failed"
-            if (record.get("kind") == "coverage" and record.get("stage") != "semver"
+            if (record.get("kind") == "control" and record.get("stage") == "semver"
+                    and record.get("status") == "fail"):
+                return "rust-matrix-failed"
+            if (record.get("kind") == "coverage"
                     and type(record.get("failed")) is int and record["failed"] > 0):
                 return "rust-matrix-failed"
-            if (record.get("kind") == "diagnostic" and record.get("stage") != "semver"
+            if (record.get("kind") == "diagnostic"
                     and record.get("level") == "error"):
                 return "rust-matrix-failed"
     return ""
@@ -1783,6 +1786,7 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
 
 
 def _run_scenario(scenario, rust_tool_cache=None):
+    _progress("scenario=" + scenario["name"])
     prepared = RUNNER_TEMP / ("devlane-e2e-" + RUN_ID + "-" + scenario["name"])
     projection_path = RUNNER_TEMP / ("devlane-e2e-projection-" + RUN_ID + "-" + scenario["name"])
     lifecycle = _SupervisorLifecycle(RUNNER_TEMP / ("devlane-" + RUN_ID))
@@ -1912,15 +1916,12 @@ def main(argv=None):
         for scenario in scenario_list:
             _phase_call("scenario-run", _run_scenario, scenario)
             done.append(scenario["name"])
-            _progress("scenario=" + scenario["name"])
         _phase_call("scenario-run", _run_scenario, rust_scenario, tooling_root)
         done.append(rust_scenario["name"])
-        _progress("scenario=" + rust_scenario["name"])
         late_scenario_list = _phase_call("late-scenario-construction", late_scenarios)
         for scenario in late_scenario_list:
             _phase_call("late-scenario-run", _run_scenario, scenario)
             done.append(scenario["name"])
-            _progress("scenario=" + scenario["name"])
     finally:
         previous_error = sys.exc_info()[1]
         try:

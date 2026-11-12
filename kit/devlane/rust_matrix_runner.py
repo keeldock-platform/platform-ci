@@ -125,6 +125,8 @@ def _run(label, argv, deadline, *, timeout=1800, cwd=SOURCE_ROOT, json_stdout=Fa
     env = {
         "PATH": "/tools/rust/bin:/usr/bin:/bin",
         "CARGO": "/tools/rust/bin/cargo",
+        "RUSTC": "/tools/rust/bin/rustc",
+        "LD_LIBRARY_PATH": "/tools/rust/lib",
         "HOME": "/devlane-home",
         "TMPDIR": "/scratch/tmp",
         "CARGO_HOME": "/scratch/cargo-home",
