@@ -43,6 +43,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from urllib import error as urllib_error
+from urllib.parse import quote
 
 import bundle
 import fetch
@@ -81,6 +82,12 @@ SYNTHETIC_LOCK = ROOT / "kit/confinement/synthetic_project/package-lock.json"
 
 DIAGNOSTIC_PHASES = diagnostic_contract.E2E_PROGRESS_PHASES
 PROGRESS_ENABLED = False
+MAX_VITEST_RAW_LOGS = 16
+MAX_VITEST_RAW_LOG_TAIL_LINES = 120
+MAX_VITEST_RAW_LOG_TAIL_BYTES = 128 * 1024
+MAX_VITEST_RAW_LOG_LINE_BYTES = 128
+MAX_VITEST_REPORT_ENTRIES = 64
+_DIAGNOSTIC_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 
 EXECUTE_EXIT_EXPECTATIONS = {
     ("synthetic-node", "accept"): 0,
@@ -417,8 +424,8 @@ def _scan_output(data, code):
 
 def _contains_output_canary(data):
     return any(canary in data for canary in (
-        SOURCE_CANARY.encode("ascii"), KEY_CANARY, b"::add-mask::", b"::error::",
-        (chr(35) * 2 + "[group]SYNTHETIC").encode("ascii"),
+        SOURCE_CANARY.encode("ascii"), KEY_CANARY, KEY_BYTES.hex().encode("ascii"),
+        *(item.encode("ascii") for item in COMMAND_CANARIES),
     ))
 
 
@@ -432,10 +439,13 @@ def _expected_execute_status(scenario, variant):
     return EXECUTE_EXIT_EXPECTATIONS[key]
 
 
-def _run(argv, *, env=None, timeout=900, expected=0, scan=True, cwd=None, diagnostic_callsite=None):
+def _run(argv, *, env=None, timeout=900, expected=0, scan=True, cwd=None, diagnostic_callsite=None,
+         on_result=None):
     result = _process_run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, env=env, timeout=timeout,
                             close_fds=True, check=False, cwd=cwd)
+    if on_result is not None:
+        on_result(result)
     if result.returncode != expected and diagnostic_callsite is not None:
         _report_command_failure(diagnostic_callsite, result)
     _require(result.returncode == expected, "production-path-command-failed")
@@ -478,6 +488,127 @@ def _report_command_failure(callsite, result):
                     break
         if count >= diagnostic_contract.MAX_E2E_COMMAND_DIAGNOSTIC_LINES:
             break
+
+
+def _unit_failure_subreason(summary):
+    if type(summary) is not bytes or _contains_output_canary(summary):
+        return ""
+    for line in summary.splitlines():
+        try:
+            record = output_filter._parse_record(line)
+        except output_filter.FilterRefusal:
+            continue
+        if (record.get("kind") == "control" and record.get("stage") == "unit"
+                and record.get("status") == "fail"
+                and record.get("subreason") in ("vitest-failed", "report-missing", "adapter-failed")):
+            return record["subreason"]
+    return ""
+
+
+def _tail_regular_log(path):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(descriptor, "rb") as source:
+            metadata = os.fstat(source.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                return None
+            start = max(0, metadata.st_size - MAX_VITEST_RAW_LOG_TAIL_BYTES)
+            if start:
+                source.seek(start - 1)
+                starts_on_line_boundary = source.read(1) == b"\n"
+            else:
+                starts_on_line_boundary = True
+            source.seek(start)
+            payload = source.read(MAX_VITEST_RAW_LOG_TAIL_BYTES)
+    except OSError:
+        return None
+    lines = payload.split(b"\n")
+    if not starts_on_line_boundary and lines:
+        lines = lines[1:]
+    if lines and lines[-1] == b"":
+        lines.pop()
+    return lines[-MAX_VITEST_RAW_LOG_TAIL_LINES:]
+
+
+def _safe_diagnostic_name(value, fallback):
+    if (type(value) is str and _DIAGNOSTIC_NAME.fullmatch(value)
+            and not _contains_output_canary(value.encode("ascii", "ignore"))):
+        return value
+    return fallback
+
+
+def _emit_vitest_failure_diagnostics(root, summary):
+    """Emit source-free raw-log tails only for fixed unit failures in the synthetic harness."""
+    if not _unit_failure_subreason(summary):
+        return
+    root = Path(root)
+    raw_root = root / "workspace/raw"
+    raw_metadata = None
+    try:
+        raw_metadata = raw_root.lstat()
+    except OSError:
+        pass
+    if raw_metadata is not None and stat.S_ISDIR(raw_metadata.st_mode):
+        try:
+            logs = sorted(raw_root.glob("*.log"), key=lambda item: item.name)[:MAX_VITEST_RAW_LOGS]
+        except OSError:
+            logs = []
+        for path in logs:
+            name = _safe_diagnostic_name(path.name, "raw-log")
+            tail = _tail_regular_log(path)
+            if tail is None:
+                continue
+            for index, raw_line in enumerate(tail, 1):
+                if _contains_output_canary(raw_line):
+                    continue
+                text = raw_line.decode("utf-8", "replace").rstrip("\r\n")
+                hash_marker = chr(35) * 2
+                text = text.replace("::", ": :").replace(hash_marker + "[", hash_marker + " [")
+                text = "".join(character if ord(character) >= 32 and ord(character) != 127 else " "
+                               for character in text)
+                text = text.encode("utf-8")[:MAX_VITEST_RAW_LOG_LINE_BYTES].decode("utf-8", "ignore")
+                encoded = quote(text, safe="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~:/,=@+!?(){} -")
+                print("devlane_e2e_vitest_diag=log name=%s line=%d text=%s" % (name, index, encoded), flush=True)
+
+    reports = root / "scratch/reports"
+    try:
+        reports_metadata = reports.lstat()
+    except OSError:
+        reports_metadata = None
+    if reports_metadata is None:
+        print("devlane_e2e_vitest_diag=report name=reports kind=missing bytes=0", flush=True)
+        return
+    if stat.S_ISLNK(reports_metadata.st_mode):
+        print("devlane_e2e_vitest_diag=report name=reports kind=symlink bytes=0", flush=True)
+        return
+    if not stat.S_ISDIR(reports_metadata.st_mode):
+        print("devlane_e2e_vitest_diag=report name=reports kind=other bytes=0", flush=True)
+        return
+    print("devlane_e2e_vitest_diag=report name=reports kind=directory bytes=0", flush=True)
+    try:
+        entries = sorted(reports.iterdir(), key=lambda item: item.name)[:MAX_VITEST_REPORT_ENTRIES]
+    except OSError:
+        entries = []
+    for index, path in enumerate(entries, 1):
+        name = _safe_diagnostic_name(path.name, "entry-%02d" % index)
+        try:
+            metadata = path.lstat()
+        except OSError:
+            kind, size = "missing", 0
+        else:
+            if stat.S_ISLNK(metadata.st_mode):
+                kind, size = "symlink", 0
+            elif stat.S_ISDIR(metadata.st_mode):
+                kind, size = "directory", 0
+            elif stat.S_ISREG(metadata.st_mode):
+                kind, size = "file", min(metadata.st_size, 999999999999)
+            else:
+                kind, size = "other", 0
+        print("devlane_e2e_vitest_diag=report name=%s kind=%s bytes=%d" % (name, kind, size), flush=True)
 
 
 def _processes_matching(marker):
@@ -868,11 +999,10 @@ def _canary_emitters():
     return "\n".join(lines) + "\n"
 
 
-def _node_source(lock, *, failing_test=False, hang=False, package_name="typescript"):
-    version = lock["packages"]["node_modules/" + package_name]["version"]
+def _node_source(lock, *, failing_test=False, hang=False):
     package = {
         "name": "synthetic-private-canary", "version": "0.0.0", "private": True,
-        "type": "module", "devDependencies": {package_name: version},
+        "type": "module", "devDependencies": dict(lock["packages"][""]["devDependencies"]),
     }
     ui_package = {
         "name": "@keeldock/kernel-ui-kit-fixture", "version": "0.0.0", "private": True,
@@ -933,6 +1063,13 @@ def _real_node_source(lock):
     }
     tsconfig = {"compilerOptions": {"strict": True, "noEmit": True, "target": "ES2022", "module": "ESNext",
                                     "moduleResolution": "bundler", "skipLibCheck": True}}
+    vitest_config = (
+        "import { defineConfig } from 'vitest/config';\n"
+        "export default defineConfig({\n"
+        "  cacheDir: '/scratch/tmp/vitest-cache',\n"
+        "  test: { pool: 'threads', include: ['tests/**/*.test.ts'] },\n"
+        "});\n"
+    )
     source = ("export const planted = '" + SOURCE_CANARY + "';\n"
               "export function add(left: number, right: number): number { return left + right; }\n")
     tests = (
@@ -950,6 +1087,7 @@ def _real_node_source(lock):
         "tsconfig.json": bundle.canonical_json(tsconfig) + b"\n",
         "packages/kernel-ui-kit/package.json": bundle.canonical_json(ui_package) + b"\n",
         "packages/kernel-tokens/package.json": bundle.canonical_json(tokens_package) + b"\n",
+        "packages/kernel-ui-kit/vitest.config.ts": vitest_config.encode("ascii"),
         "packages/kernel-ui-kit/src/example.ts": source.encode("ascii"),
         "packages/kernel-ui-kit/tests/example.test.ts": tests.encode("ascii"),
     }
@@ -1055,20 +1193,24 @@ def scenarios():
         "allowed_tests": {"synthetic canary suite accepted test": "case_0001"}, "frames": {},
         "variants": ("startup-refusal", "accept", "wrong-key", "failing-test", "cancel"),
     })
-    real_lock = _node_lock_from_reviewed({"typescript": "6.0.3", "vite": "8.3.5", "vitest": "5.0.5"})
+    real_lock = _node_lock_from_reviewed({
+        "typescript": "6.0.3", "vite": "8.3.5", "vitest": "5.0.5",
+        "esbuild": "0.27.0", "rollup": ROLLUP_VERSION,
+    })
     projection, payload = _node_projection(real_lock)
     result.append({
         "name": "real-node", "profile": "core-node", "projection": projection, "payload": payload,
         "files": lambda **kw: _real_node_source(real_lock),
         "allowed_files": {"packages/kernel-ui-kit/src/example.ts": "file_0001"},
         "allowed_tests": {"real vitest accepted test": "case_0001", "real vitest failing test": "case_0002"},
-        "frames": {}, "variants": ("accept-with-failure",),
+        "frames": {}, "variants": ("accept-with-failure",), "after_prepare": _install_script_canary_check,
     })
     return result
 
 
 INSTALL_SCRIPT_PACKAGE = "esbuild"
 INSTALL_SCRIPT_VERSION = "0.25.9"
+ROLLUP_VERSION = "4.44.2"
 INSTALL_SCRIPT_PLACEHOLDER_LIMIT = 64 * 1024
 
 
@@ -1082,20 +1224,42 @@ def _install_script_canary_check(prepared_path):
     _require(launcher.is_file() and not launcher.is_symlink(), "install-script-canary-missing")
     _require(launcher.stat().st_size < INSTALL_SCRIPT_PLACEHOLDER_LIMIT, "install-script-ran")
     _require((Path(prepared_path) / "node_modules" / "@esbuild").is_dir(), "install-script-canary-platform-package-missing")
+    if sys.platform.startswith("linux") and os.uname().machine == "x86_64":
+        modules = Path(prepared_path) / "node_modules"
+        esbuild_native = modules / "@esbuild/linux-x64/bin/esbuild"
+        rollup_native = modules / "@rollup/rollup-linux-x64-gnu/rollup.linux-x64-gnu.node"
+        _require(esbuild_native.is_file() and not esbuild_native.is_symlink()
+                 and bool(esbuild_native.stat().st_mode & 0o111), "linux-esbuild-native-package-missing")
+        _require(rollup_native.is_file() and not rollup_native.is_symlink()
+                 and bool(rollup_native.stat().st_mode & 0o444), "linux-rollup-native-package-missing")
+
+
+def _validate_linux_native_lock(lock):
+    packages = lock.get("packages") if type(lock) is dict else None
+    for package_path in (
+            "node_modules/@esbuild/linux-x64",
+            "node_modules/@rollup/rollup-linux-x64-gnu"):
+        entry = packages.get(package_path) if type(packages) is dict else None
+        _require(type(entry) is dict and entry.get("optional") is True
+                 and entry.get("os") == ["linux"] and entry.get("cpu") == ["x64"],
+                 "linux-native-lock-entry-missing")
+    return True
 
 
 def late_scenarios():
     """Scenarios that resolve packages from the public registries on the hosted runner."""
     result = []
     canary_manifest = json.dumps({"name": "synthetic-private-canary", "version": "0.0.0", "private": True,
-                                  "devDependencies": {INSTALL_SCRIPT_PACKAGE: INSTALL_SCRIPT_VERSION}})
+                                  "devDependencies": {INSTALL_SCRIPT_PACKAGE: INSTALL_SCRIPT_VERSION,
+                                                      "rollup": ROLLUP_VERSION}})
     canary_lock = _generated_npm_lock(canary_manifest)
     _require(bool(canary_lock["packages"]["node_modules/" + INSTALL_SCRIPT_PACKAGE].get("hasInstallScript")),
              "install-script-canary-lacks-marker")
+    _validate_linux_native_lock(canary_lock)
     projection, payload = _node_projection(canary_lock)
     result.append({
         "name": "install-script-canary", "profile": "core-node", "projection": projection, "payload": payload,
-        "files": lambda **kw: _node_source(canary_lock, package_name=INSTALL_SCRIPT_PACKAGE, **kw),
+        "files": lambda **kw: _node_source(canary_lock, **kw),
         "allowed_files": {"packages/kernel-ui-kit/src/example.ts": "file_0001"},
         "allowed_tests": {"synthetic canary suite accepted test": "case_0001"}, "frames": {},
         "variants": ("accept",), "after_prepare": _install_script_canary_check,
@@ -1527,7 +1691,9 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
             else:
                 expected = _expected_execute_status(scenario, variant)
                 result = _run(execute, timeout=60 * 40, expected=expected,
-                              diagnostic_callsite="supervisor-client:execute")
+                              diagnostic_callsite="supervisor-client:execute",
+                              on_result=(lambda completed: _emit_vitest_failure_diagnostics(root, completed.stdout))
+                              if scenario["name"] in diagnostic_contract.E2E_PROGRESS_SCENARIOS else None)
                 with DIAGNOSTICS.phase("variant-summary-validate"):
                     _require(_summary_has_valid_terminator(result.stdout), "summary-schema-invalid")
                     records = _summary_records(result.stdout, scenario)

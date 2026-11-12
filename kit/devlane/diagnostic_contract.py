@@ -199,6 +199,8 @@ E2E_REQUIRE_CODES = frozenset((
     "canary-in-summary",
     "deadline-file-required", "host-cleanup-root-remains", "install-script-canary-lacks-marker",
     "install-script-canary-missing", "install-script-canary-platform-package-missing", "install-script-ran",
+    "linux-esbuild-native-package-missing", "linux-native-lock-entry-missing",
+    "linux-rollup-native-package-missing",
     "linux-runner-user-required", "linux-tools-required", "node-snapshot-supervisor-unconfirmed",
     "positive-control-failed", "prepared-cleanup-supervisor-unconfirmed", "prepared-cleanup-tree-remains",
     "production-path-command-failed", "reviewed-lock-package-missing", "runner-root-already-exists",
@@ -232,6 +234,8 @@ E2E_COMMAND_CALL_SITES = frozenset(("supervisor-client:execute",))
 MAX_E2E_COMMAND_OUTPUT_BYTES = 16 * 1024
 MAX_E2E_COMMAND_DIAGNOSTIC_LINES = 4
 MAX_E2E_COMMAND_SUMMARY_RECORD_BYTES = 512
+MAX_E2E_VITEST_DIAGNOSTIC_LINES = 2048
+MAX_E2E_VITEST_DIAGNOSTIC_BYTES = 512
 _E2E_COMMAND_FAILURE = re.compile(
     r"devlane_e2e_command=failed call=(supervisor-client:execute) "
     r"returncode=(-?(?:0|[1-9][0-9]{0,8}))\Z"
@@ -248,6 +252,14 @@ _E2E_COMMAND_ADAPTER_REFUSAL = re.compile(
     r"reporter-failed|json-size|json-string|json-escape|json-control|json-depth|duplicate-json-key|"
     r"json-colon|json-object|json-array|json-value|json-trailing-data)\Z"
 )
+_E2E_VITEST_DIAGNOSTIC = re.compile(
+    r"devlane_e2e_vitest_diag=log name=[A-Za-z0-9][A-Za-z0-9._-]{0,63} "
+    r"line=[1-9][0-9]{0,2} text=(?:[A-Za-z0-9._~:/,=@+!?(){} -]|%[0-9A-F]{2}){0,384}\Z"
+)
+_E2E_REPORT_DIAGNOSTIC = re.compile(
+    r"devlane_e2e_vitest_diag=report name=[A-Za-z0-9][A-Za-z0-9._-]{0,63} "
+    r"kind=(directory|file|symlink|other|missing) bytes=(?:0|[1-9][0-9]{0,11})\Z"
+)
 
 
 def public_e2e_command_diagnostic(line):
@@ -259,6 +271,25 @@ def public_e2e_command_diagnostic(line):
     if _E2E_COMMAND_FAILURE.fullmatch(line):
         return True
     return public_e2e_command_refusal(line)
+
+
+def public_e2e_vitest_diagnostic(line):
+    """Accept only the bounded, escaped raw-log and report-listing lines from synthetic E2E."""
+    if type(line) is not str:
+        return False
+    try:
+        payload = line.encode("ascii", "strict")
+    except UnicodeEncodeError:
+        return False
+    if (len(payload) > MAX_E2E_VITEST_DIAGNOSTIC_BYTES or "::" in line
+            or (chr(35) * 2 + "[") in line
+            or any(marker in line for marker in (
+                "SYNTHETIC_SOURCE_CANARY", "PRIVATE_SOURCE_CANARY", "KEYCANARY",
+                "SYNTHETIC_KEY_CANARY", "PRIVATE_KEY_CANARY",
+            ))):
+        return False
+    return (_E2E_VITEST_DIAGNOSTIC.fullmatch(line) is not None
+            or _E2E_REPORT_DIAGNOSTIC.fullmatch(line) is not None)
 
 
 def public_e2e_command_summary_record(line):

@@ -68,9 +68,15 @@ def failure_tail(stage, payload, *, earlier_bytes_omitted=False):
     for canary in _BYTE_REDACTIONS:
         payload = payload.replace(canary, b"[synthetic-canary-redacted]")
     decoded = payload.decode("utf-8", "replace")
-    lines = decoded.splitlines()
-    omitted_lines = max(0, len(lines) - MAX_TAIL_LINES)
-    lines = lines[-MAX_TAIL_LINES:]
+    all_lines = decoded.splitlines()
+    tail_start = max(0, len(all_lines) - MAX_TAIL_LINES)
+    lines = [
+        line for index, line in enumerate(all_lines)
+        if index >= tail_start or (
+            stage == "production-path-e2e" and diagnostic_contract.public_e2e_vitest_diagnostic(line)
+        )
+    ]
+    omitted_lines = max(0, len(all_lines) - len(lines))
     output = []
     if earlier_bytes_omitted:
         output.append(_format_line(stage, 0, "earlier-output-omitted"))
@@ -82,7 +88,8 @@ def failure_tail(stage, payload, *, earlier_bytes_omitted=False):
         if (stage == "production-path-e2e"
                 and (diagnostic_contract.public_preparation_diagnostic(line)
                      or diagnostic_contract.public_e2e_runtime_diagnostic(line)
-                     or diagnostic_contract.public_e2e_command_diagnostic(line))):
+                     or diagnostic_contract.public_e2e_command_diagnostic(line)
+                     or diagnostic_contract.public_e2e_vitest_diagnostic(line))):
             output.append(line)
         else:
             output.append(_format_line(stage, index, _safe_text(line)))

@@ -501,7 +501,8 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
                          "devlane_e2e_command=failed call=supervisor-client:execute returncode=1\n")
 
         oversized = subprocess.CompletedProcess(
-            ["supervisor.py", "execute"], 1, b"x" * (test_e2e.diagnostic_contract.MAX_E2E_COMMAND_OUTPUT_BYTES + 1), b"",
+            ["supervisor.py", "execute"], 1,
+            b"x" * (test_e2e.diagnostic_contract.MAX_E2E_COMMAND_OUTPUT_BYTES + 1), b"",
         )
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -513,6 +514,53 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             test_e2e._report_command_failure("private:callsite", result)
         self.assertEqual(output.getvalue(), "")
+
+    def test_unit_failure_raw_diagnostics_are_bounded_scanned_and_neutralized(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "workspace/raw"
+            reports = root / "scratch/reports"
+            raw.mkdir(parents=True)
+            reports.mkdir(parents=True)
+            rows = ["unit line %03d" % index for index in range(150)]
+            rows[40] = "::error::safe diagnostic"
+            rows[41] = chr(35) * 2 + "[group]safe diagnostic"
+            rows[-1] = "SYNTHETIC_SOURCE_CANARY_7f8c must be skipped"
+            (raw / "unit.log").write_text("\n".join(rows) + "\n", encoding="utf-8")
+            (raw / "adapter-run.log").write_text(
+                "adapter started\nKEYCANARY-73A10X must be skipped\nadapter finished\n", encoding="ascii",
+            )
+            (reports / "vitest.json").write_text("{}", encoding="ascii")
+            (reports / "adapter.jsonl").write_text("", encoding="ascii")
+            summary = (b'{"code":"DEVLANE_FAILURE","kind":"control","stage":"unit",'
+                       b'"status":"fail","subreason":"vitest-failed"}\n')
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                test_e2e._emit_vitest_failure_diagnostics(root, summary)
+            lines = output.getvalue().splitlines()
+
+        self.assertLessEqual(len(lines), test_e2e.diagnostic_contract.MAX_E2E_VITEST_DIAGNOSTIC_LINES)
+        self.assertTrue(all(test_e2e.diagnostic_contract.public_e2e_vitest_diagnostic(line) for line in lines))
+        self.assertTrue(any("name=unit.log line=1 text=unit line 030" in line for line in lines))
+        self.assertFalse(any("name=unit.log line=120 text=unit line 149" in line for line in lines))
+        self.assertTrue(any("adapter finished" in line for line in lines))
+        self.assertTrue(any("name=reports kind=directory bytes=0" in line for line in lines))
+        self.assertTrue(any("name=vitest.json kind=file bytes=2" in line for line in lines))
+        rendered = "\n".join(lines)
+        for marker in ("SYNTHETIC_SOURCE_CANARY", "KEYCANARY-73A10X", "::error::", chr(35) * 2 + "[group]"):
+            self.assertNotIn(marker, rendered)
+
+    def test_unit_failure_raw_diagnostics_only_run_for_the_fixed_failure_reasons(self):
+        for subreason in ("vitest-failed", "report-missing", "adapter-failed"):
+            summary = ('{"kind":"control","stage":"unit","status":"fail","subreason":"%s"}\n'
+                       % subreason).encode("ascii")
+            self.assertEqual(test_e2e._unit_failure_subreason(summary), subreason)
+        for summary in (
+            b'{"kind":"control","stage":"unit","status":"fail","subreason":"typecheck-failed"}\n',
+            b'{"kind":"control","stage":"browser","status":"fail","subreason":"adapter-failed"}\n',
+            b'{"kind":"control","stage":"unit","status":"fail","subreason":"vitest-failed"} KEYCANARY-73A10X\n',
+        ):
+            self.assertEqual(test_e2e._unit_failure_subreason(summary), "")
 
     def test_committed_rust_fixture_passes_the_e2e_projection_and_archive_contract(self):
         with tempfile.TemporaryDirectory() as temporary:

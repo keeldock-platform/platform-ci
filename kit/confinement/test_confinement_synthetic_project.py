@@ -123,7 +123,7 @@ class FixtureShapeTests(unittest.TestCase):
     def test_every_file_passes_the_public_text_scanner(self):
         for relative in EXPECTED_FILES:
             with self.subTest(relative=relative):
-                public_tree.inspect_text(_text(relative), "platform")
+                public_tree.inspect_text(_text(relative), "platform", FIXTURE_PREFIX + relative)
 
     def test_every_file_is_registered_and_pinned_in_the_public_tree(self):
         for relative in EXPECTED_FILES:
@@ -256,7 +256,8 @@ class NodeGateTests(unittest.TestCase):
         package = _json("packages/host-api/package.json")
         self.assertEqual(
             package["devDependencies"],
-            {"typescript": "6.0.3", "vite": "8.3.5", "vitest": "5.0.5"},
+            {"esbuild": "0.27.0", "rollup": "4.44.2", "typescript": "6.0.3",
+             "vite": "8.3.5", "vitest": "5.0.5"},
         )
         self.assertTrue((FIXTURE / "packages/host-api/tsconfig.json").is_file())
         self.assertIn('pool: \'threads\'', _text("packages/host-api/vitest.config.ts"))
@@ -274,7 +275,8 @@ class NodeGateTests(unittest.TestCase):
         packages = _json("package-lock.json")["packages"]
         self.assertEqual(packages["node_modules/vitest"]["version"], "5.0.5")
         self.assertEqual(packages["packages/host-api"]["devDependencies"], {
-            "typescript": "6.0.3", "vite": "8.3.5", "vitest": "5.0.5",
+            "esbuild": "0.27.0", "rollup": "4.44.2", "typescript": "6.0.3",
+            "vite": "8.3.5", "vitest": "5.0.5",
         })
         preload = (FIXTURE / "packages/host-api/tests/no-net-use.mjs").read_bytes()
         blob = b"blob " + str(len(preload)).encode("ascii") + b"\0" + preload
@@ -316,19 +318,27 @@ class NodeGateTests(unittest.TestCase):
         external = {key: value for key, value in packages.items() if "resolved" in value and not value.get("link")}
         closure = _npm_dependency_closure(
             packages,
-            ("node_modules/typescript", "node_modules/vite", "node_modules/vitest"),
+            ("node_modules/typescript", "node_modules/vite", "node_modules/vitest",
+             "node_modules/esbuild", "node_modules/rollup"),
         )
         self.assertEqual(set(external), closure | {"node_modules/ms"})
-        self.assertEqual(len(closure), 62)
+        self.assertEqual(len(closure), 111)
         for key, value in external.items():
             with self.subTest(key=key):
                 self.assertRegex(value["resolved"], TARBALL_PATTERN)
                 self.assertRegex(value["integrity"], SRI_PATTERN)
         self.assertEqual(external["node_modules/ms"]["version"], "2.1.3")
         self.assertTrue(external["node_modules/ms"]["resolved"].endswith("/ms-2.1.3.tgz"))
-        for name, version in (("typescript", "6.0.3"), ("vite", "8.3.5"), ("vitest", "5.0.5")):
+        for name, version in (("typescript", "6.0.3"), ("vite", "8.3.5"), ("vitest", "5.0.5"),
+                              ("esbuild", "0.27.0"), ("rollup", "4.44.2")):
             with self.subTest(name=name):
                 self.assertEqual(packages["node_modules/" + name]["version"], version)
+        for name in ("@esbuild/linux-x64", "@rollup/rollup-linux-x64-gnu"):
+            with self.subTest(name=name):
+                native = packages["node_modules/" + name]
+                self.assertTrue(native["optional"])
+                self.assertEqual(native["os"], ["linux"])
+                self.assertEqual(native["cpu"], ["x64"])
         links = {key: value["resolved"] for key, value in packages.items() if value.get("link")}
         self.assertEqual(
             links,
@@ -345,6 +355,8 @@ class NodeGateTests(unittest.TestCase):
             self.assertEqual(entry.get("dependencies"), package.get("dependencies"))
             self.assertEqual(entry.get("devDependencies"), package.get("devDependencies"))
         self.assertEqual(packages["packages/host-api"]["devDependencies"], {
+            "esbuild": "0.27.0",
+            "rollup": "4.44.2",
             "typescript": "6.0.3",
             "vite": "8.3.5",
             "vitest": "5.0.5",

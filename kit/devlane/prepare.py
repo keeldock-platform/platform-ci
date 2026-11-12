@@ -568,7 +568,8 @@ def _prepare_root(root, tool_roots):
         refuse("preparation-root-invalid")
     root.mkdir(mode=0o755, parents=True, exist_ok=True)
     _mount_fs(["mount", "-t", "tmpfs", "-o", "size=8g,mode=0755,nosuid,nodev", "tmpfs", str(root)], root)
-    for relative in ("bin", "sbin", "lib", "lib64", "usr", "etc/ssl", "dev", "proc", "work", "tools/node", "tools/rust"):
+    for relative in ("bin", "sbin", "lib", "lib64", "usr", "etc/ssl", "dev", "proc", "tmp",
+                     "work", "tools/node", "tools/rust"):
         (root / relative).mkdir(mode=0o755, parents=True, exist_ok=True)
     for source, target in (("/usr", root / "usr"), ("/lib", root / "lib"), ("/lib64", root / "lib64")):
         if Path(source).exists():
@@ -588,6 +589,8 @@ def _prepare_root(root, tool_roots):
     dev = root / "dev"
     _mount_fs(["mount", "-t", "tmpfs", "-o", "size=64m,mode=0755", "tmpfs", str(dev)], dev)
     _make_worker_devices(dev)
+    _mount_fs(["mount", "-t", "tmpfs", "-o", "size=512m,mode=01777,nosuid,nodev", "tmpfs",
+               str(root / "tmp")], root / "tmp")
     _mount_fs(["mount", "-t", "proc", "-o", "hidepid=2,subset=pid", "proc", str(root / "proc")], root / "proc")
     (root / "devlane-home").mkdir(mode=0o700, parents=True)
     os.chown(str(root / "devlane-home"), UID, GID)

@@ -489,6 +489,7 @@ def _mount_minimal_root(root, workspace, prepared, control_root):
         os.mknod(str(root / "dev" / name), stat.S_IFCHR | mode, os.makedev(major, minor))
     _ensure_directory(root / "dev/shm", 0o1777)
     _mount_tmpfs(root / "dev/shm", "512m", "01777")
+    _mount_tmpfs(root / "tmp", "512m", "01777", "nosuid,nodev")
     _mount_tmpfs(root / "workspace", "4g", "0755", "nosuid,nodev")
     _mount_tmpfs(root / "scratch", "4g", "0755", "nosuid,nodev")
     _mount_bind(prepared, root / "prepared", readonly=True)
@@ -577,6 +578,7 @@ def _worker_environment(stage, root, tools):
         "NPM_CONFIG_OFFLINE": "true",
         "NPM_CONFIG_IGNORE_SCRIPTS": "true",
         "NPM_CONFIG_CACHE": "/scratch/npm-cache",
+        "XDG_CACHE_HOME": "/scratch/tmp",
         "PLAYWRIGHT_BROWSERS_PATH": "/prepared/ms-playwright",
         "DEVLANE_STAGE": stage,
     }
@@ -967,7 +969,8 @@ def _prepare_trusted_files(root, manifest):
 
 
 def _prepare_writable_scratch(root, *, registry_v2=False):
-    for relative in ("scratch/reports", "scratch/target", "scratch/tmp", "scratch/npm-cache", "scratch/cargo-home"):
+    for relative in ("scratch/reports", "scratch/target", "scratch/tmp", "scratch/tmp/vitest-cache",
+                     "scratch/npm-cache", "scratch/cargo-home"):
         path = root / relative
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chown(str(path), WORKER_UID, WORKER_GID)
@@ -1387,7 +1390,7 @@ class Service:
         if self.tool_info["rust_root"]:
             _mount_bind(self.tool_info["rust_root"], self.root / "tools/rust", readonly=True)
         self.mounts = [
-            self.root / "proc", self.root / "sys", self.root / "dev/shm", self.root / "dev", self.root / "workspace",
+            self.root / "proc", self.root / "sys", self.root / "dev/shm", self.root / "dev", self.root / "tmp", self.root / "workspace",
             self.root / "scratch", self.root / "prepared", self.root / "control/profiles.json",
             self.root / "control/devlane", self.root / "etc/ssl/certs",
             self.root / "tools/rust", self.root / "tools/node", self.root / "lib64", self.root / "lib",

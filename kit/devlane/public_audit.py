@@ -368,6 +368,11 @@ class _Grammar:
                 public_counts["acceptance_refusal_stage"] = stage
                 return public_counts["acceptance_refused"] == 1
             if self.kind == "synthetic":
+                if diagnostic_contract.public_e2e_vitest_diagnostic(line):
+                    public_counts["e2e_vitest_diagnostic_lines"] = public_counts.get(
+                        "e2e_vitest_diagnostic_lines", 0) + 1
+                    return (public_counts["e2e_vitest_diagnostic_lines"]
+                            <= diagnostic_contract.MAX_E2E_VITEST_DIAGNOSTIC_LINES)
                 detail_stage = diagnostic_contract.acceptance_detail_stage(line)
                 if (detail_stage is not None
                         and detail_stage == public_counts.get("acceptance_refusal_stage")):

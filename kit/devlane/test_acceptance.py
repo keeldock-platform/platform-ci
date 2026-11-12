@@ -15,6 +15,7 @@ import tarfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import bundle
@@ -1371,6 +1372,46 @@ class PreparationDefectTests(unittest.TestCase):
         ensure = source.index('_ensure_directory(root / "workspace/source", 0o700)')
         self.assertIn('os.chown(str(root / "workspace/source"), WORKER_UID, WORKER_GID)', source[ensure:])
 
+    def test_node_worker_has_writable_exec_temp_cache_and_worker_sized_limits(self):
+        mount_source = inspect.getsource(supervisor._mount_minimal_root)
+        self.assertIn('_mount_tmpfs(root / "tmp", "512m", "01777", "nosuid,nodev")', mount_source)
+        self.assertIn('_mount_tmpfs(root / "workspace", "4g", "0755", "nosuid,nodev")', mount_source)
+        self.assertIn('_mount_tmpfs(root / "scratch", "4g", "0755", "nosuid,nodev")', mount_source)
+        self.assertIn('"proc", str(root / "proc")', mount_source)
+        self.assertIn('("null", 0o666, 1, 3)', mount_source)
+        self.assertIn('_mount_tmpfs(root / "dev/shm", "512m", "01777")', mount_source)
+        executable_mounts = [line for line in mount_source.splitlines()
+                             if "_mount_tmpfs(root /" in line]
+        self.assertTrue(executable_mounts)
+        self.assertTrue(all("noexec" not in line for line in executable_mounts))
+        self.assertIn('"ro,nosuid,nodev,noexec"', mount_source)
+        prepare_source = inspect.getsource(prepare._prepare_root)
+        self.assertIn("size=512m,mode=01777,nosuid,nodev", prepare_source)
+        self.assertNotIn("noexec", prepare_source)
+
+        environment = supervisor._worker_environment("unit", Path("/unused"), {"node_dir": "/tools/node/bin"})
+        self.assertEqual(environment["HOME"], "/devlane-home")
+        self.assertEqual(environment["TMPDIR"], "/scratch/tmp")
+        self.assertEqual(environment["XDG_CACHE_HOME"], "/scratch/tmp")
+        self.assertNotIn("NODE_OPTIONS", environment)
+        self.assertEqual(environment["PATH"].split(":")[0], "/tools/node/bin")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(supervisor.os, "chown"):
+                supervisor._prepare_writable_scratch(Path(temporary))
+            self.assertTrue((Path(temporary) / "scratch/tmp/vitest-cache").is_dir())
+
+        limits = []
+        with patch.object(supervisor.resource, "setrlimit",
+                          side_effect=lambda limit, value: limits.append((limit, value))), \
+                patch.object(supervisor.os, "umask"):
+            supervisor._limited_child()
+        requested = dict(limits)
+        self.assertEqual(requested[supervisor.resource.RLIMIT_NPROC], (1024, 1024))
+        self.assertEqual(requested[supervisor.resource.RLIMIT_NOFILE], (8192, 8192))
+        self.assertEqual(requested[supervisor.resource.RLIMIT_CPU], (1200, 1200))
+        self.assertNotIn(supervisor.resource.RLIMIT_AS, requested)
+
 
 class RealLockfileAndFixtureTests(unittest.TestCase):
     def test_every_e2e_node_fixture_passes_the_production_projection_validators(self):
@@ -1385,7 +1426,10 @@ class RealLockfileAndFixtureTests(unittest.TestCase):
                 fetch.validate_projection(scenario["payload"], "core-node")
 
     def test_real_npm_lock_metadata_is_accepted_and_only_needed_fields_are_projected(self):
-        lock = test_e2e._node_lock_from_reviewed({"typescript": "6.0.3", "vite": "8.3.5", "vitest": "5.0.5"})
+        lock = test_e2e._node_lock_from_reviewed({
+            "typescript": "6.0.3", "vite": "8.3.5", "vitest": "5.0.5",
+            "esbuild": "0.27.0", "rollup": "4.44.2",
+        })
         packages = lock["packages"]
         self.assertTrue(any("/node_modules/" in path for path in packages))
         self.assertTrue(any("||" in str(value.get("engines", "")) for value in packages.values()))
@@ -1395,6 +1439,27 @@ class RealLockfileAndFixtureTests(unittest.TestCase):
         for entry in projected["packages"].values():
             self.assertFalse({"license", "funding", "deprecated", "hasInstallScript"} & set(entry))
         self.assertTrue(any("libc" in entry for entry in projected["packages"].values()))
+        linux_native = packages["node_modules/@rolldown/binding-linux-x64-gnu"]
+        self.assertTrue(linux_native["optional"])
+        self.assertEqual((linux_native["os"], linux_native["cpu"], linux_native["libc"]),
+                         (["linux"], ["x64"], ["glibc"]))
+        self.assertIn("node_modules/@rolldown/binding-linux-x64-gnu", projected["packages"])
+        self.assertTrue(test_e2e._validate_linux_native_lock(lock))
+        fixture_packages = json.loads(test_e2e.SYNTHETIC_LOCK.read_text(encoding="utf-8"))["packages"]
+        for package_path in ("node_modules/@esbuild/linux-x64", "node_modules/@rollup/rollup-linux-x64-gnu"):
+            native = fixture_packages[package_path]
+            self.assertTrue(native["optional"])
+            self.assertEqual((native["os"], native["cpu"]), (["linux"], ["x64"]))
+
+    def test_real_vitest_fixture_uses_threads_and_a_writable_scratch_cache(self):
+        real_node = next(scenario for scenario in test_e2e.scenarios() if scenario["name"] == "real-node")
+        files = real_node["files"]()
+        config = files["packages/kernel-ui-kit/vitest.config.ts"].decode("ascii")
+        self.assertIn("pool: 'threads'", config)
+        self.assertIn("cacheDir: '/scratch/tmp/vitest-cache'", config)
+        self.assertIn("tests/**/*.test.ts", config)
+        self.assertIn("--include=optional", prepare.NPM_CI_ARGUMENTS)
+        self.assertIn("--ignore-scripts", prepare.NPM_CI_ARGUMENTS)
 
     REAL_CARGO_LOCK = (
         "version = 4\n\n"
@@ -1439,6 +1504,30 @@ class RealLockfileAndFixtureTests(unittest.TestCase):
 class InstallScriptSuppressionTests(unittest.TestCase):
     """A package that declares an install script is projected and installed as inert files."""
 
+    def test_linux_native_optional_packages_are_required_from_the_fixture_lock(self):
+        lock = {"packages": {
+            "node_modules/@esbuild/linux-x64": {
+                "optional": True, "os": ["linux"], "cpu": ["x64"],
+            },
+            "node_modules/@rollup/rollup-linux-x64-gnu": {
+                "optional": True, "os": ["linux"], "cpu": ["x64"],
+            },
+        }}
+        self.assertTrue(test_e2e._validate_linux_native_lock(lock))
+        for path, changes in (
+                ("node_modules/@esbuild/linux-x64", {"os": ["darwin"]}),
+                ("node_modules/@esbuild/linux-x64", {"optional": False}),
+                ("node_modules/@rollup/rollup-linux-x64-gnu", {"cpu": ["arm64"]}),):
+            candidate = json.loads(json.dumps(lock))
+            candidate["packages"][path].update(changes)
+            with self.subTest(path=path, changes=changes), self.assertRaisesRegex(
+                    RuntimeError, "linux-native-lock-entry-missing"):
+                test_e2e._validate_linux_native_lock(candidate)
+        missing = json.loads(json.dumps(lock))
+        del missing["packages"]["node_modules/@rollup/rollup-linux-x64-gnu"]
+        with self.assertRaisesRegex(RuntimeError, "linux-native-lock-entry-missing"):
+            test_e2e._validate_linux_native_lock(missing)
+
     def test_a_public_package_with_an_install_script_marker_projects_without_the_marker(self):
         lock = test_e2e._node_lock_from_reviewed({"fsevents": "2.3.3"})
         self.assertTrue(lock["packages"]["node_modules/fsevents"].get("hasInstallScript"))
@@ -1456,6 +1545,28 @@ class InstallScriptSuppressionTests(unittest.TestCase):
             refused(candidate)
             with self.subTest(mutation=refused), self.assertRaises(fetch.Refusal):
                 fetch.project_npm_lock(bundle.canonical_json(candidate))
+
+    def test_install_script_canary_requires_linux_x64_native_packages(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            modules = Path(temporary) / "node_modules"
+            launcher = modules / "esbuild/bin/esbuild"
+            esbuild_binary = modules / "@esbuild/linux-x64/bin/esbuild"
+            rollup_binary = modules / "@rollup/rollup-linux-x64-gnu/rollup.linux-x64-gnu.node"
+            launcher.parent.mkdir(parents=True)
+            esbuild_binary.parent.mkdir(parents=True)
+            rollup_binary.parent.mkdir(parents=True)
+            launcher.write_text(chr(35) + "!/bin/sh\n" + chr(35)
+                                + " lifecycle script did not replace this placeholder\n", encoding="ascii")
+            esbuild_binary.write_bytes(b"linux esbuild binary")
+            rollup_binary.write_bytes(b"linux rollup native module")
+            os.chmod(esbuild_binary, 0o755)
+            os.chmod(rollup_binary, 0o644)
+            with patch.object(test_e2e.sys, "platform", "linux"), \
+                    patch.object(test_e2e.os, "uname", return_value=SimpleNamespace(machine="x86_64")):
+                test_e2e._install_script_canary_check(temporary)
+                rollup_binary.unlink()
+                with self.assertRaisesRegex(RuntimeError, "linux-rollup-native-package-missing"):
+                    test_e2e._install_script_canary_check(temporary)
 
     def test_production_script_suppression_layers_each_stop_a_real_install_script(self):
         npm = shutil.which("npm")

@@ -492,6 +492,15 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             acceptance_diagnostics.failure_tail("private-stage", b"detail")
 
+    def test_source_free_failure_tail_preserves_vitest_diagnostics_before_the_general_tail(self):
+        raw_log = "devlane_e2e_vitest_diag=log name=unit.log line=1 text=Error%3A%20spawn%20EPERM"
+        payload = (raw_log + "\n" + "ordinary diagnostic\n" * 250).encode("ascii")
+        details = acceptance_diagnostics.failure_tail("production-path-e2e", payload)
+        self.assertIn(raw_log, details)
+        self.assertLessEqual(len(details), 202)
+        self.assertTrue(all(diagnostic_contract.public_e2e_vitest_diagnostic(line)
+                            or diagnostic_contract.public_acceptance_detail(line) for line in details))
+
     def test_preparation_refusal_diagnostics_are_allowlisted_and_never_count_as_acceptance(self):
         root = Path(__file__).resolve().parents[2]
         grammar = audit._Grammar(
@@ -633,6 +642,62 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 self.assertFalse(grammar.step_output_ok(
                     "Run full source-free production-path acceptance", invalid, {},
                 ))
+
+    def test_vitest_raw_log_diagnostics_are_bounded_to_the_synthetic_acceptance_step(self):
+        log_line = (
+            "devlane_e2e_vitest_diag=log name=unit.stderr.log line=120 "
+            "text=Error%3A%20spawn%20EPERM"
+        )
+        report_line = "devlane_e2e_vitest_diag=report name=vitest.json kind=file bytes=2048"
+        self.assertTrue(diagnostic_contract.public_e2e_vitest_diagnostic(log_line))
+        self.assertTrue(diagnostic_contract.public_e2e_vitest_diagnostic(report_line))
+        self.assertEqual(acceptance_diagnostics.failure_tail(
+            "production-path-e2e", (log_line + "\n" + report_line + "\n").encode("ascii"),
+        ), [log_line, report_line])
+        root = Path(__file__).resolve().parents[2]
+        synthetic = audit._Grammar(
+            root / ".github/workflows/devlane-synthetic.yml", "devlane-synthetic",
+            {"run_id": "12345", "control_sha": SHA}, "synthetic",
+        )
+        counts = {}
+        self.assertTrue(synthetic.step_output_ok(
+            "Run full source-free production-path acceptance", log_line, counts,
+        ))
+        self.assertTrue(synthetic.step_output_ok(
+            "Run full source-free production-path acceptance", report_line, counts,
+        ))
+        for invalid in (
+            log_line.replace("line=120", "line=0120"),
+            log_line.replace("unit.stderr.log", "../unit.log"),
+            log_line.replace("EPERM", "EPERM::error::"),
+            log_line.replace("EPERM", "SYNTHETIC_SOURCE_CANARY_7f8c"),
+            log_line.replace("EPERM", "EPERM%2g"),
+            report_line.replace("kind=file", "kind=private"),
+            report_line + " KEYCANARY-73A10X",
+        ):
+            with self.subTest(line=invalid):
+                self.assertFalse(diagnostic_contract.public_e2e_vitest_diagnostic(invalid))
+                self.assertFalse(synthetic.step_output_ok(
+                    "Run full source-free production-path acceptance", invalid, {},
+                ))
+        self.assertFalse(synthetic.step_output_ok("Set up pinned Node toolchain", log_line, {}))
+
+        encrypted = audit._Grammar(
+            root / ".github/workflows/devlane-encrypted.yml", audit.RUN_JOB,
+            IDENTITY, "encrypted",
+        )
+        self.assertFalse(encrypted.step_output_ok(
+            "Run full source-free production-path acceptance", log_line, {},
+        ))
+
+        bounded = {}
+        for _ in range(diagnostic_contract.MAX_E2E_VITEST_DIAGNOSTIC_LINES):
+            self.assertTrue(synthetic.step_output_ok(
+                "Run full source-free production-path acceptance", log_line, bounded,
+            ))
+        self.assertFalse(synthetic.step_output_ok(
+            "Run full source-free production-path acceptance", log_line, bounded,
+        ))
 
     def test_cleanup_incomplete_diagnostic_requires_a_fixed_subreason(self):
         for reason in diagnostic_contract.CLEANUP_SUBREASONS:
