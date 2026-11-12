@@ -953,7 +953,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 state = test_e2e._DiagnosticState()
                 state.capture("variant-startup-refusal-check", caught.exception)
                 line = state.refusal_line(caught.exception)
-                self.assertRegex(line, r"stage=variant-startup-refusal-check exception=[a-z0-9-]{1,48}(?::[a-z0-9-]{1,48})?$")
+                self.assertRegex(line, r"stage=variant-startup-refusal-check exception=[a-z0-9-]{1,48}(?::[a-z0-9-]{1,48}){0,2}$")
                 for marker in ("private-path", "private-canary", "KEYCANARY-73A10X", "unknown-private-code"):
                     self.assertNotIn(marker, line)
 
@@ -1011,7 +1011,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 state = test_e2e._DiagnosticState()
                 state.capture("variant-supervisor-start-check", caught.exception)
                 line = state.refusal_line(caught.exception)
-                self.assertRegex(line, r"stage=variant-supervisor-start-check exception=[a-z0-9-]{1,48}(?::[a-z0-9-]{1,48})?$")
+                self.assertRegex(line, r"stage=variant-supervisor-start-check exception=[a-z0-9-]{1,48}(?::[a-z0-9-]{1,48}){0,2}$")
                 for marker in ("private path", "private diagnostic", "KEYCANARY-73A10X", "unknown-private-code"):
                     self.assertNotIn(marker, line)
 
@@ -3128,6 +3128,29 @@ class RustMatrixRunnerTests(unittest.TestCase):
             self.assertFalse(diagnostic_contract.public_preparation_diagnostic(
                 line.replace("network-address-unexpected", "private-path"),
             ))
+        finally:
+            test_e2e.DIAGNOSTICS.reset()
+
+        structure_code = (
+            "network-probe-refusal:network-structure-invalid:netlink-message-port-id"
+        )
+        structure_result = subprocess.CompletedProcess(
+            ["supervisor.py", "probe"], 2, b"",
+            ("devlane_supervisor_refusal=" + structure_code + "\n").encode("ascii"),
+        )
+        test_e2e.DIAGNOSTICS.reset()
+        try:
+            with self.assertRaises(test_e2e.StartupRefusalMismatch) as caught:
+                with test_e2e.DIAGNOSTICS.phase("variant-supervisor-probe-check"):
+                    test_e2e._assert_supervisor_probe_pass(structure_result)
+            self.assertEqual(caught.exception.category, structure_code)
+            line = test_e2e.DIAGNOSTICS.refusal_line(caught.exception)
+            self.assertEqual(
+                line,
+                "devlane_production_e2e=refused stage=variant-supervisor-probe-check exception="
+                + structure_code,
+            )
+            self.assertTrue(diagnostic_contract.public_preparation_diagnostic(line))
         finally:
             test_e2e.DIAGNOSTICS.reset()
 

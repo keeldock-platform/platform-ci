@@ -11,6 +11,7 @@ from pathlib import Path
 
 import check_candidate
 from public_tree import (
+    BINARY_FIXTURE_FILES,
     PINNED_FILE_SHA256,
     PLATFORM_FILES,
     PublicTreeError,
@@ -262,6 +263,12 @@ class PublicTreeTests(unittest.TestCase):
     def test_platform_candidate_has_only_the_allowlisted_tree(self):
         result = scan_tree(ROOT, "platform")
         self.assertEqual(set(result), set(PLATFORM_FILES))
+        self.assertEqual(BINARY_FIXTURE_FILES, frozenset((
+            "kit/devlane/fixtures/real-netns-rtnetlink-ipv4-ubuntu2404.bin",
+            "kit/devlane/fixtures/real-netns-rtnetlink-ipv6-ubuntu2404.bin",
+        )))
+        self.assertTrue(BINARY_FIXTURE_FILES <= PLATFORM_FILES)
+        self.assertTrue(BINARY_FIXTURE_FILES <= set(PINNED_FILE_SHA256))
         self.assertIn("kit/bootstrap/policy.py", result)
         self.assertIn(".github/workflows/windows-attestation-permission-probe.yml", result)
         self.assertIn(".github/workflows/macos-capability.yml", result)
@@ -964,6 +971,8 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/test_e2e.py',
             'kit/devlane/rust_rehearsal_fixture.py',
             'kit/devlane/fixtures/real-netns-dump-ubuntu2404.txt',
+            'kit/devlane/fixtures/real-netns-rtnetlink-ipv4-ubuntu2404.bin',
+            'kit/devlane/fixtures/real-netns-rtnetlink-ipv6-ubuntu2404.bin',
             'kit/devlane/fixtures/core-rust-rehearsal/Cargo.lock',
             'kit/devlane/fixtures/core-rust-rehearsal/Cargo.toml',
             'kit/devlane/fixtures/core-rust-rehearsal/build.rs',

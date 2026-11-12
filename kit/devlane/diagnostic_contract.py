@@ -183,7 +183,7 @@ _EXCEPTION_RESULT = re.compile(
 )
 _E2E_REFUSAL = re.compile(
     r"devlane_production_e2e=refused stage=([a-z0-9-]{1,48}) "
-    r"exception=([a-z0-9-]{1,48}(?::[a-z0-9-]{1,48})?)"
+    r"exception=([a-z0-9-]{1,48}(?::[a-z0-9-]{1,48}){0,2})"
     r"(?: (" + network_probe.ROUTE_DIAGNOSTIC_PATTERN + r"))?"
     r"(?: reason=([a-z0-9-]{1,48})(?: version=\"([A-Za-z0-9._+-][A-Za-z0-9 ._+-]{0,31})\")?)?"
     r"(?: cleanup=(unconfirmed))?\Z"

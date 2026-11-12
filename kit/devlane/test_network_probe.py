@@ -1,5 +1,6 @@
 """Executable source-free network topology and denial regressions."""
 
+import ast
 import errno
 import ipaddress
 import inspect
@@ -16,6 +17,8 @@ import supervisor
 
 
 HOST_NET = 100
+REAL_NETLINK_PORT_ID = 0x5A17
+REAL_NETLINK_SEQUENCE = 0x10203040
 
 
 FIB_TRIE = """\
@@ -129,8 +132,9 @@ def _route_attribute(kind, payload):
     return value + b"\0" * ((-len(value)) & 3)
 
 
-def _netlink_frame(message_type, payload, sequence):
-    value = struct.pack("=IHHII", 16 + len(payload), message_type, 0, sequence, 0) + payload
+def _netlink_frame(message_type, payload, sequence, *, flags=network_probe.NLM_F_MULTI,
+                   port_id=REAL_NETLINK_PORT_ID):
+    value = struct.pack("=IHHII", 16 + len(payload), message_type, flags, sequence, port_id) + payload
     return value + b"\0" * ((-len(value)) & 3)
 
 
@@ -230,6 +234,13 @@ class NetworkProbeTests(unittest.TestCase):
             with self.subTest(stderr=stderr[:96]):
                 self.assertIsNone(network_probe.refusal_code_from_result(returncode, stdout, stderr))
 
+        structure_code = "network-structure-invalid:netlink-message-port-id"
+        structure_result = ("network_probe_refusal=" + structure_code + "\n").encode("ascii")
+        self.assertEqual(network_probe.refusal_code_from_result(2, b"", structure_result), structure_code)
+        self.assertIsNone(network_probe.refusal_code_from_result(
+            2, b"", b"network_probe_refusal=network-structure-invalid:private-path\n",
+        ))
+
         route_detail = (
             "route[table=main,type=unicast,family=4,dst=0.0.0.0/0,"
             "oif=lo,proto=boot,scope=universe]"
@@ -244,6 +255,26 @@ class NetworkProbeTests(unittest.TestCase):
                 detailed.replace(b"network-route-unexpected", b"network-address-unexpected"),
                 detailed.replace(b"proto=boot", b"proto=private-path")):
             self.assertIsNone(network_probe.refusal_code_from_result(2, b"", invalid))
+
+    def test_network_structure_invalid_call_sites_use_allowlisted_suffixes(self):
+        source = Path(network_probe.__file__).read_text(encoding="utf-8")
+        self.assertNotIn('_refuse("network-structure-invalid")', source)
+        self.assertNotIn("network-structure-invalid", network_probe.REFUSAL_CODES)
+        tree = ast.parse(source)
+        literal_suffixes = set()
+        dynamic_suffixes = []
+        for node in ast.walk(tree):
+            if (not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name)
+                    or node.func.id != "_invalid_structure"):
+                continue
+            if node.args and isinstance(node.args[0], ast.Constant):
+                literal_suffixes.add(node.args[0].value)
+            else:
+                dynamic_suffixes.append(node.args[0].id if node.args and isinstance(node.args[0], ast.Name) else "")
+        self.assertLessEqual(literal_suffixes, network_probe.NETWORK_STRUCTURE_INVALID_SUFFIXES)
+        self.assertEqual(dynamic_suffixes, ["malformed_suffix"])
+        for suffix in network_probe.NETWORK_STRUCTURE_INVALID_SUFFIXES:
+            self.assertIn("network-structure-invalid:" + suffix, network_probe.REFUSAL_CODES)
 
     def test_reachable_external_control_is_required_before_the_cut(self):
         class Connected:
@@ -359,7 +390,7 @@ class NetworkProbeTests(unittest.TestCase):
         with self.assertRaisesRegex(network_probe.ProbeRefusal, "network-route-unexpected"):
             _fixture_snapshot(self, proc, net_class)
 
-    def test_real_ubuntu2404_netns_dump_and_negative_route_fixtures(self):
+    def test_real_kernel7_ubuntu2404_netns_proc_and_binary_rtnetlink_fixtures(self):
         sections = _real_netns_dump_sections()
         self.assertEqual(sections["/proc/net/route"], IPV4_ROUTE)
         self.assertEqual(sections["/proc/net/ipv6_route"], IPV6_ROUTE)
@@ -377,6 +408,27 @@ class NetworkProbeTests(unittest.TestCase):
             ipv6_address=sections["/proc/net/if_inet6"],
             flags=sections["/sys/class/net/lo/flags"],
         )
+        fixture_dir = Path(__file__).with_name("fixtures")
+        binary_replies = {
+            network_probe.socket.AF_INET: (fixture_dir / "real-netns-rtnetlink-ipv4-ubuntu2404.bin").read_bytes(),
+            10: (fixture_dir / "real-netns-rtnetlink-ipv6-ubuntu2404.bin").read_bytes(),
+        }
+        for family, reply in binary_replies.items():
+            offset = 0
+            message_types = []
+            while offset < len(reply):
+                length, message_type, flags, sequence, port_id = struct.unpack_from("=IHHII", reply, offset)
+                self.assertGreaterEqual(length, 16)
+                self.assertEqual(sequence, REAL_NETLINK_SEQUENCE)
+                self.assertEqual(port_id, REAL_NETLINK_PORT_ID)
+                self.assertTrue(flags & network_probe.NLM_F_MULTI)
+                message_types.append(message_type)
+                offset += (length + 3) & ~3
+            self.assertEqual(offset, len(reply))
+            self.assertEqual(message_types[-1], network_probe.NLMSG_DONE)
+            self.assertEqual(message_types.count(network_probe.RTM_NEWROUTE),
+                             3 if family == network_probe.socket.AF_INET else 1)
+            self.assertEqual(struct.unpack_from("=i", reply, len(reply) - 4)[0], 0)
 
         class RouteSocket:
             def __init__(self):
@@ -395,24 +447,27 @@ class NetworkProbeTests(unittest.TestCase):
                 if address != (0, 0):
                     raise AssertionError("route socket binding changed")
 
+            def getsockname(self):
+                return (REAL_NETLINK_PORT_ID, 0)
+
             def sendto(self, request, _address):
                 _length, kind, flags, sequence, _pid = struct.unpack_from("=IHHII", request)
                 if kind != network_probe.RTM_GETROUTE or flags != (
                         network_probe.NLM_F_REQUEST | network_probe.NLM_F_DUMP):
                     raise AssertionError("route dump request changed")
                 family = request[16]
-                self.responses = [
-                    *(_netlink_frame(network_probe.RTM_NEWROUTE, payload, sequence)
-                      for payload in _kernel_68_payloads(family)),
-                    _netlink_frame(network_probe.NLMSG_DONE, b"", sequence),
-                ]
+                if sequence != REAL_NETLINK_SEQUENCE:
+                    raise AssertionError("real reply fixture sequence changed")
+                self.responses = [binary_replies[family]]
 
             def recvfrom(self, _maximum):
                 return self.responses.pop(0), (0, 0)
 
         with patch.object(network_probe, "PROC_ROOT", str(proc)), \
                 patch.object(network_probe, "SYS_CLASS_NET", str(net_class)), \
+                patch.object(network_probe.socket, "AF_INET6", 10), \
                 patch.object(network_probe.os, "stat", return_value=SimpleNamespace(st_ino=200)), \
+                patch.object(network_probe.time, "monotonic_ns", return_value=REAL_NETLINK_SEQUENCE), \
                 patch.object(network_probe.socket, "socket", side_effect=lambda *_: RouteSocket()):
             self.assertEqual(network_probe.structural_snapshot(HOST_NET), {
                 "netns_inode": 200, "interfaces": ["lo"], "routes": 0,
@@ -514,11 +569,42 @@ class NetworkProbeTests(unittest.TestCase):
         with self.assertRaisesRegex(network_probe.ProbeRefusal, "network-route-unexpected route\\["):
             network_probe._validate_route_payload(gateway, network_probe.socket.AF_INET, 1)
 
+        unpadded_preference = (
+            struct.pack("=BBBBBBBBI", network_probe.socket.AF_INET6, 128, 0, 0, 255,
+                        network_probe.RTPROT_KERNEL, network_probe.RT_SCOPE_UNIVERSE,
+                        network_probe.RTN_LOCAL, 0)
+            + _route_attribute(network_probe.RTA_DST, ipaddress.IPv6Address("::1").packed)
+            + _route_attribute(network_probe.RTA_TABLE, struct.pack("=I", 255))
+            + _route_attribute(network_probe.RTA_PRIORITY, struct.pack("=I", 0))
+            + _route_attribute(network_probe.RTA_CACHEINFO, b"\0" * 32)
+            + _route_attribute(network_probe.RTA_OIF, struct.pack("=I", 1))
+            + struct.pack("=HHB", 5, network_probe.RTA_PREF, network_probe.RT6_PREF_MEDIUM)
+        )
+        self.assertEqual(network_probe._validate_route_payload(
+            unpadded_preference, network_probe.socket.AF_INET6, 1,
+        )["preference"], network_probe.RT6_PREF_MEDIUM)
+        invalid_preference = unpadded_preference[:-1] + b"\x02"
+        with self.assertRaisesRegex(
+                network_probe.ProbeRefusal,
+                "network-structure-invalid:netlink-preference-value",
+        ):
+            network_probe._validate_route_payload(
+                invalid_preference, network_probe.socket.AF_INET6, 1,
+            )
+
     def test_rtnetlink_dump_accepts_kernel_68_fixture_and_refuses_default_interface_and_gateway(self):
         class RouteSocket:
-            def __init__(self, extra_route=None, omit_broadcast=False):
+            def __init__(self, extra_route=None, omit_broadcast=False, *,
+                         route_flags=network_probe.NLM_F_MULTI,
+                         port_id=REAL_NETLINK_PORT_ID,
+                         done_payload=b"\0\0\0\0",
+                         done_flags=network_probe.NLM_F_MULTI):
                 self.extra_route = extra_route
                 self.omit_broadcast = omit_broadcast
+                self.route_flags = route_flags
+                self.port_id = port_id
+                self.done_payload = done_payload
+                self.done_flags = done_flags
                 self.responses = []
 
             def __enter__(self):
@@ -534,6 +620,9 @@ class NetworkProbeTests(unittest.TestCase):
                 if address != (0, 0):
                     raise AssertionError("route socket binding changed")
 
+            def getsockname(self):
+                return (REAL_NETLINK_PORT_ID, 0)
+
             def sendto(self, request, _address):
                 _length, kind, flags, sequence, _pid = struct.unpack_from("=IHHII", request)
                 if kind != network_probe.RTM_GETROUTE or flags != (
@@ -546,15 +635,25 @@ class NetworkProbeTests(unittest.TestCase):
                 if self.extra_route is not None and family == network_probe.socket.AF_INET:
                     payloads.append(self.extra_route)
                 self.responses = [
-                    *(_netlink_frame(network_probe.RTM_NEWROUTE, payload, sequence)
+                    *(_netlink_frame(network_probe.RTM_NEWROUTE, payload, sequence,
+                                     flags=self.route_flags, port_id=self.port_id)
                       for payload in payloads),
-                    _netlink_frame(network_probe.NLMSG_DONE, b"", sequence),
+                    _netlink_frame(network_probe.NLMSG_DONE, self.done_payload, sequence,
+                                   flags=self.done_flags, port_id=self.port_id),
                 ]
 
             def recvfrom(self, _maximum):
                 return self.responses.pop(0), (0, 0)
 
         with patch.object(network_probe.socket, "socket", side_effect=lambda *_: RouteSocket()):
+            network_probe._check_rtnetlink_routes(1)
+
+        with patch.object(
+                network_probe.socket, "socket",
+                side_effect=lambda *_: RouteSocket(
+                    done_payload=struct.pack("=i", 0) + _route_attribute(1, b"ack"),
+                    done_flags=network_probe.NLM_F_MULTI | network_probe.NLM_F_ACK_TLVS,
+                )):
             network_probe._check_rtnetlink_routes(1)
 
         negative_routes = {
@@ -583,6 +682,22 @@ class NetworkProbeTests(unittest.TestCase):
         with patch.object(network_probe.socket, "socket",
                           side_effect=lambda *_: RouteSocket(omit_broadcast=True)):
             network_probe._check_rtnetlink_routes(1)
+
+        malformed_responses = (
+            (RouteSocket(route_flags=0), "network-structure-invalid:netlink-message-flags"),
+            (RouteSocket(port_id=REAL_NETLINK_PORT_ID + 1),
+             "network-structure-invalid:netlink-message-port-id"),
+            (RouteSocket(done_payload=b""), "network-structure-invalid:netlink-done-payload"),
+            (RouteSocket(done_payload=b"\0\0"), "network-structure-invalid:netlink-done-payload"),
+            (RouteSocket(done_payload=struct.pack("=i", -1)),
+             "network-structure-invalid:netlink-kernel-error"),
+        )
+        for route_socket, reason in malformed_responses:
+            with self.subTest(reason=reason), \
+                    patch.object(network_probe.socket, "socket", side_effect=lambda *_, s=route_socket: s):
+                with self.assertRaises(network_probe.ProbeRefusal) as caught:
+                    network_probe._check_rtnetlink_routes(1)
+                self.assertEqual(str(caught.exception), reason)
 
     def test_firewall_readback_rejects_external_accept_rules_and_relaxed_policy(self):
         chains = {

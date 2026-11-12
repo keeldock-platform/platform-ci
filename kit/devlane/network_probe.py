@@ -18,6 +18,29 @@ class ProbeRefusal(ValueError):
     pass
 
 
+NETWORK_STRUCTURE_INVALID_SUFFIXES = frozenset((
+    "network-file-read", "network-file-size", "network-file-nul", "network-file-encoding",
+    "ipv4-route-address-shape", "ipv4-route-address-value", "ipv4-fib-trie-address",
+    "ipv4-fib-trie-prefix", "ipv4-route-header", "ipv6-route-empty",
+    "ipv6-route-field-count", "ipv6-route-field-shape", "ipv6-route-value",
+    "netlink-route-header", "netlink-route-family", "netlink-route-prefix",
+    "netlink-attribute-header", "netlink-attribute-length", "netlink-attribute-padding",
+    "netlink-attribute-duplicate", "netlink-attribute-flags", "netlink-destination-length",
+    "netlink-output-interface-length", "netlink-table-length", "netlink-priority-length",
+    "netlink-prefsrc-length", "netlink-gateway-length", "netlink-cacheinfo-length",
+    "netlink-preference-length", "netlink-preference-value", "netlink-pad-length",
+    "netlink-metrics-invalid",
+    "netlink-socket-bind", "netlink-socket-identity", "netlink-packet-sender",
+    "netlink-packet-empty", "netlink-packet-size", "netlink-packet-limit",
+    "netlink-message-header", "netlink-message-length", "netlink-message-alignment",
+    "netlink-message-sequence", "netlink-message-port-id", "netlink-message-flags",
+    "netlink-dump-interrupted", "netlink-done-payload", "netlink-done-ack-attributes",
+    "netlink-message-after-done", "netlink-kernel-error", "netlink-message-type",
+    "netlink-socket-failed", "loopback-metadata", "interface-list-read",
+    "interface-proc-row", "ipv6-address-proc-shape", "ipv6-address-proc-value",
+))
+
+
 REFUSAL_CODES = frozenset((
     "descriptor-probe-unavailable", "external-connectivity", "external-probe-error",
     "external-probe-result-invalid", "firewall-chain-set", "firewall-invalid",
@@ -25,10 +48,11 @@ REFUSAL_CODES = frozenset((
     "firewall-unavailable", "inherited-socket", "loopback-unavailable",
     "network-address-unexpected", "network-interface-unexpected",
     "network-namespace-not-isolated", "network-namespace-unavailable",
-    "network-route-unexpected", "network-structure-invalid", "network-structure-unexpected",
+    "network-route-unexpected", "network-structure-unexpected",
     "positive-control-error", "positive-control-unavailable", "probe-evidence-shape",
     "probe-failed", "probe-identity", "probe-not-unprivileged", "probe-tool-failed",
     "probe-tool-invalid", "probe-tool-unavailable", "proxy-environment",
+    *("network-structure-invalid:" + suffix for suffix in NETWORK_STRUCTURE_INVALID_SUFFIXES),
 ))
 MAX_REFUSAL_OUTPUT_BYTES = 512
 ROUTE_DIAGNOSTIC_PATTERN = (
@@ -42,7 +66,7 @@ ROUTE_DIAGNOSTIC_PATTERN = (
 )
 _ROUTE_DIAGNOSTIC = re.compile(ROUTE_DIAGNOSTIC_PATTERN)
 _REFUSAL_OUTPUT = re.compile(
-    rb"network_probe_refusal=([a-z0-9-]{1,64})(?: (route\[[^\n]{1,320}\]))?\n\Z"
+    rb"network_probe_refusal=([a-z0-9-]{1,64}(?::[a-z0-9-]{1,48})?)(?: (route\[[^\n]{1,320}\]))?\n\Z"
 )
 
 
@@ -57,8 +81,11 @@ RTM_GETROUTE = 26
 NLMSG_ERROR = 2
 NLMSG_DONE = 3
 NLM_F_REQUEST = 0x1
+NLM_F_MULTI = 0x2
 NLM_F_DUMP = 0x300
 NLM_F_DUMP_INTR = 0x10
+NLM_F_DUMP_FILTERED = 0x20
+NLM_F_ACK_TLVS = 0x200
 RTA_DST = 1
 RTA_OIF = 4
 RTA_GATEWAY = 5
@@ -72,6 +99,7 @@ RTA_VIA = 18
 RTA_PREF = 20
 RTA_ENCAP_TYPE = 21
 RTA_ENCAP = 22
+RTA_PAD = 24
 RTA_NH_ID = 30
 RTN_UNICAST = 1
 RTN_LOCAL = 2
@@ -86,6 +114,9 @@ RTPROT_KERNEL = 2
 RTPROT_BOOT = 3
 RTPROT_STATIC = 4
 RTPROT_RA = 9
+RT6_PREF_LOW = 3
+RT6_PREF_MEDIUM = 0
+RT6_PREF_HIGH = 1
 RT_SCOPE_UNIVERSE = 0
 RT_SCOPE_SITE = 200
 RT_SCOPE_LINK = 253
@@ -171,27 +202,34 @@ def require_external_blocked(operation):
     return False
 
 
+def _invalid_structure(suffix):
+    """Refuse malformed structure with a finite, reviewable reason code."""
+    _refuse("network-structure-invalid:" + suffix)
+
+
 def _read_network_file(path):
     try:
         with open(path, "rb") as source:
             payload = source.read(MAX_NETWORK_FILE_BYTES + 1)
     except OSError:
-        _refuse("network-structure-invalid")
-    if len(payload) > MAX_NETWORK_FILE_BYTES or b"\x00" in payload:
-        _refuse("network-structure-invalid")
+        _invalid_structure("network-file-read")
+    if len(payload) > MAX_NETWORK_FILE_BYTES:
+        _invalid_structure("network-file-size")
+    if b"\x00" in payload:
+        _invalid_structure("network-file-nul")
     try:
         return payload.decode("ascii", "strict")
     except UnicodeDecodeError:
-        _refuse("network-structure-invalid")
+        _invalid_structure("network-file-encoding")
 
 
 def _ipv4_route_address(value):
     if re.fullmatch(r"[0-9a-fA-F]{8}", value) is None:
-        _refuse("network-structure-invalid")
+        _invalid_structure("ipv4-route-address-shape")
     try:
         return str(ipaddress.IPv4Address(struct.pack("<I", int(value, 16))))
     except (OverflowError, ValueError, struct.error):
-        _refuse("network-structure-invalid")
+        _invalid_structure("ipv4-route-address-value")
 
 
 def _ipv4_local_addresses(fib_trie):
@@ -204,13 +242,13 @@ def _ipv4_local_addresses(fib_trie):
             try:
                 candidate = str(ipaddress.IPv4Address(leaf.group(1)))
             except ipaddress.AddressValueError:
-                _refuse("network-structure-invalid")
+                _invalid_structure("ipv4-fib-trie-address")
             continue
         route = re.fullmatch(r"\s*/([0-9]{1,3}) host LOCAL\s*", line)
         if route is not None and candidate is not None:
             prefix = int(route.group(1))
             if prefix > 32:
-                _refuse("network-structure-invalid")
+                _invalid_structure("ipv4-fib-trie-prefix")
             if (candidate, prefix) != ("0.0.0.0", 0):
                 local.add((candidate, prefix))
         if not re.fullmatch(r"\s*/[0-9]{1,3} [A-Za-z]+ [A-Za-z]+\s*", line):
@@ -223,7 +261,7 @@ def _check_ipv4_routes(routes):
     expected_header = ["Iface", "Destination", "Gateway", "Flags", "RefCnt", "Use",
                        "Metric", "Mask", "MTU", "Window", "IRTT"]
     if not lines or lines[0].split() != expected_header:
-        _refuse("network-structure-invalid")
+        _invalid_structure("ipv4-route-header")
     if len(lines) != 1:
         _refuse("network-route-unexpected")
 
@@ -233,10 +271,10 @@ def _check_ipv6_routes(routes):
     null_count = 0
     for line in routes.splitlines():
         if not line.strip():
-            _refuse("network-structure-invalid")
+            _invalid_structure("ipv6-route-empty")
         fields = line.split()
         if len(fields) != 10:
-            _refuse("network-structure-invalid")
+            _invalid_structure("ipv6-route-field-count")
         destination, prefix, source, source_prefix, next_hop = fields[:5]
         interface = fields[9]
         if (re.fullmatch(r"[0-9a-fA-F]{32}", destination) is None
@@ -245,7 +283,7 @@ def _check_ipv6_routes(routes):
                 or re.fullmatch(r"[0-9a-fA-F]{2}", source_prefix) is None
                 or re.fullmatch(r"[0-9a-fA-F]{32}", next_hop) is None
                 or any(re.fullmatch(r"[0-9a-fA-F]{8}", value) is None for value in fields[5:9])):
-            _refuse("network-structure-invalid")
+            _invalid_structure("ipv6-route-field-shape")
         try:
             destination = str(ipaddress.IPv6Address(bytes.fromhex(destination)))
             source = str(ipaddress.IPv6Address(bytes.fromhex(source)))
@@ -255,7 +293,7 @@ def _check_ipv6_routes(routes):
             metric = int(fields[5], 16)
             route_flags = int(fields[8], 16)
         except (ValueError, ipaddress.AddressValueError):
-            _refuse("network-structure-invalid")
+            _invalid_structure("ipv6-route-value")
         if (source != "::" or source_prefix_length != 0 or next_hop != "::"
                 or interface != "lo"):
             _refuse("network-route-unexpected")
@@ -273,55 +311,100 @@ def _check_ipv6_routes(routes):
         _refuse("network-route-unexpected")
 
 
+def _netlink_attributes(payload, malformed_suffix):
+    """Read aligned nlattrs while allowing the final attribute to omit tail padding."""
+    offset = 0
+    while offset < len(payload):
+        remaining = len(payload) - offset
+        if remaining < 4:
+            _invalid_structure("netlink-attribute-header")
+        attribute_length, raw_type = struct.unpack_from("=HH", payload, offset)
+        if attribute_length < 4 or attribute_length > remaining:
+            _invalid_structure("netlink-attribute-length")
+        end = offset + attribute_length
+        aligned_end = offset + ((attribute_length + 3) & ~3)
+        if aligned_end > len(payload):
+            if end != len(payload):
+                _invalid_structure(malformed_suffix)
+            aligned_end = len(payload)
+        yield raw_type & 0x3fff, raw_type & 0xc000, payload[offset + 4:end]
+        offset = aligned_end
+
+
 def _route_from_payload(payload, family):
     route_size = struct.calcsize("=BBBBBBBBI")
     if len(payload) < route_size:
-        _refuse("network-structure-invalid")
+        _invalid_structure("netlink-route-header")
     route_family, prefix, src_prefix, tos, table, protocol, scope, route_type, _flags = struct.unpack_from(
         "=BBBBBBBBI", payload,
     )
     if route_family != family:
-        _refuse("network-structure-invalid")
+        _invalid_structure("netlink-route-family")
     address_size = 4 if family == socket.AF_INET else 16
     if prefix > address_size * 8 or src_prefix > address_size * 8:
-        _refuse("network-structure-invalid")
+        _invalid_structure("netlink-route-prefix")
     attributes = {}
-    offset = route_size
-    while offset < len(payload):
-        if offset + 4 > len(payload):
-            _refuse("network-structure-invalid")
-        attribute_length, attribute_type = struct.unpack_from("=HH", payload, offset)
-        if attribute_length < 4 or offset + attribute_length > len(payload):
-            _refuse("network-structure-invalid")
-        attribute_type &= 0x3fff
+    for attribute_type, attribute_flags, value in _netlink_attributes(
+            payload[route_size:], "netlink-attribute-padding"):
         if attribute_type in attributes:
-            _refuse("network-structure-invalid")
+            _invalid_structure("netlink-attribute-duplicate")
+        if (attribute_flags and attribute_type not in (RTA_METRICS, RTA_ENCAP)):
+            _invalid_structure("netlink-attribute-flags")
         if attribute_type in (RTA_DST, RTA_OIF, RTA_TABLE, RTA_GATEWAY, RTA_MULTIPATH,
                               RTA_VIA, RTA_ENCAP, RTA_ENCAP_TYPE, RTA_NH_ID,
                               RTA_PRIORITY, RTA_PREFSRC, RTA_METRICS,
-                              RTA_CACHEINFO, RTA_PREF):
-            attributes[attribute_type] = payload[offset + 4:offset + attribute_length]
+                              RTA_CACHEINFO, RTA_PREF, RTA_PAD):
+            attributes[attribute_type] = value
         else:
             attributes[-1] = b"unknown"
-        offset += (attribute_length + 3) & ~3
+
     raw_destination = attributes.get(RTA_DST, b"\0" * address_size)
     if len(raw_destination) != address_size:
-        _refuse("network-structure-invalid")
+        _invalid_structure("netlink-destination-length")
     output_index = attributes.get(RTA_OIF)
     if output_index is not None and len(output_index) != 4:
-        _refuse("network-structure-invalid")
+        _invalid_structure("netlink-output-interface-length")
     output_index = struct.unpack("=I", output_index)[0] if output_index is not None else None
     route_table = attributes.get(RTA_TABLE)
     if route_table is not None:
         if len(route_table) != 4:
-            _refuse("network-structure-invalid")
+            _invalid_structure("netlink-table-length")
         route_table = struct.unpack("=I", route_table)[0]
     else:
         route_table = table
+    priority = attributes.get(RTA_PRIORITY)
+    if priority is not None and len(priority) != 4:
+        _invalid_structure("netlink-priority-length")
+    priority = struct.unpack("=I", priority)[0] if priority is not None else 0
+    preferred_source = attributes.get(RTA_PREFSRC)
+    if preferred_source is not None and len(preferred_source) != address_size:
+        _invalid_structure("netlink-prefsrc-length")
+    if RTA_GATEWAY in attributes and len(attributes[RTA_GATEWAY]) != address_size:
+        _invalid_structure("netlink-gateway-length")
+    if RTA_CACHEINFO in attributes and len(attributes[RTA_CACHEINFO]) != 32:
+        _invalid_structure("netlink-cacheinfo-length")
+    if RTA_PAD in attributes and attributes[RTA_PAD]:
+        _invalid_structure("netlink-pad-length")
+    preference = attributes.get(RTA_PREF)
+    if preference is not None:
+        if len(preference) != 1:
+            _invalid_structure("netlink-preference-length")
+        preference = preference[0]
+        if preference not in (RT6_PREF_LOW, RT6_PREF_MEDIUM, RT6_PREF_HIGH):
+            _invalid_structure("netlink-preference-value")
+    if RTA_METRICS in attributes and attributes[RTA_METRICS]:
+        try:
+            tuple(_netlink_attributes(attributes[RTA_METRICS], "netlink-metrics-invalid"))
+        except (ProbeRefusal, struct.error, ValueError):
+            _invalid_structure("netlink-metrics-invalid")
+
     destination = str(ipaddress.ip_address(raw_destination))
+    preferred_source = (str(ipaddress.ip_address(preferred_source))
+                        if preferred_source is not None else None)
     route = {
         "family": family,
         "table": route_table,
+        "header_table": table,
         "type": route_type,
         "destination": destination,
         "prefix": prefix,
@@ -331,10 +414,14 @@ def _route_from_payload(payload, family):
         "src_prefix": src_prefix,
         "tos": tos,
         "gateway": RTA_GATEWAY in attributes,
+        "priority": priority,
+        "preferred_source": preferred_source,
+        "preference": preference,
         "alternate_nexthop": any(kind in attributes for kind in (
             RTA_MULTIPATH, RTA_VIA, RTA_ENCAP, RTA_ENCAP_TYPE, RTA_NH_ID,
         )),
         "unknown_attributes": -1 in attributes,
+        "metrics": bool(attributes.get(RTA_METRICS)),
     }
     return route
 
@@ -388,16 +475,24 @@ def _route_description(route, loopback_index):
 def _expected_route(route, loopback_index):
     if (route["src_prefix"] != 0 or route["tos"] != 0 or route["gateway"]
             or route["alternate_nexthop"]
+            or route["header_table"] not in (RT_TABLE_UNSPEC, route["table"])
+            or route["priority"] != 0 or route["metrics"]
             or route["unknown_attributes"]
             or route["oif"] not in (None, loopback_index)):
         return False
     if route["family"] == socket.AF_INET:
+        if (route["preferred_source"] not in (None, "127.0.0.1")
+                or route["preference"] is not None):
+            return False
         expected = {
             (RT_TABLE_LOCAL, RTPROT_KERNEL, RT_SCOPE_HOST, RTN_LOCAL, "127.0.0.0", 8),
             (RT_TABLE_LOCAL, RTPROT_KERNEL, RT_SCOPE_HOST, RTN_LOCAL, "127.0.0.1", 32),
             (RT_TABLE_LOCAL, RTPROT_KERNEL, RT_SCOPE_LINK, RTN_BROADCAST, "127.255.255.255", 32),
         }
     else:
+        if (route["preferred_source"] not in (None, "::1")
+                or route["preference"] not in (None, RT6_PREF_MEDIUM)):
+            return False
         expected = {
             (RT_TABLE_LOCAL, RTPROT_KERNEL, RT_SCOPE_UNIVERSE, RTN_LOCAL, "::1", 128),
         }
@@ -449,27 +544,59 @@ def _check_rtnetlink_routes(loopback_index):
         try:
             with socket.socket(netlink_family, socket.SOCK_RAW, NETLINK_ROUTE) as connection:
                 connection.settimeout(3)
-                connection.bind((0, 0))
+                try:
+                    connection.bind((0, 0))
+                except OSError:
+                    _invalid_structure("netlink-socket-bind")
+                try:
+                    socket_name = connection.getsockname()
+                except (AttributeError, OSError, TypeError, ValueError):
+                    _invalid_structure("netlink-socket-identity")
+                if (type(socket_name) is not tuple or len(socket_name) < 2
+                        or type(socket_name[0]) is not int or socket_name[0] <= 0):
+                    _invalid_structure("netlink-socket-identity")
+                port_id = socket_name[0]
                 connection.sendto(header + route_request, (0, 0))
                 received = 0
                 complete = False
                 while not complete:
                     packet, sender = connection.recvfrom(65536)
-                    if sender[0] != 0 or not packet or len(packet) >= 65536:
-                        _refuse("network-structure-invalid")
+                    if (type(sender) is not tuple or len(sender) < 2 or sender[0] != 0
+                            or sender[1] != 0):
+                        _invalid_structure("netlink-packet-sender")
+                    if not packet:
+                        _invalid_structure("netlink-packet-empty")
+                    if len(packet) >= 65536:
+                        _invalid_structure("netlink-packet-size")
                     received += len(packet)
                     if received > MAX_NETWORK_FILE_BYTES:
-                        _refuse("network-structure-invalid")
+                        _invalid_structure("netlink-packet-limit")
                     offset = 0
                     while offset < len(packet):
                         if offset + 16 > len(packet):
-                            _refuse("network-structure-invalid")
+                            _invalid_structure("netlink-message-header")
                         length, message_type, message_flags, message_sequence, message_pid = struct.unpack_from(
                             "=IHHII", packet, offset,
                         )
-                        if (length < 16 or offset + length > len(packet)
-                                or message_sequence != sequence or message_pid != 0):
-                            _refuse("network-structure-invalid")
+                        remaining = len(packet) - offset
+                        if length < 16 or length > remaining:
+                            _invalid_structure("netlink-message-length")
+                        if message_sequence != sequence:
+                            _invalid_structure("netlink-message-sequence")
+                        if message_pid != port_id:
+                            _invalid_structure("netlink-message-port-id")
+                        if message_flags & NLM_F_DUMP_INTR:
+                            _invalid_structure("netlink-dump-interrupted")
+                        if not message_flags & NLM_F_MULTI:
+                            _invalid_structure("netlink-message-flags")
+                        if message_type == RTM_NEWROUTE:
+                            allowed_flags = NLM_F_MULTI | NLM_F_DUMP_FILTERED
+                        elif message_type == NLMSG_DONE:
+                            allowed_flags = NLM_F_MULTI | NLM_F_DUMP_FILTERED | NLM_F_ACK_TLVS
+                        else:
+                            allowed_flags = NLM_F_MULTI | NLM_F_DUMP_FILTERED
+                        if message_flags & ~allowed_flags:
+                            _invalid_structure("netlink-message-flags")
                         payload = packet[offset + 16:offset + length]
                         if message_type == RTM_NEWROUTE:
                             route = _validate_route_payload(payload, family, loopback_index)
@@ -478,22 +605,39 @@ def _check_rtnetlink_routes(loopback_index):
                                 _refuse("network-route-unexpected", _route_description(route, loopback_index))
                             seen_routes.add(identity)
                         elif message_type == NLMSG_DONE:
-                            if message_flags & NLM_F_DUMP_INTR:
-                                _refuse("network-structure-invalid")
-                            if payload and (len(payload) < 4 or struct.unpack_from("=i", payload)[0] != 0):
-                                _refuse("network-structure-invalid")
+                            if len(payload) < 4:
+                                _invalid_structure("netlink-done-payload")
+                            if payload and struct.unpack_from("=i", payload)[0] != 0:
+                                _invalid_structure("netlink-kernel-error")
+                            if len(payload) > 4:
+                                if not message_flags & NLM_F_ACK_TLVS:
+                                    _invalid_structure("netlink-done-payload")
+                                try:
+                                    tuple(_netlink_attributes(
+                                        payload[4:], "netlink-done-ack-attributes",
+                                    ))
+                                except (OverflowError, struct.error, ValueError):
+                                    _invalid_structure("netlink-done-ack-attributes")
                             complete = True
                             if not _route_set_is_expected(family, seen_routes):
                                 _refuse("network-route-unexpected")
                         elif message_type == NLMSG_ERROR:
-                            _refuse("network-structure-invalid")
+                            _invalid_structure("netlink-kernel-error")
                         else:
-                            _refuse("network-structure-invalid")
-                        offset += (length + 3) & ~3
+                            _invalid_structure("netlink-message-type")
+                        message_end = offset + length
+                        aligned_end = offset + ((length + 3) & ~3)
+                        if aligned_end > len(packet):
+                            if message_end != len(packet):
+                                _invalid_structure("netlink-message-alignment")
+                            aligned_end = len(packet)
+                        if complete and aligned_end != len(packet):
+                            _invalid_structure("netlink-message-after-done")
+                        offset = aligned_end
         except ProbeRefusal:
             raise
         except (OSError, OverflowError, struct.error, ValueError):
-            _refuse("network-structure-invalid")
+            _invalid_structure("netlink-socket-failed")
 
 
 def structural_snapshot(expected_host_net_inode):
@@ -507,7 +651,7 @@ def structural_snapshot(expected_host_net_inode):
     try:
         names = sorted(os.listdir(SYS_CLASS_NET))
     except OSError:
-        _refuse("network-structure-invalid")
+        _invalid_structure("interface-list-read")
     if names != ["lo"]:
         _refuse("network-interface-unexpected")
 
@@ -516,7 +660,7 @@ def structural_snapshot(expected_host_net_inode):
         link_type = int(_read_network_file(os.path.join(SYS_CLASS_NET, "lo/type")).strip(), 10)
         link_index = int(_read_network_file(os.path.join(SYS_CLASS_NET, "lo/ifindex")).strip(), 10)
     except ValueError:
-        _refuse("network-structure-invalid")
+        _invalid_structure("loopback-metadata")
     if (link_type != 772 or link_index != 1
             or link_flags != IFF_UP | IFF_LOOPBACK):
         _refuse("loopback-unavailable")
@@ -527,7 +671,7 @@ def structural_snapshot(expected_host_net_inode):
             continue
         match = re.fullmatch(r"\s*([^:]+):\s*[0-9 ]+", line)
         if match is None:
-            _refuse("network-structure-invalid")
+            _invalid_structure("interface-proc-row")
         proc_names.append(match.group(1).strip())
     if sorted(proc_names) != names:
         _refuse("network-interface-unexpected")
@@ -541,12 +685,12 @@ def structural_snapshot(expected_host_net_inode):
     for line in _read_network_file(os.path.join(net, "if_inet6")).splitlines():
         fields = line.split()
         if len(fields) != 6 or re.fullmatch(r"[0-9a-fA-F]{32}", fields[0]) is None:
-            _refuse("network-structure-invalid")
+            _invalid_structure("ipv6-address-proc-shape")
         try:
             address = str(ipaddress.IPv6Address(bytes.fromhex(fields[0])))
             ifindex, prefix, scope, flags = (int(value, 16) for value in fields[1:5])
         except (ValueError, ipaddress.AddressValueError):
-            _refuse("network-structure-invalid")
+            _invalid_structure("ipv6-address-proc-value")
         addresses6.append((address, ifindex, prefix, scope, flags, fields[5]))
     if addresses6 != [("::1", link_index, 128, 16, IFA_F_PERMANENT, "lo")]:
         _refuse("network-address-unexpected")

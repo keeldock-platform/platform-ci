@@ -46,6 +46,8 @@ PLATFORM_FILES = frozenset(
         'kit/devlane/rehearsal.py',
         'kit/devlane/rust_rehearsal_fixture.py',
         'kit/devlane/fixtures/real-netns-dump-ubuntu2404.txt',
+        'kit/devlane/fixtures/real-netns-rtnetlink-ipv4-ubuntu2404.bin',
+        'kit/devlane/fixtures/real-netns-rtnetlink-ipv6-ubuntu2404.bin',
         'kit/devlane/fixtures/core-rust-rehearsal/Cargo.lock',
         'kit/devlane/fixtures/core-rust-rehearsal/Cargo.toml',
         'kit/devlane/fixtures/core-rust-rehearsal/build.rs',
@@ -376,7 +378,7 @@ SELF_PIN_LINE_PATTERN = re.compile(
 )
 PINNED_FILE_SHA256 = {
     '.gitattributes': '0f2d6e841d5533b577f130d4865e5e6b68f24f3a2325c4bfa2ece6b943b4edbc',
-    'kit/devlane/test_rehearsal.py': 'e510fcbfaf3a979377fc726fb7fe84bae96728e8031775b7759229d9d8de7b18',
+    'kit/devlane/test_rehearsal.py': 'ad12fe9e46b142e411e56ccc67b33822cf9d4a0782a057381f36b37a91badbac',
     'kit/devlane/rehearsal.py': '0d650c6b82432ea80ee2a462b8f4037b82d1b6689fa24e1ddcbfa65eb0f32c56',
     'docs/devlane-procedure.md': '2c1e94e7ac8876f99f23d03f8564631a9835c888859ef5bf3645a6d6b687f584',
     '.github/workflows/appium-ci.yml': '961eaa4fc03e0fe687fa437673116e68479af9437dcb69173444ec57098db2d3',
@@ -417,13 +419,13 @@ PINNED_FILE_SHA256 = {
     'kit/bootstrap/policy_linux.py': '0b314a645e43f2aaec58ca23150386b5865e8a27c3101459d00d42370e7d5a5f',
     'kit/bootstrap/policy_npm.py': 'b110b4573b2919003792e05bdcec60a0108f9e2ea1ebc1ce820ff77216271794',
     'kit/bootstrap/policy_rust.py': '4306a55701a5a04c884b2b21091a6d06307134e3570f0d5d65cb103ff84023ec',
-    'kit/bootstrap/public_tree.py': '29663bda5cbe533e62484ef45ceeedc5d7bd6b24958a95a65f275c42402e0c27',
+    'kit/bootstrap/public_tree.py': 'f11c588085c7ee4fda89e2196bfe24357d5c21f05f6e5fcddf17ba720430db00',
     'kit/bootstrap/test_policy_baselines.py': '690980cc3a140970d2b813d854823e3e9f32d8b09db9e25c0ca143140c3af627',
     'kit/bootstrap/test_policy_handoff.py': '3cf707fec6cc1a62e49a948b496fe00765a04ec171fd4cdc57b07d214d3100a2',
     'kit/bootstrap/test_policy_linux.py': 'f1c62480d608d680e73cdbf0ca8b7c83552919bd5de4caa095d5e04e8c3e5f8c',
     'kit/bootstrap/test_policy_npm.py': '8893c4a89ab447a8813806afd2b35bbedbc78d530f1c5a1c8bdf67fc55865eed',
     'kit/bootstrap/test_policy_rust.py': '2465451eb33dec7787807d27ae9ef574b7447a52953c2c3f1951003243b6294a',
-    'kit/bootstrap/test_public_tree.py': '4f3f566925c34f9d797450235db1fb56d019d346afa9d68b5413946c02db8e72',
+    'kit/bootstrap/test_public_tree.py': '2f8d12543f486cdc543f68cdc615700c152cc0248fd0af0f2fc0615cbf6703cf',
     'kit/ci/feature_states.py': 'e058de49cf9e96b61e8037ee533a095082f3210429586d4183d6c44c4f57d479',
     'kit/ci/future-stage-inventory.json': '185663fbc7c94b010dc4c74f7e6867898b5186a0d88acb95e61414f15cb695aa',
     'kit/ci/future_stage.py': '11023901b556599b0f5f747b84ed540c45eae5a2d2ad65ea3a1ba95f81775d41',
@@ -579,7 +581,7 @@ PINNED_FILE_SHA256 = {
     'kit/devlane/coordinator.py': '7a0a0ec25fb7ffa8387ae7e654b969470f8f7a8e2927ec139b8c6a559bddf528',
     'kit/devlane/decrypt_once.py': '664f91b548f5ba7265d77c88b9c6d723fc1068ca7c3701b93cf9cf9960682552',
     'kit/devlane/acceptance_diagnostics.py': '3bd4e42317dbfc952d17905463b94c94f06976cedf09b7e623ef82fcbeb22795',
-    'kit/devlane/diagnostic_contract.py': '768a5edb359e6927207e1f1019a5fda531f12e85a2994fe4364d062453499a9a',
+    'kit/devlane/diagnostic_contract.py': 'ffbdc893cc470c729b08635ca803d8b2bd8979d085854cd898f1b9954bdf7dc6',
     'kit/devlane/node_tool_snapshot.py': 'f55f3ac6b71918ab2bade77c3cb26492fc9467e6f2fc38fe564e7a498212bd16',
     'kit/devlane/test_node_vendor_source_r2.py': 'f03d16132d69908df01dfcfc03159bf9d9abc47a85eb65fb1fb149a132153f61',
     'kit/devlane/test_node_vendor_source.py': 'f9a7195481377bca257ba96e16cede5468fbe196b0dc55abfc43eda46c7fa049',
@@ -599,7 +601,7 @@ PINNED_FILE_SHA256 = {
     'kit/devlane/host_cleanup.py': '2751faee6024ec71090e97ab52f13568e9a308070fbfd516caafcd394af6e88c',
     'kit/devlane/owned_tree_cleanup.py': '94f5f190a42cdcd177cd6ba4f923fba4fffbb60049c6e10351c4917427ebe06f',
     'kit/devlane/isolated_cleanup.py': '142a08f4b4921d79f5e0ca6373af393d2e0b0867806328e0733b8f37b91ea527',
-    'kit/devlane/network_probe.py': 'c7846c50b50a684f338b69f116abff20cb2aee86cfac9fae106b956d9378e4ae',
+    'kit/devlane/network_probe.py': '2e573b535fb93e78b55688e01410a93a1b908c6a9f56c68412b3433c6be2bf2c',
     'kit/devlane/permit.py': 'ee7c1cab0245ecbb86517bb4acae2a53b05802a37920af4322bde69091e95702',
     'kit/devlane/prepare.py': 'f93be7ce8c7d3207a42e6100620cccd9eb50e250bb0b1386b74c234bfcd64881',
     'kit/devlane/project.py': 'b5fce3c558378724594413f01a65cb22032c2ddde4caf16d360f197397d9e16c',
@@ -609,9 +611,9 @@ PINNED_FILE_SHA256 = {
     'kit/devlane/supervisor.py': '773617c3fb5613545b76a55a614c331485a2cbef004901bb1b24705a56ea41d7',
     'kit/devlane/test_acceptance.py': '84dcc547b9aadf4c8bc0a09bd3846c10d6b46fd5fd328c140865600cbb7fcd0a',
     'kit/devlane/test_adapters.mjs': '72eefa32c212af17202c0d0e5df0113327b9649f988f57c1101edd825ff742c0',
-    'kit/devlane/test_audit_contracts.py': '9439f7d3fbd99e429199ab85f0cb6196b266e02e1fbd9919de25ae080623a8f7',
+    'kit/devlane/test_audit_contracts.py': 'aae7a38fee5bd31f47eaae6c165018178687e777a165b3c40ebcbee3f035004d',
     'kit/devlane/test_coordinator.py': 'e4a33ee4da1ba16ec84330c6aa70b9af60c69ad537a86cc832bdbea50947711f',
-    'kit/devlane/test_e2e.py': '794ed97a34969c1e31667d4ae7e0ac22b4e781d852504936cf7583fd73c98115',
+    'kit/devlane/test_e2e.py': '30725920d7ffcdfce8d96686e8e95f4cb7294eaffe3396571b62b927d465102c',
     'kit/devlane/test_linux_runtime.py': '482a626731eb6e7bd91d74e911aa00f5f112bad053caf7432356f7905b159606',
     'kit/devlane/test_rust_report.py': '24c1574d01a8f2a8e1e042f947b1eabe480667c52cadfa9c1e2171ce93938799',
     'kit/devlane/test_rust_test_runner.py': '4ca721b0a527ce12a5ce0068ff05d8ea5821f00b47febef3555f0fe794236ce3',
@@ -620,8 +622,8 @@ PINNED_FILE_SHA256 = {
     'kit/devlane/rust_matrix_runner.py': 'd620914896005ac4f899db7de364daff9cfcd407ded356fdc23d6b320de06795',
     'kit/devlane/rust_tooling.py': '06fe1b0e56ab7bb10a88a06f44266c943ce678ff3a9838ec72a373f85f2ea58a',
     'kit/devlane/test_deadline.py': '7d7fbff28f07e687f9392ed56e5cf22f102b8b38d3bddb39597bc4d9f4137361',
-    'kit/devlane/test_network_probe.py': '4b91c53e79487fac08449dbef0a34537f29fe897d043e598b8bf867d3efc2146',
-    'kit/devlane/test_rust_matrix_runner.py': '89f9e2978f9d7db412ea5b0346e3a5ee4b8e31408a88a76c4df5738a9b65dcdd',
+    'kit/devlane/test_network_probe.py': '8f5c2a6b248092156bdf6abeecd46ee7312e176e8854d451edb9174de804dc07',
+    'kit/devlane/test_rust_matrix_runner.py': '58069b4599a1a8523d9d9f7d8a5c06e36c72cedce6c897710a7526867c8de242',
     'kit/devlane/test_rust_public_audit.py': '47bc82c21f5cd2b4165090ad578bf0fbe8c3c6885a386233cc314f462611d9e0',
     'kit/handoff/provider_requirements.txt': 'c812f3c3f036921e86568feaa3bc934040b68f3d743072cefce8ea758bd56150',
     'kit/handoff/source_capsule.py': 'a1369abb354f0723bd3cfc3209aa15c4769bfb113b2fe6369023c7f95e4546ac',
@@ -641,6 +643,8 @@ PINNED_FILE_SHA256 = {
     'kit/devlane/test_semver_review_fixes.py': '8e1f427e724cb206f6a30cf1dd915de5db92eb793de9b6a8d7163e2843b67106',
     'kit/devlane/rust_rehearsal_fixture.py': '69de6482b2fdeba1bd86dcc21342f43dfaa6f15c68e71244967d7ebdca94636f',
     'kit/devlane/fixtures/real-netns-dump-ubuntu2404.txt': '12d2185f34de2ec223b931402bb7fb683987be2e974df5a6b67fa8228d1ea774',
+    'kit/devlane/fixtures/real-netns-rtnetlink-ipv4-ubuntu2404.bin': '14e9c17acac01882acc4cfe9b5e90d63e4aff226e625058300bdfe55e90b9f2c',
+    'kit/devlane/fixtures/real-netns-rtnetlink-ipv6-ubuntu2404.bin': '76b8fc1db99045e71f24f9ba84253df4b0d03b7e2e8d9b5c5372f80c57bde024',
     'kit/devlane/fixtures/core-rust-rehearsal/Cargo.lock': '5a188f2fa3aac2d7a5422b178e0efb5c7deae6dcc5dd7133c7bfa2df2c5e4e95',
     'kit/devlane/fixtures/core-rust-rehearsal/Cargo.toml': 'd1f28b026f67d15dad590366cdbcecd47c29456278591b9286e5f008301224e7',
     'kit/devlane/fixtures/core-rust-rehearsal/build.rs': '990a2d90dced8c4bc2885071889c305b864c70bfa70c78e2518b835ad1f769a4',
@@ -662,6 +666,10 @@ PINNED_FILE_SHA256 = {
     'kit/devlane/fixtures/core-rust-rehearsal/supply-chain/audits.toml': '5bd3c57e751cd6cbb6f73d543401b3265db1dd20c0561178df2430f2ad4d1e01',
     'kit/devlane/fixtures/core-rust-rehearsal/supply-chain/config.toml': '5cf2f7865a85544967300c7ab6be4724f6fdd5686749da55d19a61358f36c47d',
 }
+BINARY_FIXTURE_FILES = frozenset((
+    "kit/devlane/fixtures/real-netns-rtnetlink-ipv4-ubuntu2404.bin",
+    "kit/devlane/fixtures/real-netns-rtnetlink-ipv6-ubuntu2404.bin",
+))
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
 SHA512_SRI_PATTERN = re.compile(r"sha512-[A-Za-z0-9+/]{86}==\Z")
 ACTION_VERSION_COMMENT_PATTERN = re.compile(
@@ -923,11 +931,15 @@ def scan_tree(root, pool):
             raise PublicTreeError("file-unreadable")
         if len(payload) > MAX_FILE_BYTES:
             raise PublicTreeError("file-too-large")
+        expected_hash = PINNED_FILE_SHA256.get(relative)
+        if relative in BINARY_FIXTURE_FILES:
+            if expected_hash is None or _pinned_file_hash(relative, payload) != expected_hash:
+                raise PublicTreeError("file-hash-mismatch")
+            continue
         try:
             text = payload.decode("utf-8")
         except UnicodeDecodeError:
             raise PublicTreeError("file-not-utf8")
-        expected_hash = PINNED_FILE_SHA256.get(relative)
         if expected_hash is not None and _pinned_file_hash(relative, payload) != expected_hash:
             raise PublicTreeError("file-hash-mismatch")
         inspect_text(text, pool, relative)

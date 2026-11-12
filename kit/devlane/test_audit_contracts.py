@@ -624,6 +624,25 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 self.assertFalse(audit.REFUSAL_LINE.fullmatch(invalid))
         self.assertFalse(audit.REFUSAL_LINE.fullmatch("network_probe_refusal=private-path"))
 
+        structure_refusal = "network-structure-invalid:netlink-message-port-id"
+        self.assertTrue(audit.REFUSAL_LINE.fullmatch(
+            "network_probe_refusal=" + structure_refusal,
+        ))
+        self.assertTrue(audit.REFUSAL_LINE.fullmatch(
+            "devlane_supervisor_refusal=network-probe-refusal:" + structure_refusal,
+        ))
+        structure_line = (
+            "devlane_production_e2e=refused stage=variant-supervisor-probe-check "
+            "exception=network-probe-refusal:" + structure_refusal
+        )
+        self.assertTrue(diagnostic_contract.public_preparation_diagnostic(structure_line))
+        self.assertTrue(grammar.step_output_ok(
+            "Run full source-free production-path acceptance", structure_line, {},
+        ))
+        self.assertFalse(diagnostic_contract.public_preparation_diagnostic(
+            structure_line.replace("netlink-message-port-id", "private-path"),
+        ))
+
         route_detail = (
             "route[table=main,type=unicast,family=4,dst=0.0.0.0/0,"
             "oif=lo,proto=boot,scope=universe]"
