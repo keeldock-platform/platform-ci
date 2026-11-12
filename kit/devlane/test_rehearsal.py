@@ -4,14 +4,17 @@ import ast
 import contextlib
 import hashlib
 import io
+import inspect
 import json
 import os
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -561,6 +564,127 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
         rendered = "\n".join(lines)
         for marker in ("SYNTHETIC_SOURCE_CANARY", "KEYCANARY-73A10X", "::error::", chr(35) * 2 + "[group]"):
             self.assertNotIn(marker, rendered)
+        self.assertFalse(destination.exists())
+
+    def test_supervisor_devices_keep_worker_writable_modes_under_private_umask(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            dev = Path(temporary) / "dev"
+            dev.mkdir()
+            old_umask = os.umask(0o077)
+            try:
+                def mock_mknod(path, _mode, _device):
+                    Path(path).touch()
+
+                with mock.patch.object(supervisor.os, "mknod", side_effect=mock_mknod):
+                    supervisor._make_worker_devices(dev)
+            finally:
+                os.umask(old_umask)
+
+            self.assertEqual((dev / "null").stat().st_mode & 0o777, 0o666)
+            self.assertEqual((dev / "zero").stat().st_mode & 0o777, 0o666)
+            self.assertEqual((dev / "random").stat().st_mode & 0o777, 0o444)
+            self.assertEqual((dev / "urandom").stat().st_mode & 0o777, 0o444)
+
+    def test_synthetic_write_report_matches_the_pinned_worker_runtime_and_scratch_layout(self):
+        lock = test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
+        files = test_e2e._node_source(lock)
+        root_package = bundle.strict_json(files["package.json"])
+        ui_package = bundle.strict_json(files["packages/kernel-ui-kit/package.json"])
+        script = files["packages/kernel-ui-kit/tests/write-report.mjs"].decode("ascii")
+        profile = bundle.strict_json((test_e2e.ROOT / "ci/devlane-profiles.json").read_bytes())["profiles"]["core-node"]
+        unit_command = profile["commands"][1]
+        environment = supervisor._worker_environment("unit", Path("/unused"), {"node_dir": "/tools/node/bin"})
+
+        self.assertEqual(root_package["type"], "module")
+        self.assertEqual(ui_package["type"], "module")
+        self.assertEqual(ui_package["scripts"]["test"], "node tests/write-report.mjs")
+        self.assertEqual(unit_command[0:4], ["npm", "--prefix", "/workspace/source/packages/kernel-ui-kit", "test"])
+        self.assertIn("--outputFile=/scratch/reports/vitest.json", unit_command)
+        self.assertIn("import fs from 'node:fs'", script)
+        self.assertIn("import { spawn } from 'node:child_process'", script)
+        self.assertIn("fs.writeFileSync(output", script)
+        self.assertIn("/scratch/reports/vitest.json", script)
+        self.assertEqual(environment["PATH"], "/tools/node/bin:/usr/bin:/bin")
+        self.assertNotIn("RUNNER_TEMP", environment)
+        self.assertNotIn("GITHUB_RUN_ID", environment)
+        self.assertEqual(supervisor.node_tool_prepare.NODE_VERSION, "24.22.1")
+        self.assertEqual(supervisor.node_tool_prepare.NPM_VERSION, "11.19.1")
+        scratch_source = inspect.getsource(supervisor._prepare_writable_scratch)
+        self.assertIn('"scratch/reports"', scratch_source)
+        self.assertIn("os.chown(str(path), WORKER_UID, WORKER_GID)", scratch_source)
+
+    def test_run_temp_supervisor_dump_survives_the_workflow_quiet_capture(self):
+        summary = (b'{"code":"DEVLANE_FAILURE","kind":"control","stage":"unit",'
+                   b'"status":"fail","subreason":"vitest-failed"}\n')
+        with tempfile.TemporaryDirectory() as temporary:
+            runner_temp = Path(temporary)
+            root = runner_temp / "namespace-root"
+            raw = root / "workspace/raw"
+            reports = root / "scratch/reports"
+            raw.mkdir(parents=True)
+            reports.mkdir(parents=True)
+            (raw / "unit.log").write_text("npm test started\n", encoding="ascii")
+            (raw / "unit.stderr.log").write_text(
+                "Error: spawn /tools/node/bin/node EACCES\n", encoding="ascii",
+            )
+            (reports / "vitest.json").write_text("{}", encoding="ascii")
+            destination = runner_temp / "devlane-vitest-local-synthetic-node-accept.json"
+            service = object.__new__(supervisor.Service)
+            service.root = root
+            service.failure_diagnostics_file = destination
+            service.owner_uid = os.getuid()
+            service.context = {
+                "wave_class": supervisor.fetch.SOURCE_FREE_WAVE_CLASS,
+                "profile": "core-node",
+            }
+            service.summary = summary
+            with mock.patch.dict(os.environ, {"RUNNER_TEMP": str(runner_temp)}):
+                self.assertTrue(service._capture_failure_diagnostics())
+
+            metadata = destination.stat()
+            self.assertEqual(metadata.st_uid, os.getuid())
+            self.assertEqual(metadata.st_mode & 0o777, 0o600)
+            driver = runner_temp / "harness-failure.py"
+            command_source = (
+                "import sys; sys.stdout.buffer.write(" + repr(summary) + "); sys.exit(1)"
+            )
+            driver.write_text(
+                "import sys\n"
+                "import test_e2e\n"
+                "command = [sys.executable, '-c', " + repr(command_source) + "]\n"
+                "test_e2e._run(command, expected=0, diagnostic_callsite='supervisor-client:execute', "
+                "on_result=lambda result: test_e2e._emit_vitest_failure_diagnostics(sys.argv[1], result.stdout))\n",
+                encoding="ascii",
+            )
+
+            workflow = (test_e2e.ROOT / ".github/workflows/devlane-synthetic.yml").read_text(encoding="utf-8")
+            workflow_lines = workflow.splitlines()
+            start = next(index for index, line in enumerate(workflow_lines) if line.strip() == "quiet() {")
+            end = next(index for index in range(start + 1, len(workflow_lines))
+                       if workflow_lines[index].strip() == "}")
+            quiet_function = textwrap.dedent("\n".join(workflow_lines[start:end + 1]))
+            self.assertIn('acceptance_diagnostics.py --stage "$stage" --file "$out"', quiet_function)
+            shell = (quiet_function + "\nquiet production-path-e2e python3 -B "
+                     + shlex.quote(str(driver)) + " " + shlex.quote(str(destination)))
+            environment = os.environ.copy()
+            environment["RUNNER_TEMP"] = str(runner_temp)
+            environment["PYTHONPATH"] = str(Path(test_e2e.__file__).resolve().parent)
+            result = subprocess.run(
+                ["/bin/bash", "-c", shell], cwd=test_e2e.ROOT, env=environment,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                close_fds=True, check=False,
+            )
+
+        self.assertEqual(result.returncode, 1, result.stderr.decode("utf-8", "replace"))
+        output_lines = result.stdout.decode("utf-8", "replace").splitlines()
+        self.assertIn("devlane_acceptance=refused stage=production-path-e2e", output_lines)
+        diagnostic_lines = [line for line in output_lines if line.startswith("devlane_e2e_vitest_diag=")]
+        self.assertTrue(diagnostic_lines, result.stdout.decode("utf-8", "replace")
+                        + result.stderr.decode("utf-8", "replace"))
+        self.assertTrue(all(test_e2e.diagnostic_contract.public_e2e_vitest_diagnostic(line)
+                            for line in diagnostic_lines))
+        self.assertTrue(any("spawn /tools/node/bin/node EACCES" in line for line in diagnostic_lines))
+        self.assertIn("devlane_e2e_vitest_diag=report name=vitest.json kind=file bytes=2", diagnostic_lines)
         self.assertFalse(destination.exists())
 
     def test_failure_diagnostic_capture_requires_source_free_context_and_fixed_unit_failure(self):

@@ -1377,11 +1377,14 @@ class PreparationDefectTests(unittest.TestCase):
 
     def test_node_worker_has_writable_exec_temp_cache_and_worker_sized_limits(self):
         mount_source = inspect.getsource(supervisor._mount_minimal_root)
+        device_source = inspect.getsource(supervisor._make_worker_devices)
         self.assertIn('_mount_tmpfs(root / "tmp", "512m", "01777", "nosuid,nodev")', mount_source)
         self.assertIn('_mount_tmpfs(root / "workspace", "4g", "0755", "nosuid,nodev")', mount_source)
         self.assertIn('_mount_tmpfs(root / "scratch", "4g", "0755", "nosuid,nodev")', mount_source)
         self.assertIn('"proc", str(root / "proc")', mount_source)
-        self.assertIn('("null", 0o666, 1, 3)', mount_source)
+        self.assertIn('_make_worker_devices(root / "dev")', mount_source)
+        self.assertIn('("null", 0o666, 1, 3)', device_source)
+        self.assertIn("os.chmod(device, mode)", device_source)
         self.assertIn('_mount_tmpfs(root / "dev/shm", "512m", "01777")', mount_source)
         executable_mounts = [line for line in mount_source.splitlines()
                              if "_mount_tmpfs(root /" in line]

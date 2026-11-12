@@ -581,6 +581,15 @@ def _mount_fs(argv, destination):
     MOUNT_TARGETS.append(Path(destination))
 
 
+def _make_worker_devices(dev):
+    """Create only the worker's standard devices with modes unaffected by umask."""
+    for name, mode, major, minor in (("null", 0o666, 1, 3), ("zero", 0o666, 1, 5),
+                                     ("random", 0o444, 1, 8), ("urandom", 0o444, 1, 9)):
+        device = Path(dev) / name
+        os.mknod(str(device), stat.S_IFCHR | mode, os.makedev(major, minor))
+        os.chmod(device, mode)
+
+
 def _unmount_tracked_mounts(mounts=None):
     """Release every tracked mount leaf-first and return a path-free failure class."""
     targets = MOUNT_TARGETS if mounts is None else mounts
@@ -633,9 +642,7 @@ def _mount_minimal_root(root, workspace, prepared, control_root):
     (root / "etc/group").write_text(group, encoding="ascii")
     (root / "etc/hosts").write_text("127.0.0.1 localhost\n::1 localhost\n", encoding="ascii")
     _mount_tmpfs(root / "dev", "64m", "0755")
-    for name, mode, major, minor in (("null", 0o666, 1, 3), ("zero", 0o666, 1, 5),
-                                     ("random", 0o444, 1, 8), ("urandom", 0o444, 1, 9)):
-        os.mknod(str(root / "dev" / name), stat.S_IFCHR | mode, os.makedev(major, minor))
+    _make_worker_devices(root / "dev")
     _ensure_directory(root / "dev/shm", 0o1777)
     _mount_tmpfs(root / "dev/shm", "512m", "01777")
     _mount_tmpfs(root / "tmp", "512m", "01777", "nosuid,nodev")
@@ -3258,6 +3265,7 @@ def _start(args):
     context = _context_from_file(args.context)
     _projection_bytes, projection_value = _bound_projection(context, args.projection)
     failure_diagnostics_file = ""
+    runner_temp_path = None
     if getattr(args, "failure_diagnostics_file", ""):
         if context.get("wave_class") != fetch.SOURCE_FREE_WAVE_CLASS or context["profile"] != "core-node":
             _refuse("source-free-diagnostics-context")
@@ -3313,8 +3321,11 @@ def _start(args):
         except (OSError, fetch.Refusal):
             _refuse("rust-toolchain-path")
     host_net_inode = os.stat("/proc/self/ns/net").st_ino
-    command = [
-        "sudo", "-n", "unshare", "--net", "--mount", "--pid", "--ipc", "--fork", "--mount-proc",
+    command = ["sudo", "-n"]
+    if failure_diagnostics_file:
+        command.append("--preserve-env=RUNNER_TEMP")
+    command.extend([
+        "unshare", "--net", "--mount", "--pid", "--ipc", "--fork", "--mount-proc",
         "--kill-child",
         sys.executable, str(Path(__file__).resolve()), "_serve",
         "--state-dir", str(state_dir), "--context", str(Path(args.context).resolve()),
@@ -3326,7 +3337,7 @@ def _start(args):
         "--host-net-inode", str(host_net_inode), "--owner-uid", str(os.getuid()),
         "--node-snapshot-id", tool_paths.get("node_snapshot_id", ""),
         "--cargo-path", tool_paths["cargo"], "--rustc-path", tool_paths["rustc"],
-    ]
+    ])
     if failure_diagnostics_file:
         command.extend(("--failure-diagnostics-file", failure_diagnostics_file))
     try:
@@ -3335,10 +3346,15 @@ def _start(args):
     except deadline_budget.DeadlineRefusal:
         _refuse("total-deadline-exhausted")
     try:
+        supervisor_environment = {
+            "PATH": "/usr/bin:/bin", "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        if failure_diagnostics_file:
+            supervisor_environment["RUNNER_TEMP"] = str(runner_temp_path)
         child = subprocess.Popen(
             command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             close_fds=True, start_new_session=True,
-            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1"},
+            env=supervisor_environment,
         )
         (state_dir / PID_NAME).write_text(str(child.pid), encoding="ascii")
         os.chmod(state_dir / PID_NAME, 0o600)

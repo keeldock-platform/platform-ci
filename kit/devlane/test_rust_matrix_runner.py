@@ -158,8 +158,6 @@ class _RootEffectiveUIDProxy:
 
 
 class _MixedOwnerMetadataProxy:
-    """Present one synthetic source file as root-owned while its siblings stay runner-owned."""
-
     _STAT_FIELDS = (
         "st_dev", "st_ino", "st_mode", "st_nlink", "st_uid", "st_gid", "st_size",
         "st_atime", "st_mtime", "st_ctime", "st_atime_ns", "st_mtime_ns", "st_ctime_ns",
@@ -1180,11 +1178,13 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 test_e2e._node_lock_from_reviewed({"typescript": "6.0.3"})
             )
             self._bind_projection_payload(args, projection)
+            context = json.loads(Path(args.context).read_text(encoding="ascii")); context["wave_class"] = test_e2e.fetch.SOURCE_FREE_WAVE_CLASS; Path(args.context).write_bytes(test_e2e.bundle.canonical_json(context) + b"\n")
+            diagnostic_path = root / "devlane-vitest-local-synthetic-node-accept.json"
             command = ["start"]
             for name in ("state_dir", "context", "workspace", "prepared", "bundle", "projection",
                          "positive_control", "deadline_file"):
                 command.extend(("--" + name.replace("_", "-"), getattr(args, name)))
-            command.extend(("--node-snapshot-id", "test-parent-ready"))
+            command.extend(("--node-snapshot-id", "test-parent-ready", "--failure-diagnostics-file", str(diagnostic_path)))
             spawned = []
 
             def fake_spawn(argv, **kwargs):
@@ -1201,7 +1201,8 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 return real_stat(path, *positional, **keywords)
 
             stdout, stderr = io.StringIO(), io.StringIO()
-            with patch.object(supervisor.sys, "platform", "linux"), \
+            with patch.dict(os.environ, {"RUNNER_TEMP": str(root)}), \
+                    patch.object(supervisor.sys, "platform", "linux"), \
                     patch.object(supervisor.os, "stat", side_effect=stat_with_control_namespace), \
                     patch.object(supervisor.subprocess, "Popen", side_effect=fake_spawn), \
                     contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
@@ -1213,13 +1214,11 @@ class RustMatrixRunnerTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(len(spawned), 1)
             argv, options = spawned[0]
-            self.assertEqual(argv[:10], ["sudo", "-n", "unshare", "--net", "--mount", "--pid", "--ipc",
-                                         "--fork", "--mount-proc", "--kill-child"])
-            self.assertEqual(argv[10], sys.executable)
-            self.assertEqual(argv[11], str(Path(supervisor.__file__).resolve()))
-            self.assertEqual(argv[12], "_serve")
+            self.assertEqual(argv[:11], "sudo -n --preserve-env=RUNNER_TEMP unshare --net --mount --pid --ipc --fork --mount-proc --kill-child".split())
+            self.assertEqual(argv[11:14], [sys.executable, str(Path(supervisor.__file__).resolve()), "_serve"])
             self.assertEqual(argv[argv.index("--deadline-file") + 1], str(Path(args.deadline_file).resolve()))
             self.assertEqual(argv[argv.index("--node-snapshot-id") + 1], "test-parent-ready")
+            self.assertEqual(argv[argv.index("--failure-diagnostics-file") + 1], str(diagnostic_path))
             self.assertNotIn("--node-path", argv)
             self.assertNotIn("--npm-path", argv)
             self.assertEqual(options["stdin"], subprocess.DEVNULL)
@@ -1229,7 +1228,9 @@ class RustMatrixRunnerTests(unittest.TestCase):
             self.assertTrue(options["start_new_session"])
             self.assertEqual(options["env"], {
                 "PATH": "/usr/bin:/bin", "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1",
+                "RUNNER_TEMP": str(root.resolve()),
             })
+            self.assertTrue(os.access(options["env"]["RUNNER_TEMP"], os.W_OK))
 
     def test_actual_service_prepare_positive_platform_seams_follow_validated_projection(self):
         with tempfile.TemporaryDirectory() as temporary:
