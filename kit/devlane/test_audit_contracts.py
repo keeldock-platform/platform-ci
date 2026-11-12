@@ -540,6 +540,50 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         )
         self.assertFalse(encrypted.step_output_ok("Prepare dependencies before the cut", detail, {}))
 
+    def test_e2e_progress_markers_use_fixed_phase_and_scenario_vocabulary(self):
+        root = Path(__file__).resolve().parents[2]
+        grammar = audit._Grammar(
+            root / ".github/workflows/devlane-synthetic.yml", "devlane-synthetic",
+            {"run_id": "12345", "control_sha": SHA}, "synthetic",
+        )
+        for line in (
+            "devlane_e2e_progress=phase=variant-supervisor-probe-check",
+            "devlane_e2e_progress=scenario=real-browser",
+        ):
+            self.assertTrue(diagnostic_contract.public_e2e_progress(line))
+            self.assertTrue(grammar.step_output_ok(
+                "Run full source-free production-path acceptance", line, {},
+            ))
+        for line in (
+            "devlane_e2e_progress=phase=private-path",
+            "devlane_e2e_progress=scenario=private-scenario",
+            "devlane_e2e_progress=scenario=real-browser/path",
+        ):
+            self.assertFalse(diagnostic_contract.public_e2e_progress(line))
+            self.assertFalse(grammar.step_output_ok(
+                "Run full source-free production-path acceptance", line, {},
+            ))
+        self.assertFalse(grammar.step_output_ok(
+            "Prepare dependencies before the cut", "devlane_e2e_progress=phase=fixture-load", {},
+        ))
+
+    def test_cleanup_incomplete_diagnostic_requires_a_fixed_subreason(self):
+        for reason in diagnostic_contract.CLEANUP_SUBREASONS:
+            line = ("devlane_production_e2e=refused stage=prepare-cleanup "
+                    "exception=cleanup-incomplete reason=" + reason + " cleanup=unconfirmed")
+            self.assertTrue(diagnostic_contract.public_preparation_diagnostic(line))
+        self.assertTrue(diagnostic_contract.public_preparation_diagnostic(
+            "devlane_production_e2e=refused stage=prepare-cleanup exception=prepare-os-error "
+            "reason=process-alive cleanup=unconfirmed",
+        ))
+        invalid = (
+            "devlane_production_e2e=refused stage=prepare-cleanup exception=cleanup-incomplete cleanup=unconfirmed",
+            "devlane_production_e2e=refused stage=prepare-cleanup exception=cleanup-incomplete reason=private-path cleanup=unconfirmed",
+            "devlane_production_e2e=refused stage=prepare-cleanup exception=cleanup-incomplete reason=umount-busy cleanup=confirmed",
+        )
+        for line in invalid:
+            self.assertFalse(diagnostic_contract.public_preparation_diagnostic(line))
+
         synthetic = _render_log(
             "devlane-synthetic", {**IDENTITY, "ref": "refs/heads/devlane/d211-1110"}, kind="synthetic",
             skip=("Install fixed Rust acceptance toolchain",),

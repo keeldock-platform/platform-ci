@@ -13,6 +13,7 @@ from pathlib import Path
 import isolated_cleanup
 import owned_tree_cleanup
 import deadline as deadline_budget
+import diagnostic_contract
 import node_tool_snapshot
 import node_vendor_source
 
@@ -22,17 +23,33 @@ HOST_DEADLINE_SECONDS = 840
 PROC_ROOT = Path("/proc")
 
 
-def _fail():
-    raise RuntimeError("cleanup-incomplete")
+def _fail(reason="tree-remove"):
+    error = RuntimeError("cleanup-incomplete")
+    error.cleanup_reason = reason if reason in diagnostic_contract.CLEANUP_SUBREASONS else ""
+    raise error
+
+
+def _isolated_cleanup_reason(stderr):
+    if type(stderr) is not bytes or len(stderr) > 256:
+        return ""
+    lines = stderr.splitlines()
+    if len(lines) != 2 or not lines[0].startswith(b"cleanup_reason=") \
+            or lines[1] != b"cleanup_receipt=unconfirmed":
+        return ""
+    try:
+        value = lines[0].partition(b"=")[2].decode("ascii", "strict")
+    except UnicodeDecodeError:
+        return ""
+    return value if value in diagnostic_contract.CLEANUP_SUBREASONS else ""
 
 
 def _cleanup_timeout(deadline_file, cap):
     if not deadline_file:
-        _fail()
+        _fail("process-alive")
     try:
         return min(cap, deadline_budget.cleanup_remaining(deadline_file))
     except deadline_budget.DeadlineRefusal:
-        _fail()
+        _fail("process-alive")
 
 
 def _kill_incomplete_supervisor(state, deadline_file):
@@ -42,12 +59,12 @@ def _kill_incomplete_supervisor(state, deadline_file):
     try:
         raw = pid_file.read_text(encoding="ascii")
         if not raw.isdecimal() or len(raw) > 10:
-            _fail()
+            _fail("process-alive")
         pid = int(raw)
         command = Path("/proc") / str(pid) / "cmdline"
         cmdline = command.read_bytes().replace(b"\x00", b" ")
         if b"kit/devlane/supervisor.py" not in cmdline or b"_serve" not in cmdline:
-            _fail()
+            _fail("process-alive")
         subprocess.run(["sudo", "-n", "kill", "--", "-" + str(pid)],
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, timeout=_cleanup_timeout(deadline_file, 5), check=False,
@@ -59,27 +76,27 @@ def _kill_incomplete_supervisor(state, deadline_file):
             except ProcessLookupError:
                 return
             time.sleep(0.1)
-        _fail()
+        _fail("process-alive")
     except (OSError, subprocess.SubprocessError, ValueError):
-        _fail()
+        _fail("process-alive")
 
 
 def _confirm_supervisor_absent(state):
     try:
         process_ids = [entry.name for entry in PROC_ROOT.iterdir() if entry.name.isdecimal()]
     except OSError:
-        _fail()
+        _fail("process-alive")
     for process_id in process_ids:
         try:
             command = (PROC_ROOT / process_id / "cmdline").read_bytes()
         except FileNotFoundError:
             continue
         except OSError:
-            _fail()
+            _fail("process-alive")
         if b"supervisor.py" in command and b"_serve" in command:
-            _fail()
+            _fail("process-alive")
     if os.path.ismount(state / "namespace-root"):
-        _fail()
+        _fail("umount-busy")
 
 
 def clean_node_snapshot(snapshot_id, deadline_file):
@@ -96,7 +113,7 @@ def clean_node_snapshot(snapshot_id, deadline_file):
     )
     if result.returncode != 0 or result.stdout != (
             b"node_snapshot_cleanup=confirmed\nnode_vendor_cleanup=confirmed\n"):
-        _fail()
+        _fail("tree-remove")
     return True
 
 
@@ -110,7 +127,7 @@ def clean_node_vendor_source(snapshot_id, *, control_uid=0):
     except FileNotFoundError:
         return True
     except OSError:
-        _fail()
+        _fail("tree-remove")
     if (not stat.S_ISDIR(base_metadata.st_mode) or stat.S_ISLNK(base_metadata.st_mode)
             or base_metadata.st_uid != control_uid or stat.S_IMODE(base_metadata.st_mode) & 0o022):
         _fail()
@@ -160,12 +177,12 @@ def clean(root_arg, runner_temp, deadline_file, node_snapshot_id=""):
         result = subprocess.run(
             ["sudo", "-n", sys.executable, "-I", "-S", "-B", str(control),
              "--state-dir", str(state)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=_cleanup_timeout(deadline_file, HOST_DEADLINE_SECONDS), check=False,
             env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1"},
         )
         if result.returncode != 0 or result.stdout.count(b"cleanup_receipt=confirmed") != 1:
-            _fail()
+            _fail(_isolated_cleanup_reason(result.stderr) or "process-alive")
     else:
         _kill_incomplete_supervisor(state, deadline_file)
     _confirm_supervisor_absent(state)
@@ -175,15 +192,15 @@ def clean(root_arg, runner_temp, deadline_file, node_snapshot_id=""):
             _fail()
         owned_tree_cleanup.remove_owned_tree(prepared, root, prefix="prepared-cleanup-")
     if prepared.exists() or prepared.is_symlink():
-        _fail()
+        _fail("tree-remove")
     if node_snapshot_id:
         clean_node_snapshot(node_snapshot_id, deadline_file)
     try:
         shutil.rmtree(root)
     except OSError:
-        _fail()
+        _fail("tree-remove")
     if root.exists() or root.is_symlink():
-        _fail()
+        _fail("tree-remove")
     print("cleanup_receipt=confirmed")
 
 
@@ -226,7 +243,10 @@ def main(argv=None):
             _fail()
         clean(args.root, args.runner_temp, args.deadline_file, args.node_snapshot_id)
         return 0
-    except Exception:
+    except Exception as error:
+        reason = getattr(error, "cleanup_reason", "")
+        if reason in diagnostic_contract.CLEANUP_SUBREASONS:
+            print("cleanup_reason=" + reason, file=sys.stderr)
         print("cleanup_receipt=unconfirmed", file=sys.stderr)
         return 2
 

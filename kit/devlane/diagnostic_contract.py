@@ -18,6 +18,41 @@ PREPARATION_STAGES = frozenset((
     "prepare-launch", "prepare-protocol",
 ))
 
+E2E_PROGRESS_PHASES = frozenset((
+    "harness-startup", "argument-parse", "deadline-validate", "fixture-toolchain-discovery",
+    "fixture-toolchain-verify", "fixture-generation", "runner-preflight", "fixture-load",
+    "tooling-root-create", "tooling-root-fetch", "tooling-root-cleanup", "scenario-construction",
+    "scenario-run", "late-scenario-construction", "late-scenario-run", "tool-path-discovery",
+    "rust-tool-path-resolution", "tool-fetch-setup", "tool-staging-create", "tool-staging-cleanup",
+    "tool-advisory-clone", "tool-advisory-revision", "tool-fetch-finish",
+    "tool-cargo-deny-download", "tool-cargo-deny-extract", "tool-cargo-deny-version", "tool-cargo-deny-copy",
+    "tool-cargo-audit-download", "tool-cargo-audit-extract", "tool-cargo-audit-version", "tool-cargo-audit-copy",
+    "tool-cargo-vet-download", "tool-cargo-vet-extract", "tool-cargo-vet-version", "tool-cargo-vet-copy",
+    "tool-cargo-semver-checks-download", "tool-cargo-semver-checks-extract",
+    "tool-cargo-semver-checks-version", "tool-cargo-semver-checks-copy",
+    "scenario-projection-write", "scenario-dependency-prepare", "scenario-tool-install",
+    "scenario-tool-verify", "scenario-after-prepare-hook", "scenario-variant-run",
+    "scenario-node-snapshot-cleanup", "scenario-prepared-tree-cleanup", "scenario-projection-cleanup",
+    "variant-root-setup", "variant-projection-write", "variant-source-build", "variant-archive-build",
+    "variant-rust-archive-verify", "variant-envelope-build", "variant-context-build",
+    "variant-context-validate", "variant-context-write", "variant-positive-control",
+    "variant-supervisor-start", "variant-supervisor-start-command", "variant-supervisor-start-check",
+    "variant-startup-tamper", "variant-startup-command", "variant-startup-refusal-check",
+    "variant-supervisor-probe-command", "variant-supervisor-probe-check", "variant-key-create",
+    "variant-decrypt", "variant-decrypt-check", "variant-key-cleanup", "variant-execute",
+    "variant-summary-validate", "variant-host-cleanup", "variant-teardown-confirm",
+    "variant-host-cleanup-finally", "variant-teardown-confirm-finally",
+    *PREPARATION_STAGES,
+    "production-e2e-diagnostic-file",
+))
+E2E_PROGRESS_SCENARIOS = frozenset((
+    "synthetic-node", "real-node", "synthetic-rust-v1-refusal", "install-script-canary", "real-browser",
+))
+CLEANUP_SUBREASONS = frozenset((
+    "umount-busy", "umount-missing", "tree-remove", "process-alive", "cgroup-nonempty",
+))
+E2E_PROGRESS_MAX_LINES = 4096
+
 PREPARATION_REFUSAL_CODES = frozenset((
     "preparation-control-size", "preparation-control-type", "projection-baseline-constraints",
     "action-budget-invalid", "action-work-budget-insufficient", "asset-binding-mismatch",
@@ -138,11 +173,13 @@ PREPARATION_E2E_CATEGORIES = frozenset(
 
 _REFUSAL_RESULT = re.compile(
     rb"dependency_preparation_refusal=stage=([a-z0-9-]{1,48}) "
-    rb"code=([a-z0-9-]{1,48}(?::[a-z0-9-]{1,48})?) cleanup=(not-needed|confirmed|unconfirmed)\n\Z"
+    rb"code=([a-z0-9-]{1,48}(?::[a-z0-9-]{1,48})?) cleanup=(not-needed|confirmed|unconfirmed)"
+    rb"(?: reason=(umount-busy|umount-missing|tree-remove|process-alive|cgroup-nonempty))?\n\Z"
 )
 _EXCEPTION_RESULT = re.compile(
     rb"dependency_preparation_exception=stage=([a-z0-9-]{1,48}) "
-    rb"class=([a-z0-9-]{1,48}) cleanup=(not-needed|confirmed|unconfirmed)\n\Z"
+    rb"class=([a-z0-9-]{1,48}) cleanup=(not-needed|confirmed|unconfirmed)"
+    rb"(?: reason=(umount-busy|umount-missing|tree-remove|process-alive|cgroup-nonempty))?\n\Z"
 )
 _E2E_REFUSAL = re.compile(
     r"devlane_production_e2e=refused stage=([a-z0-9-]{1,48}) "
@@ -189,19 +226,36 @@ def parse_preparation_result(returncode, stdout, stderr):
         return "prepare-protocol", "preparation-output-invalid", "not-needed"
     refusal = _REFUSAL_RESULT.fullmatch(stderr)
     if refusal:
-        stage, code, cleanup = (part.decode("ascii") for part in refusal.groups())
+        stage, code, cleanup, cleanup_reason = (
+            part.decode("ascii") if part is not None else "" for part in refusal.groups()
+        )
         if stage not in PREPARATION_STAGES:
+            return "prepare-protocol", "preparation-output-invalid", "not-needed"
+        if cleanup_reason and cleanup != "unconfirmed":
+            return "prepare-protocol", "preparation-output-invalid", "not-needed"
+        if code == "cleanup-incomplete" and (stage != "prepare-cleanup" or cleanup != "unconfirmed"
+                                               or cleanup_reason not in CLEANUP_SUBREASONS):
             return "prepare-protocol", "preparation-output-invalid", "not-needed"
         if code not in PREPARATION_REFUSAL_CODES:
             return stage, "preparation-refusal-unlisted", cleanup
+        if cleanup_reason:
+            return stage, code, cleanup, cleanup_reason
         return stage, code, cleanup
     exception = _EXCEPTION_RESULT.fullmatch(stderr)
     if exception:
-        stage, label, cleanup = (part.decode("ascii") for part in exception.groups())
+        stage, label, cleanup, cleanup_reason = (
+            part.decode("ascii") if part is not None else "" for part in exception.groups()
+        )
         if stage not in PREPARATION_STAGES:
             return "prepare-protocol", "preparation-output-invalid", "not-needed"
+        if cleanup_reason and cleanup != "unconfirmed":
+            return "prepare-protocol", "preparation-output-invalid", "not-needed"
         if label not in PREPARATION_EXCEPTION_LABELS:
+            if cleanup_reason:
+                return stage, "preparation-exception-unlisted", cleanup, cleanup_reason
             return stage, "preparation-exception-unlisted", cleanup
+        if cleanup_reason:
+            return stage, "prepare-" + label, cleanup, cleanup_reason
         return stage, "prepare-" + label, cleanup
     return "prepare-protocol", "preparation-output-invalid", "not-needed"
 
@@ -227,9 +281,29 @@ def public_preparation_diagnostic(line):
             return False
         if version is not None and reason != "tool-version-mismatch":
             return False
-    elif reason is not None or version is not None:
+    elif category == "cleanup-incomplete":
+        if reason not in CLEANUP_SUBREASONS or cleanup != "unconfirmed" or version is not None:
+            return False
+    elif reason is not None:
+        if reason not in CLEANUP_SUBREASONS or cleanup != "unconfirmed" or version is not None:
+            return False
+    elif version is not None:
         return False
     return cleanup is None or cleanup == "unconfirmed"
+
+
+_E2E_PROGRESS_LINE = re.compile(r"devlane_e2e_progress=(phase|scenario)=([a-z0-9-]{1,64})\Z")
+
+
+def public_e2e_progress(line):
+    """Accept only the fixed phase and scenario progress markers from the harness."""
+    if type(line) is not str or len(line) > 96:
+        return False
+    match = _E2E_PROGRESS_LINE.fullmatch(line)
+    if match is None:
+        return False
+    kind, name = match.groups()
+    return name in (E2E_PROGRESS_PHASES if kind == "phase" else E2E_PROGRESS_SCENARIOS)
 
 
 def public_acceptance_detail(line):

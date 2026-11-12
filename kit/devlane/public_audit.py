@@ -352,6 +352,11 @@ class _Grammar:
             public_counts[line] = public_counts.get(line, 0) + 1
             return public_counts[line] == 1
         if step_name == "Run full source-free production-path acceptance":
+            if diagnostic_contract.public_e2e_progress(line):
+                public_counts["e2e_progress_lines"] = public_counts.get("e2e_progress_lines", 0) + 1
+                return public_counts["e2e_progress_lines"] <= diagnostic_contract.E2E_PROGRESS_MAX_LINES
+            if line.startswith("devlane_e2e_progress="):
+                return False
             if line.startswith("devlane_acceptance=refused stage="):
                 stage = line.removeprefix("devlane_acceptance=refused stage=")
                 if stage not in diagnostic_contract.ACCEPTANCE_FAILURE_STAGES:

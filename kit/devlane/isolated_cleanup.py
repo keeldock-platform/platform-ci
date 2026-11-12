@@ -10,6 +10,17 @@ import time
 from pathlib import Path
 
 
+CLEANUP_SUBREASONS = frozenset((
+    "umount-busy", "umount-missing", "tree-remove", "process-alive", "cgroup-nonempty",
+))
+
+
+class CleanupRefusal(RuntimeError):
+    def __init__(self, reason):
+        self.reason = reason if reason in CLEANUP_SUBREASONS else "tree-remove"
+        super().__init__("cleanup-incomplete")
+
+
 SOCKET_NAME = "control.sock"
 PID_NAME = "host-pid"
 NAMESPACE_PID_NAME = "namespace-pid"
@@ -50,6 +61,13 @@ def _rpc(state, request, timeout):
         response = json.loads(_read_exact(connection, size).decode("ascii", "strict"))
     finally:
         connection.close()
+    if type(response) is dict and response.get("ok") is not True:
+        code = response.get("code")
+        prefix = "cleanup-incomplete:"
+        if type(code) is str and code.startswith(prefix):
+            reason = code[len(prefix):]
+            if reason in CLEANUP_SUBREASONS:
+                raise CleanupRefusal(reason)
     if type(response) is not dict or response.get("ok") is not True:
         raise RuntimeError("cleanup-refused")
     return response
@@ -243,6 +261,15 @@ def _remove_state(state):
             path.unlink()
 
 
+def _require_fallback_termination(state, parent_pid, namespace_pid, namespace_inodes):
+    try:
+        absent = _fallback_terminate(state, parent_pid, namespace_pid, namespace_inodes)
+    except Exception:
+        raise CleanupRefusal("process-alive") from None
+    if not absent:
+        raise CleanupRefusal("process-alive")
+
+
 def cleanup(state_arg):
     state = Path(state_arg)
     if not state.is_absolute() or state.is_symlink() or not state.is_dir():
@@ -263,20 +290,24 @@ def cleanup(state_arg):
         if response.get("status") != "cleanup-confirmed":
             raise RuntimeError("cleanup-receipt-invalid")
     except Exception:
-        if not _fallback_terminate(state, parent_pid, namespace_pid, namespace_inodes):
-            raise RuntimeError("cleanup-process-remains")
+        _require_fallback_termination(state, parent_pid, namespace_pid, namespace_inodes)
         if os.path.ismount(state / "namespace-root"):
-            raise RuntimeError("cleanup-process-remains")
-        _remove_state(state)
+            raise CleanupRefusal("umount-busy") from None
+        try:
+            _remove_state(state)
+        except OSError:
+            raise CleanupRefusal("tree-remove") from None
         print("cleanup_fallback=absence-verified")
         print("cleanup_receipt=confirmed")
         return
     if not _wait_absent(parent_pid, EXIT_WAIT_SECONDS) or (namespace_pid and not _wait_absent(namespace_pid, EXIT_WAIT_SECONDS)) or not _wait_namespaces_absent(namespace_inodes, EXIT_WAIT_SECONDS):
-        if not _fallback_terminate(state, parent_pid, namespace_pid, namespace_inodes):
-            raise RuntimeError("cleanup-process-remains")
+        _require_fallback_termination(state, parent_pid, namespace_pid, namespace_inodes)
     if os.path.ismount(state / "namespace-root"):
-        raise RuntimeError("cleanup-mount-remains")
-    _remove_state(state)
+        raise CleanupRefusal("umount-busy")
+    try:
+        _remove_state(state)
+    except OSError:
+        raise CleanupRefusal("tree-remove") from None
     print("cleanup_receipt=confirmed")
 
 
@@ -287,7 +318,9 @@ def main(argv=None):
     try:
         cleanup(arguments[1])
         return 0
-    except Exception:
+    except Exception as error:
+        if isinstance(error, CleanupRefusal):
+            print("cleanup_reason=" + error.reason, file=sys.stderr)
         print("cleanup_receipt=unconfirmed", file=sys.stderr)
         return 2
 

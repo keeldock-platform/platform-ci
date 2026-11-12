@@ -2,6 +2,7 @@
 
 import errno
 import ipaddress
+import inspect
 from pathlib import Path
 import re
 import struct
@@ -11,6 +12,7 @@ import unittest
 from unittest.mock import patch
 
 import network_probe
+import supervisor
 
 
 HOST_NET = 100
@@ -183,7 +185,33 @@ class NetworkProbeTests(unittest.TestCase):
         self.assertIn('"ro,hidepid=2,subset=pid"', source)
         self.assertIn('"ro,nosuid,nodev,noexec"', source)
         self.assertIn('str(root / "sys")', source)
-        self.assertIn('MOUNT_TARGETS.append(root / "sys")', source)
+        self.assertIn('_mount_fs(["mount", "-t", "proc"', source)
+        self.assertIn('_mount_fs(["mount", "-t", "sysfs"', source)
+        self.assertIn('MOUNT_TARGETS.append(Path(destination))', inspect.getsource(supervisor._mount_fs))
+        cleanup_source = inspect.getsource(supervisor.Service._cleanup)
+        self.assertIn('mount_reason = _unmount_tracked_mounts()', cleanup_source)
+        self.assertLess(cleanup_source.index('_kill_workload_descendants()'),
+                        cleanup_source.index('_unmount_tracked_mounts()'))
+        self.assertIn('--make-rprivate', inspect.getsource(supervisor._mount_private))
+        self.assertIn('--make-rprivate', Path(network_probe.__file__).with_name("prepare.py").read_text(
+            encoding="utf-8"))
+
+    def test_probe_proc_and_sys_mounts_are_unmounted_leaf_first(self):
+        root = Path("/probe/root")
+        proc, sysfs = root / "proc", root / "sys"
+        mounted = {root, proc, sysfs}
+        commands = []
+
+        def run(argv, **_kwargs):
+            commands.append(tuple(argv))
+            mounted.remove(Path(argv[-1]))
+
+        with patch.object(supervisor.os.path, "ismount", side_effect=lambda path: Path(path) in mounted), \
+                patch.object(supervisor, "_run", side_effect=run):
+            reason = supervisor._unmount_tracked_mounts((root, proc, sysfs))
+        self.assertEqual(reason, "")
+        self.assertEqual([command[-1] for command in commands], [str(sysfs), str(proc), str(root)])
+        self.assertEqual(mounted, set())
 
     def test_refusal_result_parser_accepts_only_bounded_fixed_codes(self):
         code = "network-address-unexpected"

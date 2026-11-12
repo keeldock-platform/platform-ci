@@ -716,6 +716,7 @@ class LinuxBoundaryReviewFixTests(unittest.TestCase):
             finally:
                 subject.close()
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "process_vm_readv is Linux-only")
     def test_vm_readv_self_read_control_uses_the_reviewed_syscall_number(self):
         self.assertEqual(boundary.PROCESS_VM_READV, 310)
         self.assertTrue(boundary.vm_readv_self_control("0123456789abcdef01234567"))

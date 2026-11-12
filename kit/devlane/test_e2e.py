@@ -77,33 +77,13 @@ RUST_LOCKFILES = rust_rehearsal_fixture.LOCKFILES
 PLAYWRIGHT_VERSION = "1.54.2"
 SYNTHETIC_LOCK = ROOT / "kit/confinement/synthetic_project/package-lock.json"
 
-DIAGNOSTIC_PHASES = frozenset((
-    "harness-startup", "argument-parse", "deadline-validate", "fixture-toolchain-discovery",
-    "fixture-toolchain-verify", "fixture-generation", "runner-preflight", "fixture-load",
-    "tooling-root-create", "tooling-root-fetch", "tooling-root-cleanup", "scenario-construction",
-    "scenario-run", "late-scenario-construction", "late-scenario-run", "tool-path-discovery",
-    "rust-tool-path-resolution", "tool-fetch-setup", "tool-staging-create", "tool-staging-cleanup",
-    "tool-advisory-clone",
-    "tool-advisory-revision", "tool-fetch-finish",
-    "tool-cargo-deny-download", "tool-cargo-deny-extract", "tool-cargo-deny-version", "tool-cargo-deny-copy",
-    "tool-cargo-audit-download", "tool-cargo-audit-extract", "tool-cargo-audit-version", "tool-cargo-audit-copy",
-    "tool-cargo-vet-download", "tool-cargo-vet-extract", "tool-cargo-vet-version", "tool-cargo-vet-copy",
-    "tool-cargo-semver-checks-download", "tool-cargo-semver-checks-extract",
-    "tool-cargo-semver-checks-version", "tool-cargo-semver-checks-copy",
-    "scenario-projection-write", "scenario-dependency-prepare", "scenario-tool-install",
-    "scenario-tool-verify", "scenario-after-prepare-hook", "scenario-variant-run",
-    "scenario-node-snapshot-cleanup",
-    "scenario-prepared-tree-cleanup", "scenario-projection-cleanup", "variant-root-setup",
-    "variant-projection-write", "variant-source-build", "variant-archive-build", "variant-rust-archive-verify",
-    "variant-envelope-build", "variant-context-build", "variant-context-validate", "variant-context-write",
-    "variant-positive-control",
-    "variant-supervisor-start", "variant-supervisor-start-command", "variant-supervisor-start-check",
-    "variant-startup-tamper", "variant-startup-command", "variant-startup-refusal-check",
-    "variant-supervisor-probe-command", "variant-supervisor-probe-check",
-    "variant-key-create", "variant-decrypt", "variant-decrypt-check", "variant-key-cleanup", "variant-execute",
-    "variant-summary-validate", "variant-host-cleanup", "variant-teardown-confirm",
-    "variant-host-cleanup-finally", "variant-teardown-confirm-finally",
-)) | diagnostic_contract.PREPARATION_STAGES | frozenset(("production-e2e-diagnostic-file",))
+DIAGNOSTIC_PHASES = diagnostic_contract.E2E_PROGRESS_PHASES
+PROGRESS_ENABLED = False
+
+
+def _progress(line):
+    if PROGRESS_ENABLED:
+        print("devlane_e2e_progress=" + line, flush=True)
 
 _EXCEPTION_CATEGORIES = {
     AssertionError: "assertion-error",
@@ -184,12 +164,13 @@ class StartupRefusalMismatch(RuntimeError):
 class PreparationRefusalMismatch(RuntimeError):
     """A preparation CLI result outside its exact finite success/refusal contract."""
 
-    def __init__(self, phase, category, cleanup_state="not-needed"):
+    def __init__(self, phase, category, cleanup_state="not-needed", cleanup_reason=""):
         self.phase = phase if phase in DIAGNOSTIC_PHASES else "prepare-protocol"
         if category not in diagnostic_contract.PREPARATION_E2E_CATEGORIES:
             category = "preparation-output-invalid"
         self.category = category
         self.cleanup_state = cleanup_state if cleanup_state == "unconfirmed" else ""
+        self.cleanup_reason = cleanup_reason if cleanup_reason in diagnostic_contract.CLEANUP_SUBREASONS else ""
         super().__init__("preparation-result-contract-mismatch")
 
 
@@ -201,18 +182,27 @@ class _DiagnosticState:
         self.cleanup_state = ""
         self.tooling_reason = ""
         self.tooling_version = ""
+        self.cleanup_reason = ""
 
     def reset(self):
         self.first_failure = None
         self.cleanup_state = ""
         self.tooling_reason = ""
         self.tooling_version = ""
+        self.cleanup_reason = ""
 
     def capture(self, phase, error):
+        cleanup_reason = getattr(error, "cleanup_reason", "")
+        if cleanup_reason in diagnostic_contract.CLEANUP_SUBREASONS:
+            self.cleanup_state = "unconfirmed"
+            self.cleanup_reason = cleanup_reason
         if self.first_failure is None:
             if type(error) is PreparationRefusalMismatch:
                 phase, category = error.phase, error.category
                 self.cleanup_state = error.cleanup_state
+                self.cleanup_reason = error.cleanup_reason or self.cleanup_reason
+            elif cleanup_reason in diagnostic_contract.CLEANUP_SUBREASONS:
+                category = "cleanup-incomplete"
             else:
                 category = (error.category if type(error) is StartupRefusalMismatch
                             else _EXCEPTION_CATEGORIES.get(type(error), "unclassified"))
@@ -234,6 +224,8 @@ class _DiagnosticState:
         except Exception as error:
             self.capture(name, error)
             raise
+        else:
+            _progress("phase=" + name)
 
     def refusal_line(self, error):
         if self.first_failure is None:
@@ -245,6 +237,8 @@ class _DiagnosticState:
             line += " reason=" + reason
             if reason == "tool-version-mismatch" and self.tooling_version:
                 line += ' version="' + self.tooling_version + '"'
+        elif self.cleanup_reason:
+            line += " reason=" + self.cleanup_reason
         if self.cleanup_state == "unconfirmed":
             line += " cleanup=unconfirmed"
         return line
@@ -1503,6 +1497,8 @@ def _deadline_termination(signum, _frame):
 
 
 def main(argv=None):
+    global PROGRESS_ENABLED
+    PROGRESS_ENABLED = False
     DIAGNOSTICS.reset()
     with DIAGNOSTICS.phase("argument-parse"):
         parser = __import__("argparse").ArgumentParser()
@@ -1523,6 +1519,9 @@ def main(argv=None):
         else:
             print(line)
         return 0
+    if argv is None and not args.generate_rust_fixture:
+        PROGRESS_ENABLED = True
+        _progress("phase=argument-parse")
     global DEADLINE_FILE
     global DIAGNOSTIC_FILE
     DEADLINE_FILE = args.deadline_file
@@ -1566,12 +1565,15 @@ def main(argv=None):
         for scenario in scenario_list:
             _phase_call("scenario-run", _run_scenario, scenario)
             done.append(scenario["name"])
+            _progress("scenario=" + scenario["name"])
         _phase_call("scenario-run", _run_scenario, rust_scenario, tooling_root)
         done.append(rust_scenario["name"])
+        _progress("scenario=" + rust_scenario["name"])
         late_scenario_list = _phase_call("late-scenario-construction", late_scenarios)
         for scenario in late_scenario_list:
             _phase_call("late-scenario-run", _run_scenario, scenario)
             done.append(scenario["name"])
+            _progress("scenario=" + scenario["name"])
     finally:
         previous_error = sys.exc_info()[1]
         try:

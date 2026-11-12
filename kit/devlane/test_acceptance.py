@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import bundle
+import diagnostic_contract
 import fetch
 import filter as public_filter
 import host_cleanup
@@ -1152,6 +1153,15 @@ class ReportingFailOpenTests(unittest.TestCase):
 
 
 class CleanupLifecycleTests(unittest.TestCase):
+    def test_host_cleanup_accepts_only_fixed_isolated_cleanup_reasons(self):
+        for reason in diagnostic_contract.CLEANUP_SUBREASONS:
+            stderr = ("cleanup_reason=" + reason + "\ncleanup_receipt=unconfirmed\n").encode("ascii")
+            self.assertEqual(host_cleanup._isolated_cleanup_reason(stderr), reason)
+        self.assertEqual(host_cleanup._isolated_cleanup_reason(
+            b"cleanup_reason=private-path\ncleanup_receipt=unconfirmed\n"), "")
+        self.assertEqual(host_cleanup._isolated_cleanup_reason(
+            b"cleanup_reason=umount-busy\nprivate-path\n"), "")
+
     def _proc(self, root, entries):
         """Build a fake host /proc: pid -> (ppid, cmdline, pid-namespace id)."""
         namespaces = Path(root) / "namespaces"
@@ -1219,6 +1229,56 @@ class CleanupLifecycleTests(unittest.TestCase):
 
 
 class PreparationDefectTests(unittest.TestCase):
+    def test_preparation_mount_ledger_unmounts_proc_before_parent_mounts(self):
+        root = Path("/prep/root")
+        targets = (root, root / "dev", root / "proc", root / "work")
+        mounted = set(targets)
+        commands = []
+
+        def unmount(argv, **_kwargs):
+            commands.append(tuple(argv))
+            mounted.remove(Path(argv[-1]))
+
+        original = list(prepare.MOUNT_TARGETS)
+        try:
+            prepare.MOUNT_TARGETS[:] = targets
+            with patch.object(prepare.os.path, "ismount", side_effect=lambda path: Path(path) in mounted), \
+                    patch.object(prepare, "_bounded_timeout", return_value=5), \
+                    patch.object(prepare.subprocess, "run", side_effect=unmount):
+                reason = prepare._unmount_tracked_mounts()
+        finally:
+            prepare.MOUNT_TARGETS[:] = original
+        self.assertEqual(reason, "")
+        self.assertEqual([command[-1] for command in commands], [str(path) for path in reversed(targets)])
+        self.assertEqual(mounted, set())
+        source = Path(prepare.__file__).read_text(encoding="utf-8")
+        self.assertIn('"mount", "-t", "proc"', source)
+        self.assertIn("cleanup_reason = _unmount_tracked_mounts()", source)
+
+    def test_preparation_unmount_reports_fixed_missing_or_busy_reasons(self):
+        target = Path("/prep/root/proc")
+        original = list(prepare.MOUNT_TARGETS)
+        try:
+            prepare.MOUNT_TARGETS[:] = (target,)
+            with patch.object(prepare.os.path, "ismount", return_value=False):
+                self.assertEqual(prepare._unmount_tracked_mounts(), "umount-missing")
+
+            mounted = {target}
+            commands = []
+
+            def reject_unmount(argv, **_kwargs):
+                commands.append(tuple(argv))
+                raise subprocess.CalledProcessError(32, argv)
+
+            with patch.object(prepare.os.path, "ismount", side_effect=lambda path: Path(path) in mounted), \
+                    patch.object(prepare, "_bounded_timeout", return_value=5), \
+                    patch.object(prepare.subprocess, "run", side_effect=reject_unmount):
+                reason = prepare._unmount_tracked_mounts()
+            self.assertEqual(reason, "umount-busy")
+            self.assertEqual(commands, [("umount", str(target)), ("umount", "-l", str(target))])
+        finally:
+            prepare.MOUNT_TARGETS[:] = original
+
     def test_resolver_configuration_is_copied_into_the_online_root(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -436,6 +436,29 @@ def _mount_fs(argv, target):
     MOUNT_TARGETS.append(Path(target))
 
 
+def _unmount_tracked_mounts():
+    """Release tracked mounts leaf-first; return only a fixed cleanup failure class."""
+    reason = ""
+    for target in reversed(tuple(dict.fromkeys(MOUNT_TARGETS))):
+        if not target.exists() and not os.path.ismount(target):
+            reason = reason or "umount-missing"
+            continue
+        if not os.path.ismount(target):
+            continue
+        try:
+            subprocess.run(["umount", str(target)], check=True, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=_bounded_timeout(5, cleanup=True))
+        except Exception:
+            try:
+                subprocess.run(["umount", "-l", str(target)], check=True, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=_bounded_timeout(5, cleanup=True))
+            except Exception:
+                pass
+        if os.path.ismount(target):
+            reason = reason or "umount-busy"
+    return reason
+
+
 def _copy_tree(source, destination):
     source, destination = Path(source), Path(destination)
     if not source.is_dir() or source.is_symlink() or destination.exists() or destination.is_symlink():
@@ -759,18 +782,22 @@ def _failure_from_exception(error):
     return "exception", label if label in diagnostic_contract.PREPARATION_EXCEPTION_LABELS else "unclassified"
 
 
-def _emit_failure(failure, cleanup, stage=None):
+def _emit_failure(failure, cleanup, stage=None, cleanup_reason=""):
     kind, value = failure
     stage = stage or PREPARATION_STAGE
     stage = stage if stage in diagnostic_contract.PREPARATION_STAGES else "prepare-protocol"
     if kind == "refusal":
         code = value if value in diagnostic_contract.PREPARATION_REFUSAL_CODES else "preparation-refusal-unlisted"
-        print("dependency_preparation_refusal=stage=%s code=%s cleanup=%s" % (stage, code, cleanup),
-              file=sys.stderr)
+        detail = " reason=" + cleanup_reason if cleanup_reason in diagnostic_contract.CLEANUP_SUBREASONS else ""
+        print("dependency_preparation_refusal=stage=%s code=%s cleanup=%s%s" % (
+            stage, code, cleanup, detail,
+        ), file=sys.stderr)
         return
     label = value if value in diagnostic_contract.PREPARATION_EXCEPTION_LABELS else "unclassified"
-    print("dependency_preparation_exception=stage=%s class=%s cleanup=%s" % (stage, label, cleanup),
-          file=sys.stderr)
+    detail = " reason=" + cleanup_reason if cleanup_reason in diagnostic_contract.CLEANUP_SUBREASONS else ""
+    print("dependency_preparation_exception=stage=%s class=%s cleanup=%s%s" % (
+        stage, label, cleanup, detail,
+    ), file=sys.stderr)
 
 
 def _argument_parser():
@@ -801,6 +828,7 @@ def main(argv=None):
     failure = None
     failure_stage = None
     cleanup = "not-needed"
+    cleanup_reason = ""
     result = 2
     try:
         args = parser.parse_args(argv)
@@ -924,17 +952,17 @@ def main(argv=None):
                 _kill_children()
             except Exception:
                 clean = False
-            for target in reversed(MOUNT_TARGETS):
-                try:
-                    subprocess.run(["umount", str(target)], check=True, stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL, timeout=_bounded_timeout(5, cleanup=True))
-                except Exception:
+                cleanup_reason = cleanup_reason or "process-alive"
+            if cleanup_reason != "process-alive":
+                cleanup_reason = _unmount_tracked_mounts() or cleanup_reason
+                if cleanup_reason:
                     clean = False
             MOUNT_TARGETS.clear()
             try:
                 root.rmdir()
             except Exception:
                 clean = False
+                cleanup_reason = cleanup_reason or "tree-remove"
         if node_snapshot_created and failure is not None:
             if clean:
                 try:
@@ -944,6 +972,7 @@ def main(argv=None):
                     cleanup = "confirmed"
                 except Exception:
                     clean = False
+                    cleanup_reason = cleanup_reason or "tree-remove"
             else:
                 clean = False
         if node_vendor_source_created and vendor_source is not None:
@@ -955,6 +984,7 @@ def main(argv=None):
                 cleanup = "confirmed"
             except Exception:
                 clean = False
+                cleanup_reason = cleanup_reason or "tree-remove"
         if not clean:
             cleanup = "unconfirmed"
             if failure is None:
@@ -971,7 +1001,7 @@ def main(argv=None):
     if result == 0:
         print("dependency_preparation=complete")
         return 0
-    _emit_failure(failure, cleanup, failure_stage)
+    _emit_failure(failure, cleanup, failure_stage, cleanup_reason)
     return result
 
 

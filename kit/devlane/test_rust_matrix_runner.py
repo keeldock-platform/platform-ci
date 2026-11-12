@@ -541,11 +541,26 @@ class RustMatrixRunnerTests(unittest.TestCase):
 
     def test_preparation_cli_reports_only_finite_codes_classes_and_parser_failures(self):
         for code in diagnostic_contract.PREPARATION_REFUSAL_CODES:
+            if code == "cleanup-incomplete":
+                continue
             line = ("dependency_preparation_refusal=stage=prepare-node-toolchain-validation "
                     "code=" + code + " cleanup=confirmed\n").encode("ascii")
             self.assertEqual(
                 diagnostic_contract.parse_preparation_result(2, b"", line),
                 ("prepare-node-toolchain-validation", code, "confirmed"),
+            )
+        for reason in diagnostic_contract.CLEANUP_SUBREASONS:
+            line = ("dependency_preparation_refusal=stage=prepare-cleanup "
+                    "code=cleanup-incomplete cleanup=unconfirmed reason=" + reason + "\n").encode("ascii")
+            self.assertEqual(
+                diagnostic_contract.parse_preparation_result(2, b"", line),
+                ("prepare-cleanup", "cleanup-incomplete", "unconfirmed", reason),
+            )
+            exception_line = ("dependency_preparation_exception=stage=prepare-cleanup "
+                              "class=os-error cleanup=unconfirmed reason=" + reason + "\n").encode("ascii")
+            self.assertEqual(
+                diagnostic_contract.parse_preparation_result(2, b"", exception_line),
+                ("prepare-cleanup", "prepare-os-error", "unconfirmed", reason),
             )
         for label in diagnostic_contract.PREPARATION_EXCEPTION_LABELS:
             line = ("dependency_preparation_exception=stage=prepare-node-version-verification "
@@ -572,6 +587,14 @@ class RustMatrixRunnerTests(unittest.TestCase):
             (0, b"dependency_preparation=complete\nprivate-canary\n", b""),
             (2, b"", b"dependency_preparation_refusal=stage=prepare-node-toolchain-validation "
              b"code=node-toolchain-owner cleanup=unconfirmed\n" * 80),
+            (2, b"", b"dependency_preparation_refusal=stage=prepare-cleanup "
+             b"code=cleanup-incomplete cleanup=unconfirmed\n"),
+            (2, b"", b"dependency_preparation_refusal=stage=prepare-cleanup "
+             b"code=cleanup-incomplete cleanup=confirmed reason=umount-busy\n"),
+            (2, b"", b"dependency_preparation_refusal=stage=prepare-cleanup "
+             b"code=cleanup-incomplete cleanup=unconfirmed reason=private-path\n"),
+            (2, b"", b"dependency_preparation_exception=stage=prepare-cleanup "
+             b"class=os-error cleanup=confirmed reason=tree-remove\n"),
             (1, b"", b"sudo: private-runner-path\n"),
         )
         for returncode, stdout, stderr in negative:
@@ -726,6 +749,8 @@ class RustMatrixRunnerTests(unittest.TestCase):
             ]
 
             for code in sorted(diagnostic_contract.PREPARATION_REFUSAL_CODES):
+                if code == "cleanup-incomplete":
+                    continue
                 with self.subTest(code=code):
                     stderr = io.StringIO()
                     with patch.object(preparation.sys, "platform", "linux"), \
@@ -809,6 +834,21 @@ class RustMatrixRunnerTests(unittest.TestCase):
         self.assertTrue(diagnostic_contract.public_preparation_diagnostic(line))
         self.assertNotIn("private path", line)
         self.assertNotIn("KEYCANARY-73A10X", line)
+
+    def test_preparation_cleanup_subreason_is_bounded_and_public(self):
+        for reason in diagnostic_contract.CLEANUP_SUBREASONS:
+            payload = ("dependency_preparation_refusal=stage=prepare-cleanup "
+                       "code=cleanup-incomplete cleanup=unconfirmed reason=" + reason + "\n").encode("ascii")
+            with patch.object(test_e2e, "_process_run", return_value=subprocess.CompletedProcess(
+                    ["prepare.py"], 2, b"", payload)):
+                with self.assertRaises(test_e2e.PreparationRefusalMismatch) as caught:
+                    test_e2e._run_preparation(["prepare.py"])
+            state = test_e2e._DiagnosticState()
+            state.capture("scenario-dependency-prepare", caught.exception)
+            public_line = state.refusal_line(caught.exception)
+            self.assertEqual(public_line, "devlane_production_e2e=refused stage=prepare-cleanup "
+                             "exception=cleanup-incomplete reason=" + reason + " cleanup=unconfirmed")
+            self.assertTrue(diagnostic_contract.public_preparation_diagnostic(public_line))
 
         with patch.object(test_e2e, "_process_run", return_value=subprocess.CompletedProcess(
                 ["prepare.py"], 2, b"", b"dependency_preparation_exception=stage=prepare-protocol "

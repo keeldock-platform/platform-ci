@@ -63,6 +63,9 @@ CANCEL_REQUESTED = threading.Event()
 SERVICE_LOCK = threading.RLock()
 MOUNT_TARGETS = []
 ACTIVE_DEADLINE_FILE = ""
+CLEANUP_SUBREASONS = frozenset((
+    "umount-busy", "umount-missing", "tree-remove", "process-alive", "cgroup-nonempty",
+))
 
 REFUSAL_CODES = frozenset((
     "matrix-semver-cgroup-unavailable",
@@ -151,6 +154,7 @@ NETWORK_PROBE_DIAGNOSTIC_CODES = NETWORK_PROBE_REFUSAL_CODES | frozenset((
     "network-probe-command-failed", "network-probe-output-invalid",
 ))
 REFUSAL_CODES |= NETWORK_PROBE_DIAGNOSTIC_CODES
+REFUSAL_CODES |= frozenset("cleanup-incomplete:" + reason for reason in CLEANUP_SUBREASONS)
 STARTUP_REFUSAL_CODES = frozenset((
     "deadline-file-invalid", "dispatch-context-invalid", "dispatch-context-unavailable",
     "firewall-unavailable", "input-size", "input-unavailable", "linux-root-required",
@@ -423,6 +427,33 @@ def _mount_tmpfs(destination, size, mode="0700", options=""):
     MOUNT_TARGETS.append(Path(destination))
 
 
+def _mount_fs(argv, destination):
+    _run(argv)
+    MOUNT_TARGETS.append(Path(destination))
+
+
+def _unmount_tracked_mounts(mounts=None):
+    """Release every tracked mount leaf-first and return a path-free failure class."""
+    targets = MOUNT_TARGETS if mounts is None else mounts
+    reason = ""
+    for mount in reversed(tuple(dict.fromkeys(Path(target) for target in targets))):
+        if not mount.exists() and not os.path.ismount(mount):
+            reason = reason or "umount-missing"
+            continue
+        if not os.path.ismount(mount):
+            continue
+        try:
+            _run(["umount", str(mount)], timeout=8, cleanup=True)
+        except SupervisorRefusal:
+            try:
+                _run(["umount", "-l", str(mount)], timeout=8, cleanup=True)
+            except SupervisorRefusal:
+                pass
+        if os.path.ismount(mount):
+            reason = reason or "umount-busy"
+    return reason
+
+
 def _mount_minimal_root(root, workspace, prepared, control_root):
     _ensure_directory(root)
     _mount_tmpfs(root, "2g", "0755", "nosuid,nodev")
@@ -466,10 +497,10 @@ def _mount_minimal_root(root, workspace, prepared, control_root):
     _mount_bind(control_root / "kit/devlane", root / "control/devlane", readonly=True)
     (root / "control/profiles.json").write_text("{}", encoding="ascii")
     _mount_bind(control_root / "ci/devlane-profiles.json", root / "control/profiles.json", readonly=True)
-    _run(["mount", "-t", "proc", "-o", "ro,hidepid=2,subset=pid", "proc", str(root / "proc")])
-    MOUNT_TARGETS.append(root / "proc")
-    _run(["mount", "-t", "sysfs", "-o", "ro,nosuid,nodev,noexec", "sysfs", str(root / "sys")])
-    MOUNT_TARGETS.append(root / "sys")
+    _mount_fs(["mount", "-t", "proc", "-o", "ro,hidepid=2,subset=pid", "proc", str(root / "proc")],
+              root / "proc")
+    _mount_fs(["mount", "-t", "sysfs", "-o", "ro,nosuid,nodev,noexec", "sysfs", str(root / "sys")],
+              root / "sys")
     _ensure_directory(root / "devlane-home", 0o700)
     os.chown(str(root / "devlane-home"), WORKER_UID, WORKER_GID)
     _ensure_directory(root / "workspace/source", 0o700)
@@ -2783,16 +2814,21 @@ class Service:
         CANCEL_REQUESTED.set()
         _signal_workload_descendants()
         failures = 0
+        cleanup_reason = ""
         shutdown_failed = False
         try:
             self._shutdown_semver_workers()
         except (SupervisorRefusal, OSError):
             shutdown_failed = True
             failures += 1
+            cleanup_reason = (
+                "cgroup-nonempty" if getattr(self, "semver_active", None) is not None else "process-alive"
+            )
         try:
             _kill_workload_descendants()
         except (SupervisorRefusal, OSError):
             failures += 1
+            cleanup_reason = cleanup_reason or "process-alive"
         if shutdown_failed:
             try:
                 self._shutdown_semver_workers()
@@ -2811,6 +2847,7 @@ class Service:
                     pass
             if os.path.ismount(baseline_mount):
                 failures += 1
+                cleanup_reason = cleanup_reason or "umount-busy"
         for relative in (
             "workspace/source", "workspace/raw", "workspace/.devlane-baseline-input",
             "workspace/semver-baseline", "workspace/semver-temporary-project",
@@ -2821,28 +2858,24 @@ class Service:
         ):
             if not _shred_tree(self.root / relative):
                 failures += 1
-        for mount in reversed(tuple(dict.fromkeys(MOUNT_TARGETS))):
-            if not os.path.ismount(mount):
-                continue
-            try:
-                _run(["umount", str(mount)], timeout=8, cleanup=True)
-            except SupervisorRefusal:
-                try:
-                    _run(["umount", "-l", str(mount)], timeout=8, cleanup=True)
-                except SupervisorRefusal:
-                    pass
-            if os.path.ismount(mount):
-                failures += 1
+                cleanup_reason = cleanup_reason or "tree-remove"
+        mount_reason = _unmount_tracked_mounts()
+        if mount_reason:
+            failures += 1
+            cleanup_reason = cleanup_reason or mount_reason
         MOUNT_TARGETS.clear()
         try:
             if self.root.exists():
                 self.root.rmdir()
         except OSError:
             failures += 1
+            cleanup_reason = cleanup_reason or "tree-remove"
         if self.root.exists() or os.path.ismount(self.root):
             failures += 1
+            cleanup_reason = cleanup_reason or "tree-remove"
         if failures:
-            _refuse("cleanup-incomplete")
+            reason = cleanup_reason if cleanup_reason in CLEANUP_SUBREASONS else "tree-remove"
+            _refuse("cleanup-incomplete:" + reason)
         return {"ok": True, "status": "cleanup-confirmed"}
 
     def request(self, value):
@@ -3219,7 +3252,7 @@ def _client(args):
             (Path(args.state_dir) / READY_NAME).unlink()
             Path(args.state_dir).rmdir()
         except OSError:
-            _refuse("cleanup-incomplete")
+            _refuse("cleanup-incomplete:tree-remove")
         print("cleanup_receipt=confirmed")
         return 0
     _refuse("control-operation-invalid")

@@ -6,6 +6,7 @@ import shutil
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -174,6 +175,8 @@ class LinuxSessionPureTests(unittest.TestCase):
             ("unix", socket.AF_UNIX, socket.SOCK_STREAM, os.path.join(directory, "kd.sock")),
             ("abstract", socket.AF_UNIX, socket.SOCK_STREAM, chr(0) + "kd-listener-" + NONCE),
         )
+        if sys.platform == "darwin":
+            cases = cases[:-1]
         for name, family, kind, address in cases:
             with self.subTest(name=name):
                 listener = session.Listener(name, family, kind, address, None, store)
