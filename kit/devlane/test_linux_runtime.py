@@ -45,6 +45,8 @@ def _inside(host_inode):
     if os.geteuid() != 0:
         raise RuntimeError("runtime-root-required")
     _run(["mount", "--make-rprivate", "/"], stage="runtime-mount-private")
+    _run(["mount", "-t", "sysfs", "-o", "ro,nosuid,nodev,noexec", "sysfs", "/sys"],
+         stage="runtime-sysfs-mount")
     _run(["ip", "link", "set", "lo", "up"], stage="runtime-loopback-up")
     _run(["nft", "-f", "-"], input_bytes=NFT_RULESET.encode("ascii"), stage="runtime-firewall-load")
     firewall = network_probe.firewall_snapshot()
