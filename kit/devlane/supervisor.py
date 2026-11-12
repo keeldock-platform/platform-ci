@@ -168,6 +168,11 @@ REFUSAL_CODES = frozenset((
     "tool-version-unavailable", "total-deadline-exhausted", "total-deadline-unavailable",
     "typescript-report-incomplete",
 ))
+DECRYPT_REFUSAL_CODES = frozenset((
+    "archive-invalid", "auth-tag", "binding-mismatch", "crypto-unavailable",
+    "decrypt-failed", "decrypt-timeout", "expired", "invalid-envelope", "key-format",
+    "request-invalid", "truncated",
+))
 NETWORK_PROBE_REFUSAL_CODES = frozenset(
     "network-probe-refusal:" + code for code in network_probe.REFUSAL_CODES
 )
@@ -258,9 +263,10 @@ def _record_startup_refusal(state_dir, owner_uid, code):
 
 
 class SupervisorRefusal(ValueError):
-    def __init__(self, code="supervisor-failed"):
+    def __init__(self, code="supervisor-failed", decrypt_refusal=None):
         super().__init__(code)
         self.code = code
+        self.decrypt_refusal = decrypt_refusal
 
 
 class SemverCgroupJob:
@@ -274,8 +280,8 @@ class SemverCgroupJob:
             self.attach_fd = None
 
 
-def _refuse(code):
-    raise SupervisorRefusal(code)
+def _refuse(code, *, decrypt_refusal=None):
+    raise SupervisorRefusal(code, decrypt_refusal=decrypt_refusal)
 
 
 def _report_network_probe_refusal(message):
@@ -383,10 +389,19 @@ def _rpc(state_dir, request):
         _refuse("supervisor-unavailable")
     finally:
         connection.close()
-    if type(response) is not dict or set(response) - {"ok", "code", "status", "summary", "catalogs"}:
+    if type(response) is not dict or set(response) - {
+            "ok", "code", "status", "summary", "catalogs", "decrypt_refusal"}:
         _refuse("control-response-invalid")
     if response.get("ok") is not True:
-        _refuse(response.get("code") if type(response.get("code")) is str else "supervisor-failed")
+        code = response.get("code") if type(response.get("code")) is str else "supervisor-failed"
+        diagnostic = response.get("decrypt_refusal")
+        if diagnostic is not None and (
+                operation != "decrypt" or code != "decrypt-rejected"
+                or diagnostic not in DECRYPT_REFUSAL_CODES):
+            _refuse("control-response-invalid")
+        _refuse(code, decrypt_refusal=diagnostic)
+    if "decrypt_refusal" in response:
+        _refuse("control-response-invalid")
     return response
 
 
@@ -400,6 +415,26 @@ def _context_from_file(path):
     except (fetch.Refusal, TypeError, KeyError):
         _refuse("dispatch-context-invalid")
     return value
+
+
+def _decrypt_child_receipt(returncode, output):
+    if type(output) is not bytes or len(output) > 4 * 1024 * 1024:
+        _refuse("decrypt-rejected", decrypt_refusal="decrypt-failed")
+    try:
+        receipt = bundle.strict_json(output, 4 * 1024 * 1024)
+    except bundle.Refusal:
+        _refuse("decrypt-rejected", decrypt_refusal="decrypt-failed")
+    if (type(receipt) is dict and set(receipt) == {"status", "reason"}
+            and receipt.get("status") == "refused"
+            and receipt.get("reason") in DECRYPT_REFUSAL_CODES
+            and returncode == 2):
+        _refuse("decrypt-rejected", decrypt_refusal=receipt["reason"])
+    if returncode != 0:
+        _refuse("decrypt-rejected", decrypt_refusal="decrypt-failed")
+    if (type(receipt) is not dict or set(receipt) != {"status", "manifest"}
+            or receipt["status"] != "accepted" or type(receipt["manifest"]) is not dict):
+        _refuse("decrypt-manifest-unavailable", decrypt_refusal="archive-invalid")
+    return receipt
 
 
 SYNTHETIC_NODE_UNIT_DIAGNOSTIC_REASONS = frozenset(("report-missing", "adapter-failed", "vitest-failed"))
@@ -2331,7 +2366,7 @@ class Service:
             _refuse("total-deadline-exhausted")
         self._verify_network_cut()
         if type(key_hex) is not str or len(key_hex) != 64 or any(char not in "0123456789abcdef" for char in key_hex):
-            _refuse("key-invalid")
+            _refuse("decrypt-rejected", decrypt_refusal="key-format")
         size, digest = _hash_file(self.bundle_path, bundle.MAX_CIPHERTEXT)
         if size != self.context["bundle_size"] or digest != self.context["bundle_sha256"]:
             _refuse("bundle-binding-mismatch")
@@ -2376,21 +2411,13 @@ class Service:
                         process.wait(timeout=3)
                     except subprocess.TimeoutExpired:
                         pass
-            _refuse("decrypt-timeout")
+            _refuse("decrypt-timeout", decrypt_refusal="decrypt-timeout")
         except (OSError, subprocess.SubprocessError):
-            _refuse("decrypt-rejected")
+            _refuse("decrypt-rejected", decrypt_refusal="decrypt-failed")
         finally:
             for index in range(len(request)):
                 request[index] = 0
-        if process.returncode != 0 or len(output) > 4 * 1024 * 1024:
-            _refuse("decrypt-rejected")
-        try:
-            receipt = bundle.strict_json(output, 4 * 1024 * 1024)
-        except bundle.Refusal:
-            _refuse("decrypt-rejected")
-        if (type(receipt) is not dict or set(receipt) != {"status", "manifest"}
-                or receipt["status"] != "accepted" or type(receipt["manifest"]) is not dict):
-            _refuse("decrypt-manifest-unavailable")
+        receipt = _decrypt_child_receipt(process.returncode, output)
         self.manifest = receipt["manifest"]
         output = b""
         receipt = None
@@ -3741,7 +3768,10 @@ def _serve(args):
                 except SupervisorRefusal as error:
                     if operation == "execute":
                         service._capture_failure_diagnostics(execution_failed=True)
-                    payload = json.dumps({"ok": False, "code": error.code}, separators=(",", ":")).encode("ascii")
+                    refusal = {"ok": False, "code": error.code}
+                    if operation == "decrypt" and error.decrypt_refusal in DECRYPT_REFUSAL_CODES:
+                        refusal["decrypt_refusal"] = error.decrypt_refusal
+                    payload = json.dumps(refusal, separators=(",", ":")).encode("ascii")
                     try:
                         _send_frame(connection, payload)
                     except OSError:
@@ -3976,7 +4006,7 @@ def _client(args):
     if args.operation == "decrypt":
         key = os.environ.get("DEVLANE_DECRYPT_KEY", "")
         if not key:
-            _refuse("decrypt-key-unavailable")
+            _refuse("decrypt-key-unavailable", decrypt_refusal="key-format")
         try:
             response = _rpc(args.state_dir, {"op": "decrypt", "key": key})
         finally:
@@ -4107,6 +4137,8 @@ def main(argv=None):
         return _client(args)
     except SupervisorRefusal as error:
         print("devlane_supervisor_refusal=" + error.code, file=sys.stderr)
+        if error.decrypt_refusal in DECRYPT_REFUSAL_CODES:
+            print("decrypt_refusal=" + error.decrypt_refusal, file=sys.stderr)
         return 2
     except Exception as error:
         code = (_startup_exception_code("parent", error) if args.operation == "start"

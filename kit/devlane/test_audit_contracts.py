@@ -512,6 +512,86 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             with self.subTest(label=label), self.assertRaises(audit.AuditRefusal):
                 audit.validate_job_log_surface(changed, audit.RUN_JOB, identity, completed=True)
 
+    def test_real_decrypt_rejection_logs_match_the_failed_at_decrypt_job_shape(self):
+        fixtures = Path(__file__).resolve().parent / "fixtures"
+        suffix = "43296698158"
+        identity = json.loads((fixtures / ("encrypted-run-" + suffix + "-identity.json")).read_text(
+            encoding="utf-8"))
+        run_log = bytes.fromhex((fixtures / ("encrypted-run-" + suffix + ".log.hex")).read_text(
+            encoding="ascii"))
+        audit_log = bytes.fromhex((fixtures / ("encrypted-audit-" + suffix + ".log.hex")).read_text(
+            encoding="ascii"))
+        run_result = audit.validate_job_log_surface(run_log, audit.RUN_JOB, identity, completed=True)
+        self.assertEqual(run_result["records"], [])
+        audit.validate_dispatch_marker(run_log, identity)
+
+        jobs = json.loads(bytes.fromhex(
+            (fixtures / ("encrypted-run-" + suffix + "-jobs.json.hex")).read_text(encoding="ascii"),
+        ).decode("utf-8"))["jobs"]
+        by_name, audit_passed = audit.validate_terminal_job_contract(jobs, identity, "core-node")
+        run_job = by_name[audit.RUN_JOB]
+        audit_job = by_name[audit.AUDIT_JOB]
+        steps = {step["name"]: step for step in run_job["steps"]}
+        self.assertEqual(run_job["conclusion"], "failure")
+        self.assertEqual(steps["Probe isolation before decryption"]["conclusion"], "success")
+        self.assertEqual(steps["Decrypt authenticated bundle"]["conclusion"], "failure")
+        self.assertEqual(steps["Execute offline profile and filter public summary"]["conclusion"], "skipped")
+        self.assertEqual(steps["Shred runner-local workspace"]["conclusion"], "success")
+        self.assertEqual(audit_job["conclusion"], "failure")
+        self.assertFalse(audit_passed)
+        with self.assertRaises(audit.AuditRefusal):
+            audit.validate_job_log_surface(audit_log, audit.AUDIT_JOB, identity, completed=True)
+
+        replay_jobs = copy.deepcopy(jobs)
+        replay_audit_job = next(job for job in replay_jobs if job["name"] == audit.AUDIT_JOB)
+        replay_audit_job["status"] = "in_progress"
+        replay_audit_job["conclusion"] = None
+        replay_audit_job["steps"][-2].update({"status": "in_progress", "conclusion": None})
+        replay_audit_job["steps"][-1].update({"status": "pending", "conclusion": None})
+
+        class API:
+            def json(self, endpoint):
+                if endpoint.endswith("/actions/runs/" + identity["run_id"]):
+                    repository = {"full_name": audit.REPOSITORY, "id": audit.REPOSITORY_ID}
+                    return ({
+                        "id": int(identity["run_id"]), "path": audit.WORKFLOW_PATH,
+                        "event": "workflow_dispatch", "head_branch": "main",
+                        "head_sha": identity["control_sha"], "run_attempt": 1,
+                        "status": "in_progress", "conclusion": None,
+                        "repository": repository, "head_repository": repository,
+                    }, {})
+                if "/jobs?" in endpoint:
+                    return ({"total_count": 2, "jobs": replay_jobs}, {})
+                if "/artifacts?" in endpoint:
+                    return ({"total_count": 0, "artifacts": []}, {})
+                return ({}, {})
+
+            def log_text(self, _identifier):
+                return run_log
+
+        permit_key = "devlane-permit-v1-" + identity["bundle_id"]
+        control_key = "devlane-control-v1-" + identity["control_run_id"]
+        with patch.object(audit, "_fetch_cache_entries", return_value=[
+                {"key": permit_key, "size_in_bytes": 1}, {"key": control_key, "size_in_bytes": 1}]), \
+                patch.object(audit, "cache_inventory_digest", return_value=identity["cache_baseline_sha256"]), \
+                patch.object(audit, "validate_check_output"), \
+                patch.object(audit, "_read_annotations", return_value=[]):
+            self.assertIsNone(audit.run_audit(API(), identity))
+
+        reasoned_log = run_log.replace(
+            b"devlane_supervisor_refusal=decrypt-rejected",
+            b"devlane_supervisor_refusal=decrypt-rejected\n"
+            b"2026-11-12T20:05:19.9416693Z decrypt_refusal=decrypt-failed",
+            1,
+        )
+        audit.validate_job_log_surface(reasoned_log, audit.RUN_JOB, identity, completed=True)
+        invalid_reason = reasoned_log.replace(b"decrypt_refusal=decrypt-failed", b"decrypt_refusal=source-bytes", 1)
+        with self.assertRaises(audit.AuditRefusal):
+            audit.validate_job_log_surface(invalid_reason, audit.RUN_JOB, identity, completed=True)
+
+        success_log = _render_real_runner_encrypted_log(IDENTITY)
+        audit.validate_job_log_surface(success_log, audit.RUN_JOB, IDENTITY, completed=True)
+
     def test_real_github_synthetic_log_fixture_is_accepted_and_closed(self):
         fixture = Path(__file__).resolve().parent / "fixtures/control-synthetic-43245798187.log.hex"
         log = bytes.fromhex(fixture.read_text(encoding="ascii"))

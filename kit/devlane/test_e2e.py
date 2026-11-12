@@ -1556,10 +1556,15 @@ def _assert_supervisor_decrypt_pass(result):
     return _assert_supervisor_result(result, 0, b"authenticated_decryption=pass\n", b"")
 
 
-def _assert_supervisor_refusal(result, code):
+def _assert_supervisor_refusal(result, code, decrypt_refusal=None):
     if code not in SUPERVISOR_REFUSAL_CODES:
         raise RuntimeError("startup-refusal-code-invalid")
-    return _assert_supervisor_result(result, 2, b"", ("devlane_supervisor_refusal=" + code + "\n").encode("ascii"))
+    stderr = "devlane_supervisor_refusal=" + code + "\n"
+    if decrypt_refusal is not None:
+        if decrypt_refusal not in supervisor.DECRYPT_REFUSAL_CODES:
+            raise RuntimeError("decrypt-refusal-code-invalid")
+        stderr += "decrypt_refusal=" + decrypt_refusal + "\n"
+    return _assert_supervisor_result(result, 2, b"", stderr.encode("ascii"))
 
 
 class _SupervisorLifecycle:
@@ -1715,7 +1720,7 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
             )
             if variant == "wrong-key":
                 _phase_call("variant-decrypt-check", _assert_supervisor_refusal,
-                            decrypt_result, "decrypt-rejected")
+                            decrypt_result, "decrypt-rejected", "auth-tag")
             else:
                 _phase_call("variant-decrypt-check", _assert_supervisor_decrypt_pass, decrypt_result)
         finally:

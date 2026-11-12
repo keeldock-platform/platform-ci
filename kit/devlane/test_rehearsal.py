@@ -26,6 +26,8 @@ import project
 import rehearsal
 import supervisor
 import test_e2e
+import decrypt_once
+from types import SimpleNamespace
 
 
 CONTROL_SHA = "a" * 40
@@ -42,6 +44,162 @@ def _private_directory(parent):
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
 class RehearsalBuilderTests(unittest.TestCase):
+    def test_created_bundle_survives_the_github_secret_stdin_path_and_decrypt_entrypoint(self):
+        if bundle.AESGCM is None:
+            self.skipTest("cryptography is required")
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = _private_directory(temporary)
+            rehearsal.build_source(owner)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(project.main([
+                    "--request", str(owner / "projection-request.json"),
+                    "--output", str(owner / "projection.json"),
+                ]), 0)
+            expires = rehearsal.build_requests(owner, CONTROL_SHA, "1234", WAVE, BUNDLE, "77", 3000)
+            request_path = owner / "bundle-request.json"
+            request = json.loads(request_path.read_text(encoding="utf-8"))
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(bundle.main([
+                    "create", "--request", str(request_path),
+                    "--ciphertext", str(owner / "bundle.enc"),
+                    "--key-file", str(owner / "key.hex"),
+                ]), 0)
+
+            with coordinator._read_key_file(owner / "key.hex") as key_file:
+                gh_stdin = key_file.read()
+            self.assertRegex(gh_stdin.decode("ascii"), r"[a-f0-9]{64}")
+            github_cli_secret = gh_stdin.rstrip(b"\r\n")
+            self.assertEqual(github_cli_secret, gh_stdin)
+            secret_environment = {coordinator.SECRET_NAME: github_cli_secret.decode("ascii")}
+            expected = {
+                "format": "kd-public-devlane-aesgcm-v1",
+                "repository_id": "1430960557",
+                "control_sha": CONTROL_SHA,
+                "workflow_path": ".github/workflows/devlane-encrypted.yml",
+                "profile": request["profile"],
+                "wave_id": WAVE,
+                "bundle_id": BUNDLE,
+                "fetch_sha256": request["fetch_sha256"],
+                "expires": expires,
+            }
+            envelope_path = owner / "bundle.enc"
+            extracted = owner / "decrypted-source"
+            original_extract = bundle.extract_authenticated_archive
+
+            def invoke_decrypt_once(secret):
+                child_request = bundle.canonical_json({"key": secret, "expected": expected})
+                child_stdout = io.BytesIO()
+                child_stderr = io.StringIO()
+
+                def extract_to_local_path(archive_bytes, destination, bindings):
+                    self.assertEqual(destination, "/workspace/source")
+                    return original_extract(archive_bytes, extracted, bindings)
+
+                with mock.patch.object(decrypt_once, "_read_envelope", return_value=envelope_path.read_bytes()), \
+                        mock.patch.object(bundle, "extract_authenticated_archive", side_effect=extract_to_local_path), \
+                        mock.patch.object(decrypt_once.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(child_request))), \
+                        mock.patch.object(decrypt_once.sys, "stdout", SimpleNamespace(buffer=child_stdout)), \
+                        mock.patch.object(decrypt_once.sys, "stderr", child_stderr):
+                    return decrypt_once.main(), child_stdout.getvalue(), child_stderr.getvalue()
+
+            wrong_key = ("0" if secret_environment[coordinator.SECRET_NAME][0] != "0" else "1") + \
+                secret_environment[coordinator.SECRET_NAME][1:]
+            wrong_result, wrong_output, _wrong_stderr = invoke_decrypt_once(wrong_key)
+            self.assertEqual(wrong_result, 2)
+            self.assertEqual(json.loads(wrong_output), {"status": "refused", "reason": "auth-tag"})
+            self.assertNotIn(github_cli_secret, wrong_output)
+
+            captured = {}
+
+            def local_supervisor_rpc(state_dir, rpc_request):
+                captured.update(rpc_request)
+                result, child_output, _child_stderr = invoke_decrypt_once(rpc_request["key"])
+                self.assertEqual(result, 0)
+                receipt = json.loads(child_output)
+                self.assertEqual(receipt["status"], "accepted")
+                self.assertNotIn(github_cli_secret, child_output)
+                return {"ok": True}
+
+            args = SimpleNamespace(operation="decrypt", state_dir=str(owner / "state"))
+            with mock.patch.dict(os.environ, secret_environment, clear=False), \
+                    mock.patch.object(supervisor, "_rpc", side_effect=local_supervisor_rpc), \
+                    contextlib.redirect_stdout(io.StringIO()) as client_stdout:
+                self.assertEqual(supervisor._client(args), 0)
+            self.assertEqual(client_stdout.getvalue(), "authenticated_decryption=pass\n")
+            self.assertEqual(captured, {"op": "decrypt", "key": secret_environment[coordinator.SECRET_NAME]})
+            self.assertTrue((extracted / "packages/kernel-ui-kit/src/example.ts").is_file())
+
+    def test_supervisor_preserves_only_fixed_decrypt_refusal_categories(self):
+        for reason in sorted(supervisor.DECRYPT_REFUSAL_CODES):
+            with self.subTest(reason=reason), self.assertRaises(supervisor.SupervisorRefusal) as caught:
+                supervisor._decrypt_child_receipt(
+                    2, bundle.canonical_json({"status": "refused", "reason": reason}),
+                )
+            self.assertEqual(caught.exception.code, "decrypt-rejected")
+            self.assertEqual(caught.exception.decrypt_refusal, reason)
+
+        with self.assertRaises(supervisor.SupervisorRefusal) as caught:
+            supervisor._decrypt_child_receipt(
+                2, bundle.canonical_json({"status": "refused", "reason": "source-bytes"}),
+            )
+        self.assertEqual(caught.exception.decrypt_refusal, "decrypt-failed")
+        receipt = {"status": "accepted", "manifest": {"schema": 1}}
+        self.assertEqual(supervisor._decrypt_child_receipt(0, bundle.canonical_json(receipt)), receipt)
+
+        service = supervisor.Service.__new__(supervisor.Service)
+        service.probe_passed = True
+        service.decrypted = False
+        service.execution_done = False
+        service.deadline_file = "unused"
+        with mock.patch.object(supervisor.deadline_budget, "remaining", return_value=30), \
+                mock.patch.object(service, "_verify_network_cut"):
+            with self.assertRaises(supervisor.SupervisorRefusal) as caught:
+                service._decrypt("malformed-key")
+        self.assertEqual(caught.exception.code, "decrypt-rejected")
+        self.assertEqual(caught.exception.decrypt_refusal, "key-format")
+
+        response = bundle.canonical_json({
+            "ok": False, "code": "decrypt-rejected", "decrypt_refusal": "auth-tag",
+        })
+
+        class Connection:
+            def __init__(self):
+                self.pending = len(response).to_bytes(4, "big") + response
+
+            def settimeout(self, _timeout):
+                return None
+
+            def connect(self, _path):
+                return None
+
+            def sendall(self, _payload):
+                return None
+
+            def recv(self, amount):
+                result = self.pending[:amount]
+                self.pending = self.pending[amount:]
+                return result
+
+            def close(self):
+                return None
+
+        with mock.patch.object(supervisor.socket, "socket", return_value=Connection()):
+            with self.assertRaises(supervisor.SupervisorRefusal) as caught:
+                supervisor._rpc("state", {"op": "decrypt", "key": "a" * 64})
+        self.assertEqual(caught.exception.code, "decrypt-rejected")
+        self.assertEqual(caught.exception.decrypt_refusal, "auth-tag")
+
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, {coordinator.SECRET_NAME: "a" * 64}), \
+                mock.patch.object(supervisor, "_rpc", side_effect=supervisor.SupervisorRefusal(
+                    "decrypt-rejected", decrypt_refusal="auth-tag")), \
+                contextlib.redirect_stderr(stderr):
+            self.assertEqual(supervisor.main(["decrypt", "--state-dir", "state"]), 2)
+        self.assertEqual(
+            stderr.getvalue(),
+            "devlane_supervisor_refusal=decrypt-rejected\ndecrypt_refusal=auth-tag\n",
+        )
+
     def test_source_is_a_private_throwaway_repository_with_a_valid_projection_request(self):
         with tempfile.TemporaryDirectory() as temporary:
             owner = _private_directory(temporary)

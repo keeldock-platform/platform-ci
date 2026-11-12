@@ -114,6 +114,14 @@ NETWORK_PROBE_SUPERVISOR_CODES = {
     "devlane_supervisor_refusal=network-probe-output-invalid": "probe-output-invalid",
     "devlane_supervisor_refusal=network-probe-stage-failed": "probe-stage-failed",
 }
+DECRYPT_REFUSAL_CODES = frozenset((
+    "archive-invalid", "auth-tag", "binding-mismatch", "crypto-unavailable",
+    "decrypt-failed", "decrypt-timeout", "expired", "invalid-envelope", "key-format",
+    "request-invalid", "truncated",
+))
+DECRYPT_FAILURE_CODES = frozenset((
+    "decrypt-key-unavailable", "decrypt-manifest-unavailable", "decrypt-rejected", "decrypt-timeout",
+))
 def cache_line_patterns(key):
     """Output lines of the pinned cache actions, bound to the one key the step may use."""
     escaped = re.escape(key)
@@ -403,6 +411,21 @@ class _Grammar:
             ) + 1
             public_counts["network_probe_supervisor_refusal_code"] = message
             return public_counts["network_probe_supervisor_refusal"] == 1
+        if line.startswith("decrypt_refusal="):
+            if step_name != "Decrypt authenticated bundle":
+                return False
+            reason = line[len("decrypt_refusal="):]
+            if reason not in DECRYPT_REFUSAL_CODES:
+                return False
+            public_counts["decrypt_refusal_detail"] = public_counts.get("decrypt_refusal_detail", 0) + 1
+            return public_counts["decrypt_refusal_detail"] == 1
+        if line.startswith("devlane_supervisor_refusal="):
+            code = line[len("devlane_supervisor_refusal="):]
+            if code in DECRYPT_FAILURE_CODES:
+                if step_name != "Decrypt authenticated bundle":
+                    return False
+                public_counts["decrypt_failure_marker"] = public_counts.get("decrypt_failure_marker", 0) + 1
+                return public_counts["decrypt_failure_marker"] == 1
         if line in NETWORK_PROBE_SUPERVISOR_CODES:
             if step_name != "Probe isolation before decryption":
                 return False
@@ -414,6 +437,8 @@ class _Grammar:
         if line in exact:
             public_counts[line] = public_counts.get(line, 0) + 1
             return public_counts[line] == 1
+        if line.startswith("decrypt_refusal="):
+            return False
         if step_name == "Run full source-free production-path acceptance":
             if diagnostic_contract.public_e2e_progress(line):
                 public_counts["e2e_progress_lines"] = public_counts.get("e2e_progress_lines", 0) + 1
@@ -1037,12 +1062,20 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
                 continue
             _refuse()
         if normalized == LOG_MARKER + "[error]Process completed with exit code 2.":
-            if (step_name != "Probe isolation before decryption"
-                    or not (counts.get("network_probe_refusal")
-                            or counts.get("network_probe_supervisor_refusal"))):
-                _refuse()
-            counts["network_probe_failed_exit"] = counts.get("network_probe_failed_exit", 0) + 1
-            if counts["network_probe_failed_exit"] != 1:
+            if step_name == "Probe isolation before decryption":
+                if not (counts.get("network_probe_refusal")
+                        or counts.get("network_probe_supervisor_refusal")):
+                    _refuse()
+                counts["network_probe_failed_exit"] = counts.get("network_probe_failed_exit", 0) + 1
+                if counts["network_probe_failed_exit"] != 1:
+                    _refuse()
+            elif step_name == "Decrypt authenticated bundle":
+                if counts.get("decrypt_failure_marker") != 1 or counts.get("authenticated_decryption=pass"):
+                    _refuse()
+                counts["decrypt_failed_exit"] = counts.get("decrypt_failed_exit", 0) + 1
+                if counts["decrypt_failed_exit"] != 1:
+                    _refuse()
+            else:
                 _refuse()
             continue
         if normalized.startswith(LOG_MARKER + "[error]"):
@@ -1078,6 +1111,24 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         if counts.get("network_cut_probe=pass", 0) + probe_refusal_count != 1:
             _refuse()
         if probe_refusal_count != counts.get("network_probe_failed_exit", 0):
+            _refuse()
+        decrypt_failure_count = counts.get("decrypt_failure_marker", 0)
+        if probe_refusal_count:
+            if (counts.get("authenticated_decryption=pass") or decrypt_failure_count
+                    or counts.get("decrypt_failed_exit") or counts.get("decrypt_refusal_detail")
+                    or "Decrypt authenticated bundle" in seen_steps
+                    or "Execute offline profile and filter public summary" in seen_steps):
+                _refuse()
+        else:
+            if counts.get("authenticated_decryption=pass", 0) + decrypt_failure_count != 1:
+                _refuse()
+            if decrypt_failure_count:
+                if (counts.get("decrypt_failed_exit") != 1 or records
+                        or "Execute offline profile and filter public summary" in seen_steps):
+                    _refuse()
+            elif counts.get("decrypt_failed_exit") or counts.get("decrypt_refusal_detail"):
+                _refuse()
+        if counts.get("decrypt_refusal_detail", 0) > 1:
             _refuse()
         cleanup_line = "cleanup_receipt=confirmed"
         if counts.get(cleanup_line) != 1 or (completed and counts.get(
@@ -1199,6 +1250,12 @@ def validate_job_contract(jobs, identity, profile):
         and decrypt_step.get("status") == "completed" and decrypt_step.get("conclusion") == "skipped"
         and execute_step.get("status") == "completed" and execute_step.get("conclusion") == "skipped"
     )
+    failed_at_decrypt = (
+        run_job.get("conclusion") == "failure"
+        and probe_failure.get("status") == "completed" and probe_failure.get("conclusion") == "success"
+        and decrypt_step.get("status") == "completed" and decrypt_step.get("conclusion") == "failure"
+        and execute_step.get("status") == "completed" and execute_step.get("conclusion") == "skipped"
+    )
     cancelled = run_job["conclusion"] in ("cancelled", "timed_out")
     for name, step in step_by_name.items():
         if failed_before_decrypt and name == "Probe isolation before decryption":
@@ -1208,6 +1265,12 @@ def validate_job_contract(jobs, identity, profile):
         if failed_before_decrypt and name in (
                 "Decrypt authenticated bundle", "Execute offline profile and filter public summary"):
             if step.get("status") != "completed" or step.get("conclusion") != "skipped":
+                _refuse()
+            continue
+        if failed_at_decrypt and name in (
+                "Decrypt authenticated bundle", "Execute offline profile and filter public summary"):
+            expected = "failure" if name == "Decrypt authenticated bundle" else "skipped"
+            if step.get("status") != "completed" or step.get("conclusion") != expected:
                 _refuse()
             continue
         if ((skipped_tool_step is not None and name == skipped_tool_step)
@@ -1225,7 +1288,8 @@ def validate_job_contract(jobs, identity, profile):
         _refuse()
     if run_job["conclusion"] in ("success", "failure"):
         expected_run_conclusion = (
-            "failure" if failed_before_decrypt or execute_step.get("conclusion") == "failure"
+            "failure" if failed_before_decrypt or failed_at_decrypt
+            or execute_step.get("conclusion") == "failure"
             else "success"
         )
         if run_job.get("conclusion") != expected_run_conclusion:

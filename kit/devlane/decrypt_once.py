@@ -11,6 +11,34 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bundle
 
 
+DECRYPT_REFUSAL_CODES = frozenset((
+    "archive-invalid", "auth-tag", "binding-mismatch", "crypto-unavailable",
+    "expired", "invalid-envelope", "key-format", "request-invalid", "truncated",
+))
+
+
+def _public_refusal(error):
+    """Map internal parser failures to a small fixed vocabulary safe for public logs."""
+    code = str(error) if isinstance(error, bundle.Refusal) else ""
+    if code == "authentication-failed":
+        return "auth-tag"
+    if code in ("key-invalid",):
+        return "key-format"
+    if code == "request-expired":
+        return "expired"
+    if code in ("envelope-truncated", "decrypt-input"):
+        return "truncated"
+    if code == "crypto-unavailable":
+        return "crypto-unavailable"
+    if code in ("binding-mismatch", "inner-binding-mismatch") or code.startswith("binding-"):
+        return "binding-mismatch"
+    if code == "ciphertext-size":
+        return "invalid-envelope"
+    if code == "decrypt-request" or code.startswith("json-"):
+        return "request-invalid"
+    return "archive-invalid"
+
+
 def _read_envelope(path):
     descriptor = None
     try:
@@ -35,6 +63,7 @@ def _read_envelope(path):
 
 
 def main():
+    reason = "archive-invalid"
     try:
         request_bytes = sys.stdin.buffer.read(64 * 1024 + 1)
         if len(request_bytes) > 64 * 1024:
@@ -64,7 +93,10 @@ def main():
         sys.stdout.buffer.write(bundle.canonical_json({"status": "accepted", "manifest": manifest}))
         sys.stdout.buffer.flush()
         return 0
-    except Exception:
+    except Exception as error:
+        reason = _public_refusal(error)
+        sys.stdout.buffer.write(bundle.canonical_json({"status": "refused", "reason": reason}))
+        sys.stdout.buffer.flush()
         print("decrypt_once=refused", file=sys.stderr)
         return 2
 
