@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import shlex
+import signal
 import subprocess
 import sys
 import tarfile
@@ -142,7 +143,7 @@ class RehearsalBuilderTests(unittest.TestCase):
             supervisor._decrypt_child_receipt(
                 2, bundle.canonical_json({"status": "refused", "reason": "source-bytes"}),
             )
-        self.assertEqual(caught.exception.decrypt_refusal, "decrypt-failed")
+        self.assertEqual(caught.exception.decrypt_refusal, "child-exit-2")
         receipt = {"status": "accepted", "manifest": {"schema": 1}}
         self.assertEqual(supervisor._decrypt_child_receipt(0, bundle.canonical_json(receipt)), receipt)
 
@@ -199,6 +200,170 @@ class RehearsalBuilderTests(unittest.TestCase):
             stderr.getvalue(),
             "devlane_supervisor_refusal=decrypt-rejected\ndecrypt_refusal=auth-tag\n",
         )
+
+    def test_decrypt_child_failures_have_fixed_codes_and_bounded_traceback_class(self):
+        signal_names = (
+            "SIGKILL", "SIGSEGV", "SIGABRT", "SIGSYS", "SIGXCPU", "SIGXFSZ", "SIGBUS", "SIGILL",
+        )
+        for name in signal_names:
+            value = getattr(signal, name, None)
+            if value is None:
+                continue
+            with self.subTest(signal=name), self.assertRaises(supervisor.SupervisorRefusal) as caught:
+                supervisor._decrypt_child_receipt(-value, b"", bytearray())
+            self.assertEqual(caught.exception.decrypt_refusal, "child-signal-" + name)
+            self.assertEqual(caught.exception.decrypt_child_error, "other")
+        with self.assertRaises(supervisor.SupervisorRefusal) as caught:
+            supervisor._decrypt_child_receipt(-99999, b"", bytearray())
+        self.assertEqual(caught.exception.decrypt_refusal, "child-signal-other")
+
+        for returncode, expected in ((1, "child-exit-1"), (2, "child-exit-2"),
+                                     (120, "child-exit-120"), (126, "child-exit-126"),
+                                     (127, "child-exit-127"), (3, "child-exit-other")):
+            with self.subTest(returncode=returncode), self.assertRaises(supervisor.SupervisorRefusal) as caught:
+                supervisor._decrypt_child_receipt(returncode, b"receipt unavailable", bytearray())
+            self.assertEqual(caught.exception.decrypt_refusal, expected)
+
+        for output, expected in ((b"", "child-no-output"), (b"not json", "child-output-invalid")):
+            captured = bytearray(b"Traceback (most recent call last):\n  File \"x\", line 1\n"
+                                 b"PanicException: PRIVATE_DETAIL")
+            with self.subTest(expected=expected), self.assertRaises(supervisor.SupervisorRefusal) as caught:
+                supervisor._decrypt_child_receipt(0, output, captured)
+            self.assertEqual(caught.exception.decrypt_refusal, expected)
+            self.assertEqual(caught.exception.decrypt_child_error, "PanicException")
+            self.assertEqual(captured, bytearray())
+
+        for exception_class in sorted(supervisor.DECRYPT_CHILD_ERROR_CLASSES):
+            stderr = bytearray(("Traceback (most recent call last):\n" + exception_class + ": private text\n")
+                               .encode("ascii"))
+            self.assertEqual(supervisor._decrypt_child_error(stderr), exception_class)
+        self.assertEqual(supervisor._decrypt_child_error(b"not a traceback"), "other")
+        self.assertEqual(supervisor._decrypt_child_error(b"PrivateError: secret"), "other")
+
+        bounded = bytearray()
+        supervisor._drain_decrypt_child_stderr(
+            io.BytesIO(b"A" * (supervisor.MAX_DECRYPT_CHILD_STDERR_BYTES + 19)), bounded,
+        )
+        self.assertEqual(len(bounded), supervisor.MAX_DECRYPT_CHILD_STDERR_BYTES)
+        self.assertEqual(bounded[-19:], b"A" * 19)
+
+    def test_decrypt_once_import_and_baseexception_failures_write_fixed_receipts(self):
+        child_stdout = io.BytesIO()
+        with mock.patch.object(decrypt_once.importlib, "import_module",
+                               side_effect=ImportError("PRIVATE_IMPORT_MESSAGE")), \
+                mock.patch.object(decrypt_once.sys, "stdout", SimpleNamespace(buffer=child_stdout)):
+            result = decrypt_once.main()
+        self.assertEqual(result, 2)
+        self.assertEqual(json.loads(child_stdout.getvalue()), {
+            "status": "refused", "reason": "child-import-failed",
+        })
+        self.assertNotIn(b"PRIVATE_IMPORT_MESSAGE", child_stdout.getvalue())
+
+        panic_type = type("PanicException", (BaseException,), {})
+        child_stdout = io.BytesIO()
+        with mock.patch.object(decrypt_once.importlib, "import_module",
+                               side_effect=panic_type("PRIVATE_CRYPTO_PANIC")), \
+                mock.patch.object(decrypt_once.sys, "stdout", SimpleNamespace(buffer=child_stdout)):
+            result = decrypt_once.main()
+        self.assertEqual(result, 2)
+        self.assertEqual(json.loads(child_stdout.getvalue()), {
+            "status": "refused", "reason": "crypto-unavailable",
+        })
+        self.assertNotIn(b"PRIVATE_CRYPTO_PANIC", child_stdout.getvalue())
+
+        request = bundle.canonical_json({"key": "a" * 64, "expected": {}})
+        child_stdout = io.BytesIO()
+        with mock.patch.object(decrypt_once, "_read_envelope",
+                               side_effect=KeyboardInterrupt("PRIVATE_PANIC_MESSAGE")), \
+                mock.patch.object(decrypt_once.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(request))), \
+                mock.patch.object(decrypt_once.sys, "stdout", SimpleNamespace(buffer=child_stdout)), \
+                contextlib.redirect_stderr(io.StringIO()):
+            result = decrypt_once.main()
+        self.assertEqual(result, 2)
+        self.assertEqual(json.loads(child_stdout.getvalue()), {
+            "status": "refused", "reason": "child-panic",
+        })
+        self.assertNotIn(b"PRIVATE_PANIC_MESSAGE", child_stdout.getvalue())
+
+        child_stdout = io.BytesIO()
+        unavailable = SimpleNamespace(AESGCM=None)
+        with mock.patch.object(decrypt_once.importlib, "import_module", return_value=unavailable), \
+                mock.patch.object(decrypt_once.sys, "stdout", SimpleNamespace(buffer=child_stdout)):
+            result = decrypt_once.main()
+        self.assertEqual(result, 2)
+        self.assertEqual(json.loads(child_stdout.getvalue()), {
+            "status": "refused", "reason": "crypto-unavailable",
+        })
+
+    def test_decrypt_child_popen_oserror_is_reported_as_spawn_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            envelope = Path(temporary) / "bundle.enc"
+            envelope.write_bytes(b"encrypted fixture")
+            service = supervisor.Service.__new__(supervisor.Service)
+            service.probe_passed = True
+            service.decrypted = False
+            service.execution_done = False
+            service.deadline_file = "unused"
+            service.root = Path(temporary) / "root"
+            service.bundle_path = envelope
+            service.context = {
+                "bundle_size": envelope.stat().st_size,
+                "bundle_sha256": hashlib.sha256(envelope.read_bytes()).hexdigest(),
+                "repository_id": "1430960557", "control_sha": "a" * 40,
+                "profile": "core-node", "wave_id": "rehearsal-wave-0001",
+                "bundle_id": "rehearsal-bundle-0001", "projection_sha256": "b" * 64,
+                "expires": 4_000_000_000,
+            }
+            with mock.patch.object(supervisor.deadline_budget, "remaining", return_value=30), \
+                    mock.patch.object(service, "_verify_network_cut"), \
+                    mock.patch.object(supervisor.subprocess, "Popen", side_effect=OSError("private")):
+                with self.assertRaises(supervisor.SupervisorRefusal) as caught:
+                    service._decrypt("a" * 64)
+            self.assertEqual(caught.exception.decrypt_refusal, "child-spawn-failed")
+
+    def test_supervisor_carries_only_allowlisted_decrypt_child_error(self):
+        response = bundle.canonical_json({
+            "ok": False, "code": "decrypt-rejected", "decrypt_refusal": "child-exit-1",
+            "decrypt_child_error": "OSError",
+        })
+
+        class Connection:
+            def __init__(self, payload):
+                self.pending = len(payload).to_bytes(4, "big") + payload
+
+            def settimeout(self, _timeout):
+                return None
+
+            def connect(self, _path):
+                return None
+
+            def sendall(self, _payload):
+                return None
+
+            def recv(self, amount):
+                result = self.pending[:amount]
+                self.pending = self.pending[amount:]
+                return result
+
+            def close(self):
+                return None
+
+        with mock.patch.object(supervisor.socket, "socket", return_value=Connection(response)):
+            with self.assertRaises(supervisor.SupervisorRefusal) as caught:
+                supervisor._rpc("state", {"op": "decrypt", "key": "a" * 64})
+        self.assertEqual(caught.exception.decrypt_refusal, "child-exit-1")
+        self.assertEqual(caught.exception.decrypt_child_error, "OSError")
+
+        with mock.patch.dict(os.environ, {coordinator.SECRET_NAME: "a" * 64}), \
+                mock.patch.object(supervisor, "_rpc", side_effect=supervisor.SupervisorRefusal(
+                    "decrypt-rejected", decrypt_refusal="child-exit-1",
+                    decrypt_child_error="OSError",
+                )), contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(supervisor.main(["decrypt", "--state-dir", "state"]), 2)
+        self.assertEqual(stderr.getvalue(),
+                         "devlane_supervisor_refusal=decrypt-rejected\n"
+                         "decrypt_refusal=child-exit-1\n"
+                         "decrypt_child_error=OSError\n")
 
     def test_source_is_a_private_throwaway_repository_with_a_valid_projection_request(self):
         with tempfile.TemporaryDirectory() as temporary:

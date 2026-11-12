@@ -116,8 +116,19 @@ NETWORK_PROBE_SUPERVISOR_CODES = {
 }
 DECRYPT_REFUSAL_CODES = frozenset((
     "archive-invalid", "auth-tag", "binding-mismatch", "crypto-unavailable",
-    "decrypt-failed", "decrypt-timeout", "expired", "invalid-envelope", "key-format",
-    "request-invalid", "truncated",
+    "child-import-failed", "child-no-output", "child-output-invalid", "child-panic",
+    "child-spawn-failed", "decrypt-failed", "decrypt-timeout", "expired",
+    "invalid-envelope", "key-format", "request-invalid", "truncated",
+))
+DECRYPT_REFUSAL_CODES |= frozenset(
+    "child-signal-" + name for name in
+    ("SIGKILL", "SIGSEGV", "SIGABRT", "SIGSYS", "SIGXCPU", "SIGXFSZ", "SIGBUS", "SIGILL")
+)
+DECRYPT_REFUSAL_CODES |= frozenset(("child-signal-other", "child-exit-other"))
+DECRYPT_REFUSAL_CODES |= frozenset("child-exit-" + str(code) for code in (1, 2, 120, 126, 127))
+DECRYPT_CHILD_ERROR_CODES = frozenset((
+    "ModuleNotFoundError", "ImportError", "PermissionError", "FileNotFoundError", "OSError",
+    "MemoryError", "PanicException", "SystemError", "UnicodeDecodeError", "other",
 ))
 DECRYPT_FAILURE_CODES = frozenset((
     "decrypt-key-unavailable", "decrypt-manifest-unavailable", "decrypt-rejected", "decrypt-timeout",
@@ -419,6 +430,15 @@ class _Grammar:
                 return False
             public_counts["decrypt_refusal_detail"] = public_counts.get("decrypt_refusal_detail", 0) + 1
             return public_counts["decrypt_refusal_detail"] == 1
+        if line.startswith("decrypt_child_error="):
+            if (step_name != "Decrypt authenticated bundle"
+                    or public_counts.get("decrypt_refusal_detail") != 1):
+                return False
+            label = line[len("decrypt_child_error="):]
+            if label not in DECRYPT_CHILD_ERROR_CODES:
+                return False
+            public_counts["decrypt_child_error"] = public_counts.get("decrypt_child_error", 0) + 1
+            return public_counts["decrypt_child_error"] == 1
         if line.startswith("devlane_supervisor_refusal="):
             code = line[len("devlane_supervisor_refusal="):]
             if code in DECRYPT_FAILURE_CODES:
@@ -438,6 +458,8 @@ class _Grammar:
             public_counts[line] = public_counts.get(line, 0) + 1
             return public_counts[line] == 1
         if line.startswith("decrypt_refusal="):
+            return False
+        if line.startswith("decrypt_child_error="):
             return False
         if step_name == "Run full source-free production-path acceptance":
             if diagnostic_contract.public_e2e_progress(line):

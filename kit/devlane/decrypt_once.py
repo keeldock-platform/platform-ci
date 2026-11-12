@@ -1,5 +1,6 @@
 """Short-lived, offline decryptor. Key bytes arrive only through stdin."""
 
+import importlib
 import json
 import os
 import stat
@@ -8,13 +9,43 @@ from pathlib import Path
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import bundle
+bundle = None
 
 
 DECRYPT_REFUSAL_CODES = frozenset((
     "archive-invalid", "auth-tag", "binding-mismatch", "crypto-unavailable",
-    "expired", "invalid-envelope", "key-format", "request-invalid", "truncated",
+    "child-import-failed", "child-no-output", "child-output-invalid", "child-panic",
+    "child-spawn-failed", "child-signal-SIGKILL", "child-signal-SIGSEGV",
+    "child-signal-SIGABRT", "child-signal-SIGSYS", "child-signal-SIGXCPU",
+    "child-signal-SIGXFSZ", "child-signal-SIGBUS", "child-signal-SIGILL",
+    "child-signal-other", "child-exit-1", "child-exit-2", "child-exit-120",
+    "child-exit-126", "child-exit-127", "child-exit-other", "decrypt-failed",
+    "decrypt-timeout", "expired",
+    "invalid-envelope", "key-format", "request-invalid", "truncated",
 ))
+
+
+def _load_bundle():
+    """Load the decrypt implementation only after main can turn failures into receipts."""
+    global bundle
+    bundle = None
+    try:
+        bundle = importlib.import_module("bundle")
+    except BaseException as error:
+        reason = "crypto-unavailable" if type(error).__name__ == "PanicException" else "child-import-failed"
+        return None, reason
+    if getattr(bundle, "AESGCM", None) is None:
+        return bundle, "crypto-unavailable"
+    return bundle, None
+
+
+def _write_refusal(reason):
+    payload = json.dumps(
+        {"status": "refused", "reason": reason},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("ascii")
+    sys.stdout.buffer.write(payload)
+    sys.stdout.buffer.flush()
 
 
 def _public_refusal(error):
@@ -63,7 +94,11 @@ def _read_envelope(path):
 
 
 def main():
-    reason = "archive-invalid"
+    _, import_refusal = _load_bundle()
+    if import_refusal is not None:
+        _write_refusal(import_refusal)
+        return 2
+    key_buffer = bytearray()
     try:
         request_bytes = sys.stdin.buffer.read(64 * 1024 + 1)
         if len(request_bytes) > 64 * 1024:
@@ -94,11 +129,16 @@ def main():
         sys.stdout.buffer.flush()
         return 0
     except Exception as error:
-        reason = _public_refusal(error)
-        sys.stdout.buffer.write(bundle.canonical_json({"status": "refused", "reason": reason}))
-        sys.stdout.buffer.flush()
+        _write_refusal(_public_refusal(error))
         print("decrypt_once=refused", file=sys.stderr)
         return 2
+    except BaseException:
+        _write_refusal("child-panic")
+        print("decrypt_once=refused", file=sys.stderr)
+        return 2
+    finally:
+        for index in range(len(key_buffer)):
+            key_buffer[index] = 0
 
 
 if __name__ == "__main__":

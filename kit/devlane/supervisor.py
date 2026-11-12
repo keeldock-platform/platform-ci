@@ -170,9 +170,30 @@ REFUSAL_CODES = frozenset((
 ))
 DECRYPT_REFUSAL_CODES = frozenset((
     "archive-invalid", "auth-tag", "binding-mismatch", "crypto-unavailable",
-    "decrypt-failed", "decrypt-timeout", "expired", "invalid-envelope", "key-format",
-    "request-invalid", "truncated",
+    "child-import-failed", "child-no-output", "child-output-invalid", "child-panic",
+    "child-spawn-failed", "decrypt-failed", "decrypt-timeout", "expired",
+    "invalid-envelope", "key-format", "request-invalid", "truncated",
 ))
+_DECRYPT_CHILD_SIGNAL_NAMES = (
+    "SIGKILL", "SIGSEGV", "SIGABRT", "SIGSYS", "SIGXCPU", "SIGXFSZ", "SIGBUS", "SIGILL",
+)
+DECRYPT_CHILD_SIGNAL_CODES = {
+    value: "child-signal-" + name for name in _DECRYPT_CHILD_SIGNAL_NAMES
+    if (value := getattr(signal, name, None)) is not None
+}
+DECRYPT_CHILD_EXIT_CODES = frozenset((1, 2, 120, 126, 127))
+DECRYPT_REFUSAL_CODES |= frozenset(DECRYPT_CHILD_SIGNAL_CODES.values())
+DECRYPT_REFUSAL_CODES |= frozenset("child-exit-" + str(code) for code in DECRYPT_CHILD_EXIT_CODES)
+DECRYPT_REFUSAL_CODES |= frozenset(("child-signal-other", "child-exit-other"))
+DECRYPT_CHILD_ERROR_CLASSES = frozenset((
+    "ModuleNotFoundError", "ImportError", "PermissionError", "FileNotFoundError", "OSError",
+    "MemoryError", "PanicException", "SystemError", "UnicodeDecodeError",
+))
+DECRYPT_CHILD_ERROR_CODES = DECRYPT_CHILD_ERROR_CLASSES | frozenset(("other",))
+MAX_DECRYPT_CHILD_STDERR_BYTES = 8 * 1024
+_DECRYPT_CHILD_TRACEBACK_LINE = re.compile(
+    rb"^(?:[A-Za-z_][A-Za-z0-9_]*\.)*([A-Za-z_][A-Za-z0-9_]*):(?: .*)?$"
+)
 NETWORK_PROBE_REFUSAL_CODES = frozenset(
     "network-probe-refusal:" + code for code in network_probe.REFUSAL_CODES
 )
@@ -263,10 +284,11 @@ def _record_startup_refusal(state_dir, owner_uid, code):
 
 
 class SupervisorRefusal(ValueError):
-    def __init__(self, code="supervisor-failed", decrypt_refusal=None):
+    def __init__(self, code="supervisor-failed", decrypt_refusal=None, decrypt_child_error=None):
         super().__init__(code)
         self.code = code
         self.decrypt_refusal = decrypt_refusal
+        self.decrypt_child_error = decrypt_child_error
 
 
 class SemverCgroupJob:
@@ -280,8 +302,10 @@ class SemverCgroupJob:
             self.attach_fd = None
 
 
-def _refuse(code, *, decrypt_refusal=None):
-    raise SupervisorRefusal(code, decrypt_refusal=decrypt_refusal)
+def _refuse(code, *, decrypt_refusal=None, decrypt_child_error=None):
+    raise SupervisorRefusal(
+        code, decrypt_refusal=decrypt_refusal, decrypt_child_error=decrypt_child_error,
+    )
 
 
 def _report_network_probe_refusal(message):
@@ -390,17 +414,24 @@ def _rpc(state_dir, request):
     finally:
         connection.close()
     if type(response) is not dict or set(response) - {
-            "ok", "code", "status", "summary", "catalogs", "decrypt_refusal"}:
+            "ok", "code", "status", "summary", "catalogs", "decrypt_refusal",
+            "decrypt_child_error"}:
         _refuse("control-response-invalid")
     if response.get("ok") is not True:
         code = response.get("code") if type(response.get("code")) is str else "supervisor-failed"
         diagnostic = response.get("decrypt_refusal")
+        child_error = response.get("decrypt_child_error")
         if diagnostic is not None and (
                 operation != "decrypt" or code != "decrypt-rejected"
                 or diagnostic not in DECRYPT_REFUSAL_CODES):
             _refuse("control-response-invalid")
-        _refuse(code, decrypt_refusal=diagnostic)
-    if "decrypt_refusal" in response:
+        if child_error is not None and (
+                operation != "decrypt" or code != "decrypt-rejected"
+                or diagnostic not in DECRYPT_REFUSAL_CODES
+                or child_error not in DECRYPT_CHILD_ERROR_CODES):
+            _refuse("control-response-invalid")
+        _refuse(code, decrypt_refusal=diagnostic, decrypt_child_error=child_error)
+    if "decrypt_refusal" in response or "decrypt_child_error" in response:
         _refuse("control-response-invalid")
     return response
 
@@ -417,24 +448,80 @@ def _context_from_file(path):
     return value
 
 
-def _decrypt_child_receipt(returncode, output):
-    if type(output) is not bytes or len(output) > 4 * 1024 * 1024:
-        _refuse("decrypt-rejected", decrypt_refusal="decrypt-failed")
+def _decrypt_child_failure_code(returncode, output):
+    if type(returncode) is int and returncode < 0:
+        return DECRYPT_CHILD_SIGNAL_CODES.get(-returncode, "child-signal-other")
+    if returncode != 0:
+        if type(returncode) is int and returncode in DECRYPT_CHILD_EXIT_CODES:
+            return "child-exit-" + str(returncode)
+        return "child-exit-other"
+    if output == b"":
+        return "child-no-output"
+    return "child-output-invalid"
+
+
+def _decrypt_child_error(stderr):
+    if type(stderr) not in (bytes, bytearray):
+        return "other"
+    final_line = next((line.strip() for line in reversed(bytes(stderr).splitlines()) if line.strip()), b"")
+    match = _DECRYPT_CHILD_TRACEBACK_LINE.fullmatch(final_line)
+    if match is None:
+        return "other"
+    label = match.group(1).decode("ascii", "strict")
+    return label if label in DECRYPT_CHILD_ERROR_CLASSES else "other"
+
+
+def _scrub_decrypt_child_stderr(stderr):
+    if type(stderr) is bytearray:
+        for index in range(len(stderr)):
+            stderr[index] = 0
+        stderr.clear()
+
+
+def _drain_decrypt_child_stderr(stream, buffer):
     try:
-        receipt = bundle.strict_json(output, 4 * 1024 * 1024)
-    except bundle.Refusal:
-        _refuse("decrypt-rejected", decrypt_refusal="decrypt-failed")
+        while True:
+            try:
+                chunk = stream.read(4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buffer.extend(chunk)
+            overflow = len(buffer) - MAX_DECRYPT_CHILD_STDERR_BYTES
+            if overflow > 0:
+                del buffer[:overflow]
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _decrypt_child_receipt(returncode, output, stderr=b""):
+    receipt = None
+    if type(output) is bytes and len(output) <= 4 * 1024 * 1024:
+        try:
+            receipt = bundle.strict_json(output, 4 * 1024 * 1024)
+        except bundle.Refusal:
+            pass
     if (type(receipt) is dict and set(receipt) == {"status", "reason"}
             and receipt.get("status") == "refused"
             and receipt.get("reason") in DECRYPT_REFUSAL_CODES
             and returncode == 2):
+        _scrub_decrypt_child_stderr(stderr)
         _refuse("decrypt-rejected", decrypt_refusal=receipt["reason"])
-    if returncode != 0:
-        _refuse("decrypt-rejected", decrypt_refusal="decrypt-failed")
-    if (type(receipt) is not dict or set(receipt) != {"status", "manifest"}
-            or receipt["status"] != "accepted" or type(receipt["manifest"]) is not dict):
-        _refuse("decrypt-manifest-unavailable", decrypt_refusal="archive-invalid")
-    return receipt
+    if returncode == 0 and (type(receipt) is dict and set(receipt) == {"status", "manifest"}
+                            and receipt["status"] == "accepted"
+                            and type(receipt["manifest"]) is dict):
+        _scrub_decrypt_child_stderr(stderr)
+        return receipt
+    reason = _decrypt_child_failure_code(returncode, output)
+    child_error = _decrypt_child_error(stderr)
+    _scrub_decrypt_child_stderr(stderr)
+    _refuse(
+        "decrypt-rejected", decrypt_refusal=reason, decrypt_child_error=child_error,
+    )
 
 
 SYNTHETIC_NODE_UNIT_DIAGNOSTIC_REASONS = frozenset(("report-missing", "adapter-failed", "vitest-failed"))
@@ -2390,15 +2477,26 @@ class Service:
             "/usr/bin/python3", "-B", "-I", "/control/devlane/decrypt_once.py",
         ]
         process = None
+        stderr_buffer = bytearray()
+        stderr_thread = None
         try:
-            process = subprocess.Popen(
-                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1"},
-                close_fds=True, start_new_session=True,
+            try:
+                process = subprocess.Popen(
+                    command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1"},
+                    close_fds=True, start_new_session=True,
+                )
+            except OSError:
+                _refuse("decrypt-rejected", decrypt_refusal="child-spawn-failed")
+            stderr_stream = process.stderr
+            process.stderr = None
+            stderr_thread = threading.Thread(
+                target=_drain_decrypt_child_stderr, args=(stderr_stream, stderr_buffer), daemon=True,
             )
-            output, _ = process.communicate(bytes(request), timeout=decrypt_timeout)
-        except subprocess.TimeoutExpired:
-            if process is not None:
+            stderr_thread.start()
+            try:
+                output, _ = process.communicate(bytes(request), timeout=decrypt_timeout)
+            except subprocess.TimeoutExpired:
                 try:
                     os.killpg(process.pid, signal.SIGTERM)
                     process.wait(timeout=2)
@@ -2411,13 +2509,18 @@ class Service:
                         process.wait(timeout=3)
                     except subprocess.TimeoutExpired:
                         pass
-            _refuse("decrypt-timeout", decrypt_refusal="decrypt-timeout")
-        except (OSError, subprocess.SubprocessError):
-            _refuse("decrypt-rejected", decrypt_refusal="decrypt-failed")
+                stderr_thread.join(timeout=3)
+                _scrub_decrypt_child_stderr(stderr_buffer)
+                _refuse("decrypt-timeout", decrypt_refusal="decrypt-timeout")
+            except (OSError, subprocess.SubprocessError):
+                stderr_thread.join(timeout=3)
+                _scrub_decrypt_child_stderr(stderr_buffer)
+                _refuse("decrypt-rejected", decrypt_refusal="decrypt-failed")
+            stderr_thread.join()
         finally:
             for index in range(len(request)):
                 request[index] = 0
-        receipt = _decrypt_child_receipt(process.returncode, output)
+        receipt = _decrypt_child_receipt(process.returncode, output, stderr_buffer)
         self.manifest = receipt["manifest"]
         output = b""
         receipt = None
@@ -3771,6 +3874,9 @@ def _serve(args):
                     refusal = {"ok": False, "code": error.code}
                     if operation == "decrypt" and error.decrypt_refusal in DECRYPT_REFUSAL_CODES:
                         refusal["decrypt_refusal"] = error.decrypt_refusal
+                    if (operation == "decrypt"
+                            and error.decrypt_child_error in DECRYPT_CHILD_ERROR_CODES):
+                        refusal["decrypt_child_error"] = error.decrypt_child_error
                     payload = json.dumps(refusal, separators=(",", ":")).encode("ascii")
                     try:
                         _send_frame(connection, payload)
@@ -4139,6 +4245,8 @@ def main(argv=None):
         print("devlane_supervisor_refusal=" + error.code, file=sys.stderr)
         if error.decrypt_refusal in DECRYPT_REFUSAL_CODES:
             print("decrypt_refusal=" + error.decrypt_refusal, file=sys.stderr)
+        if error.decrypt_child_error in DECRYPT_CHILD_ERROR_CODES:
+            print("decrypt_child_error=" + error.decrypt_child_error, file=sys.stderr)
         return 2
     except Exception as error:
         code = (_startup_exception_code("parent", error) if args.operation == "start"

@@ -1210,6 +1210,32 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 route_line.replace("network-route-unexpected", "network-address-unexpected")):
             self.assertFalse(diagnostic_contract.public_preparation_diagnostic(malformed))
 
+    def test_decrypt_child_diagnostics_are_fixed_and_appear_at_most_once(self):
+        root = Path(__file__).resolve().parents[2]
+        grammar = audit._Grammar(
+            root / ".github/workflows/devlane-encrypted.yml", audit.RUN_JOB,
+            IDENTITY, "encrypted",
+        )
+        counts = {}
+        self.assertTrue(grammar.step_output_ok(
+            "Decrypt authenticated bundle", "decrypt_refusal=child-signal-SIGSEGV", counts,
+        ))
+        self.assertTrue(grammar.step_output_ok(
+            "Decrypt authenticated bundle", "decrypt_child_error=PanicException", counts,
+        ))
+        self.assertFalse(grammar.step_output_ok(
+            "Decrypt authenticated bundle", "decrypt_child_error=ImportError", counts,
+        ))
+        self.assertFalse(grammar.step_output_ok(
+            "Decrypt authenticated bundle", "decrypt_child_error=private-path", {},
+        ))
+        self.assertFalse(grammar.step_output_ok(
+            "Probe isolation before decryption", "decrypt_child_error=OSError", {},
+        ))
+        self.assertFalse(grammar.step_output_ok(
+            "Decrypt authenticated bundle", "decrypt_child_error=OSError", {},
+        ))
+
     def test_reviewed_step_name_lists_match_the_workflow_files(self):
         root = Path(__file__).resolve().parents[2]
         encrypted = audit.parse_workflow(root / ".github/workflows/devlane-encrypted.yml")
