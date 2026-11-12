@@ -1572,7 +1572,7 @@ class Service:
         except (OSError, subprocess.TimeoutExpired):
             _refuse("network-probe-command-failed")
         if result.returncode != 0:
-            refusal = network_probe.refusal_code_from_result(
+            refusal = network_probe.refusal_message_from_result(
                 result.returncode, result.stdout, result.stderr,
             )
             if refusal is not None:

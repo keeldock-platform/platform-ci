@@ -147,6 +147,7 @@ _EXCEPTION_RESULT = re.compile(
 _E2E_REFUSAL = re.compile(
     r"devlane_production_e2e=refused stage=([a-z0-9-]{1,48}) "
     r"exception=([a-z0-9-]{1,48}(?::[a-z0-9-]{1,48})?)"
+    r"(?: (" + network_probe.ROUTE_DIAGNOSTIC_PATTERN + r"))?"
     r"(?: reason=([a-z0-9-]{1,48})(?: version=\"([A-Za-z0-9._+-][A-Za-z0-9 ._+-]{0,31})\")?)?"
     r"(?: cleanup=(unconfirmed))?\Z"
 )
@@ -160,7 +161,7 @@ TOOLING_REFUSAL_CODES = frozenset((
     "advisory-database-link", "tooling-refusal-unlisted",
 ))
 MAX_PREPARATION_OUTPUT_BYTES = 512
-MAX_PUBLIC_DIAGNOSTIC_BYTES = 192
+MAX_PUBLIC_DIAGNOSTIC_BYTES = 384
 MAX_ACCEPTANCE_DETAIL_BYTES = 384
 _ACCEPTANCE_DETAIL = re.compile(
     r"devlane_acceptance_detail stage=([a-z0-9-]{1,64}) index=(0|[1-9][0-9]{0,2}) text=([ -~]{1,256})\Z"
@@ -212,10 +213,14 @@ def public_preparation_diagnostic(line):
     match = _E2E_REFUSAL.fullmatch(line)
     if not match:
         return False
-    stage, category, reason, version, cleanup = match.groups()
+    stage, category, route_detail, reason, version, cleanup = match.groups()
     if stage not in PUBLIC_DIAGNOSTIC_PHASES or category not in PREPARATION_E2E_CATEGORIES:
         return False
     if category in NETWORK_PROBE_E2E_CATEGORIES and stage not in NETWORK_PROBE_E2E_STAGES:
+        return False
+    if route_detail is not None and (
+            category != "network-probe-refusal:network-route-unexpected"
+            or not network_probe.valid_route_diagnostic(route_detail)):
         return False
     if category == "tooling-refusal":
         if reason not in TOOLING_REFUSAL_CODES:

@@ -162,8 +162,19 @@ class StartupRefusalMismatch(RuntimeError):
     """A startup result that differs from the one exact expected refusal."""
 
     def __init__(self, category):
-        self.refusal_code = category if category in SUPERVISOR_REFUSAL_CODES else ""
-        if category in _STARTUP_DIAGNOSTIC_CATEGORIES:
+        route_detail = None
+        route_code = "network-probe-refusal:network-route-unexpected"
+        if category.startswith(route_code + " "):
+            candidate = category[len(route_code) + 1:]
+            if network_probe.valid_route_diagnostic(candidate):
+                route_detail = candidate
+        self.refusal_code = (
+            route_code if route_detail is not None else
+            category if category in SUPERVISOR_REFUSAL_CODES else ""
+        )
+        if route_detail is not None:
+            self.category = route_code + " " + route_detail
+        elif category in _STARTUP_DIAGNOSTIC_CATEGORIES:
             self.category = _REFUSAL_CATEGORY_ALIASES.get(category, category)
         else:
             self.category = "startup-refusal-unlisted"
@@ -1127,11 +1138,20 @@ def _assert_supervisor_result(result, expected_returncode, expected_stdout, expe
         if stderr.startswith(b"usage: ") or b"error: the following arguments are required" in stderr:
             raise StartupRefusalMismatch("startup-parser-refusal")
         refusal = re.fullmatch(
-            rb"devlane_supervisor_refusal=([a-z][a-z0-9-]{0,63}(?::[a-z0-9-]{1,48})?)\n",
+            rb"devlane_supervisor_refusal=([a-z][a-z0-9-]{0,63}(?::[a-z0-9-]{1,48})?)"
+            rb"(?: (route\[[^\n]{1,320}\]))?\n",
             stderr,
         )
         if refusal is not None:
             code = refusal.group(1).decode("ascii")
+            route_detail = refusal.group(2)
+            if route_detail is not None:
+                detail = route_detail.decode("ascii", "strict")
+                if (code != "network-probe-refusal:network-route-unexpected"
+                        or not network_probe.valid_route_diagnostic(detail)):
+                    raise StartupRefusalMismatch("startup-refusal-unlisted")
+                code += " " + detail
+                raise StartupRefusalMismatch(code)
             raise StartupRefusalMismatch(code if code in SUPERVISOR_REFUSAL_CODES else "startup-refusal-unlisted")
         if not stderr:
             raise StartupRefusalMismatch("startup-stderr-empty")

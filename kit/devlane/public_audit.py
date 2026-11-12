@@ -99,11 +99,15 @@ REFUSAL_LINE = re.compile(
     r"(?:link-row-path|source-row-kind|manifest-open|manifest-metadata|manifest-race|"
     r"manifest-missing|manifest-shape|manifest-digest|unlisted-site))|"
     r"network_probe_refusal=(?:"
-    + "|".join(re.escape(code) for code in sorted(network_probe.REFUSAL_CODES))
-    + r")|"
+    + "|".join(re.escape(code) for code in sorted(
+        network_probe.REFUSAL_CODES - {"network-route-unexpected"},
+    ))
+    + r"|network-route-unexpected(?: " + network_probe.ROUTE_DIAGNOSTIC_PATTERN + r")?)|"
     r"devlane_supervisor_refusal=network-probe-refusal:(?:"
-    + "|".join(re.escape(code) for code in sorted(network_probe.REFUSAL_CODES))
-    + r"))\Z"
+    + "|".join(re.escape(code) for code in sorted(
+        network_probe.REFUSAL_CODES - {"network-route-unexpected"},
+    ))
+    + r"|network-route-unexpected(?: " + network_probe.ROUTE_DIAGNOSTIC_PATTERN + r")?))\Z"
 )
 def cache_line_patterns(key):
     """Output lines of the pinned cache actions, bound to the one key the step may use."""

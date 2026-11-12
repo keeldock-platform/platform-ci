@@ -580,6 +580,25 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 self.assertFalse(audit.REFUSAL_LINE.fullmatch(invalid))
         self.assertFalse(audit.REFUSAL_LINE.fullmatch("network_probe_refusal=private-path"))
 
+        route_detail = (
+            "route[table=main,type=unicast,family=4,dst=0.0.0.0/0,"
+            "oif=lo,proto=boot,scope=universe]"
+        )
+        route_refusal = "network-route-unexpected " + route_detail
+        route_line = (
+            "devlane_production_e2e=refused stage=variant-supervisor-probe-check "
+            "exception=network-probe-refusal:" + route_refusal
+        )
+        self.assertTrue(diagnostic_contract.public_preparation_diagnostic(route_line))
+        self.assertTrue(audit.REFUSAL_LINE.fullmatch("network_probe_refusal=" + route_refusal))
+        self.assertTrue(audit.REFUSAL_LINE.fullmatch(
+            "devlane_supervisor_refusal=network-probe-refusal:" + route_refusal,
+        ))
+        for malformed in (
+                route_line.replace("oif=lo", "oif=private/path"),
+                route_line.replace("network-route-unexpected", "network-address-unexpected")):
+            self.assertFalse(diagnostic_contract.public_preparation_diagnostic(malformed))
+
     def test_reviewed_step_name_lists_match_the_workflow_files(self):
         root = Path(__file__).resolve().parents[2]
         encrypted = audit.parse_workflow(root / ".github/workflows/devlane-encrypted.yml")

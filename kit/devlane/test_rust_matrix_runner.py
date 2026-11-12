@@ -3049,6 +3049,19 @@ class RustMatrixRunnerTests(unittest.TestCase):
             with self.subTest(expected=expected), self.assertRaises(supervisor.SupervisorRefusal) as caught:
                 verify(result)
             self.assertEqual(caught.exception.code, expected)
+
+        route_detail = (
+            "route[table=main,type=unicast,family=4,dst=0.0.0.0/0,"
+            "oif=lo,proto=boot,scope=universe]"
+        )
+        detailed = subprocess.CompletedProcess(
+            ["network_probe.py"], 2, b"",
+            ("network_probe_refusal=network-route-unexpected " + route_detail + "\n").encode("ascii"),
+        )
+        with self.assertRaises(supervisor.SupervisorRefusal) as caught:
+            verify(detailed)
+        self.assertEqual(caught.exception.code,
+                         "network-probe-refusal:network-route-unexpected " + route_detail)
         with self.assertRaises(supervisor.SupervisorRefusal) as caught:
             verify(error=subprocess.TimeoutExpired(["network_probe.py"], 30))
         self.assertEqual(caught.exception.code, "network-probe-command-failed")
@@ -3073,6 +3086,34 @@ class RustMatrixRunnerTests(unittest.TestCase):
             self.assertTrue(diagnostic_contract.public_preparation_diagnostic(line))
             self.assertFalse(diagnostic_contract.public_preparation_diagnostic(
                 line.replace("network-address-unexpected", "private-path"),
+            ))
+        finally:
+            test_e2e.DIAGNOSTICS.reset()
+
+        route_detail = (
+            "route[table=main,type=unicast,family=4,dst=0.0.0.0/0,"
+            "oif=lo,proto=boot,scope=universe]"
+        )
+        detailed_code = "network-probe-refusal:network-route-unexpected " + route_detail
+        detailed = subprocess.CompletedProcess(
+            ["supervisor.py", "probe"], 2, b"",
+            ("devlane_supervisor_refusal=" + detailed_code + "\n").encode("ascii"),
+        )
+        test_e2e.DIAGNOSTICS.reset()
+        try:
+            with self.assertRaises(test_e2e.StartupRefusalMismatch) as caught:
+                with test_e2e.DIAGNOSTICS.phase("variant-supervisor-probe-check"):
+                    test_e2e._assert_supervisor_probe_pass(detailed)
+            self.assertEqual(caught.exception.category, detailed_code)
+            line = test_e2e.DIAGNOSTICS.refusal_line(caught.exception)
+            self.assertEqual(
+                line,
+                "devlane_production_e2e=refused stage=variant-supervisor-probe-check exception="
+                + detailed_code,
+            )
+            self.assertTrue(diagnostic_contract.public_preparation_diagnostic(line))
+            self.assertFalse(diagnostic_contract.public_preparation_diagnostic(
+                line.replace("oif=lo", "oif=private/path"),
             ))
         finally:
             test_e2e.DIAGNOSTICS.reset()
