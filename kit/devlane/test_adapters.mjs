@@ -9,8 +9,42 @@ import { parseStrictJson } from './safe_json.mjs';
 import { compileForTest, runTypeScriptReporter } from './typescript_reporter.mjs';
 
 const idPattern = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
-const BROWSER_SMOKE_TIMEOUT_MS = 20000;
+const BROWSER_SMOKE_TIMEOUT_MS = 15000;
 const BROWSER_SMOKE_STDERR_BYTES = 8192;
+const BROWSER_PROBE_TIMEOUT_MS = 3000;
+const BROWSER_SMOKE_VMODULE = '*child_process_launcher*=2,*render_process_host*=2,*utility_process_host*=2';
+const BROWSER_SMOKE_BASE_ARGS = [
+  '--no-sandbox', '--no-zygote', '--enable-logging=stderr', '--v=1',
+  `--vmodule=${BROWSER_SMOKE_VMODULE}`, '--headless', '--dump-dom',
+];
+const BROWSER_SMOKE_VARIANTS = [
+  { name: 'current', args: [] },
+  { name: 'single_process', args: ['--single-process'] },
+  { name: 'gpu_disabled', args: ['--disable-gpu', '--disable-software-rasterizer', '--disable-dev-shm-usage'] },
+  { name: 'network_audio_inproc', args: [
+    '--disable-features=NetworkServiceSandbox,AudioServiceOutOfProcess', '--in-process-gpu',
+  ] },
+  { name: 'font_cache', args: [], fontCache: true },
+];
+const BROWSER_MOJO_PROBE = [
+  'import ctypes, os',
+  'name = ("/devlane-mojo-" + str(os.getpid())).encode()',
+  'descriptor = os.memfd_create("devlane-mojo", os.MFD_CLOEXEC)',
+  'os.write(descriptor, b"x")',
+  'os.close(descriptor)',
+  'library = ctypes.CDLL(None, use_errno=True)',
+  'shm_open = library.shm_open',
+  'shm_open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_uint]',
+  'shm_open.restype = ctypes.c_int',
+  'shm_unlink = library.shm_unlink',
+  'shm_unlink.argtypes = [ctypes.c_char_p]',
+  'shm_unlink.restype = ctypes.c_int',
+  'assert os.getuid() == 65534 and os.access("/dev/shm", os.W_OK)',
+  'descriptor = shm_open(name, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)',
+  'assert descriptor >= 0',
+  'os.close(descriptor)',
+  'assert shm_unlink(name) == 0',
+].join(';');
 
 function fixedFailure(stage) {
   return [{ kind: 'control', stage, status: 'fail', code: 'DEVLANE_FAILURE' }];
@@ -98,40 +132,110 @@ function normalizePlaywright(report, expectedFrames) {
 
 export { normalizePlaywright, normalizeVitest };
 
-function runBrowserSmoke(executable, spawn = spawnSync) {
+function browserRuntimeProbes(spawn = spawnSync, environment = process.env, fileSystem = fs,
+  getuid = process.getuid) {
+  const output = [];
+  let hidepidTwo = false;
+  try {
+    const mounts = fileSystem.readFileSync('/proc/mounts', 'utf8');
+    hidepidTwo = mounts.split('\n').some((line) => {
+      const fields = line.split(' ');
+      return fields[1] === '/proc' && fields[3]?.split(',').includes('hidepid=2');
+    });
+  } catch {}
+  const procProbe = 'const fs=require("node:fs");const {spawn}=require("node:child_process");'
+    + 'const child=spawn("/proc/self/exe",["-e","setTimeout(()=>{},5000)"],{stdio:"ignore"});'
+    + 'try{fs.statSync("/proc/"+child.pid+"/exe");process.exitCode=0;}'
+    + 'catch{process.exitCode=4;}finally{child.kill("SIGKILL");}';
+  let procResult;
+  try {
+    procResult = spawn('/proc/self/exe', ['-e', procProbe], {
+      timeout: BROWSER_PROBE_TIMEOUT_MS,
+      maxBuffer: 1024,
+      stdio: ['ignore', 'ignore', 'ignore'],
+      env: environment,
+    });
+  } catch {}
+  const procOkay = typeof getuid === 'function' && getuid() === 65534
+    && hidepidTwo && procResult?.status === 0 && !procResult?.error;
+  output.push(`browser_smoke_probe=proc_self_exe result=${procOkay ? 'ok' : 'fail'}`);
+
+  let devicesOkay = true;
+  for (const [name, access] of [['null', fs.constants.W_OK], ['urandom', fs.constants.R_OK],
+    ['zero', fs.constants.R_OK]]) {
+    try {
+      if (!fileSystem.statSync(`/dev/${name}`).isCharacterDevice()) devicesOkay = false;
+      fileSystem.accessSync(`/dev/${name}`, access);
+    } catch {
+      devicesOkay = false;
+    }
+  }
+  output.push(`browser_smoke_probe=worker_devices result=${devicesOkay ? 'ok' : 'fail'}`);
+
+  let mojoResult;
+  try {
+    mojoResult = spawn('python3', ['-I', '-c', BROWSER_MOJO_PROBE], {
+      timeout: BROWSER_PROBE_TIMEOUT_MS,
+      maxBuffer: 1024,
+      stdio: ['ignore', 'ignore', 'ignore'],
+      env: environment,
+    });
+  } catch {}
+  const mojoStatus = mojoResult?.status === 0 && !mojoResult?.error ? 'ok'
+    : mojoResult?.error?.code === 'ENOENT' ? 'unavailable' : 'fail';
+  output.push(`browser_smoke_probe=mojo_shared_memory result=${mojoStatus}`);
+  return output;
+}
+
+function runBrowserSmoke(executable, spawn = spawnSync, probe = browserRuntimeProbes,
+  environment = process.env) {
   if (typeof executable !== 'string' || !path.posix.isAbsolute(executable) || executable.includes('\0')) {
     return { code: 125, output: 'browser_smoke_exit=unavailable\n' };
   }
-  const args = [
-    '--no-sandbox', '--no-zygote', '--enable-logging=stderr', '--v=1',
-    '--headless', '--dump-dom', 'about:blank',
-  ];
-  let result;
+  let output = '';
   try {
-    result = spawn(executable, args, {
-      timeout: BROWSER_SMOKE_TIMEOUT_MS,
-      maxBuffer: 524288,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      encoding: 'buffer',
-    });
+    const probes = probe(spawn, environment);
+    if (Array.isArray(probes)) output += probes.slice(0, 8).join('\n') + (probes.length ? '\n' : '');
   } catch {
-    return { code: 125, output: 'browser_smoke_exit=spawn-error\n' };
+    output += 'browser_smoke_probe=runtime result=fail\n';
   }
-  const timedOut = result?.error?.code === 'ETIMEDOUT';
-  const code = timedOut ? 124 : Number.isInteger(result?.status) ? result.status : 125;
-  const label = timedOut ? 'timeout' : Number.isInteger(result?.status) ? String(result.status) : 'signal';
-  let output = `browser_smoke_exit=${label}\n`;
-  if (code !== 0) {
+  const baselineEnvironment = { ...environment, HOME: '/devlane-home', XDG_CACHE_HOME: '/scratch/tmp' };
+  delete baselineEnvironment.FONTCONFIG_FILE;
+  let successful = false;
+  for (const variant of BROWSER_SMOKE_VARIANTS) {
+    const variantEnvironment = { ...baselineEnvironment };
+    if (variant.fontCache) {
+      variantEnvironment.HOME = '/scratch/tmp/browser-home';
+      variantEnvironment.XDG_CACHE_HOME = '/scratch/tmp/xdg-cache';
+      variantEnvironment.FONTCONFIG_FILE = '/etc/fonts/fonts.conf';
+    }
+    const args = [...BROWSER_SMOKE_BASE_ARGS, ...variant.args, 'about:blank'];
+    const started = process.hrtime.bigint();
+    let result;
+    try {
+      result = spawn(executable, args, {
+        timeout: BROWSER_SMOKE_TIMEOUT_MS,
+        maxBuffer: 524288,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        encoding: 'buffer',
+        env: variantEnvironment,
+      });
+    } catch {}
+    const elapsedMs = Number((process.hrtime.bigint() - started) / 1000000n);
+    const timedOut = result?.error?.code === 'ETIMEDOUT';
+    const resultLabel = timedOut ? 'timeout'
+      : result?.status === 0 && !result?.error ? 'ok'
+        : `exit:${Number.isInteger(result?.status) ? result.status : 125}`;
+    if (resultLabel === 'ok') successful = true;
     const stderr = Buffer.isBuffer(result?.stderr) ? result.stderr
       : Buffer.from(typeof result?.stderr === 'string' ? result.stderr : '');
     const tail = stderr.subarray(Math.max(0, stderr.length - BROWSER_SMOKE_STDERR_BYTES));
-    const errorCode = result?.error?.code;
-    if (typeof errorCode === 'string' && /^[A-Z0-9_]{1,32}$/.test(errorCode)) {
-      output += `browser_smoke_error=${errorCode}\n`;
-    }
-    if (tail.length > 0) output += `browser_smoke_stderr_begin\n${tail.toString('utf8')}\n`;
+    output += `browser_smoke_variant_stderr_begin=${variant.name} bytes=${tail.length}\n`;
+    if (tail.length > 0) output += `${tail.toString('utf8')}\n`;
+    output += `browser_smoke_variant_stderr_end=${variant.name}\n`;
+    output += `browser_smoke_variant=${variant.name} result=${resultLabel} ms=${elapsedMs}\n`;
   }
-  return { code: code === 0 ? 0 : code === 124 ? 124 : 1, output };
+  return { code: successful ? 0 : 1, output };
 }
 
 async function main(argv) {
@@ -217,24 +321,80 @@ if (process.env.NODE_TEST_CONTEXT) {
     assert.deepEqual(result, [{ kind: 'frame', frame: 'frame_0012', status: 'fail' }]);
     assert.equal(JSON.stringify(result).includes('SYNTHETIC_SECRET_CANARY'), false);
   });
-  test('browser smoke uses bounded headless Chromium logging and stderr', () => {
-    let observed;
-    const result = runBrowserSmoke('/prepared/ms-playwright/chromium_headless_shell-1248/chrome-linux/headless_shell',
+  test('browser smoke runs every bounded Chromium variant and records each result', () => {
+    const calls = [];
+    const results = [
+      { error: { code: 'ETIMEDOUT' }, stderr: Buffer.alloc(BROWSER_SMOKE_STDERR_BYTES + 100, 120) },
+      { status: 1, stderr: Buffer.from('single process failed') },
+      { status: 0, stderr: Buffer.from('gpu variant started') },
+      { status: null, signal: 'SIGKILL', stderr: Buffer.alloc(9000, 120) },
+      { status: 2, stderr: Buffer.from('font cache failed') },
+    ];
+    const result = runBrowserSmoke(
+      '/prepared/ms-playwright/chromium_headless_shell-1248/chrome-linux/headless_shell',
       (executable, args, options) => {
-        observed = { executable, args, options };
-        return { status: 1, stderr: Buffer.alloc(BROWSER_SMOKE_STDERR_BYTES + 100, 120) };
-      });
-    assert.equal(result.code, 1);
-    assert.equal(observed.executable,
-      '/prepared/ms-playwright/chromium_headless_shell-1248/chrome-linux/headless_shell');
-    assert.deepEqual(observed.args, [
+        calls.push({ executable, args, options });
+        return results.shift();
+      },
+      () => ['browser_smoke_probe=fixture result=ok'],
+      { HOME: '/scratch/tmp/browser-home', XDG_CACHE_HOME: '/scratch/tmp/xdg-cache',
+        FONTCONFIG_FILE: '/etc/fonts/fonts.conf' },
+    );
+    assert.equal(result.code, 0);
+    assert.equal(calls.length, 5);
+    const commonArgs = [
       '--no-sandbox', '--no-zygote', '--enable-logging=stderr', '--v=1',
-      '--headless', '--dump-dom', 'about:blank',
+      `--vmodule=${BROWSER_SMOKE_VMODULE}`, '--headless', '--dump-dom',
+    ];
+    assert.equal(calls[0].executable,
+      '/prepared/ms-playwright/chromium_headless_shell-1248/chrome-linux/headless_shell');
+    assert.deepEqual(calls.map((call) => call.args), [
+      [...commonArgs, 'about:blank'],
+      [...commonArgs, '--single-process', 'about:blank'],
+      [...commonArgs, '--disable-gpu', '--disable-software-rasterizer', '--disable-dev-shm-usage', 'about:blank'],
+      [...commonArgs, '--disable-features=NetworkServiceSandbox,AudioServiceOutOfProcess',
+        '--in-process-gpu', 'about:blank'],
+      [...commonArgs, 'about:blank'],
     ]);
-    assert.equal(observed.options.timeout, BROWSER_SMOKE_TIMEOUT_MS);
-    assert.equal(Buffer.byteLength(result.output.split('browser_smoke_stderr_begin\n')[1].split('\n')[0]),
-      BROWSER_SMOKE_STDERR_BYTES);
-    assert.match(result.output, /^browser_smoke_exit=1\n/);
+    assert.equal(calls.every((call) => call.options.timeout === BROWSER_SMOKE_TIMEOUT_MS), true);
+    assert.equal(calls.every((call) => call.args.some((arg) => arg.startsWith('--vmodule='))), true);
+    assert.deepEqual(calls[0].options.env, { HOME: '/devlane-home', XDG_CACHE_HOME: '/scratch/tmp' });
+    assert.deepEqual(calls[3].options.env, { HOME: '/devlane-home', XDG_CACHE_HOME: '/scratch/tmp' });
+    assert.deepEqual(calls[4].options.env, {
+      HOME: '/scratch/tmp/browser-home', XDG_CACHE_HOME: '/scratch/tmp/xdg-cache',
+      FONTCONFIG_FILE: '/etc/fonts/fonts.conf',
+    });
+    assert.match(result.output, /browser_smoke_variant=current result=timeout ms=[0-9]+/);
+    assert.match(result.output, /browser_smoke_variant=single_process result=exit:1 ms=[0-9]+/);
+    assert.match(result.output, /browser_smoke_variant=gpu_disabled result=ok ms=[0-9]+/);
+    assert.match(result.output, /browser_smoke_variant=network_audio_inproc result=exit:125 ms=[0-9]+/);
+    assert.match(result.output, /browser_smoke_variant=font_cache result=exit:2 ms=[0-9]+/);
+    assert.equal((result.output.match(/bytes=8192/g) || []).length, 2);
+    assert.equal(result.output.includes('browser_smoke_stderr_begin'), false);
+  });
+  test('browser runtime probes verify same-uid proc, worker devices and Mojo shared memory', () => {
+    const calls = [];
+    const fakeFileSystem = {
+      readFileSync: () => 'proc /proc proc ro,relatime,hidepid=2 0 0\n',
+      statSync: () => ({ isCharacterDevice: () => true }),
+      accessSync: () => {},
+      constants: fs.constants,
+    };
+    const output = browserRuntimeProbes((executable, args, options) => {
+      calls.push({ executable, args, options });
+      return { status: 0 };
+    }, { PATH: '/usr/bin:/bin' }, fakeFileSystem, () => 65534);
+    assert.deepEqual(output, [
+      'browser_smoke_probe=proc_self_exe result=ok',
+      'browser_smoke_probe=worker_devices result=ok',
+      'browser_smoke_probe=mojo_shared_memory result=ok',
+    ]);
+    assert.equal(calls[0].executable, '/proc/self/exe');
+    assert.equal(calls[0].args[1].includes('/proc/"+child.pid+"/exe'), true);
+    assert.equal(calls[1].executable, 'python3');
+    assert.equal(calls[1].args[2].includes('memfd_create'), true);
+    assert.equal(calls[1].args[2].includes('shm_open'), true);
+    assert.equal(calls[1].args[2].includes('/dev/shm'), true);
   });
   test('TypeScript reporter converts tsconfig enum strings and reads only source plus trusted default libraries', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devlane-ts-'));

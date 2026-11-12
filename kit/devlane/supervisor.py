@@ -926,6 +926,12 @@ def _worker_environment(stage, root, tools, *, browser_debug=False):
     }
     if stage == "browser" and browser_debug:
         env["DEBUG"] = "pw:browser*"
+    if stage == "browser":
+        env.update({
+            "HOME": "/scratch/tmp/browser-home",
+            "XDG_CACHE_HOME": "/scratch/tmp/xdg-cache",
+            "FONTCONFIG_FILE": "/etc/fonts/fonts.conf",
+        })
     if rust_path:
         env["LD_LIBRARY_PATH"] = "/tools/rust/lib"
         env["CC"] = "/usr/bin/cc"
@@ -1167,7 +1173,7 @@ def _run_browser_smoke(root, tools, deadline=None):
             pass
         return 125
     return _run_control_adapter(
-        root, command, "browser", tools, "browser-smoke.log", timeout=24,
+        root, command, "browser", tools, "browser-smoke.log", timeout=90,
         deadline=deadline,
     )
 
@@ -1457,7 +1463,8 @@ def _prepare_trusted_files(root, manifest):
 
 def _prepare_writable_scratch(root, *, registry_v2=False):
     for relative in ("scratch/reports", "scratch/raw", "scratch/playwright-results", "scratch/target", "scratch/tmp",
-                     "scratch/tmp/vitest-cache", "scratch/npm-cache", "scratch/cargo-home"):
+                     "scratch/tmp/vitest-cache", "scratch/tmp/browser-home", "scratch/tmp/xdg-cache",
+                     "scratch/tmp/xdg-cache/fontconfig", "scratch/npm-cache", "scratch/cargo-home"):
         path = root / relative
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chown(str(path), WORKER_UID, WORKER_GID)

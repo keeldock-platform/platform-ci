@@ -405,7 +405,8 @@ class ProductionExecuteFixtureTests(unittest.TestCase):
         self.assertIn("trace: 'off'", browser_config)
         self.assertIn("chromiumSandbox: false", browser_config)
         self.assertIn(
-            "args: ['--no-sandbox', '--no-zygote', '--enable-logging=stderr', '--v=1']",
+            "args: ['--no-sandbox', '--no-zygote', '--enable-logging=stderr', '--v=1', "
+            "'--disable-gpu', '--disable-dev-shm-usage', '--disable-features=AudioServiceOutOfProcess']",
             browser_config,
         )
         self.assertIn("packages/kernel-ui-kit/browser/frame.spec.mjs", browser)

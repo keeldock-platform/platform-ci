@@ -1011,6 +1011,9 @@ class SupervisorOrderAcceptanceTests(unittest.TestCase):
                 "node", "/control/devlane/test_adapters.mjs", "browser-smoke",
                 "/prepared/ms-playwright/chromium_headless_shell-1248/chrome-linux/headless_shell",
             ])
+            with patch.object(supervisor, "_run_control_adapter", return_value=0) as run_adapter:
+                self.assertEqual(supervisor._run_browser_smoke(temporary, {}), 0)
+            self.assertEqual(run_adapter.call_args.kwargs["timeout"], 90)
             browser.unlink()
             browser.symlink_to(browser.parent / "missing_shell")
             self.assertIsNone(supervisor._browser_smoke_command(temporary))
@@ -1047,11 +1050,17 @@ class SupervisorOrderAcceptanceTests(unittest.TestCase):
                 b"browser startup\nRenderer process 47 crashed with code 1\n"
                 b"SYNTHETIC_SOURCE_CANARY secret\n"
             )
+            (raw / "browser-smoke.log").write_bytes(
+                b"browser_smoke_variant=current result=timeout ms=15000\n"
+                b"Renderer process 48 crashed with code 1\n"
+                b"SYNTHETIC_SOURCE_CANARY browser output\n"
+            )
             with patch.object(supervisor, "_browser_cgroup_diagnostics",
                               return_value=[b"memory.events=oom 1 oom_kill 1", b"pids.events=max 0"]):
                 supervisor._write_browser_failure_diagnostics(temporary)
             payload = (raw / "browser-diagnostics.log").read_bytes()
             self.assertIn(b"renderer_event=Renderer process 47 crashed with code 1", payload)
+            self.assertIn(b"renderer_event=Renderer process 48 crashed with code 1", payload)
             self.assertIn(b"cgroup_memory.events=oom 1 oom_kill 1", payload)
             self.assertNotIn(b"SYNTHETIC_SOURCE_CANARY", payload)
 
@@ -1587,6 +1596,9 @@ class PreparationDefectTests(unittest.TestCase):
             "browser", Path("/unused"), {"node_dir": "/tools/node/bin"}, browser_debug=True,
         )
         self.assertEqual(browser_environment["DEBUG"], "pw:browser*")
+        self.assertEqual(browser_environment["HOME"], "/scratch/tmp/browser-home")
+        self.assertEqual(browser_environment["XDG_CACHE_HOME"], "/scratch/tmp/xdg-cache")
+        self.assertEqual(browser_environment["FONTCONFIG_FILE"], "/etc/fonts/fonts.conf")
         self.assertNotIn("DEBUG", supervisor._worker_environment(
             "unit", Path("/unused"), {"node_dir": "/tools/node/bin"}, browser_debug=True,
         ))
@@ -1603,6 +1615,21 @@ class PreparationDefectTests(unittest.TestCase):
             with patch.object(supervisor.os, "chown"):
                 supervisor._prepare_writable_scratch(Path(temporary))
             self.assertTrue((Path(temporary) / "scratch/tmp/vitest-cache").is_dir())
+            for relative in ("scratch/tmp/browser-home", "scratch/tmp/xdg-cache",
+                             "scratch/tmp/xdg-cache/fontconfig"):
+                path = Path(temporary) / relative
+                self.assertTrue(path.is_dir())
+                self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            ownership = []
+            with patch.object(supervisor.os, "chown",
+                              side_effect=lambda path, uid, gid: ownership.append((path, uid, gid))):
+                supervisor._prepare_writable_scratch(Path(temporary))
+            for relative in ("scratch/tmp/browser-home", "scratch/tmp/xdg-cache",
+                             "scratch/tmp/xdg-cache/fontconfig"):
+                self.assertIn((str(Path(temporary) / relative), supervisor.WORKER_UID,
+                               supervisor.WORKER_GID), ownership)
 
         limits = []
         with patch.object(supervisor.resource, "setrlimit",
