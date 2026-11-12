@@ -85,6 +85,9 @@ def _step_outputs(step, identity, kind, records):
                 "yarn: 1.22.22"]
     outputs = {
         "Fetch public control and validate dispatch": ["dispatch_context=validated"] if kind == "encrypted" else [],
+        "Prepare hosted Linux isolation state": ["devlane_swap=disabled"] + (
+            ["devlane_cgroup_v2=ready"] if kind == "encrypted" and identity["profile"] == "core-rust" else []
+        ),
         "Verify exact source-free control evidence": ["devlane_permit=verify_control=pass"],
         "Claim this bundle for one run before decryption": ["devlane_permit=claim=pass"],
         "Verify permit and emit bound dispatch marker": [
@@ -292,6 +295,28 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         rust = dict(IDENTITY, profile="core-rust")
         audit.validate_job_log_surface(
             _render_log(audit.RUN_JOB, rust, skip=("Set up pinned Node toolchain",)), audit.RUN_JOB, rust)
+
+    def test_host_preflight_receipts_are_bound_to_the_right_step_and_profile(self):
+        rust = dict(IDENTITY, profile="core-rust")
+        grammar = audit._Grammar(
+            ".github/workflows/devlane-encrypted.yml", audit.RUN_JOB, rust, "encrypted",
+        )
+        counts = {}
+        step = "Prepare hosted Linux isolation state"
+        self.assertTrue(grammar.step_output_ok(step, "devlane_swap=disabled", counts))
+        self.assertTrue(grammar.step_output_ok(step, "devlane_cgroup_v2=ready", counts))
+        self.assertFalse(grammar.step_output_ok(step, "devlane_cgroup_v2=ready", counts))
+        self.assertFalse(grammar.step_output_ok("Probe isolation before decryption", "devlane_swap=disabled", {}))
+        node = audit._Grammar(
+            ".github/workflows/devlane-encrypted.yml", audit.RUN_JOB, IDENTITY, "encrypted",
+        )
+        self.assertFalse(node.step_output_ok(step, "devlane_cgroup_v2=ready", {}))
+        synthetic_identity = dict(IDENTITY, ref="refs/heads/devlane/d211-1110")
+        synthetic = audit._Grammar(
+            ".github/workflows/devlane-synthetic.yml", "devlane-synthetic", synthetic_identity, "synthetic",
+        )
+        self.assertTrue(synthetic.step_output_ok(step, "devlane_swap=disabled", {}))
+        self.assertFalse(synthetic.step_output_ok(step, "devlane_cgroup_v2=ready", {}))
 
     def test_environment_lines_are_accepted_only_for_the_reviewed_environment_and_job(self):
         log = self._valid_run_log().decode("utf-8")

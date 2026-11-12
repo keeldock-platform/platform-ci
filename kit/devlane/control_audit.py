@@ -48,6 +48,7 @@ CONTROL_AUDIT_FINAL_STEPS = (
 )
 SYNTHETIC_STEP_NAMES = (
     "Fetch public control and validate protected-branch dispatch",
+    "Prepare hosted Linux isolation state",
     "Reserve work time for pinned Node action",
     "Set up pinned Node toolchain",
     "Install fixed Rust acceptance toolchain",

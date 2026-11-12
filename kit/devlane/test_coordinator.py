@@ -650,6 +650,8 @@ class TimedRevocationTests(unittest.TestCase):
             step["completed_at"] = step_done
         return {"jobs": [{"name": "devlane-encrypted-run", "status": job_status,
                           "completed_at": "2026-11-10T12:30:00Z", "steps": [
+                              {"name": "Prepare hosted Linux isolation state", "status": "completed",
+                               "conclusion": "success"},
                               {"name": "Probe isolation before decryption", "status": "completed"}, step]}]}
 
     def _attached(self, temporary):

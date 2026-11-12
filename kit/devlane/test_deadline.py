@@ -422,6 +422,53 @@ class DeadlineTests(unittest.TestCase):
         self.assertIn('host_cleanup.py --root "$RUN_ROOT" --runner-temp "$RUNNER_TEMP"', cleanup)
         self.assertIn('--deadline-file "$RUN_ROOT/deadline.json"', cleanup)
 
+    def test_hosted_isolation_preflight_disables_swap_before_runtime_and_checks_rust_cgroups(self):
+        workflows = {
+            "devlane-synthetic.yml": ("devlane-synthetic", "Set up pinned Node toolchain"),
+            "devlane-encrypted.yml": (public_audit.RUN_JOB, "Fetch ciphertext and sanitized dependency projection"),
+        }
+        for filename, (job_name, later_step) in workflows.items():
+            with self.subTest(workflow=filename):
+                jobs = public_audit.parse_workflow(WORKFLOW_ROOT / ".github/workflows" / filename)
+                steps = jobs[job_name]["steps"]
+                names = [step["name"] for step in steps]
+                preflight_index = names.index("Prepare hosted Linux isolation state")
+                preflight = steps[preflight_index]
+                source = "\n".join(preflight["run"])
+                self.assertEqual(preflight["timeout_minutes"], 2)
+                self.assertIn("timeout --signal=TERM --kill-after=5s 90s sudo -n swapoff -a", source)
+                self.assertIn('Path("/proc/swaps").read_text(encoding="ascii").splitlines()', source)
+                self.assertIn('len(lines) == 1 and lines[0].split() == expected', source)
+                self.assertIn("devlane_swap=disabled", source)
+                self.assertIn("sudo -n true", source)
+                self.assertLess(preflight_index, names.index(later_step))
+                sensitive_steps = (
+                    ("Run full source-free production-path acceptance",)
+                    if filename == "devlane-synthetic.yml" else
+                    ("Cut network and start the isolated supervisor", "Decrypt authenticated bundle",
+                     "Execute offline profile and filter public summary")
+                )
+                for sensitive_name in sensitive_steps:
+                    sensitive_source = "\n".join(next(
+                        step["run"] for step in steps if step["name"] == sensitive_name
+                    ))
+                    self.assertIn("ulimit -S -c 0", sensitive_source)
+                    self.assertIn("ulimit -H -c 0", sensitive_source)
+        encrypted_steps = public_audit.parse_workflow(
+            WORKFLOW_ROOT / ".github/workflows/devlane-encrypted.yml",
+        )[public_audit.RUN_JOB]["steps"]
+        preflight = next(step for step in encrypted_steps
+                         if step["name"] == "Prepare hosted Linux isolation state")
+        source = "\n".join(preflight["run"])
+        self.assertIn('if [[ "$DEVLANE_PROFILE" == "core-rust" ]]', source)
+        self.assertIn("timeout --signal=TERM --kill-after=5s 30s sudo -n python3 -B -c", source)
+        self.assertIn("/sys/fs/cgroup", source)
+        self.assertIn("cgroup.procs", source)
+        self.assertIn("cgroup.events", source)
+        self.assertIn("cgroup.kill", source)
+        embedded = source.split("sudo -n python3 -B -c '\n", 1)[1].split("\n' >/dev/null", 1)[0]
+        compile(embedded, "devlane-cgroup-preflight", "exec")
+
     def test_both_workflow_bootstraps_bound_git_and_teardown_to_the_initial_monotonic_cutoff(self):
         expectations = {
             "devlane-synthetic.yml": ("devlane-synthetic", 5100, 300, 5400),

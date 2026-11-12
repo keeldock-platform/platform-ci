@@ -217,6 +217,62 @@ jobs:
             python3 -B -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; import cryptography; assert AESGCM is not None and cryptography.__version__'
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             python3 -B kit/devlane/fetch.py context --output "$RUN_ROOT/context.json"
+      - name: Prepare hosted Linux isolation state
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          refuse() {
+            printf 'devlane_host_preflight=refused code=%s\n' "$1" >&2
+            exit 1
+          }
+          command -v timeout >/dev/null 2>&1 || refuse timeout-unavailable
+          sudo -n true >/dev/null 2>&1 || refuse sudo-unavailable
+          if ! timeout --signal=TERM --kill-after=5s 90s sudo -n swapoff -a >/dev/null 2>&1; then
+            refuse swapoff-failed
+          fi
+          if ! python3 -B -c 'from pathlib import Path; lines=Path("/proc/swaps").read_text(encoding="ascii").splitlines(); expected=["Filename", "Type", "Size", "Used", "Priority"]; raise SystemExit(0 if len(lines) == 1 and lines[0].split() == expected else 1)'; then
+            refuse swap-remains
+          fi
+          if [[ "$DEVLANE_PROFILE" == "core-rust" ]]; then
+            if ! timeout --signal=TERM --kill-after=5s 30s sudo -n python3 -B -c '
+          import os, stat
+          from pathlib import Path
+          root = Path("/sys/fs/cgroup")
+          if root.is_symlink() or not root.is_dir() or not os.path.ismount(root):
+              raise SystemExit(1)
+          mountinfo = Path("/proc/self/mountinfo").read_text(encoding="ascii")
+          mounted = False
+          for line in mountinfo.splitlines():
+              fields = line.split()
+              if "-" in fields:
+                  separator = fields.index("-")
+                  if separator + 1 < len(fields) and fields[separator + 1] == "cgroup2" and fields[4] == str(root):
+                      mounted = True
+                      break
+          if not mounted:
+              raise SystemExit(1)
+          path = root / ("devlane-preflight-" + str(os.getpid()) + "-" + os.urandom(8).hex())
+          descriptor = None
+          try:
+              path.mkdir(mode=0o700)
+              for name in ("cgroup.procs", "cgroup.events", "cgroup.kill"):
+                  item = path / name
+                  if not stat.S_ISREG(item.lstat().st_mode) or item.is_symlink():
+                      raise SystemExit(1)
+              descriptor = os.open(path / "cgroup.procs", os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+              if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                  raise SystemExit(1)
+          finally:
+              if descriptor is not None:
+                  os.close(descriptor)
+              if path.exists():
+                  path.rmdir()
+          ' >/dev/null 2>&1; then
+              refuse cgroup-v2-unavailable
+            fi
+            printf 'devlane_cgroup_v2=ready\n'
+          fi
+          printf 'devlane_swap=disabled\n'
       - name: Reserve work time for control evidence cache restore
         timeout-minutes: 1
         run: |
@@ -356,6 +412,8 @@ jobs:
       - name: Cut network and start the isolated supervisor
         run: |
           set -euo pipefail
+          ulimit -S -c 0
+          ulimit -H -c 0
           node_snapshot_id=""
           cargo_path=""
           rustc_path=""
@@ -389,6 +447,8 @@ jobs:
           DEVLANE_DECRYPT_KEY: ${{ secrets.DEVLANE_DECRYPT_KEY }}
         run: |
           set -euo pipefail
+          ulimit -S -c 0
+          ulimit -H -c 0
           set +x
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             python3 -B kit/devlane/supervisor.py decrypt --state-dir "$RUN_ROOT/state"
@@ -396,6 +456,8 @@ jobs:
         id: execute
         run: |
           set -euo pipefail
+          ulimit -S -c 0
+          ulimit -H -c 0
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             python3 -B kit/devlane/supervisor.py execute --state-dir "$RUN_ROOT/state" --context "$RUN_ROOT/context.json"
       - name: Shred runner-local workspace

@@ -267,6 +267,18 @@ class ProcedureDocumentTests(unittest.TestCase):
             "profiles"]["core-rust"]["rust_matrix"]["toolchain"]
         self.assertEqual(rehearsal.fixtures.RUST_VERSION, rust_version)
         self.assertIn("rustup toolchain install " + rust_version + " --profile minimal", synthetic)
+        encrypted_steps = coordinator.public_audit.parse_workflow(
+            self.root / ".github/workflows/devlane-encrypted.yml",
+        )[coordinator.RUN_JOB_NAME]["steps"]
+        synthetic_steps = coordinator.public_audit.parse_workflow(
+            self.root / ".github/workflows/devlane-synthetic.yml",
+        )["devlane-synthetic"]["steps"]
+        encrypted_names = [step["name"] for step in encrypted_steps]
+        synthetic_names = [step["name"] for step in synthetic_steps]
+        self.assertLess(encrypted_names.index("Prepare hosted Linux isolation state"),
+                        encrypted_names.index(coordinator.DECRYPT_STEP))
+        self.assertLess(synthetic_names.index("Prepare hosted Linux isolation state"),
+                        synthetic_names.index("Run full source-free production-path acceptance"))
 
 
 def bundle_request_digest(owner):

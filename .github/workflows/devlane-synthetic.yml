@@ -133,6 +133,23 @@ jobs:
               "--started-at-file", start_file,
           ])
           PY
+      - name: Prepare hosted Linux isolation state
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          refuse() {
+            printf 'devlane_host_preflight=refused code=%s\n' "$1" >&2
+            exit 1
+          }
+          command -v timeout >/dev/null 2>&1 || refuse timeout-unavailable
+          sudo -n true >/dev/null 2>&1 || refuse sudo-unavailable
+          if ! timeout --signal=TERM --kill-after=5s 90s sudo -n swapoff -a >/dev/null 2>&1; then
+            refuse swapoff-failed
+          fi
+          if ! python3 -B -c 'from pathlib import Path; lines=Path("/proc/swaps").read_text(encoding="ascii").splitlines(); expected=["Filename", "Type", "Size", "Used", "Priority"]; raise SystemExit(0 if len(lines) == 1 and lines[0].split() == expected else 1)'; then
+            refuse swap-remains
+          fi
+          printf 'devlane_swap=disabled\n'
       - name: Reserve work time for pinned Node action
         timeout-minutes: 1
         run: |
@@ -210,6 +227,8 @@ jobs:
       - name: Run full source-free production-path acceptance
         run: |
           set -euo pipefail
+          ulimit -S -c 0
+          ulimit -H -c 0
           quiet() {
             local stage="$1"; shift
             local out="$RUNNER_TEMP/devlane-acceptance.log"

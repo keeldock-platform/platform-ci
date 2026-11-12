@@ -30,6 +30,7 @@ DECRYPT_ENVIRONMENT = "devlane-decrypt"
 AUDIT_JOB = "devlane-encrypted-audit"
 STEP_NAMES = (
     "Fetch public control and validate dispatch",
+    "Prepare hosted Linux isolation state",
     "Reserve work time for control evidence cache restore",
     "Restore exact source-free control evidence",
     "Verify exact source-free control evidence",
@@ -311,6 +312,7 @@ class _Grammar:
             return any(pattern.fullmatch(line) for pattern in NODE_LINES)
         exact = {
             "Fetch public control and validate dispatch": {"dispatch_context=validated"},
+            "Prepare hosted Linux isolation state": {"devlane_swap=disabled"},
             "Verify exact source-free control evidence": {"devlane_permit=verify_control=pass"},
             "Claim this bundle for one run before decryption": {"devlane_permit=claim=pass"},
             "Install pinned Rust toolchain": {"rust_offline_tools=prepared"},
@@ -332,6 +334,9 @@ class _Grammar:
         }.get(step_name, set())
         if step_name == "Prepare dependencies before the cut" and self.identity.get("profile") == "core-rust":
             exact = exact | {"rust_offline_tools=installed"}
+        if (step_name == "Prepare hosted Linux isolation state" and self.kind == "encrypted"
+                and self.identity.get("profile") == "core-rust"):
+            exact = exact | {"devlane_cgroup_v2=ready"}
         if line in exact:
             public_counts[line] = public_counts.get(line, 0) + 1
             return public_counts[line] == 1
