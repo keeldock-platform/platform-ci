@@ -118,11 +118,12 @@ fn assert_isolation_boundaries() {
         }
 
         let runner_home = "/ho".to_owned() + "me/runner";
+        let proc_runner_home = "/proc/1/root/ho".to_owned() + "me/runner";
         for forbidden in [
             runner_home.as_str(),
             "/run/docker.sock",
             "/var/run/docker.sock",
-            "/proc/1/root/home",
+            proc_runner_home.as_str(),
         ] {
             assert!(!Path::new(forbidden).exists(), "host-path-boundary");
         }

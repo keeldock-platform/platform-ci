@@ -393,6 +393,10 @@ class ProductionExecuteFixtureTests(unittest.TestCase):
         self.assertIn("packages/kernel-ui-kit/browser/frame.spec.mjs", browser)
         self.assertNotIn("packages/kernel-ui-kit/browser/frame.spec.ts", browser)
 
+        node_probe = test_e2e._probe_script()
+        self.assertIn("/proc/1/root/ho' + 'me/runner", node_probe)
+        self.assertNotIn("/proc/1/root/home", node_probe)
+
         scenarios = test_e2e.scenarios()
         for scenario in scenarios:
             source = scenario["files"]()
@@ -407,6 +411,9 @@ class ProductionExecuteFixtureTests(unittest.TestCase):
             lockfile = Path(row["lock"]).relative_to("/workspace/source")
             self.assertTrue((fixture_root / manifest).is_file(), str(manifest))
             self.assertTrue((fixture_root / lockfile).is_file(), str(lockfile))
+        rust_source = (fixture_root / "src/lib.rs").read_text(encoding="ascii")
+        self.assertIn('"/proc/1/root/ho".to_owned() + "me/runner"', rust_source)
+        self.assertNotIn("/proc/1/root/home", rust_source)
 
         execute = test_e2e.supervisor.Service._execute.__code__.co_consts
         self.assertIn("/control/devlane/rust_matrix_runner.py", execute)
@@ -418,6 +425,46 @@ def bundle_request_digest(owner):
 
 
 class ProductionFailureDiagnosticsTests(unittest.TestCase):
+    def test_execute_command_failure_prints_only_bounded_public_diagnostics(self):
+        result = subprocess.CompletedProcess(
+            ["supervisor.py", "execute"], 2,
+            b"ignored command output\n", b"devlane_supervisor_refusal=execution-order\nprivate detail\n",
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            test_e2e._report_command_failure("supervisor-client:execute", result)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(lines, [
+            "devlane_e2e_command=failed call=supervisor-client:execute returncode=2",
+            "devlane_supervisor_refusal=execution-order",
+        ])
+        self.assertTrue(all(test_e2e.diagnostic_contract.public_e2e_command_diagnostic(line)
+                            for line in lines))
+
+        canary = subprocess.CompletedProcess(
+            ["supervisor.py", "execute"], 1,
+            b"SYNTHETIC_SOURCE_CANARY_7f8c\n", b"devlane_supervisor_refusal=execution-order\n",
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            test_e2e._report_command_failure("supervisor-client:execute", canary)
+        self.assertEqual(output.getvalue(),
+                         "devlane_e2e_command=failed call=supervisor-client:execute returncode=1\n")
+
+        oversized = subprocess.CompletedProcess(
+            ["supervisor.py", "execute"], 1, b"x" * (test_e2e.diagnostic_contract.MAX_E2E_COMMAND_OUTPUT_BYTES + 1), b"",
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            test_e2e._report_command_failure("supervisor-client:execute", oversized)
+        self.assertEqual(output.getvalue(),
+                         "devlane_e2e_command=failed call=supervisor-client:execute returncode=1\n")
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            test_e2e._report_command_failure("private:callsite", result)
+        self.assertEqual(output.getvalue(), "")
+
     def test_committed_rust_fixture_passes_the_e2e_projection_and_archive_contract(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

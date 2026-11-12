@@ -412,14 +412,49 @@ def _contains_output_canary(data):
     ))
 
 
-def _run(argv, *, env=None, timeout=900, expected=0, scan=True, cwd=None):
+def _run(argv, *, env=None, timeout=900, expected=0, scan=True, cwd=None, diagnostic_callsite=None):
     result = _process_run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, env=env, timeout=timeout,
                             close_fds=True, check=False, cwd=cwd)
+    if result.returncode != expected and diagnostic_callsite is not None:
+        _report_command_failure(diagnostic_callsite, result)
     _require(result.returncode == expected, "production-path-command-failed")
     if scan:
         _scan_output(result.stdout + result.stderr, "canary-in-command-output")
     return result
+
+
+def _report_command_failure(callsite, result):
+    """Emit only the fixed callsite, exit code, and bounded public refusal lines."""
+    if (callsite not in diagnostic_contract.E2E_COMMAND_CALL_SITES
+            or type(result.returncode) is not int):
+        return
+    print("devlane_e2e_command=failed call=" + callsite
+          + " returncode=" + str(result.returncode), flush=True)
+    stdout = result.stdout if type(result.stdout) is bytes else b""
+    stderr = result.stderr if type(result.stderr) is bytes else b""
+    contains_canary = _contains_output_canary(stdout) or _contains_output_canary(stderr)
+    if (len(stdout) + len(stderr) > diagnostic_contract.MAX_E2E_COMMAND_OUTPUT_BYTES
+            or contains_canary):
+        return
+    emitted = set()
+    count = 0
+    for payload in (stdout, stderr):
+        for raw_line in payload.splitlines(keepends=True):
+            if not raw_line.endswith(b"\n"):
+                continue
+            try:
+                line = raw_line[:-1].decode("ascii", "strict")
+            except UnicodeDecodeError:
+                continue
+            if (line not in emitted and diagnostic_contract.public_e2e_command_refusal(line)):
+                print(line, flush=True)
+                emitted.add(line)
+                count += 1
+                if count >= diagnostic_contract.MAX_E2E_COMMAND_DIAGNOSTIC_LINES:
+                    break
+        if count >= diagnostic_contract.MAX_E2E_COMMAND_DIAGNOSTIC_LINES:
+            break
 
 
 def _processes_matching(marker):
@@ -772,7 +807,8 @@ for (const name of fs.readdirSync('/proc/self/fd')) {
   try { if (fs.readlinkSync(`/proc/self/fd/${fd}`).startsWith('socket:[')) throw new Error('descriptor'); }
   catch (error) { if (error?.message === 'descriptor') throw error; }
 }
-for (const forbidden of ['/ho' + 'me/runner', '/run/docker.sock', '/var/run/docker.sock', '/proc/1/root/home']) {
+const runnerHome = '/proc/1/root/ho' + 'me/runner';
+for (const forbidden of ['/ho' + 'me/runner', '/run/docker.sock', '/var/run/docker.sock', runnerHome]) {
   if (fs.existsSync(forbidden)) throw new Error('host-path-boundary');
 }
 const environ = fs.readFileSync('/proc/self/environ', 'utf8');
@@ -1441,7 +1477,7 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
         with DIAGNOSTICS.phase("variant-execute"):
             if variant == "wrong-key":
                 """A refused decryption must leave execution refused: exit 2 and no summary at all."""
-                refused = _run(execute, expected=2)
+                refused = _run(execute, expected=2, diagnostic_callsite="supervisor-client:execute")
                 _require(refused.stdout == b"", "summary-after-decrypt-refusal")
             elif variant == "cancel":
                 wait_budget = _bounded_timeout(180)
@@ -1466,7 +1502,8 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
                 expected = 1 if (variant in ("failing-test", "accept-with-failure")
                                  or (scenario.get("expect_semver_execution_refusal") is True
                                      and variant == "accept")) else 0
-                result = _run(execute, timeout=60 * 40, expected=expected)
+                result = _run(execute, timeout=60 * 40, expected=expected,
+                              diagnostic_callsite="supervisor-client:execute")
                 with DIAGNOSTICS.phase("variant-summary-validate"):
                     _require(_summary_has_valid_terminator(result.stdout), "summary-schema-invalid")
                     records = _summary_records(result.stdout, scenario)

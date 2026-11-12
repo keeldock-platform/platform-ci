@@ -225,6 +225,49 @@ E2E_REQUIRE_CODES = frozenset((
     "supervisor-survived-cleanup", "test-failure-not-mapped", "unexpected-control-failure",
     "workflow-identity-required",
 ))
+E2E_COMMAND_CALL_SITES = frozenset(("supervisor-client:execute",))
+MAX_E2E_COMMAND_OUTPUT_BYTES = 16 * 1024
+MAX_E2E_COMMAND_DIAGNOSTIC_LINES = 4
+_E2E_COMMAND_FAILURE = re.compile(
+    r"devlane_e2e_command=failed call=(supervisor-client:execute) "
+    r"returncode=(-?(?:0|[1-9][0-9]{0,8}))\Z"
+)
+_E2E_COMMAND_SUPERVISOR_REFUSAL = re.compile(
+    r"devlane_supervisor_refusal=([a-z0-9-]{1,64}(?::[a-z0-9-]{1,48}){0,2})"
+    r"(?: (" + network_probe.ROUTE_DIAGNOSTIC_PATTERN + r"))?\Z"
+)
+_E2E_COMMAND_ADAPTER_REFUSAL = re.compile(
+    r"typescript_reporter_refusal=(manifest-invalid|file-map-invalid|tsconfig-feature-unsupported|"
+    r"tsconfig-invalid|tsconfig-option-unsupported|tsconfig-option-invalid|typescript-files-invalid|"
+    r"typescript-unavailable|source-root-invalid|usage|input-file-invalid|input-file-truncated|"
+    r"diagnostic-count|diagnostic-size|"
+    r"reporter-failed|json-size|json-string|json-escape|json-control|json-depth|duplicate-json-key|"
+    r"json-colon|json-object|json-array|json-value|json-trailing-data)\Z"
+)
+
+
+def public_e2e_command_diagnostic(line):
+    """Accept only execute callsite metadata or a fixed supervisor/adapter refusal line."""
+    if type(line) is not str or len(line.encode("ascii", "ignore")) > MAX_PUBLIC_DIAGNOSTIC_BYTES:
+        return False
+    if _E2E_COMMAND_FAILURE.fullmatch(line):
+        return True
+    return public_e2e_command_refusal(line)
+
+
+def public_e2e_command_refusal(line):
+    """Accept only refusal lines emitted by the supervisor or its fixed adapters."""
+    if type(line) is not str or len(line.encode("ascii", "ignore")) > MAX_PUBLIC_DIAGNOSTIC_BYTES:
+        return False
+    refusal = _E2E_COMMAND_SUPERVISOR_REFUSAL.fullmatch(line)
+    if refusal:
+        code, route = refusal.groups()
+        return route is None or (code == "network-probe-refusal:network-route-unexpected"
+                                 and network_probe.valid_route_diagnostic(route))
+    return line in ("rust_matrix=refused", "rust_test_adapter=refused") or \
+        _E2E_COMMAND_ADAPTER_REFUSAL.fullmatch(line) is not None
+
+
 TOOLING_REFUSAL_CODES = frozenset((
     "deadline-file-required", "tool-download-failed", "tool-archive-size",
     "tool-digest-mismatch", "tool-archive-members", "tool-archive-path",

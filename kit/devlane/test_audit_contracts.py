@@ -599,6 +599,41 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                     "Run full source-free production-path acceptance", invalid, {},
                 ))
 
+    def test_execute_command_diagnostic_uses_a_fixed_audited_grammar(self):
+        command = "devlane_e2e_command=failed call=supervisor-client:execute returncode=1"
+        refusal = "devlane_supervisor_refusal=execution-order"
+        root = Path(__file__).resolve().parents[2]
+        grammar = audit._Grammar(
+            root / ".github/workflows/devlane-synthetic.yml", "devlane-synthetic",
+            {"run_id": "12345", "control_sha": SHA}, "synthetic",
+        )
+        for line in (command, refusal,
+                     "typescript_reporter_refusal=typescript-unavailable", "rust_matrix=refused",
+                     "rust_test_adapter=refused",
+                     "typescript_reporter_refusal=source-root-invalid",
+                     "typescript_reporter_refusal=usage"):
+            with self.subTest(line=line):
+                self.assertTrue(diagnostic_contract.public_e2e_command_diagnostic(line))
+                self.assertTrue(grammar.step_output_ok(
+                    "Run full source-free production-path acceptance", line, {},
+                ))
+        details = acceptance_diagnostics.failure_tail(
+            "production-path-e2e", (command + "\n" + refusal + "\nraw npm output\n").encode("ascii"),
+        )
+        self.assertEqual(details, [command, refusal,
+                                   "devlane_acceptance_detail stage=production-path-e2e index=3 text=raw npm output"])
+        for invalid in (
+            command.replace("supervisor-client:execute", "private:execute"),
+            command.replace("returncode=1", "returncode=01"),
+            refusal.replace("execution-order", "private/path"),
+            "typescript_reporter_refusal=private/path",
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertFalse(diagnostic_contract.public_e2e_command_diagnostic(invalid))
+                self.assertFalse(grammar.step_output_ok(
+                    "Run full source-free production-path acceptance", invalid, {},
+                ))
+
     def test_cleanup_incomplete_diagnostic_requires_a_fixed_subreason(self):
         for reason in diagnostic_contract.CLEANUP_SUBREASONS:
             line = ("devlane_production_e2e=refused stage=prepare-cleanup "
