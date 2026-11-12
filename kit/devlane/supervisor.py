@@ -435,7 +435,7 @@ _SYNTHETIC_DIAGNOSTIC_CANARIES = (
     (b"KEYCANARY-73A10X" + bytes(range(16))).hex().upper().encode("ascii"),
     b"::add-mask::SYNTHETIC_SOURCE_CANARY_7f8c",
     b"::error::SYNTHETIC_SOURCE_CANARY_7f8c",
-    b"##[group]SYNTHETIC_SOURCE_CANARY_7f8c",
+    bytes((35, 35)) + b"[group]SYNTHETIC_SOURCE_CANARY_7f8c",
     b"::set-output name=x::SYNTHETIC_SOURCE_CANARY_7f8c",
 )
 

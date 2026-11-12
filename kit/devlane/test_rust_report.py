@@ -2,8 +2,10 @@
 
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import rust_matrix_runner
 import filter as public_filter
@@ -53,6 +55,26 @@ class RustReportMappingTests(unittest.TestCase):
             self.assertIn(b'"suite":"listener-all-features"', joined)
             self.assertNotIn(b"SYNTHETIC_SOURCE_CANARY", joined)
             self.assertNotIn(b"SYNTHETIC_KEY_CANARY", joined)
+
+    def test_vet_child_uses_the_pinned_rust_toolchain_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            process = Mock(pid=321, wait=Mock(return_value=0))
+            with patch.object(rust_matrix_runner, "RAW", temporary), \
+                    patch.object(rust_matrix_runner, "_remaining", return_value=30), \
+                    patch.object(rust_matrix_runner.subprocess, "Popen", return_value=process) as spawn:
+                code, _ = rust_matrix_runner._run(
+                    "fixed-vet-environment",
+                    ["/prepared/devlane-tools/cargo-vet", "vet", "check", "--locked", "--frozen"],
+                    time.monotonic() + 30,
+                )
+            self.assertEqual(code, 0)
+            env = spawn.call_args.kwargs["env"]
+            self.assertEqual(env["PATH"], "/tools/rust/bin:/usr/bin:/bin")
+            self.assertNotIn("/Users/", env["PATH"])
+            self.assertEqual((env["CARGO"], env["RUSTC"], env["LD_LIBRARY_PATH"],
+                              env["CARGO_HOME"], env["CARGO_NET_OFFLINE"], env["RUSTUP_HOME"]),
+                             ("/tools/rust/bin/cargo", "/tools/rust/bin/rustc", "/tools/rust/lib",
+                              "/scratch/cargo-home", "true", "/tools/rust"))
 
     def test_zero_exit_with_missing_or_failed_coverage_becomes_fixed_failure(self):
         for records in (

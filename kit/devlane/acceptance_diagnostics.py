@@ -71,8 +71,6 @@ def failure_tail(stage, payload, *, earlier_bytes_omitted=False):
     all_lines = decoded.splitlines()
     diagnostic_start = 0
     if stage == "production-path-e2e":
-        # The E2E command runs several fixtures in one process. Keep raw profile
-        # diagnostics from the fixture whose work began most recently.
         marker = "devlane_e2e_progress=scenario="
         diagnostic_start = max(
             (index for index, line in enumerate(all_lines)
