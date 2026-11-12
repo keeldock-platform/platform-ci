@@ -23,6 +23,7 @@ EXPECTED_FILES = frozenset((
     "runtime/crates/services/listener/Cargo.toml",
     "runtime/crates/services/listener/src/lib.rs",
     "runtime/supply-chain/audits.toml", "runtime/supply-chain/config.toml",
+    "supply-chain/imports.lock", "runtime/supply-chain/imports.lock",
 ))
 
 

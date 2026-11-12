@@ -348,6 +348,8 @@ def _cargo_environment():
     return {
         "PATH": "/tools/rust/bin:/usr/bin:/bin",
         "LD_LIBRARY_PATH": "/tools/rust/lib",
+        "CC": "/usr/bin/cc",
+        "CARGO_TARGET_" + "X" + "86_64_UNKNOWN_LINUX_GNU_LINKER": "/usr/bin/cc",
         "HOME": "/scratch/semver-cargo-home",
         "TMPDIR": TEMP_ROOT,
         "CARGO_HOME": "/scratch/semver-cargo-home",

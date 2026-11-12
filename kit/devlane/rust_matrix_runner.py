@@ -127,6 +127,8 @@ def _run(label, argv, deadline, *, timeout=1800, cwd=SOURCE_ROOT, json_stdout=Fa
         "CARGO": "/tools/rust/bin/cargo",
         "RUSTC": "/tools/rust/bin/rustc",
         "LD_LIBRARY_PATH": "/tools/rust/lib",
+        "CC": "/usr/bin/cc",
+        "CARGO_TARGET_" + "X" + "86_64_UNKNOWN_LINUX_GNU_LINKER": "/usr/bin/cc",
         "HOME": "/devlane-home",
         "TMPDIR": "/scratch/tmp",
         "CARGO_HOME": "/scratch/cargo-home",
@@ -333,7 +335,7 @@ def run(matrix, config_path, report_path, deadline):
         _simple_check(records, "deny-" + identifier, deny_args, deadline, timeout=1800)
     for workspace in workspaces:
         identifier = workspace["id"]
-        audit_args = [str(audit), "audit", "--deny", "unsound", "--no-fetch", "--db",
+        audit_args = [str(audit), "audit", "--deny", "unsound", "--no-fetch", "--no-yanked", "--db",
                       "/scratch/cargo-home/advisory-dbs/" + ADVISORY_DB_DIRECTORY,
                       "--file", workspace["lock"]]
         _simple_check(records, "audit-" + identifier, audit_args, deadline, timeout=900)

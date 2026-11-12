@@ -820,7 +820,8 @@ def _validate_rust_fixture(root, files, projection, projection_bytes, snapshot):
         "fuzz-replay-default", "fuzz-replay-all-features", "semver-runtime",
     ], "rust-matrix-suite-set")
     for path in ("deny.toml", "supply-chain/config.toml", "supply-chain/audits.toml",
-                 "runtime/supply-chain/config.toml", "runtime/supply-chain/audits.toml",
+                 "supply-chain/imports.lock", "runtime/supply-chain/config.toml",
+                 "runtime/supply-chain/audits.toml", "runtime/supply-chain/imports.lock",
                  "fuzz/corpus/valid-object.json", "fuzz/corpus/valid-array.json"):
         _require(path in files and bool(files[path]), "rust-matrix-policy-or-replay-fixture")
     _require(b'[[exemptions.fastrand]]\nversion = "2.5.0"' in files["supply-chain/config.toml"]

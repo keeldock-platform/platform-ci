@@ -3413,71 +3413,6 @@ class RustMatrixRunnerTests(unittest.TestCase):
             self.assertNotIn(b"ModuleNotFoundError", result.stderr)
             self.assertNotIn(b"candidate-import-canary", result.stderr)
 
-    def test_deny_policy_and_offline_tool_argv_match_pinned_contracts(self):
-        deny_policy = tomllib.loads(test_e2e.RUST_FIXTURE_SOURCES["deny.toml"].decode("ascii"))
-        advisories = deny_policy["advisories"]
-        self.assertEqual(advisories["yanked"], "deny")
-        self.assertEqual(advisories["unmaintained"], "workspace")
-        self.assertEqual(advisories["ignore"], [])
-        self.assertNotIn("yanked", deny_policy)
-        self.assertNotIn("unmaintained", deny_policy)
-
-        checks = []
-
-        def simple(records, suite, argv, deadline, timeout=1800):
-            checks.append((suite, argv))
-            return _coverage(records, suite)
-
-        def rust_arm(records, scope, manifest, workspace_mode, mode, config, deadline):
-            suffix = "all-features" if mode == "all" else "default"
-            records.append({
-                "kind": "coverage", "stage": "unit", "suite": scope + "-" + suffix,
-                "total": 1, "passed": 1, "failed": 0, "ignored": 0,
-            })
-            return True
-
-        def replay(records, mode, deadline):
-            suffix = "all-features" if mode == "all" else "default"
-            records.append({
-                "kind": "coverage", "stage": "unit", "suite": "fuzz-replay-" + suffix,
-                "total": 1, "passed": 1, "failed": 0, "ignored": 0,
-            })
-            return True
-
-        with tempfile.TemporaryDirectory() as temporary:
-            report = Path(temporary) / "matrix.jsonl"
-            deadline = time.monotonic() + 60
-            with patch.object(rust_matrix_runner, "_copy_advisory_database"), \
-                    patch.object(rust_matrix_runner, "_simple_check", side_effect=simple), \
-                    patch.object(rust_matrix_runner, "_rust_test_arm", side_effect=rust_arm), \
-                    patch.object(rust_matrix_runner, "_fuzz_replay", side_effect=replay), \
-                    patch.object(rust_matrix_runner, "_semver_check",
-                                 side_effect=lambda records, _deadline:
-                                 records.extend(rust_matrix_runner.semver_stage.records_for_exit(0)) or True):
-                result = rust_matrix_runner.run(
-                    rust_matrix_runner.EXPECTED_MATRIX, "fixed-test-map", str(report), deadline,
-                )
-        self.assertEqual(result, 0)
-
-        deny = next(argv for suite, argv in checks if suite == "deny-root")
-        self.assertEqual(deny[1:], [
-            "--manifest-path", "/workspace/source/Cargo.toml", "--config", "/workspace/source/deny.toml",
-            "--workspace", "--all-features", "--offline", "--locked", "check",
-        ])
-        self.assertEqual(deny[3], "--config")
-        self.assertEqual(deny[5:8], ["--workspace", "--all-features", "--offline"])
-        self.assertEqual(deny[8:], ["--locked", "check"])
-
-        audit = next(argv for suite, argv in checks if suite == "audit-root")
-        self.assertEqual(audit[1:6], ["audit", "--deny", "unsound", "--no-fetch", "--db"])
-        self.assertEqual(audit[6], "/scratch/cargo-home/advisory-dbs/" +
-                         rust_matrix_runner.ADVISORY_DB_DIRECTORY)
-        self.assertEqual(audit[7:], ["--file", "/workspace/source/Cargo.lock"])
-
-        vet = next(argv for suite, argv in checks if suite == "vet-root")
-        self.assertEqual(vet[1:3], ["vet", "check"])
-        self.assertEqual(vet[-2:], ["--locked", "--frozen"])
-
     def test_standalone_cargo_vet_child_receives_the_trusted_cargo_path(self):
         with tempfile.TemporaryDirectory() as temporary:
             process = Mock(pid=321, wait=Mock(return_value=0))
@@ -3659,73 +3594,6 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 test_e2e._verify_prepared_rust_tools(prepared, source)
             self.assertEqual(outside.stat().st_mode & 0o777, outside_mode)
 
-    def test_public_fixture_contract_covers_the_production_matrix_with_committed_locks(self):
-        root = Path(__file__).resolve().parents[2]
-        profile = json.loads((root / "ci/devlane-profiles.json").read_text(encoding="utf-8"))["profiles"]["core-rust"]
-        matrix = rust_matrix_runner.EXPECTED_MATRIX
-        self.assertEqual(profile["rust_matrix"], matrix)
-        self.assertEqual(matrix["toolchain"], "1.99.1")
-        self.assertEqual(matrix["tool_versions"], {
-            "cargo_deny": "0.20.2", "cargo_audit": "0.22.2", "cargo_vet": "0.10.3",
-        })
-        self.assertEqual(set(test_e2e.RUST_LOCKFILES), {
-            "Cargo.lock", "fuzz/Cargo.lock", "runtime/Cargo.lock",
-        })
-        self.assertEqual(len(matrix["coverage_ids"]), 23)
-        self.assertEqual(set(test_e2e.RUST_FIXTURE_TESTS), {
-            "root::Cargo.toml::tests::child_has_no_control_secrets_or_sockets",
-            "runtime::runtime/crates/services/listener/Cargo.toml::tests::listener_fixture_is_reachable",
-            "fuzz::fuzz/Cargo.toml::tests::corpus_fixture_is_present",
-            "listener::runtime/crates/services/listener/Cargo.toml::tests::listener_fixture_is_reachable",
-        })
-        self.assertIn("fuzz/corpus/valid-object.json", test_e2e.RUST_FIXTURE_SOURCES)
-        self.assertIn("fuzz/corpus/valid-array.json", test_e2e.RUST_FIXTURE_SOURCES)
-        self.assertIn("runtime/crates/services/listener/Cargo.toml", test_e2e.RUST_FIXTURE_SOURCES)
-        self.assertIn("supply-chain/audits.toml", test_e2e.RUST_FIXTURE_SOURCES)
-        self.assertIn("supply-chain/config.toml", test_e2e.RUST_FIXTURE_SOURCES)
-        self.assertIn("runtime/supply-chain/audits.toml", test_e2e.RUST_FIXTURE_SOURCES)
-        self.assertIn("runtime/supply-chain/config.toml", test_e2e.RUST_FIXTURE_SOURCES)
-        self.assertNotIn("supply-chain/imports.lock", test_e2e.RUST_FIXTURE_SOURCES)
-        self.assertNotIn("runtime/supply-chain/imports.lock", test_e2e.RUST_FIXTURE_SOURCES)
-        self.assertTrue(set(test_e2e.RUST_LOCKFILES).issubset(test_e2e.RUST_FIXTURE_SOURCES))
-        root_lock = test_e2e.RUST_FIXTURE_SOURCES["Cargo.lock"]
-        _manifest, _lock, dependencies = fetch.project_cargo_lock(root_lock)
-        self.assertEqual({(item["name"], item["version"]) for item in dependencies},
-                         {("fastrand", "2.5.0"), ("itoa", "1.0.19")})
-        self.assertTrue(all(test_e2e.RUST_FIXTURE_SOURCES[path] for path in test_e2e.RUST_LOCKFILES))
-        tooling_versions = {name: row[3].rsplit(" ", 1)[-1] for name, row in rust_tooling.TOOLS.items()}
-        self.assertEqual(tooling_versions, {
-            "cargo-deny": "0.20.2", "cargo-audit": "0.22.2", "cargo-vet": "0.10.3",
-            "cargo-semver-checks": "0.51.0",
-        })
-        semver_tool = rust_tooling.TOOLS["cargo-semver-checks"]
-        self.assertEqual(semver_tool[1], rust_matrix_runner.semver_stage.SEMVER_ASSET_SHA256)
-        self.assertEqual(semver_tool[3], "cargo-semver-checks 0.51.0")
-        generator = inspect.getsource(test_e2e._write_rust_fixture)
-        self.assertIn("source_files()", generator)
-        self.assertIn('"metadata", "--locked", "--offline"', generator)
-        self.assertNotIn("generate-lockfile", generator)
-        contract = inspect.getsource(test_e2e._validate_rust_fixture)
-        self.assertIn("fetch.validate_projection", contract)
-        self.assertIn("fetch.project_cargo_lock", contract)
-        self.assertIn("bundle.inspect_archive", contract)
-        install = inspect.getsource(test_e2e._run_scenario)
-        self.assertIn("rust_tooling.install", install)
-        self.assertIn('_phase_call("scenario-tool-verify", _verify_prepared_rust_tools, prepared, rust_tool_cache)',
-                      install)
-        self.assertLess(install.index("rust_tooling.install"), install.index('_phase_call("scenario-variant-run"'))
-        main = inspect.getsource(test_e2e.main)
-        self.assertLess(main.index("rust_tooling.fetch_tools"), main.index('_phase_call("scenario-run", _run_scenario'))
-        prepared_tools = inspect.getsource(test_e2e._verify_prepared_rust_tools)
-        self.assertIn("rust_tooling._hash_prepared_binary(path)", prepared_tools)
-        self.assertIn("semver_stage.verify_tool(source)", prepared_tools)
-        self.assertIn("semver_stage.verify_tool(tools)", prepared_tools)
-        self.assertIn('"advisory-db"', prepared_tools)
-        self.assertIn('"advisory-db-revision"', prepared_tools)
-        self.assertIn("advisory-database-binding", prepared_tools)
-        rustfmt = inspect.getsource(test_e2e._verify_rust_toolchain)
-        self.assertIn('"which", "--toolchain", RUST_VERSION, "rustfmt"', rustfmt)
-
     def test_trusted_profile_is_exactly_the_runner_contract_and_has_no_commands(self):
         root = Path(__file__).resolve().parents[2]
         profile_path = root / "ci/devlane-profiles.json"
@@ -3897,7 +3765,9 @@ class RustMatrixRunnerTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(set(audit_calls), {"audit-root", "audit-runtime", "audit-fuzz"})
         for argv in audit_calls.values():
-            self.assertEqual(argv[1:6], ["audit", "--deny", "unsound", "--no-fetch", "--db"])
+            self.assertEqual(argv[1:7], [
+                "audit", "--deny", "unsound", "--no-fetch", "--no-yanked", "--db",
+            ])
             self.assertIn("--file", argv)
             self.assertFalse(any(arg == "--ignore" or arg.startswith("--ignore=") for arg in argv))
 

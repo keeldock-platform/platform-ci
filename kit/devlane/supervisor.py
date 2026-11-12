@@ -733,6 +733,14 @@ def _make_worker_devices(dev):
         os.chmod(device, mode)
 
 
+def _host_toolchain_mounts(root):
+    mounts = [("/usr", root / "usr"), ("/lib", root / "lib"), ("/lib64", root / "lib64")]
+    alternatives = Path("/etc/alternatives")
+    if alternatives.is_dir():
+        mounts.append((alternatives, root / "etc/alternatives"))
+    return tuple(mounts)
+
+
 def _unmount_tracked_mounts(mounts=None):
     """Release every tracked mount leaf-first and return a path-free failure class."""
     targets = MOUNT_TARGETS if mounts is None else mounts
@@ -763,8 +771,10 @@ def _mount_minimal_root(root, workspace, prepared, control_root):
         "tmp", "home", "devlane-home", "control", "prepared", "workspace", "scratch", "var", "tools", "sys",
     ):
         _ensure_directory(root / name, 0o755)
-    for host, guest in (("/usr", root / "usr"), ("/lib", root / "lib"), ("/lib64", root / "lib64")):
+    for host, guest in _host_toolchain_mounts(root):
         if Path(host).exists():
+            if guest == root / "etc/alternatives":
+                _ensure_directory(guest)
             _mount_bind(host, guest, readonly=True)
     for name in ("bin", "sbin"):
         target = "usr/bin" if name == "bin" else "usr/sbin"
@@ -883,6 +893,8 @@ def _worker_environment(stage, root, tools):
     }
     if rust_path:
         env["LD_LIBRARY_PATH"] = "/tools/rust/lib"
+        env["CC"] = "/usr/bin/cc"
+        env["CARGO_TARGET_" + "X" + "86_64_UNKNOWN_LINUX_GNU_LINKER"] = "/usr/bin/cc"
     return env
 
 
@@ -1698,7 +1710,7 @@ class Service:
         self.mounts = [
             self.root / "proc", self.root / "sys", self.root / "dev/shm", self.root / "dev", self.root / "tmp", self.root / "workspace",
             self.root / "scratch", self.root / "prepared", self.root / "control/profiles.json",
-            self.root / "control/devlane", self.root / "etc/ssl/certs",
+            self.root / "control/devlane", self.root / "etc/ssl/certs", self.root / "etc/alternatives",
             self.root / "tools/rust", self.root / "tools/node", self.root / "lib64", self.root / "lib",
             self.root / "usr", self.root,
         ]

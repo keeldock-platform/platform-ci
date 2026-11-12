@@ -261,6 +261,8 @@ class ToolReceiptTests(unittest.TestCase):
         self.assertEqual(environment["RUSTC_BOOTSTRAP"], "1")
         self.assertIn("--output-format=json", environment["RUSTDOCFLAGS"])
         self.assertEqual(environment["RUSTFLAGS"], "--cap-lints=allow")
+        self.assertEqual(environment["CC"], "/usr/bin/cc")
+        self.assertEqual(environment["CARGO_TARGET_" + "X" + "86_64_UNKNOWN_LINUX_GNU_LINKER"], "/usr/bin/cc")
         for arguments in (
             ["doc", "--target-dir", "/scratch/target", "--package", "bad@1.0.0",
              "--lib", "--no-deps", "--color=never", "--target", semver_stage.TARGET_TRIPLE,

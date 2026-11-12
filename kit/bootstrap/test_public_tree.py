@@ -982,6 +982,7 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/fixtures/core-rust-rehearsal/src/lib.rs',
             'kit/devlane/fixtures/core-rust-rehearsal/supply-chain/audits.toml',
             'kit/devlane/fixtures/core-rust-rehearsal/supply-chain/config.toml',
+            'kit/devlane/fixtures/core-rust-rehearsal/supply-chain/imports.lock',
             'kit/devlane/fixtures/core-rust-rehearsal/fuzz/Cargo.lock',
             'kit/devlane/fixtures/core-rust-rehearsal/fuzz/Cargo.toml',
             'kit/devlane/fixtures/core-rust-rehearsal/fuzz/corpus/valid-array.json',
@@ -993,6 +994,7 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/fixtures/core-rust-rehearsal/runtime/crates/services/listener/src/lib.rs',
             'kit/devlane/fixtures/core-rust-rehearsal/runtime/supply-chain/audits.toml',
             'kit/devlane/fixtures/core-rust-rehearsal/runtime/supply-chain/config.toml',
+            'kit/devlane/fixtures/core-rust-rehearsal/runtime/supply-chain/imports.lock',
             'kit/devlane/test_linux_runtime.py',
             'kit/devlane/test_rust_report.py',
             'kit/devlane/test_rust_test_runner.py',
@@ -1412,6 +1414,24 @@ class PublicTreeTests(unittest.TestCase):
         inspect_text(source, "platform", path)
         with self.assertRaisesRegex(PublicTreeError, "repository-url-present"):
             inspect_text(source, "platform", "kit/devlane/unreviewed-deny.toml")
+
+    def test_cargo_vet_store_headers_are_allowed_only_for_pinned_store_files(self):
+        hash_sign = chr(35)
+        headers = {
+            "kit/devlane/fixtures/core-rust-rehearsal/supply-chain/config.toml": "config file",
+            "kit/devlane/fixtures/core-rust-rehearsal/supply-chain/audits.toml": "audits file",
+            "kit/devlane/fixtures/core-rust-rehearsal/supply-chain/imports.lock": "imports lock",
+            "kit/devlane/fixtures/core-rust-rehearsal/runtime/supply-chain/config.toml": "config file",
+            "kit/devlane/fixtures/core-rust-rehearsal/runtime/supply-chain/audits.toml": "audits file",
+            "kit/devlane/fixtures/core-rust-rehearsal/runtime/supply-chain/imports.lock": "imports lock",
+        }
+        for path, label in headers.items():
+            header = hash_sign + " cargo-vet " + label
+            inspect_text("\n" + header + "\n", "platform", path)
+            with self.assertRaisesRegex(PublicTreeError, "comment-present"):
+                inspect_text("\n" + header + "\n", "platform", path + ".copy")
+            with self.assertRaisesRegex(PublicTreeError, "comment-present"):
+                inspect_text("\n" + header + "\n" + header + "\n", "platform", path)
 
     def test_rust_rehearsal_allows_only_test_attributes_in_its_fixed_sources(self):
         path = "kit/devlane/fixtures/core-rust-rehearsal/src/lib.rs"
