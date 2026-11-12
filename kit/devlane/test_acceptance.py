@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import threading
 import io
+import contextlib
 import json
 import os
 import shutil
@@ -29,6 +30,8 @@ import node_tool_snapshot
 import permit
 import prepare
 import project
+import rust_matrix_runner
+import rust_tooling
 import supervisor
 import test_e2e
 import test_node_vendor_source
@@ -1142,6 +1145,98 @@ class ReportingFailOpenTests(unittest.TestCase):
                     root, "core-node", manifest, [("unit", 1)], {}, {"typescript": 0})
             self.assertIn(b'{"kind":"test","stage":"unit","test":"case_0001"}', records)
             self.assertIn(self.VITEST_FAILURE, records)
+
+    def test_clean_typescript_report_may_be_empty(self):
+        temporary, root = self._root()
+        with temporary:
+            (root / "scratch/reports/typescript.jsonl").write_bytes(b"")
+            (root / "scratch/reports/vitest.json").write_bytes(b"{}")
+            manifest = {"allowed_files": {}, "allowed_tests": {}, "frames": {}}
+
+            def clean_adapter(_root, _command, _stage, _tools, _log_name, *, timeout):
+                (_root / "scratch/reports/adapter.jsonl").write_bytes(b"")
+                return 0
+
+            with patch.object(supervisor, "_run_control_adapter", side_effect=clean_adapter):
+                records = supervisor._adapter_records(
+                    root, "core-node", manifest, [("typecheck", 0), ("unit", 0)], {},
+                    {"typescript": 0},
+                )
+            self.assertEqual(records, [])
+
+    def test_missing_rust_matrix_report_reaches_the_rehearsal_coverage_check(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "scratch/reports").mkdir(parents=True)
+            records = supervisor._adapter_records(
+                root, "core-rust", {"allowed_files": {}, "allowed_tests": {}, "frames": {}},
+                [], {}, {"rust_matrix": 2},
+            )
+            self.assertEqual(records, [supervisor._control_failure("unit", "report-missing")])
+            profile = json.loads((Path(__file__).resolve().parents[2]
+                                  / "ci/devlane-profiles.json").read_text())['profiles']['core-rust']
+            allowlists = {
+                "files": {}, "tests": {}, "frames": {}, "stages": profile["stages"],
+                "codes": sorted(set(profile["diagnostic_codes"] + ["DEVLANE_FAILURE"])),
+                "max_lines": {}, "suites": sorted(profile["rust_matrix"]["coverage_ids"]),
+            }
+            summary = public_filter.filter_records(records, allowlists)
+            scenario = {"profile": "core-rust", "allowed_files": {},
+                        "allowed_tests": {}, "frames": {},
+                        "expect_semver_execution_refusal": True}
+            with self.assertRaisesRegex(RuntimeError, "rust-matrix-summary-coverage-set"):
+                test_e2e._summary_records(summary, scenario)
+
+    def test_rust_matrix_refusal_prints_a_fixed_reason_code(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profile_path = root / "profiles.json"
+            profile_path.write_text("{}", encoding="ascii")
+            output = io.StringIO()
+            profile = {"profiles": {"core-rust": {"rust_matrix": rust_matrix_runner.EXPECTED_MATRIX}}}
+            with patch.object(rust_matrix_runner.bundle, "strict_json", return_value=profile), \
+                    patch.object(rust_matrix_runner, "run",
+                                 side_effect=rust_matrix_runner.MatrixRefusal("advisory-database-missing")), \
+                    contextlib.redirect_stderr(output):
+                result = rust_matrix_runner.main([
+                    str(profile_path), "fixed-config", str(root / "report.jsonl"), "--deadline", "1",
+                ])
+            self.assertEqual(result, 2)
+            line = output.getvalue().strip()
+            self.assertEqual(line, "rust_matrix=refused code=advisory-database-missing")
+            self.assertTrue(diagnostic_contract.public_e2e_command_diagnostic(line))
+            self.assertEqual(
+                rust_matrix_runner._refusal_code(rust_matrix_runner.MatrixRefusal("private/path")),
+                "matrix-runner-failed",
+            )
+
+    def test_rust_tool_install_makes_the_copied_staging_root_worker_traversable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "staging"
+            prepared = root / "prepared"
+            source.mkdir(mode=0o700)
+            prepared.mkdir(mode=0o755)
+            for name in rust_tooling.TOOLS:
+                (source / name).write_text("fixture tool", encoding="ascii")
+            (source / rust_tooling.SEMVER_RECEIPT).write_text("{}", encoding="ascii")
+            advisory = source / "advisory-db/crates/fixture"
+            advisory.mkdir(parents=True, mode=0o700)
+            (advisory / "RUSTSEC-2026-0001.md").write_text("fixture advisory", encoding="ascii")
+            for current, directories, _files in os.walk(source, topdown=False):
+                os.chmod(current, 0o700)
+                for directory in directories:
+                    os.chmod(Path(current) / directory, 0o700)
+
+            with patch.object(rust_tooling, "_remaining", return_value=30):
+                rust_tooling.install(str(source), str(prepared), "fixed-deadline")
+
+            tools = prepared / "devlane-tools"
+            self.assertEqual(tools.stat().st_mode & 0o777, 0o555)
+            for current, directories, _files in os.walk(tools, followlinks=False):
+                for directory in (".", *directories):
+                    path = Path(current) if directory == "." else Path(current) / directory
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o555)
 
     def test_adapter_status_must_agree_with_a_complete_regular_report(self):
         temporary, root = self._root()

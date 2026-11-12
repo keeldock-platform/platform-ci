@@ -577,30 +577,39 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         ))
 
     def test_variant_execute_runtime_frame_uses_a_fixed_audited_grammar(self):
-        line = ("devlane_production_e2e=refused stage=variant-execute exception=runtime-error "
-                "class=RuntimeError frame=supervisor.py:1824:_execute code=summary-schema-invalid")
-        self.assertTrue(diagnostic_contract.public_e2e_runtime_diagnostic(line))
-        self.assertFalse(diagnostic_contract.public_preparation_diagnostic(line))
-        details = acceptance_diagnostics.failure_tail("production-path-e2e", (line + "\n").encode("ascii"))
-        self.assertEqual(details, [line])
+        lines = [
+            ("devlane_production_e2e=refused stage=variant-execute exception=runtime-error "
+             "class=RuntimeError frame=supervisor.py:1824:_execute code=summary-schema-invalid"),
+            ("devlane_production_e2e=refused stage=variant-summary-validate exception=runtime-error "
+             "class=RuntimeError frame=test_e2e.py:1717:_require code=rust-matrix-summary-coverage-set"),
+        ]
+        for line in lines:
+            self.assertTrue(diagnostic_contract.public_e2e_runtime_diagnostic(line))
+            self.assertFalse(diagnostic_contract.public_preparation_diagnostic(line))
+        details = acceptance_diagnostics.failure_tail(
+            "production-path-e2e", ("\n".join(lines) + "\n").encode("ascii"),
+        )
+        self.assertEqual(details, lines)
 
         root = Path(__file__).resolve().parents[2]
         grammar = audit._Grammar(
             root / ".github/workflows/devlane-synthetic.yml", "devlane-synthetic",
             {"run_id": "12345", "control_sha": SHA}, "synthetic",
         )
-        self.assertTrue(grammar.step_output_ok(
-            "Run full source-free production-path acceptance", line, {},
-        ))
         private_frame_path = chr(47) + "private/supervisor.py"
+        for line in lines:
+            self.assertTrue(grammar.step_output_ok(
+                "Run full source-free production-path acceptance", line, {},
+            ))
         for invalid in (
-            line.replace("supervisor.py", private_frame_path),
-            line.replace("supervisor.py", "../supervisor.py"),
-            line.replace("runtime-error", "type-error"),
-            line.replace("variant-execute", "variant-decrypt"),
-            line.replace(":1824:", ":0:"),
-            line.replace("code=summary-schema-invalid", "code=private-runtime-detail"),
-            line + " KEYCANARY-73A10X",
+            lines[0].replace("supervisor.py", private_frame_path),
+            lines[0].replace("supervisor.py", "../supervisor.py"),
+            lines[0].replace("runtime-error", "type-error"),
+            lines[0].replace("variant-execute", "variant-decrypt"),
+            lines[0].replace(":1824:", ":0:"),
+            lines[0].replace("code=summary-schema-invalid", "code=private-runtime-detail"),
+            lines[0] + " KEYCANARY-73A10X",
+            lines[1].replace("variant-summary-validate", "variant-decrypt"),
         ):
             with self.subTest(line=invalid):
                 self.assertFalse(diagnostic_contract.public_e2e_runtime_diagnostic(invalid))
@@ -617,7 +626,9 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             {"run_id": "12345", "control_sha": SHA}, "synthetic",
         )
         for line in (command, refusal,
-                     "typescript_reporter_refusal=typescript-unavailable", "rust_matrix=refused",
+                     "typescript_reporter_refusal=typescript-unavailable",
+                     "rust_matrix=refused code=advisory-database-missing",
+                     "rust_matrix=refused code=matrix-runner-failed",
                      "rust_test_adapter=refused",
                      "typescript_reporter_refusal=source-root-invalid",
                      "typescript_reporter_refusal=usage"):
@@ -636,6 +647,9 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             command.replace("returncode=1", "returncode=01"),
             refusal.replace("execution-order", "private/path"),
             "typescript_reporter_refusal=private/path",
+            "rust_matrix=refused",
+            "rust_matrix=refused code=private/path",
+            "rust_matrix=refused code=unlisted-reason",
         ):
             with self.subTest(invalid=invalid):
                 self.assertFalse(diagnostic_contract.public_e2e_command_diagnostic(invalid))
@@ -650,15 +664,30 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         )
         report_line = "devlane_e2e_vitest_diag=report name=vitest.json kind=file bytes=2048"
         rust_log_line = "devlane_e2e_failure_diag=log name=compile-root-default.stdout line=1 text=cargo%20test%20failed"
+        rust_refusal_log_line = (
+            "devlane_e2e_failure_diag=log name=rust-matrix-adapter.log line=1 "
+            "text=rust_matrix=refused code=advisory-database-missing"
+        )
+        bare_rust_refusal_log_line = (
+            "devlane_e2e_failure_diag=log name=rust-matrix-adapter.log line=1 "
+            "text=rust_matrix=refused"
+        )
+        unknown_rust_refusal_log_line = (
+            "devlane_e2e_failure_diag=log name=rust-matrix-adapter.log line=1 "
+            "text=rust_matrix=refused code=private/path"
+        )
         rust_report_line = "devlane_e2e_failure_diag=report name=rust-matrix.jsonl kind=file bytes=128"
         self.assertTrue(diagnostic_contract.public_e2e_vitest_diagnostic(log_line))
         self.assertTrue(diagnostic_contract.public_e2e_vitest_diagnostic(report_line))
         self.assertTrue(diagnostic_contract.public_e2e_failure_diagnostic(rust_log_line))
+        self.assertTrue(diagnostic_contract.public_e2e_failure_diagnostic(rust_refusal_log_line))
+        self.assertFalse(diagnostic_contract.public_e2e_failure_diagnostic(bare_rust_refusal_log_line))
+        self.assertFalse(diagnostic_contract.public_e2e_failure_diagnostic(unknown_rust_refusal_log_line))
         self.assertTrue(diagnostic_contract.public_e2e_failure_diagnostic(rust_report_line))
         self.assertEqual(acceptance_diagnostics.failure_tail(
-            "production-path-e2e", (log_line + "\n" + report_line + "\n"
-                                     + rust_log_line + "\n" + rust_report_line + "\n").encode("ascii"),
-        ), [log_line, report_line, rust_log_line, rust_report_line])
+            "production-path-e2e", (log_line + "\n" + report_line + "\n" + rust_log_line + "\n"
+                                     + rust_refusal_log_line + "\n" + rust_report_line + "\n").encode("ascii"),
+        ), [log_line, report_line, rust_log_line, rust_refusal_log_line, rust_report_line])
         root = Path(__file__).resolve().parents[2]
         synthetic = audit._Grammar(
             root / ".github/workflows/devlane-synthetic.yml", "devlane-synthetic",

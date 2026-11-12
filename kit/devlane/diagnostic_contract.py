@@ -189,7 +189,8 @@ _E2E_REFUSAL = re.compile(
     r"(?: cleanup=(unconfirmed))?\Z"
 )
 _E2E_RUNTIME_ERROR = re.compile(
-    r"devlane_production_e2e=refused stage=variant-execute exception=runtime-error "
+    r"devlane_production_e2e=refused stage=(variant-execute|variant-summary-validate) "
+    r"exception=runtime-error "
     r"class=RuntimeError frame=([A-Za-z0-9_-]{1,48}\.py):([1-9][0-9]{0,7}):"
     r"([A-Za-z_][A-Za-z0-9_]{0,63})(?: code=([a-z0-9-]{1,64}))?\Z"
 )
@@ -220,7 +221,8 @@ E2E_REQUIRE_CODES = frozenset((
     "rust-matrix-root-projection", "rust-matrix-suite-count", "rust-matrix-suite-set",
     "rust-matrix-summary-counts", "rust-matrix-summary-coverage-set", "rust-matrix-summary-not-all-pass",
     "rust-matrix-summary-profile", "rust-matrix-test-map", "rust-matrix-tool-copy-binding",
-    "rust-matrix-tool-layout", "rust-matrix-tool-preparation-missing", "rust-matrix-tool-version",
+    "rust-matrix-tool-directory-access", "rust-matrix-tool-layout",
+    "rust-matrix-tool-preparation-missing", "rust-matrix-tool-version",
     "rust-matrix-toolchain-mismatch", "rust-matrix-tools-layout", "rust-matrix-tools-link",
     "rust-matrix-tools-missing", "rust-matrix-v1-non-semver-failure",
     "rust-matrix-v1-semver-refusal", "rust-matrix-workspace-dependencies",
@@ -229,6 +231,21 @@ E2E_REQUIRE_CODES = frozenset((
     "supervisor-survived-cleanup", "test-failure-not-mapped", "unexpected-control-failure",
     "vitest-negative-control-summary",
     "workflow-identity-required",
+))
+RUST_MATRIX_REFUSAL_CODES = frozenset((
+    "advisory-database-copy-exists", "advisory-database-link", "advisory-database-missing",
+    "cargo-artifact-identity-conflict", "cargo-artifact-invalid", "cargo-build-incomplete",
+    "cargo-finish-invalid", "cargo-manifest-path-invalid", "cargo-message-invalid",
+    "cargo-reason-invalid", "cargo-test-path-invalid", "cargo-test-unavailable",
+    "duplicate-json-key", "fuzz-replay-failed", "fuzz-replay-report-invalid",
+    "input-file-changed", "input-file-invalid", "input-file-size", "json-invalid", "json-size",
+    "matrix-capture-size", "matrix-phase-timeout", "matrix-profile-mismatch",
+    "matrix-report-exists", "matrix-runner-failed", "matrix-workspace-mode",
+    "rust-ignored-list-failed", "rust-ignored-list-invalid", "rust-test-coverage",
+    "rust-test-duplicate", "rust-test-ignored", "rust-test-list-failed",
+    "rust-test-list-invalid", "rust-test-list-size", "rust-test-map-invalid",
+    "rust-test-output-size", "rust-test-result-invalid", "rust-test-scope-invalid",
+    "rust-test-timeout", "total-deadline-exhausted", "total-deadline-invalid",
 ))
 E2E_COMMAND_CALL_SITES = frozenset(("supervisor-client:execute",))
 MAX_E2E_COMMAND_OUTPUT_BYTES = 16 * 1024
@@ -252,9 +269,12 @@ _E2E_COMMAND_ADAPTER_REFUSAL = re.compile(
     r"reporter-failed|json-size|json-string|json-escape|json-control|json-depth|duplicate-json-key|"
     r"json-colon|json-object|json-array|json-value|json-trailing-data)\Z"
 )
+_E2E_RUST_MATRIX_REFUSAL = re.compile(
+    r"rust_matrix=refused code=([a-z][a-z0-9-]{0,79})\Z"
+)
 _E2E_FAILURE_DIAGNOSTIC = re.compile(
     r"devlane_e2e_(?:vitest|failure)_diag=log name=[A-Za-z0-9][A-Za-z0-9._-]{0,63} "
-    r"line=[1-9][0-9]{0,2} text=(?:[A-Za-z0-9._~:/,=@+!?(){} -]|%[0-9A-F]{2}){0,384}\Z"
+    r"line=[1-9][0-9]{0,2} text=((?:[A-Za-z0-9._~:/,=@+!?(){} -]|%[0-9A-F]{2}){0,384})\Z"
 )
 _E2E_FAILURE_REPORT_DIAGNOSTIC = re.compile(
     r"devlane_e2e_(?:vitest|failure)_diag=report name=[A-Za-z0-9][A-Za-z0-9._-]{0,63} "
@@ -293,8 +313,14 @@ def public_e2e_failure_diagnostic(line):
                 "SYNTHETIC_KEY_CANARY", "PRIVATE_KEY_CANARY",
             ))):
         return False
-    return (_E2E_FAILURE_DIAGNOSTIC.fullmatch(line) is not None
-            or _E2E_FAILURE_REPORT_DIAGNOSTIC.fullmatch(line) is not None)
+    failure = _E2E_FAILURE_DIAGNOSTIC.fullmatch(line)
+    if failure is not None:
+        text = failure.group(1)
+        if text.startswith("rust_matrix=refused"):
+            refusal = _E2E_RUST_MATRIX_REFUSAL.fullmatch(text)
+            return refusal is not None and refusal.group(1) in RUST_MATRIX_REFUSAL_CODES
+        return True
+    return _E2E_FAILURE_REPORT_DIAGNOSTIC.fullmatch(line) is not None
 
 
 def public_e2e_command_summary_record(line):
@@ -323,8 +349,12 @@ def public_e2e_command_refusal(line):
         code, route = refusal.groups()
         return route is None or (code == "network-probe-refusal:network-route-unexpected"
                                  and network_probe.valid_route_diagnostic(route))
-    return line in ("rust_matrix=refused", "rust_test_adapter=refused") or \
-        _E2E_COMMAND_ADAPTER_REFUSAL.fullmatch(line) is not None
+    if line == "rust_test_adapter=refused":
+        return True
+    rust_matrix = _E2E_RUST_MATRIX_REFUSAL.fullmatch(line)
+    if rust_matrix is not None:
+        return rust_matrix.group(1) in RUST_MATRIX_REFUSAL_CODES
+    return _E2E_COMMAND_ADAPTER_REFUSAL.fullmatch(line) is not None
 
 
 TOOLING_REFUSAL_CODES = frozenset((
@@ -436,7 +466,7 @@ def public_e2e_runtime_diagnostic(line):
     if type(line) is not str or len(line.encode("ascii", "ignore")) > MAX_PUBLIC_DIAGNOSTIC_BYTES:
         return False
     match = _E2E_RUNTIME_ERROR.fullmatch(line)
-    return match is not None and (match.group(4) is None or match.group(4) in E2E_REQUIRE_CODES)
+    return match is not None and (match.group(5) is None or match.group(5) in E2E_REQUIRE_CODES)
 
 
 _E2E_PROGRESS_LINE = re.compile(r"devlane_e2e_progress=(phase|scenario)=([a-z0-9-]{1,64})\Z")

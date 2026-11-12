@@ -22,6 +22,7 @@ if sys.flags.isolated:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import bundle
+import diagnostic_contract
 import rust_test_runner
 import semver_stage
 
@@ -57,7 +58,20 @@ ADVISORY_DB_DIRECTORY = "advisory-db-3157b0e258782691"
 
 
 class MatrixRefusal(ValueError):
-    pass
+    def __init__(self, code):
+        self.code = (code if type(code) is str and code in diagnostic_contract.RUST_MATRIX_REFUSAL_CODES
+                     else "matrix-runner-failed")
+        super().__init__(self.code)
+
+
+def _refusal_code(error):
+    if type(error) is MatrixRefusal:
+        code = error.code
+    elif type(error) in (bundle.Refusal, rust_test_runner.Refusal):
+        code = error.args[0] if len(error.args) == 1 and type(error.args[0]) is str else ""
+    else:
+        code = ""
+    return code if code in diagnostic_contract.RUST_MATRIX_REFUSAL_CODES else "matrix-runner-failed"
 
 
 TERM_GRACE_SECONDS = 2
@@ -375,8 +389,8 @@ def main(argv=None):
         result = run(profile["rust_matrix"], args.config_path, args.report_path, args.deadline)
         print("rust_matrix=complete")
         return result
-    except Exception:
-        print("rust_matrix=refused", file=sys.stderr)
+    except Exception as error:
+        print("rust_matrix=refused code=" + _refusal_code(error), file=sys.stderr)
         return 2
 
 

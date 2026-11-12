@@ -260,7 +260,7 @@ class _DiagnosticState:
                     )
                     if self.tooling_reason == "tool-version-mismatch":
                         self.tooling_version = _public_tool_version_line(error.version_output)
-                if phase == "variant-execute" and type(error) is RuntimeError:
+                if phase in ("variant-execute", "variant-summary-validate") and type(error) is RuntimeError:
                     self.runtime_frame = _innermost_devlane_frame(error)
                     if (len(error.args) == 1 and type(error.args[0]) is str
                             and error.args[0] in diagnostic_contract.E2E_REQUIRE_CODES):
@@ -284,7 +284,8 @@ class _DiagnosticState:
             self.capture("harness-startup", error)
         phase, category = self.first_failure
         line = "devlane_production_e2e=refused stage=" + phase + " exception=" + category
-        if phase == "variant-execute" and category == "runtime-error" and self.runtime_frame is not None:
+        if (phase in ("variant-execute", "variant-summary-validate")
+                and category == "runtime-error" and self.runtime_frame is not None):
             basename, line_number, function = self.runtime_frame
             line += (" class=RuntimeError frame=" + basename + ":" + str(line_number)
                      + ":" + function)
@@ -892,6 +893,11 @@ def _verify_prepared_rust_tools(prepared, source):
     tools = Path(prepared) / "devlane-tools"
     source = Path(source)
     _require(tools.is_dir() and not tools.is_symlink(), "rust-matrix-tools-missing")
+    for current, directories, _files in os.walk(tools, followlinks=False):
+        for directory in (".", *directories):
+            path = Path(current) if directory == "." else Path(current) / directory
+            _require(stat.S_IMODE(path.stat().st_mode) & 0o005 == 0o005,
+                     "rust-matrix-tool-directory-access")
     expected_entries = set(rust_tooling.TOOLS) | {
         "advisory-db", "advisory-db-revision", rust_tooling.SEMVER_RECEIPT,
     }

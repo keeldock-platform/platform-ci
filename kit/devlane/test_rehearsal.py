@@ -852,25 +852,27 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
                          "devlane_production_e2e=refused stage=fixture-load exception=name-error")
 
     def test_variant_execute_runtime_error_reports_only_its_innermost_devlane_frame(self):
-        state = test_e2e._DiagnosticState()
+        for phase in ("variant-execute", "variant-summary-validate"):
+            with self.subTest(phase=phase):
+                state = test_e2e._DiagnosticState()
 
-        def throw_require_runtime_error():
-            test_e2e._require(False, "summary-schema-invalid")
+                def throw_require_runtime_error():
+                    test_e2e._require(False, "summary-schema-invalid")
 
-        try:
-            with state.phase("variant-execute"):
-                throw_require_runtime_error()
-        except RuntimeError as error:
-            line = state.refusal_line(error)
-        self.assertRegex(
-            line,
-            r"^devlane_production_e2e=refused stage=variant-execute exception=runtime-error "
-            r"class=RuntimeError frame=test_e2e\.py:[1-9][0-9]*:_require "
-            r"code=summary-schema-invalid$",
-        )
-        for private in ("/runner", "/source", "KEYCANARY-73A10X", "private"):
-            self.assertNotIn(private, line)
-        self.assertTrue(test_e2e.diagnostic_contract.public_e2e_runtime_diagnostic(line))
+                try:
+                    with state.phase(phase):
+                        throw_require_runtime_error()
+                except RuntimeError as error:
+                    line = state.refusal_line(error)
+                self.assertRegex(
+                    line,
+                    r"^devlane_production_e2e=refused stage=" + phase + r" exception=runtime-error "
+                    r"class=RuntimeError frame=test_e2e\.py:[1-9][0-9]*:_require "
+                    r"code=summary-schema-invalid$",
+                )
+                for private in ("/runner", "/source", "KEYCANARY-73A10X", "private"):
+                    self.assertNotIn(private, line)
+                self.assertTrue(test_e2e.diagnostic_contract.public_e2e_runtime_diagnostic(line))
 
         generic = test_e2e._DiagnosticState()
 
@@ -878,7 +880,7 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
             raise RuntimeError("private /runner/source KEYCANARY-73A10X")
 
         try:
-            with generic.phase("variant-execute"):
+            with generic.phase("variant-summary-validate"):
                 throw_generic_runtime_error()
         except RuntimeError as error:
             generic_line = generic.refusal_line(error)
@@ -888,10 +890,10 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
 
         outside_frame = test_e2e._DiagnosticState()
         error = RuntimeError("detail")
-        outside_frame.capture("variant-execute", error)
+        outside_frame.capture("variant-summary-validate", error)
         self.assertIsNone(outside_frame.runtime_frame)
         self.assertEqual(outside_frame.refusal_line(error),
-                         "devlane_production_e2e=refused stage=variant-execute exception=runtime-error")
+                         "devlane_production_e2e=refused stage=variant-summary-validate exception=runtime-error")
 
     def test_e2e_require_code_allowlist_matches_all_fixed_require_call_sites(self):
         source = Path(test_e2e.__file__).read_text(encoding="utf-8")

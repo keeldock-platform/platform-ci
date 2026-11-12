@@ -311,12 +311,15 @@ def install(source, prepared, deadline_file):
             or receipt.stat().st_nlink != 1):
         raise ToolingRefusal("tool-copy-invalid")
     receipt.chmod(0o444)
-    for root, directories, files in os.walk(destination / "advisory-db", followlinks=False):
+    advisory_database = destination / "advisory-db"
+    for root, directories, files in os.walk(advisory_database, followlinks=False):
         for name in directories + files:
             path = Path(root) / name
             if path.is_symlink():
                 raise ToolingRefusal("advisory-database-link")
             path.chmod(0o555 if path.is_dir() else 0o444)
+    advisory_database.chmod(0o555)
+    destination.chmod(0o555)
     _remaining(60)
     print("rust_offline_tools=installed")
 
