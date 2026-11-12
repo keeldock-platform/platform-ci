@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+from urllib.parse import urlsplit
 
 
 SHA_RE = re.compile(r"[a-f0-9]{40}\Z")
@@ -34,6 +35,8 @@ WORKFLOW_CHECKS = {
     ),
 }
 GITHUB_ACTIONS_APP_ID = 15368
+CONTROL_STATUS_CONTEXT = "keeldock/control-verified"
+CONTROL_STATUS_CREATOR = "github-actions[bot]"
 SOURCE_FREE_CONTROL_REF = re.compile(r"refs/heads/[A-Za-z0-9._/-]{1,200}\Z")
 MAIN_ONLY_REF = "refs/heads/main"
 REFUSALS = frozenset((
@@ -58,11 +61,15 @@ def durable_evidence_allowed(ref):
 
 
 def control_contexts():
+    return frozenset((CONTROL_STATUS_CONTEXT,))
+
+
+def control_check_contexts():
     return frozenset(context for contexts in WORKFLOW_CHECKS.values() for context in contexts)
 
 
 def required_checks_satisfiable_before_merge(required):
-    """Exactly the contexts the source-free control produces, each pinned to the Actions app (no subset, no unpinned)."""
+    """Require only the Actions-app-pinned commit status written after control acceptance."""
     if type(required) is not dict:
         return False
     return (set(required) == control_contexts()
@@ -175,8 +182,28 @@ def green_required_checks(required, check_runs, statuses, expected_sha):
         ]
         status_matches = [
             row for row in statuses
-            if type(row) is dict and row.get("context") == context and row.get("sha") == expected_sha
+            if type(row) is dict and row.get("context") == context
+            and row.get("sha", expected_sha) == expected_sha
         ]
+        if context == CONTROL_STATUS_CONTEXT:
+            if required_app != GITHUB_ACTIONS_APP_ID or matches or not status_matches:
+                raise PromotionRefusal("check")
+            latest = _latest(status_matches)
+            creator = latest.get("creator")
+            try:
+                status_url = urlsplit(latest.get("url") if type(latest.get("url")) is str else "")
+            except ValueError:
+                raise PromotionRefusal("check") from None
+            status_path = re.fullmatch(
+                r"/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/statuses/" + expected_sha,
+                status_url.path,
+            )
+            if (latest.get("state") != "success" or type(creator) is not dict
+                    or creator.get("login") != CONTROL_STATUS_CREATOR or creator.get("type") != "Bot"
+                    or status_url.scheme != "https" or status_url.netloc != "api.github.com"
+                    or status_url.query or status_url.fragment or status_path is None):
+                raise PromotionRefusal("check")
+            continue
         attempts = matches
         if required_app is not None and not attempts:
             raise PromotionRefusal("check")
@@ -222,7 +249,9 @@ def promotion_checks_reusable(workflow, target, expected_sha, repository, curren
         statuses = [row for row in _pages(status_payload)
                     if not _belongs_to_workflow_run(row, current_run_id)]
         required = {context: GITHUB_ACTIONS_APP_ID for context in contexts}
-        return green_required_checks(required, check_runs, statuses, expected_sha)
+        gate = {CONTROL_STATUS_CONTEXT: GITHUB_ACTIONS_APP_ID}
+        return (green_required_checks(required, check_runs, [], expected_sha)
+                and green_required_checks(gate, [], statuses, expected_sha))
     except (PromotionRefusal, TypeError, ValueError):
         return False
 
@@ -280,7 +309,15 @@ def promote(root, target, sha, owner_approved):
         raise PromotionRefusal("protection")
     check_payload = _api_json(repository, "commits/" + sha + "/check-runs?filter=all&per_page=100", paginate=True)
     status_payload = _api_json(repository, "commits/" + sha + "/statuses?per_page=100", paginate=True)
-    green_required_checks(required, _pages(check_payload, "check_runs"), _pages(status_payload), sha)
+    check_runs = _pages(check_payload, "check_runs")
+    statuses = _pages(status_payload)
+    green_required_checks(
+        {context: GITHUB_ACTIONS_APP_ID for context in control_check_contexts()},
+        check_runs,
+        [],
+        sha,
+    )
+    green_required_checks(required, [], statuses, sha)
     if _remote_sha(root, source) != sha:
         raise PromotionRefusal("head")
     _run(("git", "push", "origin", sha + ":refs/heads/" + target), cwd=root)

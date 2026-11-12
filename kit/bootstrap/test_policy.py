@@ -1402,6 +1402,25 @@ class WorkflowPolicyTests(unittest.TestCase):
             with self.assertRaises(PolicyError):
                 validate_workflow_text(changed, "platform")
 
+    def test_status_write_is_limited_to_control_audit(self):
+        workflow = self._platform_workflow()
+        control_job = workflow.split("  control-audit:\n", 1)[1]
+        self.assertIn(
+            "    permissions:\n      actions: read\n      checks: read\n      statuses: write\n",
+            control_job,
+        )
+        self.assertNotIn("statuses: write", workflow.split("  control-audit:\n", 1)[0])
+        for changed in (
+            workflow.replace("      statuses: write\n", "", 1),
+            workflow.replace(
+                "  devlane-synthetic:\n",
+                "  devlane-synthetic:\n    permissions:\n      statuses: write\n", 1,
+            ),
+            workflow.replace("      statuses: write\n", "      statuses: read\n", 1),
+        ):
+            with self.assertRaises(PolicyError):
+                validate_workflow_text(changed, "platform")
+
     def test_actual_workflow_rejects_skips_masking_extra_execution_and_filters(self):
         base = self._platform_workflow()
         mutations = (

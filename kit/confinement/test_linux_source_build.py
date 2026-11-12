@@ -171,18 +171,17 @@ class PromotionDocumentationTests(unittest.TestCase):
         promotion_source = (root / "kit/promotion/branch_promotion.py").read_text(encoding="utf-8")
         promotion_context_block = promotion_source.split("WORKFLOW_CHECKS = {", 1)[1].split("\n}", 1)[0]
         current_control_contexts = re.findall(r'^\s+"([^"]+)",$', promotion_context_block, re.MULTILINE)
-        documented_context_block = docs.split("The contexts checked by the promotion tool are:", 1)[1].split(
-            "Use the job check names GitHub reports:", 1
+        required_rule_block = docs.split("One-time branch-rule setup", 1)[1].split(
+            "Keep the usual pull-request review rules", 1
         )[0]
-        documented_contexts = re.findall(r"^\s+- `([^`]+)`$", documented_context_block, re.MULTILINE)
+        documented_contexts = re.findall(r"^\s+- `([^`]+)`$", required_rule_block, re.MULTILINE)
         self.assertEqual(len(current_control_contexts), 18)
-        self.assertEqual(len(documented_contexts), 18)
         self.assertEqual(len(current_control_contexts), len(set(current_control_contexts)))
-        self.assertEqual(len(documented_contexts), len(set(documented_contexts)))
-        self.assertEqual(set(current_control_contexts), set(documented_contexts))
-        self.assertIn("pull request 173 merged by protected linear fast-forward", docs)
+        self.assertEqual(documented_contexts, ["keeldock/control-verified"])
+        self.assertIn("all 18 control check runs on the exact SHA", docs)
+        self.assertIn("linear merge creates a new commit on `develop`", docs)
         self.assertIn("5ef503e19fbeb600c3bbef9b047a15c238602efc", docs)
-        self.assertNotIn("current `main` copy has only `push` and `pull_request`", docs)
+        self.assertIn("workflow_dispatch", docs)
         self.assertIn("Use only the approved public encrypted devlane", docs)
         self.assertIn("Private product source must not run through private-repository Actions", docs)
 
@@ -191,13 +190,13 @@ class PromotionDocumentationTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         docs_path = root / "docs/branch-promotion.md"
         docs = docs_path.read_text(encoding="utf-8")
-        before, remaining = docs.split("The contexts checked by the promotion tool are:", 1)
-        contexts, after = remaining.split("Use the job check names GitHub reports:", 1)
+        before, remaining = docs.split("One-time branch-rule setup", 1)
+        contexts, after = remaining.split("Keep the usual pull-request review rules", 1)
         first = re.search(r"(?m)^\s+- `([^`]+)`$", contexts)
         self.assertIsNotNone(first)
         duplicated = contexts[:first.end()] + "\n" + first.group(0) + contexts[first.end():]
-        altered = before + "The contexts checked by the promotion tool are:" + duplicated
-        altered += "Use the job check names GitHub reports:" + after
+        altered = before + "One-time branch-rule setup" + duplicated
+        altered += "Keep the usual pull-request review rules" + after
         original_read = Path.read_text
 
         def read_with_duplicate(path, *args, **kwargs):

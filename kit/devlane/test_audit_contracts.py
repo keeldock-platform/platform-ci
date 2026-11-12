@@ -1201,12 +1201,93 @@ class ControlAuditorMutationTests(unittest.TestCase):
     def test_refusal_output_contains_only_a_fixed_stage_code(self):
         from contextlib import redirect_stdout
         from io import StringIO
-        from unittest.mock import patch
         output = StringIO()
         with patch.object(control_audit, "control_identity", side_effect=control_audit.ControlAuditRefusal()):
             with redirect_stdout(output):
                 self.assertEqual(control_audit.main(), 1)
         self.assertEqual(output.getvalue(), "control_audit=refused stage=identity\n")
+
+    def test_control_status_is_posted_once_after_the_accepted_audit_on_any_branch(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        identity = dict(self.identity, ref="refs/heads/devlane/d211-1110")
+        events = []
+        output = StringIO()
+        with patch.object(control_audit, "control_identity", return_value=identity), \
+                patch.object(control_audit, "GitHubAPI", return_value=object()), \
+                patch.object(control_audit, "run_audit", side_effect=lambda api, value: events.append("audit")), \
+                patch.object(control_audit, "post_control_status", side_effect=lambda api, value: events.append("status")) as post, \
+                patch.dict("os.environ", {"GITHUB_TOKEN": "x"}, clear=False), \
+                redirect_stdout(output):
+            self.assertEqual(control_audit.main(), 0)
+        self.assertEqual(events, ["audit", "status"])
+        post.assert_called_once()
+        self.assertEqual(output.getvalue(), "control_audit=accepted jobs=18 synthetic_artifacts=1\n")
+
+    def test_control_status_post_uses_exact_sha_context_body_and_actions_bot_response(self):
+        from email.message import Message
+        from unittest.mock import Mock
+
+        class Response:
+            status = 201
+
+            def __init__(self, value):
+                self.headers = Message()
+                self.headers["Content-Type"] = "application/json"
+                self.value = value
+
+            def read(self, limit):
+                return self.value
+
+            def close(self):
+                pass
+
+        target_url = "https://github.com/" + control_audit.REPOSITORY + "/actions/runs/12345"
+        value = {
+            "url": "https://api.github.com/repos/" + control_audit.REPOSITORY + "/statuses/" + SHA,
+            "context": control_audit.CONTROL_STATUS_CONTEXT,
+            "state": "success",
+            "description": control_audit.CONTROL_STATUS_DESCRIPTION,
+            "target_url": target_url,
+            "creator": {"login": control_audit.CONTROL_STATUS_CREATOR, "type": "Bot"},
+        }
+        opener = Mock()
+        opener.open.return_value = Response(json.dumps(value).encode("utf-8"))
+        api = type("API", (), {"_token": "token-never-printed", "_opener": opener})()
+        control_audit.post_control_status(api, self.identity)
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, "https://api.github.com/repos/" + control_audit.REPOSITORY + "/statuses/" + SHA)
+        self.assertEqual(request.method, "POST")
+        self.assertEqual(request.get_header("Authorization"), "Bearer token-never-printed")
+        self.assertEqual(json.loads(request.data), {
+            "context": control_audit.CONTROL_STATUS_CONTEXT,
+            "state": "success",
+            "description": control_audit.CONTROL_STATUS_DESCRIPTION,
+            "target_url": target_url,
+        })
+
+    def test_control_status_post_failure_has_only_the_fixed_reason(self):
+        from unittest.mock import Mock
+        opener = Mock()
+        opener.open.side_effect = OSError("secret-bearing API error")
+        api = type("API", (), {"_token": "token-never-printed", "_opener": opener})()
+        with self.assertRaisesRegex(control_audit.ControlAuditRefusal, "status-post"):
+            control_audit.post_control_status(api, self.identity)
+
+    def test_audit_refusal_never_posts_the_control_status(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        identity = dict(self.identity, ref="refs/heads/devlane/d211-1110")
+        output = StringIO()
+        with patch.object(control_audit, "control_identity", return_value=identity), \
+                patch.object(control_audit, "GitHubAPI", return_value=object()), \
+                patch.object(control_audit, "run_audit", side_effect=control_audit.ControlAuditRefusal("job-graph")), \
+                patch.object(control_audit, "post_control_status") as post, \
+                patch.dict("os.environ", {"GITHUB_TOKEN": "x"}, clear=False), \
+                redirect_stdout(output):
+            self.assertEqual(control_audit.main(), 1)
+        post.assert_not_called()
+        self.assertEqual(output.getvalue(), "control_audit=refused stage=job-graph\n")
 
     def test_control_marker_and_synthetic_artifact_are_bound(self):
         log = (
@@ -1360,12 +1441,18 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
         self.assertEqual(control_audit.SOURCE_FREE_BRANCH_REF.pattern, expression[1:-1] + r"\Z")
 
     def test_control_and_lane_workflows_request_no_write_permission(self):
-        for relative in ("public-policy.yml", "devlane-synthetic.yml", "devlane-encrypted.yml", "node-lock-smoke.yml",
+        for relative in ("devlane-synthetic.yml", "devlane-encrypted.yml", "node-lock-smoke.yml",
                          "linux-confinement.yml", "windows-confinement.yml", "windows-handoff-synthetic.yml",
                          "development-feedback-smoke.yml"):
             with self.subTest(workflow=relative):
                 self.assertIsNone(re.search(r"(?m)^\s+[a-z-]+: write\s*$", self._workflow(relative)))
-        self.assertIn("actions: read", self._workflow("public-policy.yml"))
+        control = self._workflow("public-policy.yml")
+        control_job = control.split("  control-audit:\n", 1)[1]
+        self.assertRegex(control_job, r"(?m)^      actions: read$")
+        self.assertRegex(control_job, r"(?m)^      checks: read$")
+        self.assertRegex(control_job, r"(?m)^      statuses: write$")
+        self.assertNotRegex(control.split("  control-audit:\n", 1)[0], r"(?m)^\s+[a-z-]+: write$")
+        self.assertEqual(control.count("statuses: write"), 1)
 
     def test_the_acceptance_step_runs_the_rehearsal_builders(self):
         self.assertIn("kit/devlane/test_rehearsal.py", self._workflow("devlane-synthetic.yml"))

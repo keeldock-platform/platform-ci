@@ -1,10 +1,12 @@
 """Terminal control-wave audit for the exact 18-job graph."""
 
+import json
 import os
 import re
 import sys
 from pathlib import Path
 from urllib.parse import urlsplit
+import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "confinement"))
 
@@ -18,6 +20,9 @@ REPOSITORY_ID = 1430960557
 WORKFLOW_PATH = ".github/workflows/public-policy.yml"
 CONTROL_RUNNERS = ("ubuntu-24.04", "macos-15", "windows-2025")
 RUN_JOB = "control-audit"
+CONTROL_STATUS_CONTEXT = "keeldock/control-verified"
+CONTROL_STATUS_DESCRIPTION = "18-job source-free control verified"
+CONTROL_STATUS_CREATOR = "github-actions[bot]"
 SYNTHETIC_JOB = "devlane-synthetic / devlane-synthetic"
 MAX_MACOS_CAPACITY_NOTICES = 64
 CONTROL_JOB_NAMES = frozenset(
@@ -135,7 +140,7 @@ def _validate_child_steps(name, job, *, require_main=True):
 class ControlAuditRefusal(ValueError):
     STAGES = frozenset({
         "control-graph", "identity", "run-record", "job-graph", "synthetic-log",
-        "policy-marker", "artifacts", "check-runs", "internal",
+        "policy-marker", "artifacts", "check-runs", "status-post", "internal",
     })
 
     def __init__(self, stage="control-graph"):
@@ -476,15 +481,74 @@ def run_audit(api, identity):
         _under_stage("check-runs", check_job)
 
 
+def post_control_status(api, identity):
+    target_url = "https://github.com/" + REPOSITORY + "/actions/runs/" + identity["run_id"]
+    payload = json.dumps({
+        "context": CONTROL_STATUS_CONTEXT,
+        "state": "success",
+        "description": CONTROL_STATUS_DESCRIPTION,
+        "target_url": target_url,
+    }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.github.com/repos/" + REPOSITORY + "/statuses/" + identity["control_sha"],
+        data=payload,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": "Bearer " + api._token,
+            "Content-Type": "application/json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "public-control-audit",
+            "Accept-Encoding": "identity",
+        },
+        method="POST",
+    )
+    try:
+        response = api._opener.open(request, timeout=30)
+    except Exception:
+        _refuse("status-post")
+    try:
+        if response.status != 201:
+            _refuse("status-post")
+        content_type = response.headers.get_content_type()
+        if content_type != "application/json" or response.headers.get("Content-Encoding", "identity").lower() != "identity":
+            _refuse("status-post")
+        raw = response.read(64 * 1024 + 1)
+        if len(raw) > 64 * 1024:
+            _refuse("status-post")
+    except ControlAuditRefusal:
+        raise
+    except Exception:
+        _refuse("status-post")
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
+    status_url = "https://api.github.com/repos/" + REPOSITORY + "/statuses/" + identity["control_sha"]
+    try:
+        result = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        _refuse("status-post")
+    creator = result.get("creator") if type(result) is dict else None
+    if (type(result) is not dict or result.get("url") != status_url
+            or result.get("context") != CONTROL_STATUS_CONTEXT or result.get("state") != "success"
+            or result.get("description") != CONTROL_STATUS_DESCRIPTION or result.get("target_url") != target_url
+            or type(creator) is not dict or creator.get("login") != CONTROL_STATUS_CREATOR
+            or creator.get("type") != "Bot"):
+        _refuse("status-post")
+
+
 def main():
     try:
         identity = _under_stage("identity", control_identity, os.environ)
-        run_audit(GitHubAPI(os.environ["GITHUB_TOKEN"]), identity)
+        api = GitHubAPI(os.environ["GITHUB_TOKEN"])
+        run_audit(api, identity)
         if identity["ref"] == "refs/heads/main":
             evidence_path = os.environ.get("DEVLANE_CONTROL_EVIDENCE_PATH")
             if type(evidence_path) is not str or not evidence_path:
                 _refuse()
             permit.create_control(evidence_path, identity["control_sha"], identity["run_id"], identity["ref"])
+        post_control_status(api, identity)
         print("control_audit=accepted jobs=18 synthetic_artifacts=1")
         return 0
     except ControlAuditRefusal as error:

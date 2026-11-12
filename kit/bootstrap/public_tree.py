@@ -383,7 +383,7 @@ PINNED_FILE_SHA256 = {
     '.gitattributes': '0f2d6e841d5533b577f130d4865e5e6b68f24f3a2325c4bfa2ece6b943b4edbc',
     'kit/devlane/test_rehearsal.py': '195e3a22ce039019e4137601a8353d8824c83f538bbc1e75234610cb052b02b1',
     'kit/devlane/rehearsal.py': 'a74dc59bd09d695cab40115ff21b85950dbe64c8f8b71ea0eeff2d83a657cb98',
-    'docs/devlane-procedure.md': 'de527975be7ed7cdd7fd4990d43d347babd254ce3934023d5d0f645c31f30a97',
+    'docs/devlane-procedure.md': '834b24da09e7aaa3d672a71b7225cf7690a3c8838caef98102fb2719e7ed8122',
     '.github/workflows/appium-ci.yml': '961eaa4fc03e0fe687fa437673116e68479af9437dcb69173444ec57098db2d3',
     '.github/workflows/baselines-prepare.yml': '2df5141dca9ad0e5067c0bfa258f0feca5ebf46c451a5e7ec34562159683aa0f',
     '.github/workflows/capsule-vectors.yml': '7366acdb58988c5675e86268abe268e71f71bc16681ab560ba8e33f37fc9f9f7',
@@ -412,7 +412,10 @@ PINNED_FILE_SHA256 = {
     'core-ci/linux_quick_return.py': 'b711e81a2779d891cbba6d11becfe07d730331acc71c7ed2a9841f41439b5fd8',
     'core-ci/test_linux_quick_return.py': 'f6653e9db604a7a3a2213c285ab30567f8c39d46632b1650e4a15c4d8ee8b634',
     'core-ci/test_separation.py': 'e7ff85c8f45a7ecd03f98f72c4123018a5d39847fcb49442fbdf7f9225d9cb3b',
-    'docs/branch-promotion.md': '95f6a46129ff306e0138aca15feaabba3d830495b4c98cf0a1feb6821fdb0b0f',
+    'docs/branch-promotion.md': '1a1ab7145e8851de28ca79e0ade137c2c67680f48c41e868ad63baf1757f1c7b',
+    ('platform', '.github/workflows/public-policy.yml'): '856a1a8ee635e5f31a28e82af68b8693967e6bf0acd284ac41acc32972218e3a',
+    'kit/bootstrap/policy.py': '4c1b248cdcca11ed52049ad02e8d75892571a5482c20e1f3d8a6eea99cc73481',
+    'kit/bootstrap/test_policy.py': '61ae5bc9e1c6ac7674d228e45c52ce10df045adcdae333a947ea65187d65bad2',
     'kit/baselines/baselines_prepare.py': 'bc9e58d9b96c5c3941f1735626e5da9c4ccbfdc1e748a70c198a38d5c811bb98',
     'kit/baselines/test_baselines_prepare.py': '76dda4abf5b311b4cfac3eeced6a28dcad12e6870a36861d31d333b51c0910ab',
     'kit/bootstrap/action.yml': '236745bfd3f0cc3aa8ea6b71c7e647044d4149142d8e68fe57710a86ef325d04',
@@ -422,13 +425,13 @@ PINNED_FILE_SHA256 = {
     'kit/bootstrap/policy_linux.py': '0b314a645e43f2aaec58ca23150386b5865e8a27c3101459d00d42370e7d5a5f',
     'kit/bootstrap/policy_npm.py': 'b110b4573b2919003792e05bdcec60a0108f9e2ea1ebc1ce820ff77216271794',
     'kit/bootstrap/policy_rust.py': '4306a55701a5a04c884b2b21091a6d06307134e3570f0d5d65cb103ff84023ec',
-    'kit/bootstrap/public_tree.py': 'f29bf869221587dcb8d1a42ae3f7a966b05352a8b0d024a2eb86e8e50ee2875f',
+    'kit/bootstrap/public_tree.py': '20d84a6333af125c95108380aadaea20d560cbec380fc1c80a7cc8178dc653c0',
     'kit/bootstrap/test_policy_baselines.py': '690980cc3a140970d2b813d854823e3e9f32d8b09db9e25c0ca143140c3af627',
     'kit/bootstrap/test_policy_handoff.py': '3cf707fec6cc1a62e49a948b496fe00765a04ec171fd4cdc57b07d214d3100a2',
     'kit/bootstrap/test_policy_linux.py': 'f1c62480d608d680e73cdbf0ca8b7c83552919bd5de4caa095d5e04e8c3e5f8c',
     'kit/bootstrap/test_policy_npm.py': '8893c4a89ab447a8813806afd2b35bbedbc78d530f1c5a1c8bdf67fc55865eed',
     'kit/bootstrap/test_policy_rust.py': '2465451eb33dec7787807d27ae9ef574b7447a52953c2c3f1951003243b6294a',
-    'kit/bootstrap/test_public_tree.py': '4cb283d2b4afc7a2560cf46cdcc66edf6ecb711dda47029b14dbcd6ed391e557',
+    'kit/bootstrap/test_public_tree.py': '465d8bfa7514b7fc7f9f5cc19e65fa7491f05b51e312cc61de1b8823604a40e8',
     'kit/ci/feature_states.py': 'e058de49cf9e96b61e8037ee533a095082f3210429586d4183d6c44c4f57d479',
     'kit/ci/future-stage-inventory.json': '185663fbc7c94b010dc4c74f7e6867898b5186a0d88acb95e61414f15cb695aa',
     'kit/ci/future_stage.py': '11023901b556599b0f5f747b84ed540c45eae5a2d2ad65ea3a1ba95f81775d41',
@@ -547,7 +550,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_linux_boundary.py': '360059febee2441715457093640d7d3ef5f3be3d46e2198bd4fec19fe933f23f',
     'kit/confinement/test_linux_channels.py': 'bddad18cd3fbc9ad9290004d56c08976dfd7e309e5cc32e30483d1aa15fa5adc',
     'kit/confinement/test_linux_session.py': '4905cf0c27e7bc3e302abe714a02cd08de6512b65061357f6d371792ab61129b',
-    'kit/confinement/test_linux_source_build.py': 'f39d3ad1b4e57e6aba57435b7be08ce23d3ebb6616bf5d132eccdc493c91d098',
+    'kit/confinement/test_linux_source_build.py': 'db4c1258700a2f845525da00b05ab591913566a6dcf370010da4555ed402b9a6',
     'kit/confinement/test_linux_source_build_tiers.py': 'a14ac0ebc3be6eeb9aba172ff1099a7cc37b010ae6eeaaa762056bc1001bc32a',
     'kit/confinement/test_macos_core_bootstrap.py': '69ab67960a31e4a298c8136f7492b7c5c84ea80b855fd5c2be0726d1125f7115',
     'kit/confinement/test_macos_core_contract.py': '912b587088bd3a83c2c57201994da53aa961e25dd4bdd7ca97ec506c6a297470',
@@ -580,7 +583,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/windows_source_run.ps1': '2b37591c61db5394dce725e15546df0dff466d3f2d28d529aa91e2329ee50eb6',
     'kit/devlane/__init__.py': 'e19ad6f4a13d793137d6cffdba831912e2e7da6c739bc538dcfce9f3171a704f',
     'kit/devlane/bundle.py': '1af0ed2e76fcf738170667e578d0c5976fab5ac39fed63f7d2eb850466806575',
-    'kit/devlane/control_audit.py': 'e7e40bd6e57037ca7bdcea47d3841a058dda5d0669db0bd79b39f1812e0f947a',
+    'kit/devlane/control_audit.py': '9785cbb3cc7ce15313eed358df07520186ea4c5335af3e2e3bea84956a2b2274',
     'kit/devlane/coordinator.py': '7a0a0ec25fb7ffa8387ae7e654b969470f8f7a8e2927ec139b8c6a559bddf528',
     'kit/devlane/decrypt_once.py': '664f91b548f5ba7265d77c88b9c6d723fc1068ca7c3701b93cf9cf9960682552',
     'kit/devlane/acceptance_diagnostics.py': '57f8212ff066a891cc8c07415793178b5d594c8bbf9bda95063c43d943ce174a',
@@ -614,7 +617,7 @@ PINNED_FILE_SHA256 = {
     'kit/devlane/supervisor.py': '39bbb7531373412bf45833d833a5355abe2ce3c49a420b47456fce5c6fb5f236',
     'kit/devlane/test_acceptance.py': '446a2886912e061f3a9e3b0bd19bb15f032a7a2c82a599dc5aca3690f8c8e120',
     'kit/devlane/test_adapters.mjs': '55362b48bc9d4642df26d5ca58641aa30956d46487429a786964d17ad054497d',
-    'kit/devlane/test_audit_contracts.py': '8d0376ed1814caf81f46ed5fb64974b1c63b9d21e34efe0e73338afb0c14048e',
+    'kit/devlane/test_audit_contracts.py': '9ef7bd17e449bb009b2664380daacf081c1b7a8eebe3143caede21189f3bf325',
     'kit/devlane/fixtures/control-synthetic-43245798187.log.hex': 'b53f89bbf7e668540103432e5de9fe042464850b3fa04a9ab6d366f04310c0bd',
     'kit/devlane/test_coordinator.py': 'e4a33ee4da1ba16ec84330c6aa70b9af60c69ad537a86cc832bdbea50947711f',
     'kit/devlane/test_e2e.py': 'fba5a11bc0deefe74fb9d1c9637a04a70441abcd016505f061a2d9a327b52692',
@@ -632,8 +635,8 @@ PINNED_FILE_SHA256 = {
     'kit/handoff/provider_requirements.txt': 'c812f3c3f036921e86568feaa3bc934040b68f3d743072cefce8ea758bd56150',
     'kit/handoff/source_capsule.py': 'a1369abb354f0723bd3cfc3209aa15c4769bfb113b2fe6369023c7f95e4546ac',
     'kit/handoff/test_source_capsule.py': '6ea11945a8e08040b78faa4d4861abdd600901ed048abe22a2edfc3b97bfcd57',
-    'kit/promotion/branch_promotion.py': '702a80a39fd63c04281b825894e532664d5c2ad403fd0be36e63c3ae0b92ae93',
-    'kit/promotion/test_branch_promotion.py': '9ac5eb12623bed68124e09ca22b80a21d7a401584926dac49564a670f147e4ec',
+    'kit/promotion/branch_promotion.py': '26386626323326183cc381ccbf84d29e856a3bce8ba963d7fc66c1fbd9bee3f2',
+    'kit/promotion/test_branch_promotion.py': '99ca63d8e84f8a36c578220382d20bea7933c3dabe1a8d46301d32eb9cac787a',
     'kit/selector/ci19_catalogue.py': '7fe71cbf6307035d9351ab417951baeb12b39eb860a121077f55a1a70002df71',
     'kit/selector/fixtures/ci19_mcp_feature_owners.json': '69124b6f86729cac26478957d5430346dad9fedf4f98c8cb677536d66f5bf306',
     'kit/selector/suite_selector.py': '6c9a497566179ae7169717d2d58b6ae9239ed6ff4573de493b8cad55cab8a4fa',
@@ -955,7 +958,7 @@ def scan_tree(root, pool):
             raise PublicTreeError("file-unreadable")
         if len(payload) > MAX_FILE_BYTES:
             raise PublicTreeError("file-too-large")
-        expected_hash = PINNED_FILE_SHA256.get(relative)
+        expected_hash = PINNED_FILE_SHA256.get((pool, relative), PINNED_FILE_SHA256.get(relative))
         if relative in BINARY_FIXTURE_FILES:
             if expected_hash is None or _pinned_file_hash(relative, payload) != expected_hash:
                 raise PublicTreeError("file-hash-mismatch")

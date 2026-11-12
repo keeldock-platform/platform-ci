@@ -10,11 +10,12 @@ This is the committed procedure for running the encrypted public dev lane. It is
 - Revoking the key as soon as the decrypt step concludes is mandatory and timed (step 8). A wave whose revocation missed the limit is recorded as late and reviewed before the next wave.
 - A coordinator `finally` block and its watcher run only while that process and host remain alive. Process kill, interpreter failure or host loss can leave a secret installed. Before any later wave, run `recover-pending-secrets`, verify it completes, and resolve every open wave. This recovery is durable and resumable; it cannot guarantee revocation within 120 seconds during process, host or API loss.
 - Keep `record-control-evidence` mandatory (step 1). Any job running on `main` can write an Actions cache entry named like control evidence, so the cache entry alone is never trusted; the coordinator re-reads the real control run, its 18 jobs and the single matching cache entry.
+- GitHub does not count check runs created by `workflow_dispatch` toward required status checks. After it accepts the full 18-job graph, `control-audit` posts one `keeldock/control-verified` success status on the exact control SHA, with the run URL as its target. The promotion tool checks that newest status and independently checks every latest 18-job control attempt. The status API record exposes `creator.login` as `github-actions[bot]` and its context; the endpoint is scoped to the SHA in its request path and has no app field. Branch rules pin the context to GitHub Actions app ID `15368`.
 - Outputs are drafts until reviewed. Do not use a private wave result for a business decision before the rehearsal below has passed on the exact commit.
 
 **One-time GitHub setup (owner)**
 
-1. Branch rules and the order in which to apply them are in `docs/branch-promotion.md`. They must be complete, with the control green on `main` at the commit you intend to use.
+1. For `develop`, `uat` and `main`, set the required status check to exactly `keeldock/control-verified` and pin it to GitHub Actions app ID `15368`. Keep linear history required, block force pushes, and block branch deletion. GitHub ignores the 18 `workflow_dispatch` check runs as required checks, so the accepted control status is the branch-protection gate. Then fast-forward with `kit/promotion/branch_promotion.py` as described in `docs/branch-promotion.md`. The promotion tool verifies all 18 control check runs and the latest gate status on the exact SHA before it advances a branch. The control must be accepted on `main` at the commit you intend to use.
 2. Create the decryption environment. It admits only `main`, gives administrators no bypass of that rule (`can_admins_bypass` is false) and has no reviewers, no wait timer, no variables and no secrets until a wave installs one. A reviewer gate or a wait timer would hold a run while the key is installed, so neither is allowed.
 
    ```sh
@@ -57,7 +58,7 @@ test "$CONTROL_SHA" = "$REMOTE_MAIN_SHA"
 
 **Wave sequence (rehearsal and private waves are identical except where marked)**
 
-1. Run the source-free control on `main` at the exact commit, with a fresh opaque control wave identifier. The coordinator verifies remote `main`, records one dispatch interval before calling GitHub, issues exactly one dispatch, and polls complete paginated inventories for the exact `public control=<CONTROL_WAVE_ID>` title and canonical run identity. Zero results are polled until the persisted deadline; API refusal, incomplete inventory or multiple matches stops the operation. It never dispatches again.
+1. Run the source-free control on `main` at the exact commit, with a fresh opaque control wave identifier. After the audit accepts the 18-job graph, the workflow posts its one success status on that SHA. The coordinator verifies remote `main`, records one dispatch interval before calling GitHub, issues exactly one dispatch, and polls complete paginated inventories for the exact `public control=<CONTROL_WAVE_ID>` title and canonical run identity. Zero results are polled until the persisted deadline; API refusal, incomplete inventory or multiple matches stops the operation. It never dispatches again.
 
    ```sh
    (

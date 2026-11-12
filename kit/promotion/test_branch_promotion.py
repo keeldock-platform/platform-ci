@@ -19,7 +19,7 @@ WORKFLOW_CHECK_JOBS = {
         "windows-handoff-synthetic", "development-feedback-smoke", "devlane-synthetic", "control-audit",
     ),
 }
-EXPECTED_REQUIRED_CONTEXTS = frozenset((
+EXPECTED_CONTROL_CHECK_CONTEXTS = frozenset((
     "policy-ubuntu-24.04",
     "policy-macos-15",
     "policy-windows-2025",
@@ -39,6 +39,7 @@ EXPECTED_REQUIRED_CONTEXTS = frozenset((
     "devlane-synthetic / devlane-synthetic",
     "control-audit",
 ))
+EXPECTED_REQUIRED_CONTEXTS = frozenset(("keeldock/control-verified",))
 BASH_REF_GATE = re.compile(
     r"^[ \t]*\[\[\s*(?P<negate>!\s*)?\"\$CI_REF\"\s*=~\s*(?P<pattern>[^\s]+)\s*\]\][ \t]*$"
 )
@@ -400,6 +401,12 @@ class BranchPromotionTests(unittest.TestCase):
     def test_promotion_reuses_only_prior_green_checks_for_the_exact_sha(self):
         sha = "a" * 40
         contexts = branch_promotion.WORKFLOW_CHECKS["public-policy"]
+        gate_status = {
+            "id": 900, "context": branch_promotion.CONTROL_STATUS_CONTEXT,
+            "state": "success", "creator": {"login": branch_promotion.CONTROL_STATUS_CREATOR, "type": "Bot"},
+            "url": "https://api.github.com/repos/" + "keeldock" + "-platform/platform-ci/statuses/" + sha,
+            "target_url": "https://github.com/" + "keeldock" + "-platform/platform-ci/actions/runs/99",
+        }
         runs = [
             {"name": context, "status": "completed", "conclusion": "success",
              "head_sha": sha, "created_at": "2026-11-08T10:00:00Z",
@@ -424,7 +431,7 @@ class BranchPromotionTests(unittest.TestCase):
         })
         payloads = [
             [{"check_runs": runs}],
-            [[]],
+            [[gate_status]],
         ]
         with patch.object(branch_promotion, "_api_json", side_effect=payloads) as api:
             self.assertFalse(branch_promotion.promotion_checks_reusable(
@@ -445,7 +452,7 @@ class BranchPromotionTests(unittest.TestCase):
         }]
         with patch.object(
             branch_promotion, "_api_json",
-            side_effect=[[{"check_runs": successful_retry}], [[]]],
+            side_effect=[[{"check_runs": successful_retry}], [[gate_status]]],
         ):
             self.assertTrue(branch_promotion.promotion_checks_reusable(
                 "public-policy", "uat", sha, "keeldock-platform/platform-ci", "200",
@@ -460,18 +467,37 @@ class BranchPromotionTests(unittest.TestCase):
         }]
         with patch.object(
             branch_promotion, "_api_json",
-            side_effect=[[{"check_runs": failed_then_skipped}], [[]]],
+            side_effect=[[{"check_runs": failed_then_skipped}], [[gate_status]]],
         ):
             self.assertFalse(branch_promotion.promotion_checks_reusable(
                 "public-policy", "main", sha,
                 "keeldock-platform/platform-ci", "200",
             ))
 
-        with patch.object(branch_promotion, "_api_json", side_effect=[[{"check_runs": runs[:-1]}], [[]]]):
+        with patch.object(branch_promotion, "_api_json", side_effect=[[{"check_runs": runs[:-1]}], [[gate_status]]]):
             self.assertFalse(branch_promotion.promotion_checks_reusable(
                 "public-policy", "main", "b" * 40,
                 "keeldock-platform/platform-ci", "200",
             ))
+
+    def test_control_gate_requires_the_newest_actions_status_to_be_success(self):
+        sha = "a" * 40
+        required = {branch_promotion.CONTROL_STATUS_CONTEXT: branch_promotion.GITHUB_ACTIONS_APP_ID}
+        success = {
+            "id": 10, "context": branch_promotion.CONTROL_STATUS_CONTEXT, "state": "success",
+            "creator": {"login": branch_promotion.CONTROL_STATUS_CREATOR, "type": "Bot"},
+            "url": "https://api.github.com/repos/" + "keeldock" + "-platform/platform-ci/statuses/" + sha,
+        }
+        self.assertTrue(branch_promotion.green_required_checks(required, [], [success], sha))
+        newer_failure = dict(success, id=11, state="failure")
+        with self.assertRaisesRegex(branch_promotion.PromotionRefusal, "check"):
+            branch_promotion.green_required_checks(required, [], [success, newer_failure], sha)
+        other_creator = dict(success, creator={"login": "octocat", "type": "User"})
+        with self.assertRaisesRegex(branch_promotion.PromotionRefusal, "check"):
+            branch_promotion.green_required_checks(required, [], [other_creator], sha)
+        wrong_sha = dict(success, sha="b" * 40)
+        with self.assertRaisesRegex(branch_promotion.PromotionRefusal, "check"):
+            branch_promotion.green_required_checks(required, [], [wrong_sha], sha)
 
     def test_promotion_control_is_manual_on_protected_branches(self):
         contexts = tuple(
@@ -480,7 +506,9 @@ class BranchPromotionTests(unittest.TestCase):
             for context in workflow_contexts
         )
         self.assertEqual(len(contexts), 18)
-        self.assertEqual(set(contexts), EXPECTED_REQUIRED_CONTEXTS)
+        self.assertEqual(set(contexts), EXPECTED_CONTROL_CHECK_CONTEXTS)
+        self.assertEqual(branch_promotion.control_contexts(), EXPECTED_REQUIRED_CONTEXTS)
+        self.assertEqual(len(branch_promotion.control_contexts()), 1)
         workflow = (ROOT / ".github/workflows/public-policy.yml").read_text(encoding="utf-8")
         self.assertIn("on:\n  workflow_dispatch:", workflow)
         self.assertNotIn("  pull_request:\n", workflow)
@@ -596,13 +624,10 @@ class BranchPromotionTests(unittest.TestCase):
         full = {context: branch_promotion.GITHUB_ACTIONS_APP_ID for context in EXPECTED_REQUIRED_CONTEXTS}
         self.assertTrue(branch_promotion.required_checks_satisfiable_before_merge(full))
         self.assertFalse(branch_promotion.required_checks_satisfiable_before_merge({**full, "extra-required-check": None}))
-        self.assertFalse(branch_promotion.required_checks_satisfiable_before_merge({**full, "control-audit": 1}))
+        self.assertFalse(branch_promotion.required_checks_satisfiable_before_merge({branch_promotion.CONTROL_STATUS_CONTEXT: 1}))
         self.assertFalse(branch_promotion.required_checks_satisfiable_before_merge({}))
         self.assertFalse(branch_promotion.required_checks_satisfiable_before_merge(
-            {key: value for key, value in list(full.items())[1:]}))
-        self.assertFalse(branch_promotion.required_checks_satisfiable_before_merge({**full, "control-audit": None}))
-        self.assertFalse(branch_promotion.required_checks_satisfiable_before_merge(
-            {**full, "control-audit": True}))
+            {branch_promotion.CONTROL_STATUS_CONTEXT: True}))
         self.assertFalse(branch_promotion.required_checks_satisfiable_before_merge(None))
         document = (ROOT / "docs/branch-promotion.md").read_text(encoding="utf-8")
         listed = set(re.findall(r"(?m)^   - `([^`]+)`$", document))
@@ -634,13 +659,11 @@ class BranchPromotionTests(unittest.TestCase):
     def test_promotion_refuses_an_unchecked_sha_before_attempting_a_push(self):
         sha = "a" * 40
         previous = "b" * 40
-        contexts = sorted(EXPECTED_REQUIRED_CONTEXTS)
+        contexts = sorted(EXPECTED_CONTROL_CHECK_CONTEXTS)
         protections = {
             "contexts": [],
-            "checks": [
-                {"context": context, "app_id": branch_promotion.GITHUB_ACTIONS_APP_ID}
-                for context in contexts
-            ],
+            "checks": [{"context": branch_promotion.CONTROL_STATUS_CONTEXT,
+                        "app_id": branch_promotion.GITHUB_ACTIONS_APP_ID}],
         }
         check_runs = [
             {
@@ -670,7 +693,11 @@ class BranchPromotionTests(unittest.TestCase):
             with patch.object(
                 branch_promotion,
                 "_api_json",
-                side_effect=(protections, protections, [{"check_runs": check_runs}], [[]]),
+                side_effect=(protections, protections, [{"check_runs": check_runs}], [[{
+                    "id": 999, "context": branch_promotion.CONTROL_STATUS_CONTEXT, "sha": sha,
+                    "state": "success", "creator": {"login": branch_promotion.CONTROL_STATUS_CREATOR, "type": "Bot"},
+                    "url": "https://api.github.com/repos/" + "keeldock" + "-platform/platform-ci/statuses/" + sha,
+                }]]),
             ) as api:
                 with patch.object(
                     branch_promotion.subprocess,

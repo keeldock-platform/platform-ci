@@ -466,9 +466,10 @@ class PublicTreeTests(unittest.TestCase):
         self.assertIn("Require status checks to pass", rules)
         self.assertIn("15368", rules)
         self.assertNotIn("promotion-check-reuse", rules)
-        self.assertIn("a manual dispatch is accepted from any branch", rules)
-        self.assertIn("One-time migration order", rules)
-        self.assertIn("does not modify GitHub branch protection", rules)
+        self.assertIn("manual dispatch", rules)
+        self.assertIn("any branch ref", rules)
+        self.assertIn("One-time branch-rule setup", rules)
+        self.assertIn("changes no GitHub settings", rules)
         action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
         self.assertIn('discover -s "$CI_ACTION_PATH/../promotion" -p "test_*.py"', action)
 
@@ -647,7 +648,7 @@ class PublicTreeTests(unittest.TestCase):
             for name in PLATFORM_FILES:
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
-                if name in PINNED_FILE_SHA256:
+                if name in PINNED_FILE_SHA256 or ("platform", name) in PINNED_FILE_SHA256:
                     shutil.copyfile(ROOT / name, path)
                 else:
                     path.write_text("safe\n", encoding="utf-8")
@@ -715,10 +716,13 @@ class PublicTreeTests(unittest.TestCase):
     def test_reviewed_native_and_source_controls_have_public_tree_hash_pins(self):
         expected = {
             '.github/workflows/core-dependency-checks.yml',
+            ('platform', '.github/workflows/public-policy.yml'),
             'docs/branch-promotion.md',
             '.github/workflows/linux-source-admission.yml',
             'kit/bootstrap/action.yml',
+            'kit/bootstrap/policy.py',
             'kit/bootstrap/public_tree.py',
+            'kit/bootstrap/test_policy.py',
             '.github/workflows/core-rust-format-return.yml',
             '.github/workflows/core-build-diagnostic-return.yml',
             '.github/workflows/windows-source-admission.yml',
@@ -1009,7 +1013,8 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/typescript_reporter.mjs',
         })
         self.assertEqual(set(PINNED_FILE_SHA256), expected)
-        self.assertTrue(expected.issubset(PLATFORM_FILES))
+        self.assertTrue({name for name in expected if type(name) is str}.issubset(PLATFORM_FILES))
+        self.assertIn(("platform", ".github/workflows/public-policy.yml"), expected)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             for name in PLATFORM_FILES:

@@ -217,6 +217,7 @@ jobs:
     permissions:
       actions: read
       checks: read
+      statuses: write
     env:
       CI_REPOSITORY: ${{ github.repository }}
       CI_REPOSITORY_ID: ${{ github.repository_id }}
