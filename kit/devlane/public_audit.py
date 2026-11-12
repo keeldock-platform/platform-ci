@@ -83,6 +83,7 @@ TEMP = RUNNER_HOME + "/work/_temp"
 HOSTED_TOOL_CACHE = "/opt/hostedtoolcache/node/24.22.1/x64"
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 LOG_MARKER = chr(35) * 2
+ANSI_SGR = (b"\x1b[0m", b"\x1b[36;1m")
 PROVIDER_GROUPS = frozenset((
     "Runner Image Provisioner", "Operating System", "Runner Image", "GITHUB_TOKEN Permissions", "Secret source",
 ))
@@ -233,6 +234,7 @@ class _Grammar:
         if self.environment != (DECRYPT_ENVIRONMENT if kind == "encrypted" and job_key == RUN_JOB else None):
             _refuse()
         self.steps = self.job["steps"]
+        self.job_key = job_key
         if kind == "encrypted" and any(
                 step["uses"] and step["uses"].startswith("actions/setup-node@") for step in self.steps):
             _refuse()
@@ -249,6 +251,13 @@ class _Grammar:
                 self.headers.setdefault(LOG_MARKER + "[group]Run " + step["uses"], set()).add(step["name"])
         self.post = {"Post " + step["name"]: step for step in self.steps if step["uses"]
                      and step["uses"].startswith("actions/setup-node@")}
+
+    def expected_env_names(self, step):
+        names = set(self.job["env"]) | set(step["env"])
+        if (self.kind == "encrypted" and self.job_key == RUN_JOB
+                and step["name"] != self.names[0]):
+            names = names | {"RUN_ROOT"}
+        return names
 
     def env_value_ok(self, name, value):
         identity, kind = self.identity, self.kind
@@ -284,6 +293,10 @@ class _Grammar:
         return False
 
     def with_value_ok(self, step, key, value):
+        if key == "token" and (step["uses"] or "").startswith("actions/setup-node@"):
+            return value == "***"
+        if (step["uses"] or "").startswith("actions/cache/") and key in ("enableCrossOsArchive", "lookup-only"):
+            return value == "false"
         declared = step["with"].get(key)
         if declared is None:
             return False
@@ -297,6 +310,8 @@ class _Grammar:
                 and value == TEMP + suffix
         if key == "key":
             return value == self.expected_cache_key(step)
+        if key == "token" and "github.token" in declared:
+            return value == "***"
         return False
 
     def expected_cache_key(self, step):
@@ -346,6 +361,10 @@ class _Grammar:
             "Run full source-free production-path acceptance": {"devlane_acceptance=pass"},
             "Probe the loopback-only Linux network boundary": {"devlane_linux_probe=pass"},
         }.get(step_name, set())
+        if step_name == "Install pinned Rust toolchain":
+            exact = exact | {"rust_matrix_fixture=loaded committed_locks=3 matrix_coverage_ids=23"}
+        if step_name == "Install fixed Rust acceptance toolchain":
+            exact = exact | {"rust_matrix_fixture=loaded committed_locks=3 matrix_coverage_ids=23"}
         if step_name == "Prepare dependencies before the cut" and self.identity.get("profile") == "core-rust":
             exact = exact | {"rust_offline_tools=installed"}
         if (step_name == "Prepare hosted Linux isolation state" and self.kind == "encrypted"
@@ -457,6 +476,383 @@ def validate_summary_records(record_lines, profile):
         _refuse()
 
 
+def _hosted_preamble(lines, grammar, job_name, identity, workflow_path):
+    """Validate the setup text and runner metadata emitted by a real GitHub job log."""
+    index = 0
+
+    def take():
+        nonlocal index
+        if index >= len(lines):
+            _refuse()
+        value = lines[index]
+        index += 1
+        return value
+
+    if not re.fullmatch(r"Current runner version: '[0-9]+\.[0-9]+\.[0-9]+'", take()):
+        _refuse()
+
+    def group(name):
+        if take() != LOG_MARKER + "[group]" + name:
+            _refuse()
+        values = []
+        while index < len(lines) and lines[index] != LOG_MARKER + "[endgroup]":
+            if lines[index].startswith(LOG_MARKER + "["):
+                _refuse()
+            values.append(take())
+        if take() != LOG_MARKER + "[endgroup]":
+            _refuse()
+        return values
+
+    provisioner = group("Runner Image Provisioner")
+    provisioner_patterns = (
+        r"Hosted Compute Agent",
+        r"Version: [0-9]{8}\.[0-9]+",
+        r"Commit: [a-f0-9]{40}",
+        r"Build Date: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
+        r"Worker ID: \{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}",
+        r"Region: [a-z0-9-]{2,32}",
+        r"Cloud: (?:Azure|AWS|GCP)",
+    )
+    if len(provisioner) != len(provisioner_patterns) or any(
+            not re.fullmatch(pattern, value)
+            for pattern, value in zip(provisioner_patterns, provisioner)):
+        _refuse()
+
+    operating_system = group("Operating System")
+    if (len(operating_system) != 3 or operating_system[0] != "Ubuntu"
+            or not re.fullmatch(r"24\.04\.[0-9]+", operating_system[1])
+            or operating_system[2] != "LTS"):
+        _refuse()
+
+    runner_image = group("Runner Image")
+    image_patterns = (
+        r"Image: ubuntu-24\.04",
+        r"Version: [0-9]{8}\.[0-9]+\.[0-9]+",
+        r"Included Software: https://github\.com/actions/runner-images/blob/ubuntu24/[0-9]{8}\.[0-9]+/images/ubuntu/Ubuntu2404-Readme\.md",
+        r"Image Release: https://github\.com/actions/runner-images/releases/tag/ubuntu24%2F[0-9]{8}\.[0-9]+",
+    )
+    if len(runner_image) != len(image_patterns) or any(
+            not re.fullmatch(pattern, value)
+            for pattern, value in zip(image_patterns, runner_image)):
+        _refuse()
+    if group("GITHUB_TOKEN Permissions") != ["Metadata: read"]:
+        _refuse()
+
+    canonical = [LOG_MARKER + "[section]Starting: Set up job"]
+    for name, values in (
+            ("Runner Image Provisioner", provisioner),
+            ("Operating System", operating_system),
+            ("Runner Image", runner_image),
+            ("GITHUB_TOKEN Permissions", ["Metadata: read"])):
+        canonical.append(LOG_MARKER + "[group]" + name)
+        canonical.extend(value for value in values if not value.startswith("Worker ID:"))
+        canonical.append(LOG_MARKER + "[endgroup]")
+
+    environment_seen = False
+
+    def maybe_environment():
+        nonlocal environment_seen
+        if index < len(lines) and ENVIRONMENT_LINE.fullmatch(lines[index]):
+            environment = take()
+            if (environment_seen or grammar.environment is None or environment not in (
+                    "Environment: " + DECRYPT_ENVIRONMENT,
+                    "Deployment environment: " + DECRYPT_ENVIRONMENT)):
+                _refuse()
+            environment_seen = True
+            canonical.append(environment)
+
+    fixed_preamble = (
+        "Secret source: Actions",
+        "Prepare workflow directory",
+        "Prepare all required actions",
+        "Getting action download info",
+    )
+    maybe_environment()
+    if take() != fixed_preamble[0]:
+        _refuse()
+    canonical.append(fixed_preamble[0])
+    maybe_environment()
+    if index < len(lines) and lines[index] == "Cache mode: write":
+        canonical.append(take())
+    maybe_environment()
+    for expected in fixed_preamble[1:]:
+        maybe_environment()
+        if take() != expected:
+            _refuse()
+        canonical.append(expected)
+        maybe_environment()
+
+    expected_downloads = []
+    seen_actions = set()
+    for step in grammar.steps:
+        uses = step["uses"] or ""
+        if uses and not uses.startswith("./") and uses not in seen_actions:
+            seen_actions.add(uses)
+            action_path, separator, revision = uses.rpartition("@")
+            if not separator or not re.fullmatch(r"[a-f0-9]{40}", revision):
+                _refuse()
+            repository = "/".join(action_path.split("/")[:2]) + "@" + revision
+            if repository not in expected_downloads:
+                expected_downloads.append(repository)
+    expected_downloads = [
+        "Download action repository '%s' (SHA:%s)" % (repository, repository.rsplit("@", 1)[1])
+        for repository in expected_downloads
+    ]
+    for expected in expected_downloads:
+        maybe_environment()
+        if take() != expected:
+            _refuse()
+        canonical.append(expected)
+
+    expected_workflow = None
+    if grammar.kind == "synthetic":
+        expected_workflow = (
+            "Uses: keeldock-platform/platform-ci/%s@%s (%s)"
+            % (workflow_path, identity.get("ref"), identity.get("control_sha"))
+        )
+    maybe_environment()
+    if index < len(lines) and lines[index].startswith("Uses:"):
+        if expected_workflow is None or take() != expected_workflow:
+            _refuse()
+        canonical.append(expected_workflow)
+    elif expected_workflow is not None:
+        _refuse()
+
+    if grammar.kind == "synthetic":
+        expected_inputs = {"control_wave_id": identity.get("wave_id")}
+    else:
+        expected_inputs = {
+            "profile": identity.get("profile"),
+            "control_run_id": identity.get("control_run_id"),
+            "wave_id": identity.get("wave_id"),
+            "bundle_id": identity.get("bundle_id"),
+            "bundle_asset_id": None,
+            "bundle_sha256": None,
+            "bundle_size": None,
+            "projection_asset_id": None,
+            "projection_sha256": None,
+            "projection_size": None,
+            "expires": None,
+            "cache_baseline_sha256": identity.get("cache_baseline_sha256"),
+        }
+    maybe_environment()
+    if take() != LOG_MARKER + "[group] Inputs":
+        _refuse()
+    observed_inputs = {}
+    input_lines = []
+    while index < len(lines) and lines[index] != LOG_MARKER + "[endgroup]":
+        line = take()
+        if not line.startswith("  "):
+            _refuse()
+        key, separator, value = line[2:].partition(": ")
+        if not separator or key in observed_inputs or key not in expected_inputs:
+            _refuse()
+        expected = expected_inputs[key]
+        if expected is not None:
+            valid = value == str(expected)
+        elif key.endswith("_asset_id") or key.endswith("_size") or key == "expires":
+            valid = DECIMAL.fullmatch(value) is not None
+        elif key.endswith("_sha256"):
+            valid = SHA256.fullmatch(value) is not None
+        else:
+            valid = False
+        if not valid:
+            _refuse()
+        observed_inputs[key] = value
+        input_lines.append(line)
+    if take() != LOG_MARKER + "[endgroup]" or set(observed_inputs) != set(expected_inputs):
+        _refuse()
+    canonical.append(LOG_MARKER + "[group] Inputs")
+    canonical.extend(input_lines)
+    canonical.append(LOG_MARKER + "[endgroup]")
+
+    maybe_environment()
+    expected_job_name = ("devlane-synthetic / devlane-synthetic"
+                         if grammar.kind == "synthetic" else job_name)
+    job_line = take()
+    if job_line != "Complete job name: " + expected_job_name:
+        _refuse()
+    canonical.append(job_line)
+    maybe_environment()
+    if index >= len(lines) or not lines[index].startswith(LOG_MARKER + "[group]Run "):
+        _refuse()
+    canonical.append(LOG_MARKER + "[section]Finishing: Set up job")
+    return canonical, index
+
+
+def _parse_hosted_step_block(block, step, grammar):
+    run = step["run"]
+    expected_env = grammar.expected_env_names(step)
+    canonical = []
+    if run:
+        shell_options = (
+            "shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}",
+            "shell: /usr/bin/bash -e {0}",
+        )
+        shell_index = next((index for index, line in enumerate(block) if line in shell_options), None)
+        if shell_index is None:
+            _refuse()
+        script = [line for line in block[:shell_index] if line]
+        if script != run:
+            _refuse()
+        canonical.extend(run)
+        canonical.append(block[shell_index])
+        remainder = block[shell_index + 1:]
+        expected_with = {}
+    else:
+        if not step["uses"] or not block or block[0] != "with:":
+            _refuse()
+        canonical.append("with:")
+        remainder = block[1:]
+        expected_with = step["with"]
+
+    observed_with = {}
+    observed_env = {}
+    mode = None
+    for line in remainder:
+        if line == "env:":
+            if mode == "env":
+                _refuse()
+            mode = "env"
+            canonical.append(line)
+            continue
+        if not line.startswith("  "):
+            _refuse()
+        key, separator, value = line[2:].partition(": ")
+        if not separator:
+            _refuse()
+        if mode == "env":
+            if key in observed_env or key not in expected_env or not grammar.env_value_ok(key, value):
+                _refuse()
+            observed_env[key] = value
+        elif not run:
+            uses = step["uses"] or ""
+            implicit_input = (
+                key == "token" and uses.startswith("actions/setup-node@")
+                or key in ("enableCrossOsArchive", "lookup-only") and uses.startswith("actions/cache/")
+            )
+            if (key in observed_with or not implicit_input and key not in expected_with
+                    or not grammar.with_value_ok(step, key, value)):
+                _refuse()
+            observed_with[key] = value
+        else:
+            _refuse()
+        canonical.append(line)
+    if set(observed_env) != set(expected_env):
+        _refuse()
+    if not run:
+        required_with = {key for key, value in expected_with.items() if value != ""}
+        if not required_with <= set(observed_with):
+            _refuse()
+    return canonical
+
+
+def _canonicalize_github_hosted_log(text, grammar, job_name, identity, workflow_path):
+    lines = [TIME_PREFIX.sub("", line, count=1).rstrip() for line in text.splitlines()]
+    if len(lines) > 20_000 or any(len(line) > 16_384 for line in lines):
+        _refuse()
+    canonical, index = _hosted_preamble(lines, grammar, job_name, identity, workflow_path)
+    position = -1
+    post_output = []
+    cleanup_seen = False
+    while index < len(lines):
+        header = lines[index]
+        if not header.startswith(LOG_MARKER + "[group]Run "):
+            _refuse()
+        description = header[len(LOG_MARKER + "[group]Run "):]
+        index += 1
+        block = []
+        while index < len(lines) and lines[index] != LOG_MARKER + "[endgroup]":
+            if lines[index].startswith(LOG_MARKER + "[group]"):
+                _refuse()
+            block.append(lines[index])
+            index += 1
+        if index >= len(lines):
+            _refuse()
+        index += 1
+
+        matches = []
+        for candidate_index in range(position + 1, len(grammar.steps)):
+            step = grammar.steps[candidate_index]
+            uses = step["uses"] or ""
+            run = step["run"]
+            if ((uses and uses == description)
+                    or (run and run[0].strip() == description)):
+                matches.append((candidate_index, step))
+        if not matches:
+            _refuse()
+
+        parsed = None
+        step = None
+        for candidate_index, candidate in matches:
+            try:
+                parsed = _parse_hosted_step_block(block, candidate, grammar)
+                position, step = candidate_index, candidate
+                break
+            except AuditRefusal:
+                continue
+        if parsed is None or step is None:
+            _refuse()
+        canonical.extend((
+            LOG_MARKER + "[section]Starting: " + step["name"],
+            LOG_MARKER + "[group]Run " + description,
+        ))
+        canonical.extend(parsed)
+        canonical.append(LOG_MARKER + "[endgroup]")
+
+        output = []
+        while index < len(lines) and not lines[index].startswith(LOG_MARKER + "[group]Run "):
+            line = lines[index]
+            if line == "Cleaning up orphan processes":
+                cleanup_seen = True
+                index += 1
+                break
+            if line == "Post job cleanup.":
+                post_output.append(line)
+                index += 1
+                continue
+            if line == LOG_MARKER + "[group]Environment details":
+                index += 1
+                env_details = []
+                while index < len(lines) and lines[index] != LOG_MARKER + "[endgroup]":
+                    if lines[index].startswith(LOG_MARKER + "["):
+                        _refuse()
+                    env_details.append(lines[index])
+                    index += 1
+                expected_details = ["node: v24.22.1", "npm: 11.19.1", "yarn: 1.22.22"]
+                if index >= len(lines) or env_details != expected_details:
+                    _refuse()
+                output.extend(env_details)
+                index += 1
+                continue
+            if line.startswith(LOG_MARKER + "["):
+                _refuse()
+            output.append(line)
+            index += 1
+        canonical.extend(output)
+        canonical.append(LOG_MARKER + "[section]Finishing: " + step["name"])
+        if cleanup_seen:
+            break
+
+    if post_output:
+        if len(post_output) != 1 or not grammar.post:
+            _refuse()
+        post_name = next(iter(grammar.post))
+        canonical.extend((
+            LOG_MARKER + "[section]Starting: " + post_name,
+            post_output[0],
+            LOG_MARKER + "[section]Finishing: " + post_name,
+        ))
+    if not cleanup_seen or index != len(lines):
+        _refuse()
+    canonical.extend((
+        LOG_MARKER + "[section]Starting: Complete job",
+        "Cleaning up orphan processes",
+        LOG_MARKER + "[section]Finishing: Complete job",
+    ))
+    return "\n".join(canonical) + "\n"
+
+
 def validate_job_log_surface(log, job_name, identity, *, completed=True, workflow=None, failed_acceptance=False):
     """Closed contract for an encrypted-lane job log.
 
@@ -469,7 +865,11 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
     if (type(failed_acceptance) is not bool
             or (failed_acceptance and (workflow != "synthetic" or job_name != "devlane-synthetic"))):
         _refuse()
-    if type(log) is not bytes or len(log) > MAX_LOG_BYTES or b"\x00" in log or b"\x1b" in log:
+    if type(log) is not bytes or len(log) > MAX_LOG_BYTES:
+        _refuse()
+    for sequence in ANSI_SGR:
+        log = log.replace(sequence, b"")
+    if any(byte < 32 and byte != 10 or byte == 127 for byte in log) or b"\x1b" in log:
         _refuse()
     try:
         text = log.decode("utf-8", "strict")
@@ -477,11 +877,16 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         _refuse()
     if text.startswith("﻿"):
         text = text[1:]
+    if any(ord(char) < 32 and char != "\n" or 127 <= ord(char) <= 159 for char in text):
+        _refuse()
     kind = "synthetic" if workflow == "synthetic" else "encrypted"
     workflow_path = (".github/workflows/devlane-synthetic.yml" if kind == "synthetic"
                      else ".github/workflows/devlane-encrypted.yml")
     job_key = job_name if kind == "encrypted" else "devlane-synthetic"
     grammar = _Grammar(workflow_path, job_key, identity, kind)
+    first_line = text.splitlines()[0] if text else ""
+    if TIME_PREFIX.sub("", first_line, count=1).startswith("Current runner version: "):
+        text = _canonicalize_github_hosted_log(text, grammar, job_name, identity, workflow_path)
     lines = text.splitlines()
     if len(lines) > 20_000 or any(len(line) > 16_384 for line in lines):
         _refuse()
@@ -539,7 +944,7 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         if section == "setup":
             if normalized.startswith(LOG_MARKER + "[group]"):
                 if normalized[len(LOG_MARKER + "[group]"):] not in PROVIDER_GROUPS | {
-                        "Set up job", "Prepare all required actions"}:
+                        "Set up job", "Prepare all required actions", " Inputs"}:
                     _refuse()
                 continue
             if "nvironment" in normalized:
@@ -589,7 +994,7 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
             if original and TIME_PREFIX.sub("", original, count=1).startswith("  ") and mode:
                 key, separator, value = normalized.strip().partition(":")
                 value = value.strip()
-                if separator and mode == "env" and key in grammar.job["env"] | step["env"] \
+                if separator and mode == "env" and key in grammar.expected_env_names(step) \
                         and grammar.env_value_ok(key, value):
                     continue
                 if separator and mode == "with" and grammar.with_value_ok(step, key, value):

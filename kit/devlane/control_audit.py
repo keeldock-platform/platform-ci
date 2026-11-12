@@ -133,11 +133,25 @@ def _validate_child_steps(name, job, *, require_main=True):
 
 
 class ControlAuditRefusal(ValueError):
-    pass
+    STAGES = frozenset({
+        "control-graph", "identity", "run-record", "job-graph", "synthetic-log",
+        "policy-marker", "artifacts", "check-runs", "internal",
+    })
+
+    def __init__(self, stage="control-graph"):
+        self.stage = stage if stage in self.STAGES else "internal"
+        super().__init__(self.stage)
 
 
-def _refuse():
-    raise ControlAuditRefusal("control-graph-invalid")
+def _refuse(stage="control-graph"):
+    raise ControlAuditRefusal(stage)
+
+
+def _under_stage(stage, function, *args, **kwargs):
+    try:
+        return function(*args, **kwargs)
+    except ControlAuditRefusal:
+        raise ControlAuditRefusal(stage) from None
 
 
 def control_identity(env):
@@ -345,6 +359,11 @@ def validate_terminal_control_run(run, jobs, control_run_id, control_sha, *, req
 def validate_control_marker(log, identity, expected_runner):
     if type(log) is not bytes or len(log) > 32 * 1024 * 1024:
         _refuse()
+    log = log.replace(b"\r\n", b"\n")
+    for sequence in public_audit.ANSI_SGR:
+        log = log.replace(sequence, b"")
+    if any(byte < 32 and byte != 10 or byte == 127 for byte in log) or b"\x1b" in log:
+        _refuse()
     matches = list(MARKER.finditer(log))
     if len(matches) != 1:
         _refuse()
@@ -389,8 +408,12 @@ def _macos_capacity_notice(control_sha):
 def validate_control_annotations(job_name, control_sha, count, annotations):
     if type(count) is not int or count < 0 or type(annotations) is not list or len(annotations) != count:
         _refuse()
-    is_macos_feedback = job_name == "development-feedback-smoke / feedback-smoke-producer macos-15"
-    if is_macos_feedback:
+    macos_capacity_jobs = {
+        "policy-macos-15",
+        "node-lock-smoke / node-lock-smoke-macos-15",
+        "development-feedback-smoke / feedback-smoke-producer macos-15",
+    }
+    if job_name in macos_capacity_jobs:
         if count > MAX_MACOS_CAPACITY_NOTICES or any(
                 item != _macos_capacity_notice(control_sha) for item in annotations):
             _refuse()
@@ -403,6 +426,7 @@ def validate_synthetic_log(log, identity, *, failed_acceptance=False):
         public_audit.validate_job_log_surface(
             log, "devlane-synthetic", {
                 "run_id": identity["run_id"], "control_sha": identity["control_sha"], "ref": identity["ref"],
+                "wave_id": identity.get("wave_id"),
             },
             completed=True, workflow="synthetic", failed_acceptance=failed_acceptance)
     except public_audit.AuditRefusal:
@@ -412,15 +436,15 @@ def validate_synthetic_log(log, identity, *, failed_acceptance=False):
 def run_audit(api, identity):
     prefix = "/repos/" + REPOSITORY + "/actions/runs/" + identity["run_id"]
     run, _ = api.json(prefix)
-    validate_run_record(run, identity)
+    _under_stage("run-record", validate_run_record, run, identity)
     value, headers = api.json(prefix + "/jobs?filter=all&per_page=100&page=1")
     if (type(value) is not dict or value.get("total_count") != 18 or type(value.get("jobs")) is not list
             or len(value["jobs"]) != 18 or headers.get("Link")):
-        _refuse()
-    jobs = validate_jobs(value["jobs"], identity)
+        _refuse("job-graph")
+    jobs = _under_stage("job-graph", validate_jobs, value["jobs"], identity)
     """Hosted-output assertion: the real synthetic job log must satisfy the same closed contract the encrypted-lane auditor applies, so any drift in what GitHub actually prints (scaffolding, cache action, setup action, env blocks) fails the control, never a private run."""
     synthetic_job = jobs[SYNTHETIC_JOB]
-    validate_synthetic_log(
+    _under_stage("synthetic-log", validate_synthetic_log,
         api.log_text(synthetic_job["id"]), identity,
         failed_acceptance=synthetic_job["conclusion"] == "failure",
     )
@@ -428,25 +452,31 @@ def run_audit(api, identity):
         name = "policy-" + runner
         log = api.log_text(jobs[name]["id"])
         expected_os = {"ubuntu-24.04": "Linux", "macos-15": "macOS", "windows-2025": "Windows"}[runner]
-        validate_control_marker(log, identity, expected_os)
+        _under_stage("policy-marker", validate_control_marker, log, identity, expected_os)
     artifacts, _ = api.json(prefix + "/artifacts?per_page=100&page=1")
-    validate_artifacts(artifacts, identity)
+    _under_stage("artifacts", validate_artifacts, artifacts, identity)
     for job in jobs.values():
-        check_id = int(job["check_run_url"].rsplit("/", 1)[1])
-        check, _ = api.json("/repos/%s/check-runs/%d" % (REPOSITORY, check_id))
-        output = check.get("output") if type(check) is dict else None
-        if (type(check) is not dict or check.get("id") != check_id
-                or check.get("head_sha") != identity["control_sha"]
-                or check.get("status") != job.get("status")
-                or type(output) is not dict or type(output.get("annotations_count")) is not int):
-            _refuse()
-        annotations = _read_annotations(api, "/repos/%s/check-runs/%d/annotations" % (REPOSITORY, check_id))
-        validate_control_annotations(job["name"], identity["control_sha"], output["annotations_count"], annotations)
+        def check_job(check_job=job):
+            check_id = int(check_job["check_run_url"].rsplit("/", 1)[1])
+            check, _ = api.json("/repos/%s/check-runs/%d" % (REPOSITORY, check_id))
+            output = check.get("output") if type(check) is dict else None
+            if (type(check) is not dict or check.get("id") != check_id
+                    or check.get("head_sha") != identity["control_sha"]
+                    or check.get("status") != check_job.get("status")
+                    or type(output) is not dict or type(output.get("annotations_count")) is not int):
+                _refuse("check-runs")
+            if check_job["name"] == RUN_JOB and check_job.get("status") == "in_progress":
+                return
+            annotations = _read_annotations(api, "/repos/%s/check-runs/%d/annotations" % (REPOSITORY, check_id))
+            validate_control_annotations(
+                check_job["name"], identity["control_sha"], output["annotations_count"], annotations,
+            )
+        _under_stage("check-runs", check_job)
 
 
 def main():
     try:
-        identity = control_identity(os.environ)
+        identity = _under_stage("identity", control_identity, os.environ)
         run_audit(GitHubAPI(os.environ["GITHUB_TOKEN"]), identity)
         if identity["ref"] == "refs/heads/main":
             evidence_path = os.environ.get("DEVLANE_CONTROL_EVIDENCE_PATH")
@@ -455,8 +485,11 @@ def main():
             permit.create_control(evidence_path, identity["control_sha"], identity["run_id"], identity["ref"])
         print("control_audit=accepted jobs=18 synthetic_artifacts=1")
         return 0
+    except ControlAuditRefusal as error:
+        print("control_audit=refused stage=" + error.stage)
+        return 1
     except Exception:
-        print("control_audit=refused")
+        print("control_audit=refused stage=internal")
         return 1
 
 

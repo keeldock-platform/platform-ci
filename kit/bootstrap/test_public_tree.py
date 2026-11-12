@@ -967,6 +967,7 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/test_acceptance.py',
             'kit/devlane/test_adapters.mjs',
             'kit/devlane/test_audit_contracts.py',
+            'kit/devlane/fixtures/control-synthetic-43245798187.log.hex',
             'kit/devlane/test_coordinator.py',
             'kit/devlane/test_e2e.py',
             'kit/devlane/rust_rehearsal_fixture.py',

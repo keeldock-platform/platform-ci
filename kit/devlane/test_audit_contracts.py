@@ -146,6 +146,8 @@ def _render_log(job_key, identity=None, *, records=(), kind="encrypted", skip=("
                 lines.append("  %s: %s" % (key, _with_value(step, key, identity, kind)))
         env = dict(job["env"])
         env.update(step["env"])
+        if kind == "encrypted" and job_key == audit.RUN_JOB and step["name"] != audit.STEP_NAMES[0]:
+            env["RUN_ROOT"] = "${{ runner.temp }}/devlane-" + identity["run_id"]
         if env:
             lines.append("env:")
             lines.extend("  %s: %s" % (name, _env_value(name, identity, kind)) for name in env)
@@ -157,6 +159,84 @@ def _render_log(job_key, identity=None, *, records=(), kind="encrypted", skip=("
                   MARK + "[section]Finishing: Post Set up pinned Node toolchain"]
     lines += [MARK + "[section]Starting: Complete job", "Cleaning up orphan processes",
               MARK + "[section]Finishing: Complete job"]
+    return "".join(stamp + line + "\n" for line in lines).encode("utf-8")
+
+
+def _render_real_runner_encrypted_log(identity):
+    grammar = audit._Grammar(
+        ".github/workflows/devlane-encrypted.yml", audit.RUN_JOB, identity, "encrypted",
+    )
+    marker = audit.LOG_MARKER
+    lines = ["Current runner version: '2.338.2'"]
+
+    def group(name, values):
+        lines.extend([marker + "[group]" + name, *values, marker + "[endgroup]"])
+
+    runner_images = "https://" + "github.com" + "/actions/runner-images"
+    group("Runner Image Provisioner", [
+        "Hosted Compute Agent", "Version: 20261028.624", "Commit: " + "0" * 40,
+        "Build Date: 2026-10-28T21:51:42Z", "Worker ID: {279bda81-5141-421a-9d8d-864e1958a8d7}",
+        "Region: centralus", "Cloud: Azure",
+    ])
+    group("Operating System", ["Ubuntu", "24.04.5", "LTS"])
+    group("Runner Image", [
+        "Image: ubuntu-24.04", "Version: 20261101.360.1",
+        "Included Software: %s/blob/ubuntu24/20261101.360/images/ubuntu/Ubuntu2404-Readme.md" % runner_images,
+        "Image Release: %s/releases/tag/ubuntu24%%2F20261101.360" % runner_images,
+    ])
+    group("GITHUB_TOKEN Permissions", ["Metadata: read"])
+    lines.extend((
+        "Secret source: Actions", "Deployment environment: devlane-decrypt", "Cache mode: write",
+        "Prepare workflow directory", "Prepare all required actions", "Getting action download info",
+    ))
+    seen = set()
+    for step in grammar.steps:
+        uses = step["uses"] or ""
+        if uses and not uses.startswith("./"):
+            action, _, revision = uses.rpartition("@")
+            repository = "/".join(action.split("/")[:2]) + "@" + revision
+            if repository not in seen:
+                seen.add(repository)
+                lines.append("Download action repository '%s' (SHA:%s)" % (repository, revision))
+    inputs = {
+        "profile": identity["profile"], "control_run_id": identity["control_run_id"],
+        "wave_id": identity["wave_id"], "bundle_id": identity["bundle_id"],
+        "bundle_asset_id": "111", "bundle_sha256": "c" * 64, "bundle_size": "4096",
+        "projection_asset_id": "222", "projection_sha256": "d" * 64, "projection_size": "512",
+        "expires": "2000000000", "cache_baseline_sha256": identity["cache_baseline_sha256"],
+    }
+    lines.extend([marker + "[group] Inputs"])
+    lines.extend("  %s: %s" % (key, value) for key, value in inputs.items())
+    lines.extend((marker + "[endgroup]", "Complete job name: " + audit.RUN_JOB))
+
+    for step in grammar.steps:
+        if step["name"] == "Install pinned Rust toolchain":
+            continue
+        uses = step["uses"] or ""
+        run = step["run"]
+        lines.append(marker + "[group]Run " + (run[0].strip() if run else uses))
+        if run:
+            lines.extend("\x1b[36;1m" + line + "\x1b[0m" for line in run)
+            lines.append("shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}")
+        else:
+            lines.append("with:")
+            for key in step["with"]:
+                value = _with_value(step, key, identity, "encrypted")
+                if value != "":
+                    lines.append("  %s: %s" % (key, value))
+            if uses.startswith("actions/cache/"):
+                lines.append("  enableCrossOsArchive: false")
+                if "/restore@" in uses:
+                    lines.append("  lookup-only: false")
+        env_names = grammar.expected_env_names(step)
+        if env_names:
+            lines.append("env:")
+            lines.extend("  %s: %s" % (key, _env_value(key, identity, "encrypted"))
+                         for key in sorted(env_names))
+        lines.append(marker + "[endgroup]")
+        lines.extend(_step_outputs(step, identity, "encrypted", ()))
+    lines.append("Cleaning up orphan processes")
+    stamp = "2026-11-10T12:00:00.1234567Z "
     return "".join(stamp + line + "\n" for line in lines).encode("utf-8")
 
 
@@ -295,6 +375,56 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         rust = dict(IDENTITY, profile="core-rust")
         audit.validate_job_log_surface(
             _render_log(audit.RUN_JOB, rust, skip=("Set up pinned Node toolchain",)), audit.RUN_JOB, rust)
+
+    def test_known_github_sgr_is_accepted_on_the_encrypted_lane_log_path(self):
+        log = self._valid_run_log()
+        colored = log.replace(
+            b"Run set -euo pipefail",
+            b"Run \x1b[36;1mset -euo pipefail\x1b[0m",
+            1,
+        )
+        audit.validate_job_log_surface(colored, audit.RUN_JOB, IDENTITY)
+        with self.assertRaises(audit.AuditRefusal):
+            audit.validate_job_log_surface(colored.replace(b"set -euo pipefail", b"set \x1b[2J -euo pipefail", 1),
+                                           audit.RUN_JOB, IDENTITY)
+
+    def test_github_runner_shaped_encrypted_log_accepts_its_environment_and_sgr(self):
+        log = _render_real_runner_encrypted_log(IDENTITY)
+        audit.validate_job_log_surface(log, audit.RUN_JOB, IDENTITY)
+        with self.assertRaises(audit.AuditRefusal):
+            audit.validate_job_log_surface(log.replace(b"\x1b[36;1m", b"\x1b[31m", 1),
+                                           audit.RUN_JOB, IDENTITY)
+
+    def test_real_github_synthetic_log_fixture_is_accepted_and_closed(self):
+        fixture = Path(__file__).resolve().parent / "fixtures/control-synthetic-43245798187.log.hex"
+        log = bytes.fromhex(fixture.read_text(encoding="ascii"))
+        identity = {
+            "run_id": "43245798187",
+            "control_sha": "bda18e03c451a00ec91bb7c34d616a55295a7eee",
+            "ref": "refs/heads/devlane/d211-1110",
+            "wave_id": "control-20261112T151518Z-082fe3",
+        }
+        audit.validate_job_log_surface(log, "devlane-synthetic", identity, workflow="synthetic")
+        mutations = {
+            "free text": log.replace(
+                b"devlane_swap=disabled",
+                b"devlane_swap=disabled\nfree text injected",
+                1,
+            ),
+            "path": log.replace(
+                b"devlane_swap=disabled",
+                b"devlane_swap=disabled\n" + (chr(47) + "home" + chr(47) + "runner/work/foreign/private").encode("ascii"),
+                1,
+            ),
+            "unknown escape": log.replace(
+                b"devlane_swap=disabled",
+                b"devlane_swap=disabled\x1b[2J",
+                1,
+            ),
+        }
+        for label, changed in mutations.items():
+            with self.subTest(label), self.assertRaises(audit.AuditRefusal):
+                audit.validate_job_log_surface(changed, "devlane-synthetic", identity, workflow="synthetic")
 
     def test_host_preflight_receipts_are_bound_to_the_right_step_and_profile(self):
         rust = dict(IDENTITY, profile="core-rust")
@@ -1025,17 +1155,34 @@ class ControlAuditorMutationTests(unittest.TestCase):
 
     def test_composed_provider_annotations_accept_only_the_bounded_exact_macos_notice(self):
         job = "development-feedback-smoke / feedback-smoke-producer macos-15"
+        macos_jobs = (
+            "policy-macos-15",
+            "node-lock-smoke / node-lock-smoke-macos-15",
+            job,
+        )
         notice = control_audit._macos_capacity_notice(SHA)
-        control_audit.validate_control_annotations(job, SHA, 1, [notice])
-        control_audit.validate_control_annotations(job, SHA, 64, [notice] * 64)
+        for name in macos_jobs:
+            control_audit.validate_control_annotations(name, SHA, 1, [notice])
+            control_audit.validate_control_annotations(name, SHA, 64, [notice] * 64)
         for name, count, annotations in (
                 (job, 65, [notice] * 65),
                 (job, 1, [dict(notice, message="unexpected annotation")]),
-                ("policy-macos-15", 1, [notice]),
                 (job, 2, [notice])):
             with self.subTest(name=name, count=count):
                 with self.assertRaises(control_audit.ControlAuditRefusal):
                     control_audit.validate_control_annotations(name, SHA, count, annotations)
+        with self.assertRaises(control_audit.ControlAuditRefusal):
+            control_audit.validate_control_annotations("policy-ubuntu-24.04", SHA, 1, [notice])
+
+    def test_refusal_output_contains_only_a_fixed_stage_code(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from unittest.mock import patch
+        output = StringIO()
+        with patch.object(control_audit, "control_identity", side_effect=control_audit.ControlAuditRefusal()):
+            with redirect_stdout(output):
+                self.assertEqual(control_audit.main(), 1)
+        self.assertEqual(output.getvalue(), "control_audit=refused stage=identity\n")
 
     def test_control_marker_and_synthetic_artifact_are_bound(self):
         log = (
@@ -1045,6 +1192,12 @@ class ControlAuditorMutationTests(unittest.TestCase):
         control_audit.validate_control_marker(log, self.identity, "Linux")
         with self.assertRaises(control_audit.ControlAuditRefusal):
             control_audit.validate_control_marker(log, self.identity, "Windows")
+        windows_log = (b"\x1b[36;1munrelated hosted script echo\x1b[0m\r\n"
+                       + log.replace(b"\n", b"\r\n"))
+        control_audit.validate_control_marker(windows_log, self.identity, "Linux")
+        with self.assertRaises(control_audit.ControlAuditRefusal):
+            control_audit.validate_control_marker(windows_log.replace(b"\x1b[0m", b"\x1b[2J", 1),
+                                                  self.identity, "Linux")
         artifact = {
             "total_count": 1,
             "artifacts": [{
