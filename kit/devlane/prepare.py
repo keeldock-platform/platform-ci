@@ -592,7 +592,7 @@ def _copy_tree(source, destination):
                 if total > 4 * 1024 * 1024 * 1024:
                     refuse("prepared-tree-size")
                 shutil.copyfile(entry, target, follow_symlinks=False)
-                os.chmod(target, 0o444 | (stat.S_IMODE(mode) & 0o111))
+                os.chmod(target, 0o555 if stat.S_IMODE(mode) & 0o111 else 0o444)
             else:
                 refuse("prepared-member-type")
 

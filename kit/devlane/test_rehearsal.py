@@ -199,6 +199,12 @@ class ProcedureDocumentTests(unittest.TestCase):
     root = Path(__file__).resolve().parents[2]
     text = (root / "docs/devlane-procedure.md").read_text(encoding="utf-8")
 
+    def test_single_process_browser_fixture_is_documented_as_temporary(self):
+        self.assertIn("passes `--single-process` as a temporary measure", self.text)
+        self.assertIn("until the `current` variant in the five-variant browser smoke succeeds", self.text)
+        self.assertIn("FOLLOW-UP: remove `--single-process` after a control run proves the multi-process variant works.",
+                      self.text)
+
     @staticmethod
     def _integrated_contract_errors(text):
         errors = []
@@ -405,7 +411,7 @@ class ProductionExecuteFixtureTests(unittest.TestCase):
         self.assertIn("trace: 'off'", browser_config)
         self.assertIn("chromiumSandbox: false", browser_config)
         self.assertIn(
-            "args: ['--no-sandbox', '--no-zygote', '--enable-logging=stderr', '--v=1', "
+            "args: ['--no-sandbox', '--single-process', '--enable-logging=stderr', '--v=1', "
             "'--disable-gpu', '--disable-dev-shm-usage', '--disable-features=AudioServiceOutOfProcess']",
             browser_config,
         )

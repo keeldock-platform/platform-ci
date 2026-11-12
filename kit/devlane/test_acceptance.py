@@ -1001,6 +1001,19 @@ class SupervisorOrderAcceptanceTests(unittest.TestCase):
                 self.assertEqual(popen.call_args.kwargs["cwd"], "/")
                 self.assertIn('cd /workspace/source && exec "$@"', popen.call_args.args[0])
 
+    def test_proc_is_mounted_readonly_inside_the_unshared_pid_namespace_without_gid_override(self):
+        launch_source = inspect.getsource(supervisor._start)
+        serve_source = inspect.getsource(supervisor._serve)
+        prepare_source = inspect.getsource(supervisor.Service.prepare)
+        mount_source = inspect.getsource(supervisor._mount_minimal_root)
+        self.assertIn('"unshare", "--net", "--mount", "--pid", "--ipc", "--fork", "--mount-proc"', launch_source)
+        self.assertLess(launch_source.index('"--mount-proc"'), launch_source.index('"_serve"'))
+        self.assertIn("service.prepare()", serve_source)
+        self.assertLess(prepare_source.index('_require_linux_root()'),
+                        prepare_source.index('_mount_minimal_root('))
+        self.assertIn('"ro,hidepid=2"', mount_source)
+        self.assertNotIn('"gid=', mount_source)
+
     def test_browser_smoke_selects_only_a_prepared_headless_shell(self):
         with tempfile.TemporaryDirectory() as temporary:
             browser = Path(temporary) / "prepared/ms-playwright/chromium_headless_shell-1248/chrome-linux/headless_shell"
@@ -1463,6 +1476,35 @@ class CleanupLifecycleTests(unittest.TestCase):
 
 
 class PreparationDefectTests(unittest.TestCase):
+    def test_published_prepared_executables_are_readable_and_directories_traversable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            browser = source / "ms-playwright/chromium_headless_shell-1248/chrome-linux/headless_shell"
+            node = source / "node/bin/node"
+            data = source / "node/share/runtime.dat"
+            browser.parent.mkdir(parents=True, mode=0o700)
+            node.parent.mkdir(parents=True, mode=0o700)
+            data.parent.mkdir(parents=True, mode=0o700)
+            for path in (browser, node, data):
+                path.write_bytes(b"fixture")
+            browser.chmod(0o500)
+            node.chmod(0o500)
+            data.chmod(0o600)
+            destination = root / "published"
+
+            prepare._publish_prepared_output(source, destination, os.getuid(), os.getgid())
+
+            for directory in (destination, destination / "ms-playwright",
+                              destination / "ms-playwright/chromium_headless_shell-1248",
+                              destination / "ms-playwright/chromium_headless_shell-1248/chrome-linux",
+                              destination / "node", destination / "node/bin",
+                              destination / "node/share"):
+                self.assertEqual(directory.stat().st_mode & 0o777, 0o755)
+            self.assertEqual((destination / browser.relative_to(source)).stat().st_mode & 0o777, 0o555)
+            self.assertEqual((destination / node.relative_to(source)).stat().st_mode & 0o777, 0o555)
+            self.assertEqual((destination / data.relative_to(source)).stat().st_mode & 0o777, 0o444)
+
     def test_preparation_mount_ledger_unmounts_proc_before_parent_mounts(self):
         root = Path("/prep/root")
         targets = (root, root / "dev", root / "proc", root / "work")

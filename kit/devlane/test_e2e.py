@@ -1148,7 +1148,7 @@ def _browser_source(lock):
     }
     config = ("export default { testDir: '.', reporter: 'json', workers: 1, use: { "
               "screenshot: 'off', video: 'off', trace: 'off', "
-              "launchOptions: { chromiumSandbox: false, args: ['--no-sandbox', '--no-zygote', "
+              "launchOptions: { chromiumSandbox: false, args: ['--no-sandbox', '--single-process', "
               "'--enable-logging=stderr', '--v=1', '--disable-gpu', '--disable-dev-shm-usage', "
               "'--disable-features=AudioServiceOutOfProcess'] } } };\n")
     spec = (

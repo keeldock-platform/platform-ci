@@ -28,6 +28,13 @@ const BROWSER_SMOKE_VARIANTS = [
 ];
 const BROWSER_MOJO_PROBE = [
   'import ctypes, os',
+  'PR_GET_DUMPABLE = 3',
+  'library = ctypes.CDLL(None, use_errno=True)',
+  'prctl = getattr(library, "prctl", None)',
+  'ctypes.set_errno(0)',
+  'dumpable = prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) if prctl is not None else -1',
+  'prctl_errno = ctypes.get_errno()',
+  'print("prctl_dumpable=%s prctl_errno=%s" % (dumpable if dumpable >= 0 else "unavailable", prctl_errno))',
   'name = ("/devlane-mojo-" + str(os.getpid())).encode()',
   'descriptor = os.memfd_create("devlane-mojo", os.MFD_CLOEXEC)',
   'os.write(descriptor, b"x")',
@@ -132,33 +139,141 @@ function normalizePlaywright(report, expectedFrames) {
 
 export { normalizePlaywright, normalizeVitest };
 
+function errnoLabel(error) {
+  if (!error) return 'none:0';
+  const code = typeof error.code === 'string' && /^[A-Z][A-Z0-9_]{0,31}$/.test(error.code)
+    ? error.code : 'unknown';
+  const number = Number.isInteger(error.errno) && Math.abs(error.errno) <= 65535
+    ? String(Math.abs(error.errno)) : 'unknown';
+  return `${code}:${number}`;
+}
+
+function metadataSummary(fileSystem, target) {
+  try {
+    const value = fileSystem.statSync(target);
+    const uid = Number.isInteger(value.uid) ? value.uid : 'unknown';
+    const gid = Number.isInteger(value.gid) ? value.gid : 'unknown';
+    const mode = Number.isInteger(value.mode) ? (value.mode & 0o7777).toString(8).padStart(4, '0') : 'unknown';
+    return `ok:${uid}:${gid}:${mode}`;
+  } catch (error) {
+    return `err:${errnoLabel(error)}`;
+  }
+}
+
+function accessSummary(fileSystem, target, mode) {
+  try {
+    fileSystem.accessSync(target, mode);
+    return 'ok';
+  } catch (error) {
+    return `err:${errnoLabel(error)}`;
+  }
+}
+
+function safeProcTarget(fileSystem) {
+  try {
+    const target = fileSystem.readlinkSync('/proc/self/exe');
+    if (typeof target !== 'string') return 'invalid';
+    if (/^\/(?:tools|prepared|usr|bin)\/[A-Za-z0-9._/+:-]{1,240}$/.test(target)) return target;
+    if (target.endsWith(' (deleted)')) return 'deleted';
+    return target.startsWith('/') ? 'outside-root' : 'invalid';
+  } catch (error) {
+    return `err:${errnoLabel(error)}`;
+  }
+}
+
+function statusIdentity(fileSystem) {
+  try {
+    const text = fileSystem.readFileSync('/proc/self/status', 'utf8');
+    const field = (name) => {
+      const match = text.match(new RegExp(`^${name}:\\s+([0-9\\s]+)$`, 'm'));
+      if (!match) return 'unavailable';
+      const values = match[1].trim().split(/\s+/);
+      return values.length === 4 && values.every((value) => /^[0-9]{1,10}$/.test(value))
+        ? values.join(',') : 'unavailable';
+    };
+    const dumpable = text.match(/^Dumpable:\s*([0-2])\s*$/m)?.[1] || 'unavailable';
+    return { uid: field('Uid'), gid: field('Gid'), dumpable };
+  } catch {
+    return { uid: 'unavailable', gid: 'unavailable', dumpable: 'unavailable' };
+  }
+}
+
+function directorySummary(fileSystem, target) {
+  if (typeof target !== 'string' || !path.posix.isAbsolute(target)) return 'unavailable';
+  const parts = target.split('/').filter(Boolean);
+  const rows = [`root:${metadataSummary(fileSystem, '/')}:x${accessSummary(fileSystem, '/', fs.constants.X_OK)}`];
+  for (let index = 1; index < parts.length && rows.length < 8; index += 1) {
+    const directory = `/${parts.slice(0, index).join('/')}`;
+    const name = /^[A-Za-z0-9._-]{1,80}$/.test(parts[index - 1]) ? parts[index - 1] : 'other';
+    rows.push(`${name}:${metadataSummary(fileSystem, directory)}:x${accessSummary(fileSystem, directory, fs.constants.X_OK)}`);
+  }
+  return rows.join(',');
+}
+
 function browserRuntimeProbes(spawn = spawnSync, environment = process.env, fileSystem = fs,
-  getuid = process.getuid) {
+  getuid = process.getuid, browserExecutable = '') {
   const output = [];
-  let hidepidTwo = false;
+  let hidepid = 'unavailable';
+  let procGid = 'none';
   try {
     const mounts = fileSystem.readFileSync('/proc/mounts', 'utf8');
-    hidepidTwo = mounts.split('\n').some((line) => {
+    const procMount = mounts.split('\n').find((line) => {
       const fields = line.split(' ');
-      return fields[1] === '/proc' && fields[3]?.split(',').includes('hidepid=2');
+      return fields[1] === '/proc' && fields[2] === 'proc';
     });
+    if (procMount) {
+      const options = procMount.split(' ')[3]?.split(',') || [];
+      hidepid = options.find((option) => /^hidepid=[0-9]+$/.test(option))?.slice(8) || 'default';
+      procGid = options.find((option) => /^gid=[0-9]+$/.test(option))?.slice(4) || 'none';
+    }
   } catch {}
-  const procProbe = 'const fs=require("node:fs");const {spawn}=require("node:child_process");'
-    + 'const child=spawn("/proc/self/exe",["-e","setTimeout(()=>{},5000)"],{stdio:"ignore"});'
-    + 'try{fs.statSync("/proc/"+child.pid+"/exe");process.exitCode=0;}'
-    + 'catch{process.exitCode=4;}finally{child.kill("SIGKILL");}';
+  const status = statusIdentity(fileSystem);
+  const selfStat = metadataSummary(fileSystem, '/proc/self');
+  const exeStat = metadataSummary(fileSystem, '/proc/self/exe');
+  const exeAccess = accessSummary(fileSystem, '/proc/self/exe', fs.constants.R_OK | fs.constants.X_OK);
+  const readlink = safeProcTarget(fileSystem);
+  const procProbe = [
+    'const fs=require("node:fs");const {spawn}=require("node:child_process");',
+    'let finished=false;let child;let deadline;',
+    'function errnoLabel(error){const code=typeof error.code==="string"&&/^[A-Z][A-Z0-9_]{0,31}$/.test(error.code)?error.code:"unknown";const number=Number.isInteger(error.errno)&&Math.abs(error.errno)<=65535?String(Math.abs(error.errno)):"unknown";return code+":"+number;}',
+    'function finish(childSpawn,childStat,childErrno,code){if(finished)return;finished=true;if(deadline)clearTimeout(deadline);if(child&&child.pid)child.kill("SIGKILL");process.stdout.write(JSON.stringify({child_spawn:childSpawn,child_stat:childStat,child_errno:childErrno}));process.exitCode=code;}',
+    'child=spawn("/proc/self/exe",["-e","setTimeout(()=>{},5000)"],{stdio:"ignore"});',
+    'child.once("spawn",()=>{try{fs.statSync("/proc/"+child.pid+"/exe");finish("ok","ok","none:0",0);}catch(error){finish("ok","err:"+(typeof error.code==="string"&&/^[A-Z][A-Z0-9_]{0,31}$/.test(error.code)?error.code:"unknown"),errnoLabel(error),4);}});',
+    'child.once("error",error=>finish("err:"+(typeof error.code==="string"&&/^[A-Z][A-Z0-9_]{0,31}$/.test(error.code)?error.code:"unknown"),"unavailable",errnoLabel(error),4));',
+    'deadline=setTimeout(()=>finish("timeout","unavailable","unknown",4),1500);',
+  ].join('');
   let procResult;
   try {
     procResult = spawn('/proc/self/exe', ['-e', procProbe], {
       timeout: BROWSER_PROBE_TIMEOUT_MS,
       maxBuffer: 1024,
-      stdio: ['ignore', 'ignore', 'ignore'],
+      stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf8',
       env: environment,
     });
   } catch {}
+  const procRecord = (() => {
+    try {
+      const value = JSON.parse(procResult?.stdout || 'null');
+      if (value && typeof value === 'object'
+          && /^(?:ok|err:[A-Z][A-Z0-9_]{0,31}|timeout)$/.test(value.child_spawn)
+          && /^(?:ok|err:[A-Z][A-Z0-9_]{0,31}|unavailable)$/.test(value.child_stat)
+          && /^(?:none:0|[A-Z][A-Z0-9_]{0,31}:[0-9]{1,5}|unknown)$/.test(value.child_errno)) {
+        return value;
+      }
+    } catch {}
+    return { child_spawn: 'unavailable', child_stat: 'unavailable', child_errno: 'unknown' };
+  })();
   const procOkay = typeof getuid === 'function' && getuid() === 65534
-    && hidepidTwo && procResult?.status === 0 && !procResult?.error;
-  output.push(`browser_smoke_probe=proc_self_exe result=${procOkay ? 'ok' : 'fail'}`);
+    && hidepid === '2' && procResult?.status === 0 && !procResult?.error
+    && !readlink.startsWith('err:') && selfStat.startsWith('ok:')
+    && exeStat.startsWith('ok:') && exeAccess === 'ok'
+    && procRecord.child_spawn === 'ok' && procRecord.child_stat === 'ok';
+  output.push(`browser_smoke_probe=proc_self_exe result=${procOkay ? 'ok' : 'fail'} launch_errno=${errnoLabel(procResult?.error)}`);
+  output.push(`browser_smoke_probe=proc_self_exe_details readlink=${readlink} self_stat=${selfStat} exe_stat=${exeStat} exe_access=${exeAccess} status_Uid=${status.uid} status_Gid=${status.gid} status_Dumpable=${status.dumpable} child_spawn=${procRecord.child_spawn} child_stat=${procRecord.child_stat} child_errno=${procRecord.child_errno} hidepid=${hidepid} gid=${procGid}`);
+
+  const nodeExecutable = typeof process.execPath === 'string' ? process.execPath : '';
+  output.push(`browser_smoke_probe=exec_permissions node=${metadataSummary(fileSystem, nodeExecutable)} node_access=${accessSummary(fileSystem, nodeExecutable, fs.constants.R_OK | fs.constants.X_OK)} node_dirs=${directorySummary(fileSystem, nodeExecutable)} browser=${metadataSummary(fileSystem, browserExecutable)} browser_access=${accessSummary(fileSystem, browserExecutable, fs.constants.R_OK | fs.constants.X_OK)} browser_dirs=${directorySummary(fileSystem, browserExecutable)}`);
 
   let devicesOkay = true;
   for (const [name, access] of [['null', fs.constants.W_OK], ['urandom', fs.constants.R_OK],
@@ -176,11 +291,17 @@ function browserRuntimeProbes(spawn = spawnSync, environment = process.env, file
   try {
     mojoResult = spawn('python3', ['-I', '-c', BROWSER_MOJO_PROBE], {
       timeout: BROWSER_PROBE_TIMEOUT_MS,
-      maxBuffer: 1024,
-      stdio: ['ignore', 'ignore', 'ignore'],
+      maxBuffer: 2048,
+      stdio: ['ignore', 'pipe', 'ignore'],
       env: environment,
     });
   } catch {}
+  const mojoStdout = Buffer.isBuffer(mojoResult?.stdout) ? mojoResult.stdout.toString('ascii')
+    : typeof mojoResult?.stdout === 'string' ? mojoResult.stdout : '';
+  const dumpableMatch = mojoStdout.match(/^prctl_dumpable=(0|1|2|unavailable) prctl_errno=([0-9]{1,5})$/m);
+  output.push(dumpableMatch
+    ? `browser_smoke_probe=prctl_get_dumpable result=${dumpableMatch[1] === 'unavailable' ? 'unavailable' : 'ok'} value=${dumpableMatch[1]} errno=${dumpableMatch[2]} helper=python3`
+    : 'browser_smoke_probe=prctl_get_dumpable result=unavailable');
   const mojoStatus = mojoResult?.status === 0 && !mojoResult?.error ? 'ok'
     : mojoResult?.error?.code === 'ENOENT' ? 'unavailable' : 'fail';
   output.push(`browser_smoke_probe=mojo_shared_memory result=${mojoStatus}`);
@@ -194,7 +315,7 @@ function runBrowserSmoke(executable, spawn = spawnSync, probe = browserRuntimePr
   }
   let output = '';
   try {
-    const probes = probe(spawn, environment);
+    const probes = probe(spawn, environment, fs, process.getuid, executable);
     if (Array.isArray(probes)) output += probes.slice(0, 8).join('\n') + (probes.length ? '\n' : '');
   } catch {
     output += 'browser_smoke_probe=runtime result=fail\n';
@@ -375,26 +496,83 @@ if (process.env.NODE_TEST_CONTEXT) {
   test('browser runtime probes verify same-uid proc, worker devices and Mojo shared memory', () => {
     const calls = [];
     const fakeFileSystem = {
-      readFileSync: () => 'proc /proc proc ro,relatime,hidepid=2 0 0\n',
-      statSync: () => ({ isCharacterDevice: () => true }),
+      readFileSync: (file) => file === '/proc/mounts'
+        ? 'proc /proc proc ro,relatime,hidepid=2,gid=65534 0 0\n'
+        : 'Uid:\t65534\t65534\t65534\t65534\nGid:\t65534\t65534\t65534\t65534\n',
+      readlinkSync: () => '/tools/node/bin/node',
+      statSync: () => ({ mode: 0o100555, uid: 0, gid: 0, isCharacterDevice: () => true }),
       accessSync: () => {},
       constants: fs.constants,
     };
     const output = browserRuntimeProbes((executable, args, options) => {
       calls.push({ executable, args, options });
-      return { status: 0 };
-    }, { PATH: '/usr/bin:/bin' }, fakeFileSystem, () => 65534);
-    assert.deepEqual(output, [
-      'browser_smoke_probe=proc_self_exe result=ok',
-      'browser_smoke_probe=worker_devices result=ok',
-      'browser_smoke_probe=mojo_shared_memory result=ok',
-    ]);
+      return executable === 'python3'
+        ? { status: 0, stdout: Buffer.from('prctl_dumpable=1 prctl_errno=0\n') }
+        : { status: 0, stdout: JSON.stringify({
+          child_spawn: 'ok', child_stat: 'ok', child_errno: 'none:0',
+        }) };
+    }, { PATH: '/usr/bin:/bin' }, fakeFileSystem, () => 65534,
+    '/prepared/ms-playwright/chromium_headless_shell-1248/chrome-linux/headless_shell');
+    assert.match(output[0], /^browser_smoke_probe=proc_self_exe result=ok launch_errno=none:0$/);
+    assert.match(output[1], /readlink=\/tools\/node\/bin\/node .*status_Uid=65534,65534,65534,65534 status_Gid=65534,65534,65534,65534 .*child_spawn=ok child_stat=ok child_errno=none:0 hidepid=2 gid=65534/);
+    assert.match(output[2], /browser_smoke_probe=exec_permissions node=ok:0:0:0555 .*browser=ok:0:0:0555 browser_access=ok browser_dirs=root:ok:0:0:0555:xok,prepared:ok:0:0:0555:xok,ms-playwright:ok:0:0:0555:xok,chromium_headless_shell-1248:ok:0:0:0555:xok,chrome-linux:ok:0:0:0555:xok/);
+    assert.equal(output[3], 'browser_smoke_probe=worker_devices result=ok');
+    assert.equal(output[4], 'browser_smoke_probe=prctl_get_dumpable result=ok value=1 errno=0 helper=python3');
+    assert.equal(output[5], 'browser_smoke_probe=mojo_shared_memory result=ok');
     assert.equal(calls[0].executable, '/proc/self/exe');
     assert.equal(calls[0].args[1].includes('/proc/"+child.pid+"/exe'), true);
+    assert.doesNotThrow(() => new Function(calls[0].args[2]));
     assert.equal(calls[1].executable, 'python3');
     assert.equal(calls[1].args[2].includes('memfd_create'), true);
     assert.equal(calls[1].args[2].includes('shm_open'), true);
     assert.equal(calls[1].args[2].includes('/dev/shm'), true);
+    assert.equal(calls[1].args[2].includes('PR_GET_DUMPABLE'), true);
+    const pythonSyntax = spawnSync('python3', [
+      '-c', 'import sys; compile(sys.argv[1], "<browser-probe>", "exec")', calls[1].args[2],
+    ], { stdio: 'ignore' });
+    assert.equal(pythonSyntax.status, 0);
+  });
+  test('browser proc diagnostics show bounded errno and permission details', () => {
+    const denied = Object.assign(new Error('SYNTHETIC_SECRET_CANARY'), { code: 'EACCES', errno: -13 });
+    const fakeFileSystem = {
+      readFileSync: (file) => file === '/proc/mounts'
+        ? 'proc /proc proc ro,relatime,hidepid=2,gid=73 0 0\n'
+        : 'Uid:\t65534\t65534\t65534\t65534\nGid:\t65534\t65534\t65534\t65534\n',
+      readlinkSync: () => '/external/opaque/node',
+      statSync: (file) => {
+        if (file === '/proc/self/exe') throw denied;
+        return { mode: 0o40555, uid: 0, gid: 0 };
+      },
+      accessSync: (file) => { if (file === '/proc/self/exe') throw denied; },
+      constants: fs.constants,
+    };
+    const output = browserRuntimeProbes((executable) => executable === 'python3'
+      ? { status: 0, stdout: Buffer.from('prctl_dumpable=1 prctl_errno=0\n') }
+      : { status: null, error: denied }, { PATH: '/usr/bin:/bin' }, fakeFileSystem, () => 65534,
+    '/prepared/ms-playwright/chromium_headless_shell-1248/chrome-linux/headless_shell');
+    assert.equal(output[0], 'browser_smoke_probe=proc_self_exe result=fail launch_errno=EACCES:13');
+    assert.match(output[1], /readlink=outside-root self_stat=ok:0:0:0555 exe_stat=err:EACCES:13 exe_access=err:EACCES:13 .*status_Uid=65534,65534,65534,65534 status_Gid=65534,65534,65534,65534 .*hidepid=2 gid=73/);
+    assert.equal(output.join('\n').includes('SYNTHETIC_SECRET_CANARY'), false);
+  });
+  test('browser proc diagnostics report nested executable errno', () => {
+    const fakeFileSystem = {
+      readFileSync: (file) => file === '/proc/mounts'
+        ? 'proc /proc proc ro,relatime,hidepid=2 0 0\n'
+        : 'Uid:\t65534\t65534\t65534\t65534\nGid:\t65534\t65534\t65534\t65534\n',
+      readlinkSync: () => '/tools/node/bin/node',
+      statSync: () => ({ mode: 0o100555, uid: 0, gid: 0, isCharacterDevice: () => true }),
+      accessSync: () => {},
+      constants: fs.constants,
+    };
+    const output = browserRuntimeProbes((executable) => executable === '/proc/self/exe'
+      ? { status: 4, stdout: JSON.stringify({
+        child_spawn: 'err:EACCES', child_stat: 'unavailable', child_errno: 'EACCES:13',
+      }) }
+      : { status: 0, stdout: Buffer.from('prctl_dumpable=1 prctl_errno=0\n') },
+    { PATH: '/usr/bin:/bin' }, fakeFileSystem, () => 65534,
+    '/prepared/ms-playwright/chromium_headless_shell-1248/chrome-linux/headless_shell');
+    assert.match(output[1], /child_spawn=err:EACCES child_stat=unavailable child_errno=EACCES:13/);
+    assert.equal(output[0], 'browser_smoke_probe=proc_self_exe result=fail launch_errno=none:0');
   });
   test('TypeScript reporter converts tsconfig enum strings and reads only source plus trusted default libraries', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devlane-ts-'));
