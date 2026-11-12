@@ -1142,7 +1142,9 @@ def _browser_source(lock):
         "name": "@keeldock/kernel-tokens-fixture", "version": "0.0.0", "private": True,
         "type": "module", "scripts": {"check:generated": "node -e \"process.exit(0)\""},
     }
-    config = "export default { testDir: '.', reporter: 'json', workers: 1 };\n"
+    config = ("export default { testDir: '.', reporter: 'json', workers: 1, use: { "
+              "screenshot: 'off', video: 'off', trace: 'off', "
+              "launchOptions: { chromiumSandbox: false } } };\n")
     spec = (
         "import { test, expect } from '@playwright/test';\n"
         "test('browser frame accepted', async ({ page }) => {\n"
@@ -1796,6 +1798,9 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
                     if scenario["frames"]:
                         _require(any(b'"frame":"frame_0001"' in line and b'"status":"pass"' in line
                                      for line in summary), "browser-frame-not-reported")
+                    if scenario["name"] == "real-browser" and variant == "accept":
+                        _require(records == [{"kind": "frame", "frame": "frame_0001", "status": "pass"}],
+                                 "browser-summary-counts")
                     if variant == "accept" and scenario["name"] == "synthetic-node":
                         _require(not any(b'"kind":"control"' in line for line in summary),
                                  "unexpected-control-failure")

@@ -393,8 +393,17 @@ class ProductionExecuteFixtureTests(unittest.TestCase):
         browser = fixtures[-1]
         browser_command = self.profiles["profiles"]["core-node"]["browser_command"]
         config_argument = next(item for item in browser_command if item.startswith("--config="))
+        self.assertEqual(browser_command[3:], [
+            "--config=/workspace/source/packages/kernel-ui-kit/browser/playwright.config.ts",
+            "--reporter=json", "--output=/scratch/playwright-results", "--trace=off",
+        ])
         config_path = Path(config_argument.partition("=")[2]).relative_to("/workspace/source").as_posix()
         self.assertIn(config_path, browser)
+        browser_config = browser[config_path].decode("ascii")
+        self.assertIn("screenshot: 'off'", browser_config)
+        self.assertIn("video: 'off'", browser_config)
+        self.assertIn("trace: 'off'", browser_config)
+        self.assertIn("chromiumSandbox: false", browser_config)
         self.assertIn("packages/kernel-ui-kit/browser/frame.spec.mjs", browser)
         self.assertNotIn("packages/kernel-ui-kit/browser/frame.spec.ts", browser)
 

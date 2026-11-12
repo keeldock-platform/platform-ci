@@ -1461,6 +1461,10 @@ def _preflight_tools(profile, projection, tool_paths, owner_uid=None):
 UNIT_FAILURE_SUBREASONS = frozenset((
     "report-missing", "adapter-failed", "filter-refused", "vitest-failed",
 ))
+BROWSER_MEDIA_SUFFIXES = frozenset((
+    ".avif", ".bmp", ".gif", ".har", ".jpeg", ".jpg", ".mkv", ".mov", ".mp4",
+    ".png", ".tif", ".tiff", ".trace", ".webm", ".zip",
+))
 
 
 def _control_failure(stage, subreason=None):
@@ -1470,6 +1474,38 @@ def _control_failure(stage, subreason=None):
             raise ValueError("invalid unit failure subreason")
         record["subreason"] = subreason
     return json.dumps(record, separators=(",", ":")).encode("ascii")
+
+
+def _browser_media_outputs_present(root):
+    for relative in ("scratch/playwright-results", "scratch/reports"):
+        directory = Path(root) / relative
+        try:
+            metadata = directory.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True
+        if not stat.S_ISDIR(metadata.st_mode):
+            return True
+        pending = [directory]
+        while pending:
+            current = pending.pop()
+            try:
+                entries = list(os.scandir(current))
+            except OSError:
+                return True
+            for entry in entries:
+                try:
+                    entry_mode = entry.stat(follow_symlinks=False).st_mode
+                except OSError:
+                    return True
+                if stat.S_ISDIR(entry_mode):
+                    pending.append(Path(entry.path))
+                elif not stat.S_ISREG(entry_mode):
+                    return True
+                elif Path(entry.name).suffix.lower() in BROWSER_MEDIA_SUFFIXES:
+                    return True
+    return False
 
 
 def _filter_failure_summary():
@@ -1586,16 +1622,19 @@ def _adapter_records(root, profile, manifest, outcomes, tools, adapter_results=N
         else:
             records.append(_control_failure("unit", "report-missing"))
         if manifest["frames"]:
-            output = root / "scratch/reports/playwright.jsonl"
-            if os.path.lexists(output):
-                output.unlink()
-            command = [
-                "node",
-                "/control/devlane/test_adapters.mjs", "playwright", "/workspace/raw/browser.log",
-                "/scratch/reports/playwright.jsonl",
-            ]
-            result = _run_control_adapter(root, command, "browser", tools, "browser-adapter.log", timeout=30)
-            records.extend(_adapter_lines(output, result, "browser", rule="node"))
+            if _browser_media_outputs_present(root):
+                records.append(_control_failure("browser"))
+            else:
+                output = root / "scratch/reports/playwright.jsonl"
+                if os.path.lexists(output):
+                    output.unlink()
+                command = [
+                    "node",
+                    "/control/devlane/test_adapters.mjs", "playwright", "/workspace/raw/browser.log",
+                    "/scratch/reports/playwright.jsonl",
+                ]
+                result = _run_control_adapter(root, command, "browser", tools, "browser-adapter.log", timeout=30)
+                records.extend(_adapter_lines(output, result, "browser", rule="node"))
     for stage, code in outcomes:
         if code != 0 and not (profile == "core-node" and stage == "unit"):
             records.append(_control_failure(stage))

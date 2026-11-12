@@ -195,7 +195,8 @@ _E2E_RUNTIME_ERROR = re.compile(
     r"([A-Za-z_][A-Za-z0-9_]{0,63})(?: code=([a-z0-9-]{1,64}))?\Z"
 )
 E2E_REQUIRE_CODES = frozenset((
-    "background-process-survived-cleanup", "browser-frame-not-reported", "cancel-target-did-not-start",
+    "background-process-survived-cleanup", "browser-frame-not-reported", "browser-summary-counts",
+    "cancel-target-did-not-start",
     "cancelled-execute-reported-success", "canary-after-cancel", "canary-in-command-output",
     "canary-in-summary",
     "deadline-file-required", "host-cleanup-root-remains", "install-script-canary-lacks-marker",

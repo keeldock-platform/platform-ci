@@ -1165,6 +1165,36 @@ class ReportingFailOpenTests(unittest.TestCase):
                 )
             self.assertEqual(records, [])
 
+    def test_browser_media_outputs_become_a_fixed_failure_before_playwright_report_mapping(self):
+        media_paths = (
+            "scratch/playwright-results/nested/failure.png",
+            "scratch/playwright-results/trace.zip",
+            "scratch/reports/nested/video.webm",
+        )
+        for media_path in media_paths:
+            with self.subTest(media_path=media_path):
+                temporary, root = self._root()
+                with temporary:
+                    media = root / media_path
+                    media.parent.mkdir(parents=True, exist_ok=True)
+                    media.write_bytes(b"media")
+                    (root / "scratch/reports/typescript.jsonl").write_bytes(b"")
+                    (root / "scratch/reports/vitest.json").write_bytes(b"{}")
+                    manifest = {"allowed_files": {}, "allowed_tests": {},
+                                "frames": {"browser frame": "frame_0001"}}
+
+                    def unit_adapter(_root, _command, _stage, _tools, _log_name, *, timeout):
+                        (_root / "scratch/reports/adapter.jsonl").write_bytes(b"")
+                        return 0
+
+                    with patch.object(supervisor, "_run_control_adapter", side_effect=unit_adapter) as adapter:
+                        records = supervisor._adapter_records(
+                            root, "core-node", manifest,
+                            [("typecheck", 0), ("unit", 0), ("browser", 0)], {}, {"typescript": 0},
+                        )
+                    self.assertEqual(adapter.call_count, 1)
+                    self.assertEqual(records, [supervisor._control_failure("browser")])
+
     def test_missing_rust_matrix_report_reaches_the_rehearsal_coverage_check(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
