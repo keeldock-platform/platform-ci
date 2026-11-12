@@ -225,7 +225,7 @@ def _validate_run(api, identity):
             or value.get("head_sha") != identity["sha"]
             or value.get("event") != identity["event"]
             or type(value.get("run_attempt")) is not int or value.get("run_attempt") != 1
-            or value.get("status") != "in_progress" or value.get("conclusion") is not None
+            or value.get("status") not in ("queued", "in_progress") or value.get("conclusion") is not None
             or type(repo) is not dict or type(repo.get("id")) is not int
             or repo.get("full_name") != REPOSITORY
             or repo.get("id") != identity["repository_id"]

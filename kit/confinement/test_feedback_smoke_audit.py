@@ -483,6 +483,20 @@ class ProviderShapeTests(unittest.TestCase):
         _, valid = subject._validate_jobs(FakeAPI(state), identity)
         self.assertFalse(valid)
 
+    def test_run_record_accepts_queued_while_a_child_waits_for_a_runner(self):
+        """GitHub reports the whole run as queued while any job still waits for a hosted runner."""
+        state, env = _fixture()
+        identity = subject._validate_environment(env)
+        for status in ("queued", "in_progress"):
+            state["run"]["status"] = status
+            self.assertTrue(subject._validate_run(FakeAPI(state), identity))
+        for status in ("completed", "waiting", "requested"):
+            state["run"]["status"] = status
+            self.assertFalse(subject._validate_run(FakeAPI(state), identity))
+        state["run"]["status"] = "queued"
+        state["run"]["conclusion"] = "failure"
+        self.assertFalse(subject._validate_run(FakeAPI(state), identity))
+
     def _composed_identity_and_jobs(self):
         state, env = _fixture(branch="develop", event="workflow_dispatch")
         env.update({"FEEDBACK_AUDIT_MODE": "composed-control", "GITHUB_WORKFLOW": "public-policy"})
@@ -805,7 +819,7 @@ class ReadinessAndDetailTests(unittest.TestCase):
 
     def test_readiness_waits_for_a_consistent_run_record(self):
         state, env = _fixture()
-        state["run"]["status"] = "queued"
+        state["run"]["status"] = "requested"
 
         def settle(count):
             if count == 2:

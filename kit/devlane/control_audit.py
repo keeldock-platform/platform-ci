@@ -182,7 +182,7 @@ def validate_run_record(run, identity):
             or run.get("display_title") != "public control=" + identity["wave_id"]
             or run.get("head_branch") != identity["ref"].removeprefix("refs/heads/") or run.get("head_sha") != identity["control_sha"]
             or run.get("event") != "workflow_dispatch" or run.get("run_attempt") != 1
-            or run.get("status") != "in_progress" or run.get("conclusion") is not None
+            or run.get("status") not in ("queued", "in_progress") or run.get("conclusion") is not None
             or type(repository) is not dict or repository.get("full_name") != REPOSITORY
             or repository.get("id") != REPOSITORY_ID
             or type(head_repository) is not dict or head_repository.get("full_name") != REPOSITORY
