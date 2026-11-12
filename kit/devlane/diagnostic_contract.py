@@ -196,6 +196,7 @@ _E2E_RUNTIME_ERROR = re.compile(
 E2E_REQUIRE_CODES = frozenset((
     "background-process-survived-cleanup", "browser-frame-not-reported", "cancel-target-did-not-start",
     "cancelled-execute-reported-success", "canary-after-cancel", "canary-in-command-output",
+    "canary-in-summary",
     "deadline-file-required", "host-cleanup-root-remains", "install-script-canary-lacks-marker",
     "install-script-canary-missing", "install-script-canary-platform-package-missing", "install-script-ran",
     "linux-runner-user-required", "linux-tools-required", "node-snapshot-supervisor-unconfirmed",
@@ -219,15 +220,18 @@ E2E_REQUIRE_CODES = frozenset((
     "rust-matrix-summary-profile", "rust-matrix-test-map", "rust-matrix-tool-copy-binding",
     "rust-matrix-tool-layout", "rust-matrix-tool-preparation-missing", "rust-matrix-tool-version",
     "rust-matrix-toolchain-mismatch", "rust-matrix-tools-layout", "rust-matrix-tools-link",
-    "rust-matrix-tools-missing", "rust-matrix-v1-semver-refusal", "rust-matrix-workspace-dependencies",
+    "rust-matrix-tools-missing", "rust-matrix-v1-non-semver-failure",
+    "rust-matrix-v1-semver-refusal", "rust-matrix-workspace-dependencies",
     "rust-matrix-workspace-projection", "rust-matrix-workspace-set", "rust-tool-cleanup-remains",
     "rustup-unavailable", "summary-after-decrypt-refusal", "summary-limits", "summary-schema-invalid",
     "supervisor-survived-cleanup", "test-failure-not-mapped", "unexpected-control-failure",
+    "vitest-negative-control-summary",
     "workflow-identity-required",
 ))
 E2E_COMMAND_CALL_SITES = frozenset(("supervisor-client:execute",))
 MAX_E2E_COMMAND_OUTPUT_BYTES = 16 * 1024
 MAX_E2E_COMMAND_DIAGNOSTIC_LINES = 4
+MAX_E2E_COMMAND_SUMMARY_RECORD_BYTES = 512
 _E2E_COMMAND_FAILURE = re.compile(
     r"devlane_e2e_command=failed call=(supervisor-client:execute) "
     r"returncode=(-?(?:0|[1-9][0-9]{0,8}))\Z"
@@ -247,12 +251,31 @@ _E2E_COMMAND_ADAPTER_REFUSAL = re.compile(
 
 
 def public_e2e_command_diagnostic(line):
-    """Accept only execute callsite metadata or a fixed supervisor/adapter refusal line."""
+    """Accept execute metadata, refusal lines, or one canonical public summary record."""
+    if public_e2e_command_summary_record(line):
+        return True
     if type(line) is not str or len(line.encode("ascii", "ignore")) > MAX_PUBLIC_DIAGNOSTIC_BYTES:
         return False
     if _E2E_COMMAND_FAILURE.fullmatch(line):
         return True
     return public_e2e_command_refusal(line)
+
+
+def public_e2e_command_summary_record(line):
+    """Accept one line validated by the closed public summary record grammar."""
+    if type(line) is not str:
+        return False
+    try:
+        payload = line.encode("ascii", "strict")
+    except UnicodeEncodeError:
+        return False
+    if len(payload) > MAX_E2E_COMMAND_SUMMARY_RECORD_BYTES:
+        return False
+    try:
+        from filter import is_public_summary_record
+    except ImportError:
+        return False
+    return is_public_summary_record(payload)
 
 
 def public_e2e_command_refusal(line):

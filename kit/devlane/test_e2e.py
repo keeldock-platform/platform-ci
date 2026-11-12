@@ -17,7 +17,8 @@ commands, adapters, filter and cleanup; nothing is stubbed):
   the legacy schema-1 envelope must fail the SemVer v2 gate explicitly.
 * real-node: the pinned Vitest, Vite and TypeScript packages (native bindings
   included) installed online from the reviewed lock, run offline, with a passing
-  and a failing real test.
+  test and an intentionally failing negative-control test. Its execute status 1
+  is expected and its public summary must contain case_0002 plus vitest-failed.
 * real-browser: the pinned Playwright test runner with an installed Chromium,
   run offline.
 * install-script-canary: a public package whose lock entry declares an install script
@@ -80,6 +81,15 @@ SYNTHETIC_LOCK = ROOT / "kit/confinement/synthetic_project/package-lock.json"
 
 DIAGNOSTIC_PHASES = diagnostic_contract.E2E_PROGRESS_PHASES
 PROGRESS_ENABLED = False
+
+EXECUTE_EXIT_EXPECTATIONS = {
+    ("synthetic-node", "accept"): 0,
+    ("synthetic-node", "failing-test"): 1,
+    ("real-node", "accept-with-failure"): 1,
+    ("synthetic-rust-v1-refusal", "accept"): 1,
+    ("install-script-canary", "accept"): 0,
+    ("real-browser", "accept"): 0,
+}
 
 
 def _progress(line):
@@ -412,6 +422,16 @@ def _contains_output_canary(data):
     ))
 
 
+def _expected_execute_status(scenario, variant):
+    key = (scenario["name"], variant)
+    if key not in EXECUTE_EXIT_EXPECTATIONS:
+        raise RuntimeError("execute-expectation-unlisted")
+    if (scenario["name"] == "synthetic-rust-v1-refusal") != (
+            scenario.get("expect_semver_execution_refusal") is True):
+        raise RuntimeError("execute-expectation-profile-mismatch")
+    return EXECUTE_EXIT_EXPECTATIONS[key]
+
+
 def _run(argv, *, env=None, timeout=900, expected=0, scan=True, cwd=None, diagnostic_callsite=None):
     result = _process_run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, env=env, timeout=timeout,
@@ -425,7 +445,7 @@ def _run(argv, *, env=None, timeout=900, expected=0, scan=True, cwd=None, diagno
 
 
 def _report_command_failure(callsite, result):
-    """Emit only the fixed callsite, exit code, and bounded public refusal lines."""
+    """Emit the fixed callsite, bounded public summary records, and refusal lines."""
     if (callsite not in diagnostic_contract.E2E_COMMAND_CALL_SITES
             or type(result.returncode) is not int):
         return
@@ -439,7 +459,7 @@ def _report_command_failure(callsite, result):
         return
     emitted = set()
     count = 0
-    for payload in (stdout, stderr):
+    for payload, is_stdout in ((stdout, True), (stderr, False)):
         for raw_line in payload.splitlines(keepends=True):
             if not raw_line.endswith(b"\n"):
                 continue
@@ -447,7 +467,10 @@ def _report_command_failure(callsite, result):
                 line = raw_line[:-1].decode("ascii", "strict")
             except UnicodeDecodeError:
                 continue
-            if (line not in emitted and diagnostic_contract.public_e2e_command_refusal(line)):
+            is_summary_record = (is_stdout
+                                 and output_filter.is_public_summary_record(raw_line[:-1]))
+            is_refusal = diagnostic_contract.public_e2e_command_refusal(line)
+            if line not in emitted and (is_summary_record or is_refusal):
                 print(line, flush=True)
                 emitted.add(line)
                 count += 1
@@ -1502,9 +1525,7 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
                 _require(process.returncode != 0, "cancelled-execute-reported-success")
                 _scan_output(output + errors, "canary-after-cancel")
             else:
-                expected = 1 if (variant in ("failing-test", "accept-with-failure")
-                                 or (scenario.get("expect_semver_execution_refusal") is True
-                                     and variant == "accept")) else 0
+                expected = _expected_execute_status(scenario, variant)
                 result = _run(execute, timeout=60 * 40, expected=expected,
                               diagnostic_callsite="supervisor-client:execute")
                 with DIAGNOSTICS.phase("variant-summary-validate"):
@@ -1515,12 +1536,26 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
                                      and record.get("suite") == "semver-runtime"
                                      and record.get("failed") == 1 for record in records),
                                  "rust-matrix-v1-semver-refusal")
+                        _require(all(record.get("passed") == record.get("total")
+                                     and record.get("failed") == 0
+                                     and record.get("ignored") == 0
+                                     for record in records if record.get("kind") == "coverage"
+                                     and record.get("suite") != "semver-runtime"),
+                                 "rust-matrix-v1-non-semver-failure")
                     summary = result.stdout.splitlines()
                     _require(len(summary) <= 100 and len(result.stdout) <= 16 * 1024, "summary-limits")
                     if variant in ("failing-test", "accept-with-failure"):
                         wanted = "case_0001" if variant == "failing-test" else "case_0002"
                         _require(any(record.get("kind") == "test" and record.get("test") == wanted
                                      for record in records), "test-failure-not-mapped")
+                    if scenario["name"] == "real-node" and variant == "accept-with-failure":
+                        expected_records = [
+                            {"code": "DEVLANE_FAILURE", "kind": "control", "stage": "unit",
+                             "status": "fail", "subreason": "vitest-failed"},
+                            {"kind": "test", "stage": "unit", "test": "case_0002"},
+                        ]
+                        _require(records == expected_records, "vitest-negative-control-summary")
+                        _require(not _contains_output_canary(result.stdout), "canary-in-summary")
                     if scenario["frames"]:
                         _require(any(b'"frame":"frame_0001"' in line and b'"status":"pass"' in line
                                      for line in summary), "browser-frame-not-reported")

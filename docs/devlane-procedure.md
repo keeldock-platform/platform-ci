@@ -232,6 +232,8 @@ Record the rehearsal verdict, the commit it ran on and the measured revocation l
 
 This fixture proves the encrypted legacy Rust vendoring and matrix path and that the source-bound SemVer gate still fails closed. It does not exercise the production schema-2 Rust preparation and SemVer execution path, so it cannot authorize private `core-rust` waves. Keep those waves disabled until a reviewed schema-2 source-bound rehearsal can exercise that path on the exact commit on `main`. `core-node` remains governed by its own successful rehearsal criteria.
 
+The source-free production-path E2E suite has two deliberate negative controls. Its `real-node/accept-with-failure` variant must exit 1 and emit exactly the `case_0002` test record plus the unit control record with `subreason=vitest-failed`; the harness scans all command output for canaries. Its `synthetic-rust-v1-refusal/accept` variant also expects exit 1 for the single SemVer refusal, with the other 22 matrix coverage rows passing. These are harness assertions; the rehearsal pass criteria above remain unchanged.
+
 **Residual risks the owner has accepted**
 
 - Dependency disclosure. The sanitized projection asset is public while a wave is open and lists every public dependency name and version (and the crate list for the Rust profile). Anyone who fetches it in that window learns the dependency set of the private project. It is deleted at cleanup.

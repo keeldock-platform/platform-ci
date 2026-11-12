@@ -233,6 +233,41 @@ def validate_public_summary(payload, allowlists, required_frames=()):
     return payload
 
 
+def is_public_summary_record(line):
+    """Return whether one canonical line belongs to the public summary grammar."""
+    if type(line) is not bytes or not line or len(line) > MAX_RECORD_BYTES:
+        return False
+    try:
+        record = _parse_record(line)
+        files = {}
+        tests = {}
+        frames = {}
+        suites = []
+        codes = {"DEVLANE_FAILURE"}
+        for field, target in (("file", files), ("test", tests), ("frame", frames)):
+            value = record.get(field)
+            if type(value) is str:
+                target[value] = value
+        suite = record.get("suite")
+        if type(suite) is str:
+            suites.append(suite)
+        code = record.get("code")
+        if type(code) is str and CODE.fullmatch(code):
+            codes.add(code)
+        allowlists = {
+            "files": files,
+            "tests": tests,
+            "frames": frames,
+            "stages": sorted(ALLOWED_STAGES),
+            "codes": sorted(codes),
+            "max_lines": {name: 10_000_000 for name in files},
+            "suites": sorted(set(suites)),
+        }
+        return filter_records([line], allowlists) == line + b"\n"
+    except (FilterRefusal, ValueError, TypeError, RecursionError):
+        return False
+
+
 def load_allowlists(path):
     from bundle import strict_json, Refusal
     value = strict_json(Path(path).read_bytes(), 4 * 1024 * 1024)

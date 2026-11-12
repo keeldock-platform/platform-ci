@@ -426,6 +426,20 @@ def bundle_request_digest(owner):
 
 
 class ProductionFailureDiagnosticsTests(unittest.TestCase):
+    def test_execute_status_contract_distinguishes_expected_node_and_rust_failures(self):
+        self.assertEqual(test_e2e._expected_execute_status(
+            {"name": "synthetic-node"}, "accept"), 0)
+        self.assertEqual(test_e2e._expected_execute_status(
+            {"name": "synthetic-node"}, "failing-test"), 1)
+        self.assertEqual(test_e2e._expected_execute_status(
+            {"name": "real-node"}, "accept-with-failure"), 1)
+        self.assertEqual(test_e2e._expected_execute_status(
+            {"name": "synthetic-rust-v1-refusal", "expect_semver_execution_refusal": True},
+            "accept"), 1)
+        with self.assertRaisesRegex(RuntimeError, "execute-expectation-profile-mismatch"):
+            test_e2e._expected_execute_status(
+                {"name": "synthetic-rust-v1-refusal"}, "accept")
+
     def test_execute_command_failure_prints_only_bounded_public_diagnostics(self):
         result = subprocess.CompletedProcess(
             ["supervisor.py", "execute"], 2,
@@ -441,6 +455,40 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
         ])
         self.assertTrue(all(test_e2e.diagnostic_contract.public_e2e_command_diagnostic(line)
                             for line in lines))
+
+        summary = (
+            b'{"code":"DEVLANE_FAILURE","kind":"control","stage":"unit",'
+            b'"status":"fail","subreason":"vitest-failed"}\n'
+            b'{"kind":"test","stage":"unit","test":"case_0002"}\n'
+            b'private detail\n'
+        )
+        result = subprocess.CompletedProcess(
+            ["supervisor.py", "execute"], 1, summary,
+            b"devlane_supervisor_refusal=execution-order\n",
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            test_e2e._report_command_failure("supervisor-client:execute", result)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(lines, [
+            "devlane_e2e_command=failed call=supervisor-client:execute returncode=1",
+            '{"code":"DEVLANE_FAILURE","kind":"control","stage":"unit","status":"fail","subreason":"vitest-failed"}',
+            '{"kind":"test","stage":"unit","test":"case_0002"}',
+            "devlane_supervisor_refusal=execution-order",
+        ])
+        self.assertTrue(all(test_e2e.diagnostic_contract.public_e2e_command_diagnostic(line)
+                            for line in lines))
+
+        bounded_lines = b"".join(
+            ('{"kind":"test","stage":"unit","test":"case_%04d"}\n' % index).encode("ascii")
+            for index in range(1, 7)
+        )
+        bounded = subprocess.CompletedProcess(["supervisor.py", "execute"], 1, bounded_lines, b"")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            test_e2e._report_command_failure("supervisor-client:execute", bounded)
+        self.assertEqual(len(output.getvalue().splitlines()),
+                         1 + test_e2e.diagnostic_contract.MAX_E2E_COMMAND_DIAGNOSTIC_LINES)
 
         canary = subprocess.CompletedProcess(
             ["supervisor.py", "execute"], 1,
