@@ -1294,8 +1294,8 @@ def _prepare_trusted_files(root, manifest):
 
 
 def _prepare_writable_scratch(root, *, registry_v2=False):
-    for relative in ("scratch/reports", "scratch/raw", "scratch/target", "scratch/tmp", "scratch/tmp/vitest-cache",
-                     "scratch/npm-cache", "scratch/cargo-home"):
+    for relative in ("scratch/reports", "scratch/raw", "scratch/playwright-results", "scratch/target", "scratch/tmp",
+                     "scratch/tmp/vitest-cache", "scratch/npm-cache", "scratch/cargo-home"):
         path = root / relative
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chown(str(path), WORKER_UID, WORKER_GID)
@@ -3259,7 +3259,7 @@ class Service:
             "workspace/source", "workspace/raw", "workspace/.devlane-baseline-input",
             "workspace/semver-baseline", "workspace/semver-temporary-project",
             "trusted", "scratch/tmp", "scratch/target",
-            "scratch/reports", "scratch/npm-cache", "scratch/cargo-home",
+            "scratch/reports", "scratch/playwright-results", "scratch/npm-cache", "scratch/cargo-home",
             "scratch/semver-cargo-home", "scratch/semver-cargo-bin",
             "scratch/semver-target", "scratch/semver-state",
         ):

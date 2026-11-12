@@ -1587,11 +1587,12 @@ class PreparationDefectTests(unittest.TestCase):
                               side_effect=lambda path, uid, gid: ownership.append((path, uid, gid))):
                 supervisor._prepare_writable_scratch(root)
 
-            for relative in ("scratch/raw", "scratch/target", "scratch/cargo-home"):
+            for relative in ("scratch/raw", "scratch/playwright-results", "scratch/target", "scratch/cargo-home"):
                 path = root / relative
                 self.assertTrue(path.is_dir())
                 self.assertIn((str(path), supervisor.WORKER_UID, supervisor.WORKER_GID), ownership)
             self.assertEqual((root / "scratch/raw").stat().st_mode & 0o777, 0o700)
+            self.assertEqual((root / "scratch/playwright-results").stat().st_mode & 0o777, 0o700)
             cargo_config = (root / "scratch/cargo-home/config.toml").read_text(encoding="ascii")
             self.assertIn('[source.crates-io]\nreplace-with = "vendored-sources"', cargo_config)
             self.assertIn('[source.vendored-sources]\ndirectory = "/prepared/cargo-vendor"', cargo_config)
