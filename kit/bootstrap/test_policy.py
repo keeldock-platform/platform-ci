@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from policy import (
+    DESKTOP_TAURI_SMOKE_WORKFLOW_SHA256,
     MACOS_CAPABILITY_WORKFLOW_TEMPLATE,
     MACOS_CACHE_PROOF_ACTION_SHA,
     MACOS_CACHE_PROOF_WORKFLOW_TEMPLATE,
@@ -46,6 +47,7 @@ from test_policy_windows import *
 
 GOOD_SHA = "a" * 40
 PLATFORM_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/public-policy.yml"
+DESKTOP_TAURI_SMOKE_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/desktop-tauri-smoke.yml"
 MACOS_CAPABILITY_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-capability.yml"
 MACOS_REVIEWED_BUILD_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-reviewed-build.yml"
 MACOS_RUST_TOOLCHAIN_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-rust-toolchain-smoke.yml"
@@ -130,18 +132,43 @@ class ControlShaTests(unittest.TestCase):
 
 
 class PolicyDocumentTests(unittest.TestCase):
-    def test_public_pool_and_schema_version_are_fixed_fields(self):
-        self.assertEqual(validate_policy_document({"pool": "platform", "schema_version": 1}), "platform")
+    def test_public_pool_schema_and_platform_workflow_allowlist_are_fixed(self):
+        platform = validate_policy_document({
+            "pool": "platform",
+            "schema_version": 2,
+            "workflow_allowlist": [".github/workflows/desktop-tauri-smoke.yml"],
+        })
+        self.assertEqual(platform["pool"], "platform")
+        self.assertEqual(platform["workflow_allowlist"], (".github/workflows/desktop-tauri-smoke.yml",))
+        self.assertEqual(
+            validate_policy_document({"pool": "connect", "schema_version": 1})["pool"],
+            "connect",
+        )
         for value in (
             {"pool": "private", "schema_version": 1},
-            {"pool": "platform", "schema_version": True},
-            {"pool": "platform", "schema_version": 1, "source": "secret"},
+            {"pool": "platform", "schema_version": True, "workflow_allowlist": []},
+            {"pool": "platform", "schema_version": 1, "workflow_allowlist": []},
+            {"pool": "platform", "schema_version": 2},
+            {
+                "pool": "platform",
+                "schema_version": 2,
+                "workflow_allowlist": [".github/workflows/other.yml"],
+            },
+            {
+                "pool": "platform",
+                "schema_version": 2,
+                "workflow_allowlist": [".github/workflows/desktop-tauri-smoke.yml"] * 2,
+            },
+            {"pool": "connect", "schema_version": 1, "workflow_allowlist": []},
         ):
             with self.subTest(fields=tuple(sorted(value))):
                 with self.assertRaises(PolicyError):
                     validate_policy_document(value)
         with self.assertRaisesRegex(PolicyError, "policy-pool-mismatch"):
-            validate_policy_document({"pool": "connect", "schema_version": 1}, "platform")
+            validate_policy_document({
+                "pool": "connect",
+                "schema_version": 1,
+            }, "platform")
 
 
 class WorkflowPolicyTests(unittest.TestCase):
@@ -169,6 +196,47 @@ class WorkflowPolicyTests(unittest.TestCase):
                     self.assertNotEqual(changed, workflow)
                     with self.assertRaises(PolicyError):
                         validate_workflow_text(changed, "platform", kind)
+
+    def test_desktop_tauri_smoke_is_a_fixed_public_workflow_with_sha_pinned_actions(self):
+        workflow = DESKTOP_TAURI_SMOKE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(
+            hashlib.sha256(workflow.encode("utf-8")).hexdigest(),
+            DESKTOP_TAURI_SMOKE_WORKFLOW_SHA256,
+        )
+        self.assertTrue(validate_workflow_text(workflow, "platform", "desktop-tauri-smoke"))
+        self.assertEqual(workflow.count("ubuntu-24.04"), 2)
+        self.assertEqual(workflow.count("macos-15"), 3)
+        self.assertEqual(workflow.count("windows-2025"), 3)
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("schedule:", workflow)
+        self.assertIn("permissions: {}", workflow)
+        self.assertIn("contents: read", workflow)
+        self.assertIn("npm ci --ignore-scripts", workflow)
+        self.assertIn("npm run build", workflow)
+        self.assertIn("cargo build --locked --manifest-path src-tauri/Cargo.toml", workflow)
+        self.assertIn("cargo test --locked --manifest-path src-tauri/Cargo.toml", workflow)
+        self.assertIn("npm run tauri build -- --debug --no-bundle", workflow)
+        self.assertIn("xcodebuild -version", workflow)
+        self.assertIn("cl.exe /Bv", workflow)
+        self.assertIn("windows-sdk=", workflow)
+        self.assertIn("webview2-runtime=", workflow)
+        self.assertNotIn("secrets.", workflow)
+        self.assertNotIn(chr(35), workflow)
+        action_refs = re.findall(
+            r"(?m)^\s+uses: ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@([0-9a-f]{40})$",
+            workflow,
+        )
+        self.assertEqual(
+            action_refs,
+            [
+                ("actions/checkout", "11bd71901bbe5b1630ceea73d27597364c9af683"),
+                ("actions/setup-node", "49933ea5288caeca8642d1e84afbd3f7d6820020"),
+            ],
+        )
+        with self.assertRaisesRegex(PolicyError, "workflow-template-mismatch"):
+            validate_workflow_text(workflow + "\n", "platform", "desktop-tauri-smoke")
+        with self.assertRaisesRegex(PolicyError, "workflow-kind-pool"):
+            validate_workflow_text(workflow, "connect", "desktop-tauri-smoke")
 
     def test_development_feedback_smoke_requires_reviewed_platform_workflow(self):
         path = Path(__file__).resolve().parents[2] / ".github/workflows/development-feedback-smoke.yml"

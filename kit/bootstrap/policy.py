@@ -20,6 +20,13 @@ MAX_POLICY_BYTES = 2048
 MAX_RESULT_BYTES = 2048
 MAX_COUNT = 100000
 MAX_DURATION_MS = 86400000
+PLATFORM_POLICY_WORKFLOW_ALLOWLIST = (".github/workflows/desktop-tauri-smoke.yml",)
+PLATFORM_POLICY_WORKFLOW_KINDS = MappingProxyType({
+    ".github/workflows/desktop-tauri-smoke.yml": "desktop-tauri-smoke",
+})
+DESKTOP_TAURI_SMOKE_WORKFLOW_SHA256 = "66657210c34c3d6ca76b7f224fc9e82b06e68fcea92c21934895e638d7ac70af"
+DESKTOP_TAURI_SMOKE_CHECKOUT_ACTION_SHA = "11bd71901bbe5b1630ceea73d27597364c9af683"
+DESKTOP_TAURI_SMOKE_SETUP_NODE_ACTION_SHA = "49933ea5288caeca8642d1e84afbd3f7d6820020"
 MACOS_SOURCE_READER_ACTION_SHA = "64ab729a6294000f5aa4a4bc0b73d1f32bc45510"
 MACOS_SOURCE_READER_WORKFLOW_SHA256 = "e6082feb71990ef2590c791f09927d6a33a277d0bfc60cf2a6ab472ab4f417fc"
 MACOS_RULES_SOURCE_READER_WORKFLOW_SHA256 = "c0f145c306a6fff9739496d2a6b352016f4203cb5836807cefc3b862facf8431"
@@ -95,16 +102,32 @@ def verify_git_head(root, expected_sha):
 
 
 def validate_policy_document(value, expected_pool=None):
-    if type(value) is not dict or set(value) != {"pool", "schema_version"}:
+    if type(value) is not dict or "pool" not in value:
         raise PolicyError("policy-fields")
     pool = value["pool"]
     if type(pool) is not str or pool not in PUBLIC_POOLS:
         raise PolicyError("policy-pool")
     if expected_pool is not None and (type(expected_pool) is not str or pool != expected_pool):
         raise PolicyError("policy-pool-mismatch")
-    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
-        raise PolicyError("policy-version")
-    return pool
+    if pool == "platform":
+        if set(value) != {"pool", "schema_version", "workflow_allowlist"}:
+            raise PolicyError("policy-fields")
+        if type(value["schema_version"]) is not int or value["schema_version"] != 2:
+            raise PolicyError("policy-version")
+        workflow_allowlist = value["workflow_allowlist"]
+        if type(workflow_allowlist) is not list or tuple(workflow_allowlist) != PLATFORM_POLICY_WORKFLOW_ALLOWLIST:
+            raise PolicyError("policy-workflow-allowlist")
+    else:
+        if set(value) != {"pool", "schema_version"}:
+            raise PolicyError("policy-fields")
+        if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+            raise PolicyError("policy-version")
+        workflow_allowlist = ()
+    return MappingProxyType({
+        "pool": pool,
+        "schema_version": value["schema_version"],
+        "workflow_allowlist": tuple(workflow_allowlist),
+    })
 
 
 def load_policy_document(path, expected_pool=None):
@@ -1426,6 +1449,12 @@ def validate_workflow_text(text, pool, workflow_kind="public-policy"):
         if pool != "platform":
             raise PolicyError("workflow-kind-pool")
         if hashlib.sha256(text.encode("utf-8")).hexdigest() != DEVELOPMENT_FEEDBACK_SMOKE_WORKFLOW_SHA256:
+            raise PolicyError("workflow-template-mismatch")
+        return True
+    if workflow_kind == "desktop-tauri-smoke":
+        if pool != "platform":
+            raise PolicyError("workflow-kind-pool")
+        if hashlib.sha256(text.encode("utf-8")).hexdigest() != DESKTOP_TAURI_SMOKE_WORKFLOW_SHA256:
             raise PolicyError("workflow-template-mismatch")
         return True
     if workflow_kind == "attestation-probe":

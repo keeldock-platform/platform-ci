@@ -1,0 +1,17 @@
+[package]
+name = "desktop-tauri-smoke"
+version = "0.1.0"
+description = "Public Tauri desktop build smoke fixture"
+edition = "2021"
+rust-version = "1.85"
+build = "build.rs"
+
+[lib]
+name = "desktop_tauri_smoke"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "=2.7.3", features = [] }
+
+[dependencies]
+tauri = { version = "=2.12.4", features = [] }

@@ -266,6 +266,7 @@ class PublicTreeTests(unittest.TestCase):
         self.assertEqual(BINARY_FIXTURE_FILES, frozenset((
             "kit/devlane/fixtures/real-netns-rtnetlink-ipv4-ubuntu2404.bin",
             "kit/devlane/fixtures/real-netns-rtnetlink-ipv6-ubuntu2404.bin",
+            "kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/icons/icon.png",
         )))
         self.assertTrue(BINARY_FIXTURE_FILES <= PLATFORM_FILES)
         self.assertTrue(BINARY_FIXTURE_FILES <= set(PINNED_FILE_SHA256))
@@ -296,6 +297,50 @@ class PublicTreeTests(unittest.TestCase):
         self.assertIn("kit/confinement/macos_capability.swift", result)
         self.assertIn("kit/confinement/test_macos_capability.py", result)
         self.assertIn("kit/confinement/test_macos_descriptors.py", result)
+
+    def test_public_tauri_smoke_fixture_and_workflow_are_registered_and_pinned(self):
+        prefix = "kit/devlane/fixtures/desktop-tauri-smoke/"
+        fixture_files = sorted(name for name in PLATFORM_FILES if name.startswith(prefix))
+        expected_fixture = {
+            "kit/devlane/fixtures/desktop-tauri-smoke/package-lock.json",
+            "kit/devlane/fixtures/desktop-tauri-smoke/package.json",
+            "kit/devlane/fixtures/desktop-tauri-smoke/build.mjs",
+            "kit/devlane/fixtures/desktop-tauri-smoke/index.html",
+            "kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/Cargo.lock",
+            "kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/Cargo.toml",
+            "kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/build.rs",
+            "kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/icons/icon.png",
+            "kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/src/lib.rs",
+            "kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/src/main.rs",
+            "kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/tauri.conf.json",
+        }
+        policy_files = {
+            ".github/workflows/desktop-tauri-smoke.yml",
+            "ci/policy.json",
+            "kit/bootstrap/check_candidate.py",
+            "kit/bootstrap/policy.py",
+            "kit/bootstrap/public_tree.py",
+            "kit/bootstrap/test_policy.py",
+            "kit/bootstrap/test_public_tree.py",
+        }
+        self.assertEqual(set(fixture_files), expected_fixture)
+        tree = scan_tree(ROOT, "platform")
+        for name in fixture_files + sorted(policy_files):
+            with self.subTest(name=name):
+                self.assertIn(name, PLATFORM_FILES)
+                self.assertIn(name, tree)
+                pin_key = ("platform", name) if name == "ci/policy.json" else name
+                self.assertIn(pin_key, PINNED_FILE_SHA256)
+        for name in fixture_files:
+            if name.endswith(("Cargo.lock", "package-lock.json", ".png")):
+                continue
+            self.assertNotIn(chr(35), (ROOT / name).read_text(encoding="utf-8"))
+        for name in (
+            ".github/workflows/desktop-tauri-smoke.yml",
+            "kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/Cargo.lock",
+            "kit/devlane/fixtures/desktop-tauri-smoke/package-lock.json",
+        ):
+            self.assertNotIn(chr(35), (ROOT / name).read_text(encoding="utf-8"))
 
     def test_release_evidence_scanner_is_registered_and_discovered(self):
         self.assertIn("kit/confinement/release_evidence.py", PLATFORM_FILES)
@@ -715,6 +760,10 @@ class PublicTreeTests(unittest.TestCase):
 
     def test_reviewed_native_and_source_controls_have_public_tree_hash_pins(self):
         expected = {
+            '.github/workflows/desktop-tauri-smoke.yml',
+            ('platform', 'ci/policy.json'),
+            'kit/bootstrap/check_candidate.py',
+            'kit/bootstrap/test_public_tree.py',
             '.github/workflows/core-dependency-checks.yml',
             ('platform', '.github/workflows/public-policy.yml'),
             'docs/branch-promotion.md',
@@ -1021,6 +1070,17 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/test_rust_matrix_runner.py',
             'kit/devlane/test_rust_public_audit.py',
             'kit/devlane/typescript_reporter.mjs',
+            'kit/devlane/fixtures/desktop-tauri-smoke/package-lock.json',
+            'kit/devlane/fixtures/desktop-tauri-smoke/package.json',
+            'kit/devlane/fixtures/desktop-tauri-smoke/build.mjs',
+            'kit/devlane/fixtures/desktop-tauri-smoke/index.html',
+            'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/Cargo.lock',
+            'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/Cargo.toml',
+            'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/build.rs',
+            'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/icons/icon.png',
+            'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/src/lib.rs',
+            'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/src/main.rs',
+            'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/tauri.conf.json',
         })
         self.assertEqual(set(PINNED_FILE_SHA256), expected)
         self.assertTrue({name for name in expected if type(name) is str}.issubset(PLATFORM_FILES))
@@ -1363,6 +1423,11 @@ class PublicTreeTests(unittest.TestCase):
         valid_field = '{"integrity": "' + valid_sri + '"}'
 
         inspect_text(valid_field, "platform", SYNTHETIC_NPM_LOCK_PATH)
+        inspect_text(
+            valid_field,
+            "platform",
+            "kit/devlane/fixtures/desktop-tauri-smoke/package-lock.json",
+        )
 
         for text, relative_path in (
             (

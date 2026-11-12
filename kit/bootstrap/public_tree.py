@@ -374,6 +374,18 @@ PLATFORM_FILES = frozenset(
         'kit/devlane/test_network_probe.py',
         'kit/devlane/test_rust_matrix_runner.py',
         'kit/devlane/test_rust_public_audit.py',
+        '.github/workflows/desktop-tauri-smoke.yml',
+        'kit/devlane/fixtures/desktop-tauri-smoke/package-lock.json',
+        'kit/devlane/fixtures/desktop-tauri-smoke/package.json',
+        'kit/devlane/fixtures/desktop-tauri-smoke/build.mjs',
+        'kit/devlane/fixtures/desktop-tauri-smoke/index.html',
+        'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/Cargo.lock',
+        'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/Cargo.toml',
+        'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/build.rs',
+        'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/icons/icon.png',
+        'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/src/lib.rs',
+        'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/src/main.rs',
+        'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/tauri.conf.json',
     )
 )
 CONSUMER_FILES = frozenset((".github/workflows/public-policy.yml", "ci/policy.json"))
@@ -385,6 +397,10 @@ ALLOWED_FILES = {
 }
 MAX_FILE_BYTES = 262144
 SYNTHETIC_NPM_LOCK_PATH = "kit/confinement/synthetic_project/package-lock.json"
+SYNTHETIC_NPM_LOCK_PATHS = frozenset((
+    SYNTHETIC_NPM_LOCK_PATH,
+    "kit/devlane/fixtures/desktop-tauri-smoke/package-lock.json",
+))
 SELF_PIN_PATH = "kit/bootstrap/public_tree.py"
 SELF_PIN_LINE_PATTERN = re.compile(
     rb"(?m)^    'kit/bootstrap/public_tree\.py': '[0-9a-f]{64}',$"
@@ -424,9 +440,9 @@ PINNED_FILE_SHA256 = {
     'core-ci/test_separation.py': 'e7ff85c8f45a7ecd03f98f72c4123018a5d39847fcb49442fbdf7f9225d9cb3b',
     'docs/branch-promotion.md': '1a1ab7145e8851de28ca79e0ade137c2c67680f48c41e868ad63baf1757f1c7b',
     ('platform', '.github/workflows/public-policy.yml'): '856a1a8ee635e5f31a28e82af68b8693967e6bf0acd284ac41acc32972218e3a',
-    'kit/bootstrap/policy.py': '4c1b248cdcca11ed52049ad02e8d75892571a5482c20e1f3d8a6eea99cc73481',
-    'kit/bootstrap/test_policy.py': '61ae5bc9e1c6ac7674d228e45c52ce10df045adcdae333a947ea65187d65bad2',
-    'kit/baselines/baselines_prepare.py': 'bc9e58d9b96c5c3941f1735626e5da9c4ccbfdc1e748a70c198a38d5c811bb98',
+    'kit/bootstrap/policy.py': '9575128a76a7419abd1ad91bd61e5d25278a08959539aea5c4eaab1e70a8f221',
+    'kit/bootstrap/test_policy.py': '59f2523a07156c1baddc4fd924d86526813f08fb91c7ba12ea30d86d299b44b6',
+    'kit/baselines/baselines_prepare.py': '2bd39ebcaccf6e0522d6b3081fa91a898037a9c771730e3f1c00b881ee7f77ee',
     'kit/baselines/test_baselines_prepare.py': '76dda4abf5b311b4cfac3eeced6a28dcad12e6870a36861d31d333b51c0910ab',
     'kit/bootstrap/action.yml': '236745bfd3f0cc3aa8ea6b71c7e647044d4149142d8e68fe57710a86ef325d04',
     'kit/bootstrap/policy_baselines.py': 'f221172213f5610b4c4e25c499b6066f0559b7d598255161853de38aaf7f2a1a',
@@ -435,13 +451,13 @@ PINNED_FILE_SHA256 = {
     'kit/bootstrap/policy_linux.py': '0b314a645e43f2aaec58ca23150386b5865e8a27c3101459d00d42370e7d5a5f',
     'kit/bootstrap/policy_npm.py': 'b110b4573b2919003792e05bdcec60a0108f9e2ea1ebc1ce820ff77216271794',
     'kit/bootstrap/policy_rust.py': '4306a55701a5a04c884b2b21091a6d06307134e3570f0d5d65cb103ff84023ec',
-    'kit/bootstrap/public_tree.py': 'ab78728dd3627885572e8a47651bdd196d1f3990e99f03c744513831e3df9ccb',
+    'kit/bootstrap/public_tree.py': '2aa363f1e9cd515f274038d6b701864da4c1f0e7827af1db04360e2e5ad9b41c',
     'kit/bootstrap/test_policy_baselines.py': '690980cc3a140970d2b813d854823e3e9f32d8b09db9e25c0ca143140c3af627',
     'kit/bootstrap/test_policy_handoff.py': '3cf707fec6cc1a62e49a948b496fe00765a04ec171fd4cdc57b07d214d3100a2',
     'kit/bootstrap/test_policy_linux.py': 'f1c62480d608d680e73cdbf0ca8b7c83552919bd5de4caa095d5e04e8c3e5f8c',
     'kit/bootstrap/test_policy_npm.py': '8893c4a89ab447a8813806afd2b35bbedbc78d530f1c5a1c8bdf67fc55865eed',
     'kit/bootstrap/test_policy_rust.py': '2465451eb33dec7787807d27ae9ef574b7447a52953c2c3f1951003243b6294a',
-    'kit/bootstrap/test_public_tree.py': 'f930f1102de914ef870697a71cfc355909f0f1f15f38e494332f96aa36ef40d8',
+    'kit/bootstrap/test_public_tree.py': '3a5cc7215702a42b3aae0a117904cc24b1381340ac6b1a8829b16edf3dc1002a',
     'kit/ci/feature_states.py': 'e058de49cf9e96b61e8037ee533a095082f3210429586d4183d6c44c4f57d479',
     'kit/ci/future-stage-inventory.json': '185663fbc7c94b010dc4c74f7e6867898b5186a0d88acb95e61414f15cb695aa',
     'kit/ci/future_stage.py': '11023901b556599b0f5f747b84ed540c45eae5a2d2ad65ea3a1ba95f81775d41',
@@ -694,10 +710,26 @@ PINNED_FILE_SHA256 = {
     'kit/devlane/fixtures/core-rust-rehearsal/supply-chain/config.toml': '6511f4606f1ce0496bb2d7196bcf47bde1dc79d9271048eb8510818fbd77efbd',
     'kit/devlane/fixtures/core-rust-rehearsal/supply-chain/imports.lock': 'ff01c4f0f1a725196404edd25fbab0b4ad073de1264fa124b92e2344ec39eb7a',
     'kit/devlane/fixtures/core-rust-rehearsal/runtime/supply-chain/imports.lock': 'ff01c4f0f1a725196404edd25fbab0b4ad073de1264fa124b92e2344ec39eb7a',
+
+    '.github/workflows/desktop-tauri-smoke.yml': '66657210c34c3d6ca76b7f224fc9e82b06e68fcea92c21934895e638d7ac70af',
+    ('platform', 'ci/policy.json'): 'e28afbcceece16eb7590ba1e7910e13e4f07bfb1455e1ea68bfb5de31d4435b7',
+    'kit/bootstrap/check_candidate.py': '3155dc7990286f3dbfac345475e7258c4d9837d574dcbc3b9f9a9591a23f2e71',
+    'kit/devlane/fixtures/desktop-tauri-smoke/package-lock.json': 'ac46fa7a64e3d42eae4c876ea4eb9e812f98ddb24ae471036cf9f4299e8a623a',
+    'kit/devlane/fixtures/desktop-tauri-smoke/package.json': 'd903118c9fcb7eb14264bc3e15c28c59022f91ef4f87f7b239d76a88b9f79837',
+    'kit/devlane/fixtures/desktop-tauri-smoke/build.mjs': 'd1234349731053a1c6e777113f4b32eddb1eb949e3093d1da75d2579f724c9a3',
+    'kit/devlane/fixtures/desktop-tauri-smoke/index.html': '733c4c284857374634f1d0ce2a51497d47cea001042df53a96d655ba3910ce36',
+    'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/Cargo.lock': 'e268f6e248b44b48559cd20a8757bbbf545e1795e00abb87429adc57ead479b0',
+    'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/Cargo.toml': '21544791c139e83d112c6b7e36ab4a929b0844f112d1dfa2732b09a05e1ddfe0',
+    'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/build.rs': '487059eaf8a947b80f20a9aacac038a5047b2ad69d2401b827376c67d6fe847f',
+    'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/icons/icon.png': 'de7472f4851586243f8b19d5f254a4553400a9a303244fb5aefa855317d367bd',
+    'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/src/lib.rs': '4705cc63d675b1621bfd01b28d87d789e58622b066697a47de775ae9d099bab6',
+    'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/src/main.rs': 'cadaae13fdda82c558f51a943c89cdf05dbcf151eed89dca388c66b1f74a3539',
+    'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/tauri.conf.json': '9bce3fca18224c76a7825207f84b34dae160e4e133b9d51e7230fe25dcebd2d7',
 }
 BINARY_FIXTURE_FILES = frozenset((
     "kit/devlane/fixtures/real-netns-rtnetlink-ipv4-ubuntu2404.bin",
     "kit/devlane/fixtures/real-netns-rtnetlink-ipv6-ubuntu2404.bin",
+    "kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/icons/icon.png",
 ))
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
 SHA512_SRI_PATTERN = re.compile(r"sha512-[A-Za-z0-9+/]{86}==\Z")
@@ -746,6 +778,7 @@ PINNED_CARGO_FIXTURE_LOCKS = frozenset((
     "kit/devlane/fixtures/core-rust-rehearsal/Cargo.lock",
     "kit/devlane/fixtures/core-rust-rehearsal/fuzz/Cargo.lock",
     "kit/devlane/fixtures/core-rust-rehearsal/runtime/Cargo.lock",
+    "kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/Cargo.lock",
 ))
 PINNED_CARGO_REGISTRY_READERS = frozenset((
     "kit/devlane/cargo_projection.py",
@@ -854,7 +887,7 @@ def _valid_sha512_integrity_spans(text):
 
 
 def _plan_scan_text(text, relative_path):
-    if relative_path != SYNTHETIC_NPM_LOCK_PATH:
+    if relative_path not in SYNTHETIC_NPM_LOCK_PATHS:
         return text
     spans = _valid_sha512_integrity_spans(text)
     if not spans:

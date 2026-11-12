@@ -4,6 +4,7 @@ from pathlib import Path
 from api_budget import load_budget_document
 from policy import (
     LANE_CANDIDATE_WORKFLOWS,
+    PLATFORM_POLICY_WORKFLOW_KINDS,
     PolicyError,
     load_policy_document,
     validate_workflow_text,
@@ -21,7 +22,8 @@ def main():
     root = Path(arguments.root)
     try:
         actual_sha = verify_git_head(root, arguments.sha)
-        pool = load_policy_document(root / "ci/policy.json", arguments.pool)
+        policy_document = load_policy_document(root / "ci/policy.json", arguments.pool)
+        pool = policy_document["pool"]
         workflow_path = root / ".github/workflows/public-policy.yml"
         with workflow_path.open("rb") as source:
             workflow_payload = source.read(262145)
@@ -76,6 +78,14 @@ def main():
                 if len(lane_payload) > 262144:
                     raise PolicyError(too_large_code)
                 validate_workflow_text(lane_payload.decode("utf-8"), pool, workflow_kind)
+            for path in policy_document["workflow_allowlist"]:
+                workflow_path = root / path
+                with workflow_path.open("rb") as source:
+                    workflow_payload = source.read(262145)
+                if len(workflow_payload) > 262144:
+                    raise PolicyError("policy-workflow-too-large")
+                workflow_kind = PLATFORM_POLICY_WORKFLOW_KINDS[path]
+                validate_workflow_text(workflow_payload.decode("utf-8"), pool, workflow_kind)
         scan_tree(root, pool)
         if pool == "platform":
             load_budget_document(root / "ci/api-budgets.json")

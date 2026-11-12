@@ -69,6 +69,8 @@ USES_RE = re.compile(
 )
 TEMPLATE_USES_RE = re.compile(r"uses:\s+([A-Za-z0-9_./-]+)@([0-9a-f]{40})")
 POLICY_SHA_CONSTANTS = (
+    ("actions/checkout", "DESKTOP_TAURI_SMOKE_CHECKOUT_ACTION_SHA"),
+    ("actions/setup-node", "DESKTOP_TAURI_SMOKE_SETUP_NODE_ACTION_SHA"),
     ("actions/create-github-app-token", "MACOS_SOURCE_READER_ACTION_SHA"),
     ("actions/cache/restore", "MACOS_CACHE_PROOF_ACTION_SHA"),
     ("actions/cache/save", "MACOS_CACHE_PROOF_ACTION_SHA"),
