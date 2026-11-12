@@ -25,6 +25,7 @@ from bundle import Refusal, strict_json
 REPOSITORY = "keeldock-platform/platform-ci"
 REPOSITORY_ID = "1430960557"
 WORKFLOW_PATH = ".github/workflows/devlane-encrypted.yml"
+SOURCE_FREE_WAVE_CLASS = "source-free-synthetic"
 MAX_PROJECTION = 16 * 1024 * 1024
 MAX_CIPHERTEXT = 64 * 1024 * 1024
 MAX_REDIRECTS = 5
@@ -58,8 +59,10 @@ def validate_dispatch(identity, expected_profile=None, now=None):
         "bundle_asset_id", "bundle_sha256", "bundle_size", "projection_asset_id",
         "projection_sha256", "projection_size", "expires",
     }
-    if set(identity) != required:
+    if set(identity) not in (required, required | {"wave_class"}):
         _fail("dispatch-shape")
+    if "wave_class" in identity and identity["wave_class"] != SOURCE_FREE_WAVE_CLASS:
+        _fail("dispatch-wave-class")
     if identity["repository"] != REPOSITORY or identity["repository_id"] != REPOSITORY_ID:
         _fail("repository-identity")
     if identity["server_url"] != "https://github.com" or identity["event"] != "workflow_dispatch":

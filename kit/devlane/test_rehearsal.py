@@ -20,6 +20,7 @@ import bundle
 import coordinator
 import project
 import rehearsal
+import supervisor
 import test_e2e
 
 
@@ -518,6 +519,7 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
     def test_unit_failure_raw_diagnostics_are_bounded_scanned_and_neutralized(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            destination = root / "devlane-vitest-local-synthetic-node-accept.json"
             raw = root / "workspace/raw"
             reports = root / "scratch/reports"
             raw.mkdir(parents=True)
@@ -534,9 +536,19 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
             (reports / "adapter.jsonl").write_text("", encoding="ascii")
             summary = (b'{"code":"DEVLANE_FAILURE","kind":"control","stage":"unit",'
                        b'"status":"fail","subreason":"vitest-failed"}\n')
+            service = object.__new__(supervisor.Service)
+            service.root = root
+            service.failure_diagnostics_file = destination
+            service.owner_uid = os.getuid()
+            service.context = {"wave_class": supervisor.fetch.SOURCE_FREE_WAVE_CLASS, "profile": "core-node"}
+            service.summary = summary
+            self.assertTrue(service._capture_failure_diagnostics())
+            metadata = destination.stat()
+            self.assertEqual(metadata.st_uid, os.getuid())
+            self.assertEqual(metadata.st_mode & 0o777, 0o600)
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
-                test_e2e._emit_vitest_failure_diagnostics(root, summary)
+                test_e2e._emit_vitest_failure_diagnostics(destination, summary)
             lines = output.getvalue().splitlines()
 
         self.assertLessEqual(len(lines), test_e2e.diagnostic_contract.MAX_E2E_VITEST_DIAGNOSTIC_LINES)
@@ -549,6 +561,29 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
         rendered = "\n".join(lines)
         for marker in ("SYNTHETIC_SOURCE_CANARY", "KEYCANARY-73A10X", "::error::", chr(35) * 2 + "[group]"):
             self.assertNotIn(marker, rendered)
+        self.assertFalse(destination.exists())
+
+    def test_failure_diagnostic_capture_requires_source_free_context_and_fixed_unit_failure(self):
+        summary = (b'{"code":"DEVLANE_FAILURE","kind":"control","stage":"unit",'
+                   b'"status":"fail","subreason":"vitest-failed"}\n')
+        for wave_class, profile, payload in (
+                ("encrypted", "core-node", summary),
+                (supervisor.fetch.SOURCE_FREE_WAVE_CLASS, "core-rust", summary),
+                (supervisor.fetch.SOURCE_FREE_WAVE_CLASS, "core-node",
+                 b'{"kind":"control","stage":"unit","status":"fail","subreason":"typecheck-failed"}\n')):
+            with self.subTest(wave_class=wave_class, profile=profile), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "workspace/raw").mkdir(parents=True)
+                (root / "scratch/reports").mkdir(parents=True)
+                destination = root / "devlane-vitest-local-synthetic-node-accept.json"
+                service = object.__new__(supervisor.Service)
+                service.root = root
+                service.failure_diagnostics_file = destination
+                service.owner_uid = os.getuid()
+                service.context = {"wave_class": wave_class, "profile": profile}
+                service.summary = payload
+                self.assertFalse(service._capture_failure_diagnostics())
+                self.assertFalse(destination.exists())
 
     def test_unit_failure_raw_diagnostics_only_run_for_the_fixed_failure_reasons(self):
         for subreason in ("vitest-failed", "report-missing", "adapter-failed"):

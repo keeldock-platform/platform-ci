@@ -41,6 +41,11 @@ import node_tool_snapshot
 
 MAX_RPC = 32 * 1024
 MAX_SUMMARY = output_filter.MAX_SUMMARY_BYTES
+MAX_SYNTHETIC_DIAGNOSTIC_LOGS = 16
+MAX_SYNTHETIC_DIAGNOSTIC_TAIL_LINES = 120
+MAX_SYNTHETIC_DIAGNOSTIC_TAIL_BYTES = 128 * 1024
+MAX_SYNTHETIC_DIAGNOSTIC_REPORTS = 64
+MAX_SYNTHETIC_DIAGNOSTIC_FILE_BYTES = 4 * 1024 * 1024
 SOCKET_NAME = "control.sock"
 READY_NAME = "ready.json"
 PID_NAME = "host-pid"
@@ -80,6 +85,8 @@ REFUSAL_CODES = frozenset((
     "matrix-semver-tool-binding",
     "matrix-semver-worker-channel",
     "matrix-semver-worker-peer",
+    "source-free-diagnostics-context",
+    "source-free-diagnostics-path",
     'matrix-semver-checkpoint-cgroup',
     'matrix-semver-checkpoint-cgroup-not-quiescent',
     'matrix-semver-checkpoint-command',
@@ -186,6 +193,7 @@ STARTUP_REFUSAL_CODES = frozenset((
     "profile-config-invalid", "profile-config-unavailable", "profile-unknown",
     "projection-binding-mismatch", "projection-invalid", "report-file-changed", "report-file-invalid",
     "report-file-size", "rust-tool-layout", "rust-toolchain-missing", "rust-toolchain-path",
+    "source-free-diagnostics-context", "source-free-diagnostics-path",
     "state-directory-not-empty", "state-directory-permissions", "supervisor-failed",
     "supervisor-operation-failed", "supervisor-start-failed", "supervisor-start-timeout",
     "swap-enabled", "swap-state-unavailable", "tool-manifest-invalid", "tool-path-invalid",
@@ -367,6 +375,147 @@ def _context_from_file(path):
     except (fetch.Refusal, TypeError, KeyError):
         _refuse("dispatch-context-invalid")
     return value
+
+
+SYNTHETIC_UNIT_DIAGNOSTIC_REASONS = frozenset(("report-missing", "adapter-failed", "vitest-failed"))
+
+
+def _synthetic_unit_failure_reason(summary):
+    if type(summary) is not bytes or len(summary) > MAX_SUMMARY:
+        return ""
+    for line in summary.splitlines():
+        try:
+            record = bundle.strict_json(line, output_filter.MAX_RAW_RECORD_BYTES)
+        except bundle.Refusal:
+            continue
+        if (type(record) is dict and record.get("kind") == "control"
+                and record.get("stage") == "unit" and record.get("status") == "fail"
+                and record.get("code") == "DEVLANE_FAILURE"
+                and record.get("subreason") in SYNTHETIC_UNIT_DIAGNOSTIC_REASONS):
+            return record["subreason"]
+    return ""
+
+
+def _synthetic_diagnostic_log_tail(path):
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                             | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return None
+    try:
+        with os.fdopen(descriptor, "rb") as source:
+            metadata = os.fstat(source.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                return None
+            start = max(0, metadata.st_size - MAX_SYNTHETIC_DIAGNOSTIC_TAIL_BYTES)
+            if start:
+                source.seek(start - 1)
+                on_boundary = source.read(1) == b"\n"
+            else:
+                on_boundary = True
+            source.seek(start)
+            payload = source.read(MAX_SYNTHETIC_DIAGNOSTIC_TAIL_BYTES)
+    except OSError:
+        return None
+    lines = payload.split(b"\n")
+    if not on_boundary and lines:
+        lines = lines[1:]
+    if lines and lines[-1] == b"":
+        lines.pop()
+    return lines[-MAX_SYNTHETIC_DIAGNOSTIC_TAIL_LINES:]
+
+
+def _synthetic_diagnostic_reports(root):
+    reports = Path(root) / "scratch/reports"
+    try:
+        metadata = reports.lstat()
+    except OSError:
+        return [{"name": "reports", "kind": "missing", "bytes": 0}]
+    if stat.S_ISLNK(metadata.st_mode):
+        return [{"name": "reports", "kind": "symlink", "bytes": 0}]
+    if not stat.S_ISDIR(metadata.st_mode):
+        return [{"name": "reports", "kind": "other", "bytes": 0}]
+    result = [{"name": "reports", "kind": "directory", "bytes": 0}]
+    try:
+        entries = sorted(reports.iterdir(), key=lambda item: item.name)[:MAX_SYNTHETIC_DIAGNOSTIC_REPORTS]
+    except OSError:
+        entries = []
+    for path in entries:
+        try:
+            metadata = path.lstat()
+        except OSError:
+            kind, size = "missing", 0
+        else:
+            if stat.S_ISLNK(metadata.st_mode):
+                kind, size = "symlink", 0
+            elif stat.S_ISDIR(metadata.st_mode):
+                kind, size = "directory", 0
+            elif stat.S_ISREG(metadata.st_mode):
+                kind, size = "file", min(metadata.st_size, 999_999_999_999)
+            else:
+                kind, size = "other", 0
+        result.append({"name": path.name, "kind": kind, "bytes": size})
+    return result
+
+
+def _capture_source_free_unit_diagnostics(root, destination, owner_uid, wave_class, profile, summary):
+    """Copy bounded synthetic-only diagnostics before the private namespace is shredded."""
+    if (wave_class != fetch.SOURCE_FREE_WAVE_CLASS or profile != "core-node"
+            or not _synthetic_unit_failure_reason(summary) or not destination):
+        return False
+    path = Path(destination)
+    if (not path.is_absolute()
+            or re.fullmatch(r"devlane-vitest-[A-Za-z0-9_-]{1,128}\.json", path.name) is None):
+        return False
+    logs = []
+    raw_root = Path(root) / "workspace/raw"
+    try:
+        metadata = raw_root.lstat()
+        if stat.S_ISDIR(metadata.st_mode):
+            for log_path in sorted(raw_root.glob("*.log"), key=lambda item: item.name)[:MAX_SYNTHETIC_DIAGNOSTIC_LOGS]:
+                tail = _synthetic_diagnostic_log_tail(log_path)
+                if tail is not None:
+                    logs.append({"name": log_path.name,
+                                 "lines": [base64.b64encode(line).decode("ascii") for line in tail]})
+    except OSError:
+        pass
+    document = {
+        "schema": 1,
+        "wave_class": fetch.SOURCE_FREE_WAVE_CLASS,
+        "subreason": _synthetic_unit_failure_reason(summary),
+        "logs": logs,
+        "reports": _synthetic_diagnostic_reports(root),
+    }
+    try:
+        payload = bundle.canonical_json(document) + b"\n"
+        if len(payload) > MAX_SYNTHETIC_DIAGNOSTIC_FILE_BYTES:
+            return False
+        descriptor = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                             | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), 0o600)
+    except (OSError, bundle.Refusal):
+        return False
+    created = True
+    try:
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("diagnostic-write-failed")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.fchown(descriptor, owner_uid, -1)
+        os.fchmod(descriptor, 0o600)
+        return True
+    except OSError:
+        if created:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        return False
+    finally:
+        os.close(descriptor)
 
 
 def _require_linux_root():
@@ -1319,7 +1468,7 @@ def _shred_tree(root):
 
 class Service:
     def __init__(self, state_dir, context_path, workspace, prepared, bundle_path, projection_path,
-                 host_net_inode, owner_uid, tool_paths, deadline_file):
+                 host_net_inode, owner_uid, tool_paths, deadline_file, failure_diagnostics_file=None):
         global ACTIVE_DEADLINE_FILE
         self.startup_phase = "construct"
         self.state_dir = Path(state_dir)
@@ -1330,6 +1479,7 @@ class Service:
         self.projection_path = Path(projection_path).absolute()
         self.host_net_inode = host_net_inode
         self.owner_uid = owner_uid
+        self.failure_diagnostics_file = failure_diagnostics_file
         self.tool_paths = tool_paths
         self.deadline_file = Path(deadline_file).resolve(strict=True)
         ACTIVE_DEADLINE_FILE = str(self.deadline_file)
@@ -1358,6 +1508,12 @@ class Service:
         self.summary = None
         self.outcomes = []
         self.mounts = []
+
+    def _capture_failure_diagnostics(self):
+        return _capture_source_free_unit_diagnostics(
+            self.root, self.failure_diagnostics_file, self.owner_uid,
+            self.context.get("wave_class"), self.context.get("profile"), self.summary,
+        )
 
     def prepare(self):
         self.startup_phase = "deadline"
@@ -1967,6 +2123,7 @@ class Service:
         except output_filter.FilterRefusal:
             filter_failed = True
             self.summary = _filter_failure_summary()
+        self._capture_failure_diagnostics()
         self.execution_done = True
         status = "pass" if all(code == 0 for _, code in outcomes) and not filter_failed and not _summary_failed(self.summary) else "fail"
         catalogs = {
@@ -2974,6 +3131,7 @@ def _serve(args):
             args.bundle, args.projection, args.host_net_inode, args.owner_uid,
             {"node_snapshot_id": args.node_snapshot_id or "",
              "cargo": args.cargo_path or None, "rustc": args.rustc_path or None}, args.deadline_file,
+            getattr(args, "failure_diagnostics_file", None),
         )
         startup_phase = "prepare"
         service.prepare()
@@ -3099,6 +3257,24 @@ def _start(args):
         _refuse("total-deadline-unavailable")
     context = _context_from_file(args.context)
     _projection_bytes, projection_value = _bound_projection(context, args.projection)
+    failure_diagnostics_file = ""
+    if getattr(args, "failure_diagnostics_file", ""):
+        if context.get("wave_class") != fetch.SOURCE_FREE_WAVE_CLASS or context["profile"] != "core-node":
+            _refuse("source-free-diagnostics-context")
+        diagnostic_path = Path(args.failure_diagnostics_file)
+        runner_temp = os.environ.get("RUNNER_TEMP", "")
+        try:
+            runner_temp_path = Path(runner_temp).resolve(strict=True)
+            parent = diagnostic_path.parent.resolve(strict=True)
+            parent_metadata = parent.stat()
+            if (not diagnostic_path.is_absolute() or parent != runner_temp_path
+                    or not stat.S_ISDIR(parent_metadata.st_mode) or parent_metadata.st_uid != os.getuid()
+                    or re.fullmatch(r"devlane-vitest-[A-Za-z0-9_-]{1,128}\.json", diagnostic_path.name) is None
+                    or os.path.lexists(diagnostic_path)):
+                _refuse("source-free-diagnostics-path")
+        except OSError:
+            _refuse("source-free-diagnostics-path")
+        failure_diagnostics_file = str(diagnostic_path)
     state_dir = Path(args.state_dir)
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if state_dir.is_symlink() or state_dir.stat().st_uid != os.getuid() or stat.S_IMODE(state_dir.stat().st_mode) & 0o077:
@@ -3151,6 +3327,8 @@ def _start(args):
         "--node-snapshot-id", tool_paths.get("node_snapshot_id", ""),
         "--cargo-path", tool_paths["cargo"], "--rustc-path", tool_paths["rustc"],
     ]
+    if failure_diagnostics_file:
+        command.extend(("--failure-diagnostics-file", failure_diagnostics_file))
     try:
         start_deadline = min(start_deadline,
                              time.monotonic() + deadline_budget.remaining(args.deadline_file))
@@ -3303,6 +3481,7 @@ def _argument_parser():
         start.add_argument("--" + name, required=True)
     start.add_argument("--positive-control", required=True)
     start.add_argument("--deadline-file", required=True)
+    start.add_argument("--failure-diagnostics-file", default="")
     start.add_argument("--node-snapshot-id", default="")
     for name in ("cargo-path", "rustc-path"):
         start.add_argument("--" + name, default="")
@@ -3310,6 +3489,7 @@ def _argument_parser():
     for name in ("state-dir", "context", "workspace", "prepared", "bundle", "projection"):
         client.add_argument("--" + name, required=True)
     client.add_argument("--deadline-file", required=True)
+    client.add_argument("--failure-diagnostics-file", default="")
     client.add_argument("--host-net-inode", type=int, required=True)
     client.add_argument("--owner-uid", type=int, required=True)
     client.add_argument("--node-snapshot-id", default="")

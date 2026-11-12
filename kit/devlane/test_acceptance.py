@@ -820,11 +820,14 @@ class FetchProjectionAcceptanceTests(unittest.TestCase):
             "expires": 2_000_000_000,
         }
         self.assertEqual(fetch.validate_dispatch(identity, now=1_999_999_000), identity)
+        source_free = {**identity, "wave_class": fetch.SOURCE_FREE_WAVE_CLASS}
+        self.assertEqual(fetch.validate_dispatch(source_free, now=1_999_999_000), source_free)
         for changed in (
             {**identity, "event": "pull_request"},
             {**identity, "ref": "refs/pull/5/merge"},
             {**identity, "run_attempt": 2},
             {**identity, "repository": "attacker/repo"},
+            {**identity, "wave_class": "encrypted"},
         ):
             with self.subTest(changed=changed):
                 with self.assertRaises(bundle.Refusal):

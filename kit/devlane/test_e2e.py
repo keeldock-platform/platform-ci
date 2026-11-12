@@ -27,6 +27,8 @@ commands, adapters, filter and cleanup; nothing is stubbed):
 """
 
 import gzip
+import base64
+import binascii
 import hashlib
 import io
 import json
@@ -505,7 +507,14 @@ def _unit_failure_subreason(summary):
     return ""
 
 
-def _tail_regular_log(path):
+def _safe_diagnostic_name(value, fallback):
+    if (type(value) is str and _DIAGNOSTIC_NAME.fullmatch(value)
+            and not _contains_output_canary(value.encode("ascii", "ignore"))):
+        return value
+    return fallback
+
+
+def _read_vitest_failure_diagnostics(path, expected_subreason):
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
@@ -514,101 +523,83 @@ def _tail_regular_log(path):
     try:
         with os.fdopen(descriptor, "rb") as source:
             metadata = os.fstat(source.fileno())
-            if not stat.S_ISREG(metadata.st_mode):
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                    or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600
+                    or metadata.st_size > supervisor.MAX_SYNTHETIC_DIAGNOSTIC_FILE_BYTES):
                 return None
-            start = max(0, metadata.st_size - MAX_VITEST_RAW_LOG_TAIL_BYTES)
-            if start:
-                source.seek(start - 1)
-                starts_on_line_boundary = source.read(1) == b"\n"
-            else:
-                starts_on_line_boundary = True
-            source.seek(start)
-            payload = source.read(MAX_VITEST_RAW_LOG_TAIL_BYTES)
+            payload = source.read(supervisor.MAX_SYNTHETIC_DIAGNOSTIC_FILE_BYTES + 1)
     except OSError:
         return None
-    lines = payload.split(b"\n")
-    if not starts_on_line_boundary and lines:
-        lines = lines[1:]
-    if lines and lines[-1] == b"":
-        lines.pop()
-    return lines[-MAX_VITEST_RAW_LOG_TAIL_LINES:]
-
-
-def _safe_diagnostic_name(value, fallback):
-    if (type(value) is str and _DIAGNOSTIC_NAME.fullmatch(value)
-            and not _contains_output_canary(value.encode("ascii", "ignore"))):
-        return value
-    return fallback
-
-
-def _emit_vitest_failure_diagnostics(root, summary):
-    """Emit source-free raw-log tails only for fixed unit failures in the synthetic harness."""
-    if not _unit_failure_subreason(summary):
-        return
-    root = Path(root)
-    raw_root = root / "workspace/raw"
-    raw_metadata = None
+    if len(payload) > supervisor.MAX_SYNTHETIC_DIAGNOSTIC_FILE_BYTES:
+        return None
     try:
-        raw_metadata = raw_root.lstat()
-    except OSError:
-        pass
-    if raw_metadata is not None and stat.S_ISDIR(raw_metadata.st_mode):
-        try:
-            logs = sorted(raw_root.glob("*.log"), key=lambda item: item.name)[:MAX_VITEST_RAW_LOGS]
-        except OSError:
-            logs = []
-        for path in logs:
-            name = _safe_diagnostic_name(path.name, "raw-log")
-            tail = _tail_regular_log(path)
-            if tail is None:
+        document = bundle.strict_json(payload, supervisor.MAX_SYNTHETIC_DIAGNOSTIC_FILE_BYTES)
+    except bundle.Refusal:
+        return None
+    if (type(document) is not dict or set(document) != {"schema", "wave_class", "subreason", "logs", "reports"}
+            or document["schema"] != 1 or document["wave_class"] != fetch.SOURCE_FREE_WAVE_CLASS
+            or document["subreason"] != expected_subreason
+            or type(document["logs"]) is not list or len(document["logs"]) > MAX_VITEST_RAW_LOGS
+            or type(document["reports"]) is not list
+            or len(document["reports"]) > MAX_VITEST_REPORT_ENTRIES + 1):
+        return None
+    return document
+
+
+def _print_vitest_failure_diagnostics(document):
+    for log in document["logs"]:
+        if type(log) is not dict or set(log) != {"name", "lines"}:
+            continue
+        name = _safe_diagnostic_name(log["name"], "raw-log")
+        if type(log["lines"]) is not list or len(log["lines"]) > MAX_VITEST_RAW_LOG_TAIL_LINES:
+            continue
+        for index, encoded_line in enumerate(log["lines"], 1):
+            if type(encoded_line) is not str:
                 continue
-            for index, raw_line in enumerate(tail, 1):
-                if _contains_output_canary(raw_line):
-                    continue
-                text = raw_line.decode("utf-8", "replace").rstrip("\r\n")
-                hash_marker = chr(35) * 2
-                text = text.replace("::", ": :").replace(hash_marker + "[", hash_marker + " [")
-                text = "".join(character if ord(character) >= 32 and ord(character) != 127 else " "
-                               for character in text)
-                text = text.encode("utf-8")[:MAX_VITEST_RAW_LOG_LINE_BYTES].decode("utf-8", "ignore")
-                encoded = quote(text, safe="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~:/,=@+!?(){} -")
-                print("devlane_e2e_vitest_diag=log name=%s line=%d text=%s" % (name, index, encoded), flush=True)
+            try:
+                raw_line = base64.b64decode(encoded_line, validate=True)
+            except (ValueError, binascii.Error):
+                continue
+            if len(raw_line) > MAX_VITEST_RAW_LOG_TAIL_BYTES or _contains_output_canary(raw_line):
+                continue
+            text = raw_line.decode("utf-8", "replace").rstrip("\r\n")
+            hash_marker = chr(35) * 2
+            text = text.replace("::", ": :").replace(hash_marker + "[", hash_marker + " [")
+            text = "".join(character if ord(character) >= 32 and ord(character) != 127 else " "
+                           for character in text)
+            text = text.encode("utf-8")[:MAX_VITEST_RAW_LOG_LINE_BYTES].decode("utf-8", "ignore")
+            encoded = quote(text, safe="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~:/,=@+!?(){} -")
+            line = "devlane_e2e_vitest_diag=log name=%s line=%d text=%s" % (name, index, encoded)
+            if diagnostic_contract.public_e2e_vitest_diagnostic(line):
+                print(line, flush=True)
 
-    reports = root / "scratch/reports"
+    for index, report in enumerate(document["reports"], 1):
+        if (type(report) is not dict or set(report) != {"name", "kind", "bytes"}
+                or report["kind"] not in ("directory", "file", "symlink", "other", "missing")
+                or type(report["bytes"]) is not int or not 0 <= report["bytes"] <= 999_999_999_999):
+            continue
+        name = _safe_diagnostic_name(report["name"], "entry-%02d" % index)
+        line = "devlane_e2e_vitest_diag=report name=%s kind=%s bytes=%d" % (
+            name, report["kind"], report["bytes"],
+        )
+        if diagnostic_contract.public_e2e_vitest_diagnostic(line):
+            print(line, flush=True)
+
+
+def _emit_vitest_failure_diagnostics(path, summary):
+    """Print sanitized tails copied by the supervisor for one source-free unit failure."""
     try:
-        reports_metadata = reports.lstat()
-    except OSError:
-        reports_metadata = None
-    if reports_metadata is None:
-        print("devlane_e2e_vitest_diag=report name=reports kind=missing bytes=0", flush=True)
-        return
-    if stat.S_ISLNK(reports_metadata.st_mode):
-        print("devlane_e2e_vitest_diag=report name=reports kind=symlink bytes=0", flush=True)
-        return
-    if not stat.S_ISDIR(reports_metadata.st_mode):
-        print("devlane_e2e_vitest_diag=report name=reports kind=other bytes=0", flush=True)
-        return
-    print("devlane_e2e_vitest_diag=report name=reports kind=directory bytes=0", flush=True)
-    try:
-        entries = sorted(reports.iterdir(), key=lambda item: item.name)[:MAX_VITEST_REPORT_ENTRIES]
-    except OSError:
-        entries = []
-    for index, path in enumerate(entries, 1):
-        name = _safe_diagnostic_name(path.name, "entry-%02d" % index)
+        subreason = _unit_failure_subreason(summary)
+        if not subreason:
+            return
+        document = _read_vitest_failure_diagnostics(path, subreason)
+        if document is not None:
+            _print_vitest_failure_diagnostics(document)
+    finally:
         try:
-            metadata = path.lstat()
+            Path(path).unlink()
         except OSError:
-            kind, size = "missing", 0
-        else:
-            if stat.S_ISLNK(metadata.st_mode):
-                kind, size = "symlink", 0
-            elif stat.S_ISDIR(metadata.st_mode):
-                kind, size = "directory", 0
-            elif stat.S_ISREG(metadata.st_mode):
-                kind, size = "file", min(metadata.st_size, 999999999999)
-            else:
-                kind, size = "other", 0
-        print("devlane_e2e_vitest_diag=report name=%s kind=%s bytes=%d" % (name, kind, size), flush=True)
+            pass
 
 
 def _processes_matching(marker):
@@ -1545,6 +1536,10 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
         lifecycle.begin_variant(root)
         _require(not root.exists() and not root.is_symlink(), "runner-root-already-exists")
         root.mkdir(mode=0o700)
+    diagnostic_name = "devlane-vitest-%s-%s-%s.json" % (
+        RUN_ID or "local", scenario["name"], variant,
+    )
+    diagnostic_path = RUNNER_TEMP / diagnostic_name
     try:
         projection_path = root / "projection.json"
         _phase_call("variant-projection-write", projection_path.write_bytes, projection_bytes)
@@ -1590,6 +1585,7 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
                 "bundle_sha256": hashlib.sha256(envelope).hexdigest(), "bundle_size": len(envelope),
                 "projection_asset_id": "123457", "projection_sha256": projection_sha,
                 "projection_size": len(projection_bytes), "expires": expires,
+                "wave_class": fetch.SOURCE_FREE_WAVE_CLASS,
             }
         _phase_call("variant-context-validate", fetch.validate_dispatch, context)
         context_path = root / "context.json"
@@ -1607,6 +1603,7 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
                                 "--bundle", str(bundle_path), "--projection", str(projection_path),
                                 "--positive-control", str(positive_path), "--deadline-file", DEADLINE_FILE)
             start.extend(("--node-snapshot-id", tool_paths.get("node_snapshot_id", "")))
+            start.extend(("--failure-diagnostics-file", str(diagnostic_path)))
             for name in ("cargo", "rustc"):
                 start.extend(("--" + name + "-path", tool_paths[name]))
             lifecycle.note_start_attempt()
@@ -1692,7 +1689,8 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
                 expected = _expected_execute_status(scenario, variant)
                 result = _run(execute, timeout=60 * 40, expected=expected,
                               diagnostic_callsite="supervisor-client:execute",
-                              on_result=(lambda completed: _emit_vitest_failure_diagnostics(root, completed.stdout))
+                              on_result=(lambda completed: _emit_vitest_failure_diagnostics(
+                                  diagnostic_path, completed.stdout))
                               if scenario["name"] in diagnostic_contract.E2E_PROGRESS_SCENARIOS else None)
                 with DIAGNOSTICS.phase("variant-summary-validate"):
                     _require(_summary_has_valid_terminator(result.stdout), "summary-schema-invalid")
@@ -1736,6 +1734,10 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
     finally:
         previous_error = sys.exc_info()[1]
         cleanup_error = None
+        try:
+            diagnostic_path.unlink(missing_ok=True)
+        except OSError as error:
+            cleanup_error = error
         try:
             _phase_call("variant-key-cleanup", (root / "synthetic-key.hex").unlink, missing_ok=True)
         except OSError as error:
