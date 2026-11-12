@@ -1,0 +1,10 @@
+[cargo-vet]
+version = "0.10"
+
+[[exemptions.fastrand]]
+version = "2.5.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.itoa]]
+version = "1.0.19"
+criteria = "safe-to-deploy"

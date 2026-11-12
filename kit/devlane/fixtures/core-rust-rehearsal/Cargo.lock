@@ -1,0 +1,26 @@
+version = 4
+
+[[package]]
+name = "devlane-rehearsal-root"
+version = "0.0.0"
+dependencies = [
+ "devlane-rehearsal-support",
+ "fastrand",
+ "itoa",
+]
+
+[[package]]
+name = "devlane-rehearsal-support"
+version = "0.0.0"
+
+[[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
+name = "itoa"
+version = "1.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"

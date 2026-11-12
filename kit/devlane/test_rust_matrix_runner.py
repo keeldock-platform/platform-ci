@@ -26,6 +26,7 @@ from unittest.mock import Mock, patch
 import public_audit
 import network_probe
 import filter as output_filter
+import fetch
 import rust_matrix_runner
 import rust_tooling
 import cgroup_exec
@@ -3491,7 +3492,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 test_e2e._verify_prepared_rust_tools(prepared, source)
             self.assertEqual(outside.stat().st_mode & 0o777, outside_mode)
 
-    def test_public_fixture_contract_covers_the_production_matrix_without_static_locks(self):
+    def test_public_fixture_contract_covers_the_production_matrix_with_committed_locks(self):
         root = Path(__file__).resolve().parents[2]
         profile = json.loads((root / "ci/devlane-profiles.json").read_text(encoding="utf-8"))["profiles"]["core-rust"]
         matrix = rust_matrix_runner.EXPECTED_MATRIX
@@ -3519,9 +3520,12 @@ class RustMatrixRunnerTests(unittest.TestCase):
         self.assertIn("runtime/supply-chain/config.toml", test_e2e.RUST_FIXTURE_SOURCES)
         self.assertNotIn("supply-chain/imports.lock", test_e2e.RUST_FIXTURE_SOURCES)
         self.assertNotIn("runtime/supply-chain/imports.lock", test_e2e.RUST_FIXTURE_SOURCES)
-        self.assertNotIn("Cargo.lock", test_e2e.RUST_FIXTURE_SOURCES)
-        self.assertNotIn("fuzz/Cargo.lock", test_e2e.RUST_FIXTURE_SOURCES)
-        self.assertNotIn("runtime/Cargo.lock", test_e2e.RUST_FIXTURE_SOURCES)
+        self.assertTrue(set(test_e2e.RUST_LOCKFILES).issubset(test_e2e.RUST_FIXTURE_SOURCES))
+        root_lock = test_e2e.RUST_FIXTURE_SOURCES["Cargo.lock"]
+        _manifest, _lock, dependencies = fetch.project_cargo_lock(root_lock)
+        self.assertEqual({(item["name"], item["version"]) for item in dependencies},
+                         {("fastrand", "2.5.0"), ("itoa", "1.0.19")})
+        self.assertTrue(all(test_e2e.RUST_FIXTURE_SOURCES[path] for path in test_e2e.RUST_LOCKFILES))
         tooling_versions = {name: row[3].rsplit(" ", 1)[-1] for name, row in rust_tooling.TOOLS.items()}
         self.assertEqual(tooling_versions, {
             "cargo-deny": "0.20.2", "cargo-audit": "0.22.2", "cargo-vet": "0.10.3",
@@ -3531,7 +3535,9 @@ class RustMatrixRunnerTests(unittest.TestCase):
         self.assertEqual(semver_tool[1], rust_matrix_runner.semver_stage.SEMVER_ASSET_SHA256)
         self.assertEqual(semver_tool[3], "cargo-semver-checks 0.51.0")
         generator = inspect.getsource(test_e2e._write_rust_fixture)
-        self.assertIn("generate-lockfile", generator)
+        self.assertIn("source_files()", generator)
+        self.assertIn('"metadata", "--locked", "--offline"', generator)
+        self.assertNotIn("generate-lockfile", generator)
         contract = inspect.getsource(test_e2e._validate_rust_fixture)
         self.assertIn("fetch.validate_projection", contract)
         self.assertIn("fetch.project_cargo_lock", contract)

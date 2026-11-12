@@ -1,0 +1,9 @@
+[package]
+name = "devlane-rehearsal-listener"
+version = "0.0.0"
+edition = "2021"
+
+[features]
+default = ["fixture-default"]
+fixture-default = []
+fixture-all = []

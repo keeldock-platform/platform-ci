@@ -961,6 +961,27 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/test_audit_contracts.py',
             'kit/devlane/test_coordinator.py',
             'kit/devlane/test_e2e.py',
+            'kit/devlane/rust_rehearsal_fixture.py',
+            'kit/devlane/fixtures/core-rust-rehearsal/Cargo.lock',
+            'kit/devlane/fixtures/core-rust-rehearsal/Cargo.toml',
+            'kit/devlane/fixtures/core-rust-rehearsal/build.rs',
+            'kit/devlane/fixtures/core-rust-rehearsal/deny.toml',
+            'kit/devlane/fixtures/core-rust-rehearsal/crates/support/Cargo.toml',
+            'kit/devlane/fixtures/core-rust-rehearsal/crates/support/src/lib.rs',
+            'kit/devlane/fixtures/core-rust-rehearsal/src/lib.rs',
+            'kit/devlane/fixtures/core-rust-rehearsal/supply-chain/audits.toml',
+            'kit/devlane/fixtures/core-rust-rehearsal/supply-chain/config.toml',
+            'kit/devlane/fixtures/core-rust-rehearsal/fuzz/Cargo.lock',
+            'kit/devlane/fixtures/core-rust-rehearsal/fuzz/Cargo.toml',
+            'kit/devlane/fixtures/core-rust-rehearsal/fuzz/corpus/valid-array.json',
+            'kit/devlane/fixtures/core-rust-rehearsal/fuzz/corpus/valid-object.json',
+            'kit/devlane/fixtures/core-rust-rehearsal/fuzz/src/main.rs',
+            'kit/devlane/fixtures/core-rust-rehearsal/runtime/Cargo.lock',
+            'kit/devlane/fixtures/core-rust-rehearsal/runtime/Cargo.toml',
+            'kit/devlane/fixtures/core-rust-rehearsal/runtime/crates/services/listener/Cargo.toml',
+            'kit/devlane/fixtures/core-rust-rehearsal/runtime/crates/services/listener/src/lib.rs',
+            'kit/devlane/fixtures/core-rust-rehearsal/runtime/supply-chain/audits.toml',
+            'kit/devlane/fixtures/core-rust-rehearsal/runtime/supply-chain/config.toml',
             'kit/devlane/test_linux_runtime.py',
             'kit/devlane/test_rust_report.py',
             'kit/devlane/test_rust_test_runner.py',
@@ -1373,6 +1394,22 @@ class PublicTreeTests(unittest.TestCase):
             with self.subTest(pool=pool, path=path):
                 with self.assertRaisesRegex(PublicTreeError, "repository-url-present"):
                     inspect_text(text, pool, path)
+
+    def test_rust_rehearsal_deny_registry_url_is_scoped_to_its_fixture_file(self):
+        path = "kit/devlane/fixtures/core-rust-rehearsal/deny.toml"
+        source = (ROOT / path).read_text(encoding="utf-8")
+        inspect_text(source, "platform", path)
+        with self.assertRaisesRegex(PublicTreeError, "repository-url-present"):
+            inspect_text(source, "platform", "kit/devlane/unreviewed-deny.toml")
+
+    def test_rust_rehearsal_allows_only_test_attributes_in_its_fixed_sources(self):
+        path = "kit/devlane/fixtures/core-rust-rehearsal/src/lib.rs"
+        source = (ROOT / path).read_text(encoding="utf-8")
+        inspect_text(source, "platform", path)
+        with self.assertRaisesRegex(PublicTreeError, "comment-present"):
+            inspect_text("fn test() {" + chr(35) + "[ignore]}", "platform", path)
+        with self.assertRaisesRegex(PublicTreeError, "comment-present"):
+            inspect_text(chr(35) + "[test]", "platform", "kit/devlane/unreviewed.rs")
 
     def test_public_cross_pool_references_remain_allowed(self):
         inspect_text("uses: keeldock-platform/platform-ci/kit/bootstrap@" + "a" * 40, "connect")

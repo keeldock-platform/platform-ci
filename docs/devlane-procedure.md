@@ -195,12 +195,18 @@ test "$CONTROL_SHA" = "$REMOTE_MAIN_SHA"
 
 **Rehearsal wave (required before the first private wave)**
 
-Run the whole wave sequence above once with the synthetic source from `rehearsal.py source`, on the exact commit that is on `main`. The source is the hostile synthetic Node fixture: planted source and key canary text, workflow-command text on every output channel and a workload that fails if any isolation boundary is open. It contains no private source. The rehearsal proves what the source-free control cannot, because the control never runs the encrypted workflow itself.
+Run the whole wave sequence above on the exact commit that is on `main`. The default `rehearsal.py source` profile is the hostile synthetic Node fixture. For the Rust matrix, select `core-rust` explicitly:
+
+```sh
+python3 -B kit/devlane/rehearsal.py source --directory "$DEVLANE_PRIVATE" --profile core-rust
+```
+
+The Rust fixture is a multi-crate root workspace, an independent fuzz-replay package, a second workspace with a listener package, and three committed `Cargo.lock` files. Its only crates.io dependencies are `itoa` and `fastrand`, so the workflow exercises offline vendoring. The source plants source and key canaries plus workflow-command text in build and test output. Its isolation test fails if network access, host paths, control environment values, key bytes in visible files, or inherited socket descriptors are present. It contains no private source. Both profile runs use the existing encrypted workflow dispatch and audit path; the source-free control never runs that path.
 
 Pass criteria. All of them must hold before any private wave:
 
 1. Step 8 installed the key as an environment secret on `devlane-decrypt`, and the coordinator accepted the environment restriction to `main`. Both the environment branch policy and the workflow's own reference check admit only `main`; the coordinator rechecks the environment and remote `main` immediately before installation and dispatch.
-2. The run took the real permit path, restored the control evidence cache, saved and restored the one-run permit, fetched both assets anonymously, received the secret only in the decrypt step, and printed no canary text anywhere.
+2. The run took the real permit path, restored the control evidence cache, saved and restored the one-run permit, fetched both assets anonymously, received the secret only in the decrypt step, and printed no canary text anywhere. For `core-rust`, the report must contain every fixed matrix coverage ID; all 22 non-SemVer suites pass and the synthetic-only `semver-runtime` row is the exact fail-closed `DEVLANE_SEMVER_EXECUTION` negative control described below.
 3. Step 8 printed `within_limit=true`.
 4. Step 10 recorded the audit disposition `accepted`, which means the real hosted log satisfied the closed log grammar. Read it with:
 
@@ -222,7 +228,9 @@ Pass criteria. All of them must hold before any private wave:
 
 Record the rehearsal verdict, the commit it ran on and the measured revocation latency. If any criterion fails, fix it in a reviewed change, rebase the commit onto `main`, rerun the control and repeat the rehearsal. The rehearsal never counts for a different commit.
 
-**Profile coverage.** The rehearsal exercises the `core-node` profile only. The Rust steps of the encrypted workflow (the pinned toolchain setup) are not covered by it and fail closed. No private wave may use the `core-rust` profile until a core-rust rehearsal, with a synthetic Rust source, has passed on the exact commit on `main`; that rehearsal needs a reviewed Rust fixture and is a separate change. Until then, private waves are `core-node` only.
+**Profile coverage and Rust acceptance.** A `core-rust` rehearsal uses the pinned Rust toolchain, the three-workspace matrix, default and all-feature test arms, replay target, and the same encrypted workflow, cleanup, audit, and duplicate-refusal path. For this synthetic schema-1 fixture, `semver-runtime` must refuse with `DEVLANE_SEMVER_EXECUTION`: the production SemVer v2 stage is bound to the real candidate and baseline source maps, which this small synthetic tree cannot satisfy. Treat that one exact refusal as expected only for this fixture; any other missing or failed coverage is a rehearsal failure. The in-run audit must still accept the completed log grammar, and terminal cleanup must complete.
+
+This fixture proves the encrypted legacy Rust vendoring and matrix path and that the source-bound SemVer gate still fails closed. It does not exercise the production schema-2 Rust preparation and SemVer execution path, so it cannot authorize private `core-rust` waves. Keep those waves disabled until a reviewed schema-2 source-bound rehearsal can exercise that path on the exact commit on `main`. `core-node` remains governed by its own successful rehearsal criteria.
 
 **Residual risks the owner has accepted**
 

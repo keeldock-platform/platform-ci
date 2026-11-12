@@ -12,8 +12,8 @@ commands, adapters, filter and cleanup; nothing is stubbed):
   inspection of the workload's environment, descriptors and files for key bytes),
   a wrong-key refusal, a failing test mapped to its opaque identity, and a
   cancellation while a profile command is running.
-* synthetic-rust-v1-refusal: actual public root, fuzz and runtime workspaces with
-  Cargo-generated locks, a listener package, replay corpus and the fixed matrix;
+* synthetic-rust-v1-refusal: committed root, fuzz and runtime workspaces, a
+  listener package, replay corpus and the fixed matrix;
   the legacy schema-1 envelope must fail the SemVer v2 gate explicitly.
 * real-node: the pinned Vitest, Vite and TypeScript packages (native bindings
   included) installed online from the reviewed lock, run offline, with a passing
@@ -50,6 +50,7 @@ import host_cleanup
 import owned_tree_cleanup
 import rust_matrix_runner
 import rust_tooling
+import rust_rehearsal_fixture
 import semver_stage
 import deadline as deadline_budget
 import diagnostic_contract
@@ -72,7 +73,7 @@ COMMAND_CANARIES = ("::add-mask::SYNTHETIC_SOURCE_CANARY_7f8c", "::error::SYNTHE
                     chr(35) * 2 + "[group]SYNTHETIC_SOURCE_CANARY_7f8c", "::set-output name=x::SYNTHETIC_SOURCE_CANARY_7f8c")
 BACKGROUND_MARKER = "DEVLANE_E2E_BACKGROUND_MARKER"
 RUST_VERSION = "1.99.1"
-RUST_LOCKFILES = ("Cargo.lock", "fuzz/Cargo.lock", "runtime/Cargo.lock")
+RUST_LOCKFILES = rust_rehearsal_fixture.LOCKFILES
 PLAYWRIGHT_VERSION = "1.54.2"
 SYNTHETIC_LOCK = ROOT / "kit/confinement/synthetic_project/package-lock.json"
 
@@ -462,121 +463,8 @@ def _rust_projection(lock_bytes, fuzz_lock_bytes, runtime_lock_bytes):
     return projection, payload
 
 
-RUST_FIXTURE_SOURCES = {
-    "Cargo.toml": (
-        '[package]\nname = "devlane-matrix-root"\nversion = "0.0.0"\nedition = "2021"\nbuild = "build.rs"\n\n'
-        '[workspace]\nmembers = ["."]\nresolver = "2"\n\n'
-        '[features]\nsynthetic-matrix = []\n\n'
-        '[dependencies]\nitoa = "=1.0.15"\n\n[dev-dependencies]\nfastrand = "=2.3.0"\n'
-    ).encode("ascii"),
-    "build.rs": None,
-    "src/lib.rs": None,
-    "deny.toml": (
-        '[graph]\nall-features = true\n\n'
-        '[advisories]\nversion = 2\nyanked = "deny"\nunmaintained = "workspace"\nignore = []\n\n'
-        '[licenses]\nversion = 2\nallow = ["MIT", "Apache-2.0", "Unicode-3.0"]\n'
-        'confidence-threshold = 0.93\nprivate = { ignore = true }\n\n'
-        '[bans]\nmultiple-versions = "warn"\nwildcards = "deny"\nallow-wildcard-paths = true\nhighlight = "all"\nskip = []\n\n'
-        '[sources]\nunknown-registry = "deny"\nunknown-git = "deny"\n'
-        'allow-registry = ["https:' + chr(47) * 2 + 'github.com/rust-lang/crates.io-index"]\nallow-git = []\n'
-    ).encode("ascii"),
-    "supply-chain/config.toml": (
-        '[cargo-vet]\nversion = "0.10"\n\n'
-        '[[exemptions.fastrand]]\nversion = "2.3.0"\ncriteria = "safe-to-deploy"\n\n'
-        '[[exemptions.itoa]]\nversion = "1.0.15"\ncriteria = "safe-to-deploy"\n'
-    ).encode("ascii"),
-    "supply-chain/audits.toml": b'[audits]\n',
-    "fuzz/Cargo.toml": (
-        '[package]\nname = "devlane-matrix-fuzz-replay"\nversion = "0.0.0"\nedition = "2021"\n'
-        '\n[workspace]\n\n[features]\nsynthetic-matrix = []\n'
-    ).encode("ascii"),
-    "fuzz/src/main.rs": None,
-    "fuzz/corpus/valid-object.json": b'{"kind":"object","value":1}\n',
-    "fuzz/corpus/valid-array.json": b'{"kind":"array","items":[]}\n',
-    "runtime/Cargo.toml": (
-        '[workspace]\nmembers = ["crates/services/listener"]\nresolver = "2"\n'
-    ).encode("ascii"),
-    "runtime/crates/services/listener/Cargo.toml": (
-        '[package]\nname = "devlane-matrix-listener"\nversion = "0.0.0"\nedition = "2021"\n'
-        '\n[features]\nsynthetic-matrix = []\n'
-    ).encode("ascii"),
-    "runtime/crates/services/listener/src/lib.rs": None,
-    "runtime/supply-chain/config.toml": b'[cargo-vet]\nversion = "0.10"\n',
-    "runtime/supply-chain/audits.toml": b'[audits]\n',
-}
-
-RUST_FIXTURE_TESTS = {
-    "root::Cargo.toml::tests::child_has_no_control_secrets_or_sockets": "case_0001",
-    "runtime::runtime/crates/services/listener/Cargo.toml::tests::listener_fixture_is_reachable": "case_0002",
-    "fuzz::fuzz/Cargo.toml::tests::corpus_fixture_is_present": "case_0003",
-    "listener::runtime/crates/services/listener/Cargo.toml::tests::listener_fixture_is_reachable": "case_0004",
-}
-
-
-def _rust_fixture_source_map():
-    marker = chr(35)
-    root_library = (
-        'pub fn rendered(value: u32) -> String {\n'
-        '    let mut buffer = itoa::Buffer::new();\n'
-        '    buffer.format(value).to_owned()\n'
-        '}\n\n'
-        + marker + '[cfg(test)]\nmod tests {\n    ' + marker + '[test]\n'
-        '    fn child_has_no_control_secrets_or_sockets() {\n'
-        '        for (name, _) in std::env::vars() {\n'
-        '            assert_ne!(name, "DEVLANE_DECRYPT_KEY");\n'
-        '            assert!(!name.starts_with("GITHUB_"));\n'
-        '            assert!(!name.starts_with("RUNNER_"));\n'
-        '            assert!(!name.starts_with("ACTIONS_"));\n'
-        '        }\n'
-        '        let key_canary = "' + KEY_CANARY.decode("ascii") + '";\n'
-        '        assert!(!std::env::vars().any(|(_, value)| value.contains(key_canary)));\n'
-        '        assert!(!std::env::args().any(|argument| argument.contains(key_canary)));\n'
-        '        assert_eq!(super::rendered(7), "7");\n'
-        '        let _ = fastrand::u8(..);\n'
-        '        assert!(!std::path::Path::new("/ho\\x6de/runner").exists());\n'
-        '        let fds = std::fs::read_dir("/proc/self/fd").expect("proc-fd");\n'
-        '        for entry in fds.flatten() {\n'
-        '            if let Ok(target) = std::fs::read_link(entry.path()) {\n'
-        '                assert!(!target.to_string_lossy().starts_with("socket:["));\n'
-        '            }\n'
-        '        }\n'
-        '        let _private = "' + SOURCE_CANARY + '";\n'
-        '    }\n}\n'
-    ).encode("ascii")
-    listener_library = (
-        marker + '[cfg(test)]\nmod tests {\n    ' + marker + '[test]\n'
-        '    fn listener_fixture_is_reachable() {\n'
-        '        assert_eq!(std::env::var("CI").ok().as_deref(), Some("1"));\n'
-        '    }\n}\n'
-    ).encode("ascii")
-    fuzz_main = (
-        'const CORPUS: [&[u8]; 2] = [\n'
-        '    include_bytes!("../corpus/valid-object.json"),\n'
-        '    include_bytes!("../corpus/valid-array.json"),\n'
-        '];\n\n'
-        'fn replay_corpus() -> usize {\n'
-        '    for seed in CORPUS {\n'
-        '        if !seed.starts_with(b"{") || !seed.ends_with(b"}\\n") {\n'
-        '            std::process::exit(2);\n'
-        '        }\n'
-        '    }\n'
-        '    CORPUS.len()\n'
-        '}\n\n'
-        'fn main() {\n'
-        '    println!("Replayed {} parser corpus seeds.", replay_corpus());\n'
-        '}\n\n'
-        + marker + '[cfg(test)]\nmod tests {\n    ' + marker + '[test]\n'
-        '    fn corpus_fixture_is_present() {\n'
-        '        assert_eq!(super::replay_corpus(), 2);\n'
-        '    }\n}\n'
-    ).encode("ascii")
-    return {
-        "build.rs": _rust_build_script().encode("ascii"),
-        "src/lib.rs": root_library,
-        "fuzz/src/main.rs": fuzz_main,
-        "runtime/crates/services/listener/src/lib.rs": listener_library,
-    }
-
+RUST_FIXTURE_SOURCES = rust_rehearsal_fixture.source_files()
+RUST_FIXTURE_TESTS = rust_rehearsal_fixture.TESTS
 
 def _write_rust_fixture(root, cargo_path):
     if not sys.platform.startswith("linux") or os.geteuid() == 0:
@@ -585,23 +473,19 @@ def _write_rust_fixture(root, cargo_path):
     root = Path(root)
     _require(not root.exists() and not root.is_symlink(), "rust-fixture-output-exists")
     root.mkdir(mode=0o700, parents=True)
-    files = dict(RUST_FIXTURE_SOURCES)
-    files.update(_rust_fixture_source_map())
+    files = rust_rehearsal_fixture.source_files()
     for relative, payload in files.items():
         path = root / relative
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         path.write_bytes(payload)
+    for manifest in ("Cargo.toml", "fuzz/Cargo.toml", "runtime/Cargo.toml"):
+        _run([cargo_path, "metadata", "--locked", "--offline", "--no-deps", "--format-version", "1",
+              "--manifest-path", str(root / manifest)], cwd=root, timeout=120, scan=False)
     lock_hashes = {}
     for relative in RUST_LOCKFILES:
-        manifest = "Cargo.toml" if relative == "Cargo.lock" else relative.removesuffix("Cargo.lock") + "Cargo.toml"
-        _run([cargo_path, "generate-lockfile", "--manifest-path", str(root / manifest)],
-             cwd=root, timeout=600, scan=False)
-        lock_path = root / relative
-        _require(lock_path.is_file() and not lock_path.is_symlink(), "rust-fixture-lock-missing")
-        lock_bytes = lock_path.read_bytes()
-        _require(bool(lock_bytes), "rust-fixture-lock-empty")
-        lock_hashes[relative] = hashlib.sha256(lock_bytes).hexdigest()
-        files[relative] = lock_bytes
+        payload = files.get(relative)
+        _require(type(payload) is bytes and bool(payload), "rust-fixture-lock-missing")
+        lock_hashes[relative] = hashlib.sha256(payload).hexdigest()
     projection, projection_bytes = _rust_projection(
         files["Cargo.lock"], files["fuzz/Cargo.lock"], files["runtime/Cargo.lock"])
     snapshot = {
@@ -614,7 +498,7 @@ def _write_rust_fixture(root, cargo_path):
     (root / ".devlane-projection.json").write_bytes(projection_bytes)
     (root / ".devlane-lock-snapshot.json").write_bytes(bundle.canonical_json(snapshot) + b"\n")
     _validate_rust_fixture(root, files, projection, projection_bytes, snapshot)
-    print("rust_matrix_fixture=generated locks=3 matrix_coverage_ids=23")
+    print("rust_matrix_fixture=loaded committed_locks=3 matrix_coverage_ids=23")
 
 
 def _validate_rust_fixture(root, files, projection, projection_bytes, snapshot):
@@ -657,8 +541,8 @@ def _validate_rust_fixture(root, files, projection, projection_bytes, snapshot):
         "fuzz::fuzz/Cargo.toml::tests::corpus_fixture_is_present",
         "listener::runtime/crates/services/listener/Cargo.toml::tests::listener_fixture_is_reachable",
     }, "rust-matrix-test-map")
-    required_files = set(RUST_FIXTURE_SOURCES) | set(_rust_fixture_source_map()) | set(RUST_LOCKFILES)
-    _require(required_files.issubset(files) and all(bool(files[path]) for path in required_files),
+    required_files = set(RUST_FIXTURE_SOURCES)
+    _require(required_files == set(files) and all(bool(files[path]) for path in required_files),
              "rust-matrix-fixture-files")
     for relative in required_files:
         path = root / relative
@@ -689,8 +573,8 @@ def _validate_rust_fixture(root, files, projection, projection_bytes, snapshot):
                  "runtime/supply-chain/config.toml", "runtime/supply-chain/audits.toml",
                  "fuzz/corpus/valid-object.json", "fuzz/corpus/valid-array.json"):
         _require(path in files and bool(files[path]), "rust-matrix-policy-or-replay-fixture")
-    _require(b'[[exemptions.fastrand]]\nversion = "2.3.0"' in files["supply-chain/config.toml"]
-             and b'[[exemptions.itoa]]\nversion = "1.0.15"' in files["supply-chain/config.toml"],
+    _require(b'[[exemptions.fastrand]]\nversion = "2.5.0"' in files["supply-chain/config.toml"]
+             and b'[[exemptions.itoa]]\nversion = "1.0.19"' in files["supply-chain/config.toml"],
              "rust-matrix-fixture-vet-policy")
     return archive
 
@@ -707,7 +591,7 @@ def _load_rust_fixture(root):
              and re.fullmatch(r"[a-f0-9]{64}", snapshot["projection_sha256"]) is not None,
              "rust-matrix-projection-snapshot-shape")
     files = {}
-    for relative in set(RUST_FIXTURE_SOURCES) | set(_rust_fixture_source_map()) | set(RUST_LOCKFILES):
+    for relative in set(RUST_FIXTURE_SOURCES):
         path = root / relative
         _require(path.is_file() and not path.is_symlink(), "rust-fixture-source-missing")
         files[relative] = path.read_bytes()

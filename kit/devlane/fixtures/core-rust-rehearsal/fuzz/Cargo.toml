@@ -1,0 +1,11 @@
+[package]
+name = "devlane-rehearsal-fuzz-replay"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[features]
+default = ["fixture-default"]
+fixture-default = []
+fixture-all = []

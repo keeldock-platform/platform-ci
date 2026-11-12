@@ -1,0 +1,21 @@
+[package]
+name = "devlane-rehearsal-root"
+version = "0.0.0"
+edition = "2021"
+build = "build.rs"
+
+[workspace]
+members = [".", "crates/support"]
+resolver = "2"
+
+[features]
+default = ["fixture-default"]
+fixture-default = []
+fixture-all = []
+
+[dependencies]
+itoa = "=1.0.19"
+devlane-rehearsal-support = { path = "crates/support" }
+
+[dev-dependencies]
+fastrand = "=2.5.0"

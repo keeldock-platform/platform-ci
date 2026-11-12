@@ -1,9 +1,9 @@
 """Owner-side request builders for a source-free rehearsal wave and for ordinary waves.
 
-The rehearsal source is the hostile synthetic Node fixture the acceptance test already uses: planted
-source and key canaries, workflow-command text on every output channel, and a workload that fails if
-any isolation boundary is open. It lives in a throwaway local repository under an owner-only
-directory, never in a checkout. Nothing here talks to GitHub or reads real source.
+The default rehearsal source is the hostile synthetic Node fixture; `--profile core-rust` selects the
+reviewed hostile Rust fixture. Both plant source and key canaries and workflow-command text, and the
+Rust tests fail if an isolation boundary is open. Each source lives in a throwaway local repository
+under an owner-only directory, never in a checkout. Nothing here talks to GitHub or reads real source.
 """
 
 import argparse
@@ -19,11 +19,13 @@ from pathlib import Path
 
 import bundle
 import test_e2e as fixtures
+import rust_rehearsal_fixture
 
 
 NODE_VERSION = "24.22.1"
 NPM_VERSION = "11.19.1"
-REHEARSAL_PROFILE = "core-node"
+DEFAULT_REHEARSAL_PROFILE = "core-node"
+RUST_TOOLCHAIN = "1.99.1"
 REHEARSAL_TEST = {"synthetic canary suite accepted test": "case_0001"}
 REHEARSAL_FILE = {"src/example.ts": "file_0001"}
 DECIMAL = re.compile(r"[1-9][0-9]{0,18}\Z")
@@ -74,18 +76,24 @@ def _git(repository, *arguments):
     return result.stdout.decode("utf-8", "strict").strip()
 
 
-def synthetic_source():
-    """The hostile synthetic Node project and the dependency lock it is projected from."""
+def synthetic_source(profile=DEFAULT_REHEARSAL_PROFILE):
+    """Return the source fixture and its reviewed lock material for one fixed profile."""
+    if profile == "core-rust":
+        return None, rust_rehearsal_fixture.source_files()
+    if profile != "core-node":
+        _refuse("rehearsal-profile")
     lock = fixtures._node_lock_from_reviewed({"typescript": "6.0.3"})
     return lock, fixtures._node_source(lock)
 
 
-def build_source(directory):
+def build_source(directory, profile=DEFAULT_REHEARSAL_PROFILE):
     root = _directory(directory)
+    if profile not in ("core-node", "core-rust"):
+        _refuse("rehearsal-profile")
     repository = root / "source-repo"
     if repository.exists() or repository.is_symlink():
         _refuse("rehearsal-source-exists")
-    lock, files = synthetic_source()
+    lock, files = synthetic_source(profile)
     repository.mkdir(mode=0o700)
     _git(repository, "init", "--quiet", "--initial-branch", "rehearsal")
     for name, payload in sorted(files.items()):
@@ -99,9 +107,15 @@ def build_source(directory):
     if not bundle.GIT_SHA.fullmatch(revision):
         _refuse("rehearsal-revision")
     request = {
-        "schema": 1, "repository": str(repository), "source_revision": revision, "profile": REHEARSAL_PROFILE,
-        "tools": {"node": NODE_VERSION, "npm": NPM_VERSION}, "playwright": [], "lockfile": "package-lock.json",
+        "schema": 1, "repository": str(repository), "source_revision": revision, "profile": profile,
+        "tools": ({"node": NODE_VERSION, "npm": NPM_VERSION} if profile == "core-node"
+                  else {"cargo": RUST_TOOLCHAIN, "rustc": RUST_TOOLCHAIN}),
+        "playwright": [],
     }
+    if profile == "core-node":
+        request["lockfile"] = "package-lock.json"
+    else:
+        request["lockfiles"] = list(rust_rehearsal_fixture.LOCKFILES)
     _write_new(root / "projection-request.json", bundle.canonical_json(request) + b"\n")
     return revision
 
@@ -132,18 +146,25 @@ def build_requests(directory, control_sha, control_run_id, wave_id, bundle_id, r
     projection = root / "projection.json"
     if not projection.is_file() or projection.is_symlink():
         _refuse("projection-missing")
+    projected = bundle.strict_json(projection.read_bytes(), 16 * 1024 * 1024)
+    if (request.get("profile") not in ("core-node", "core-rust")
+            or type(projected) is not dict or projected.get("profile") != request["profile"]):
+        _refuse("projection-profile-mismatch")
+    profile = request["profile"]
+    allowed_files = REHEARSAL_FILE if profile == "core-node" else {}
+    allowed_tests = REHEARSAL_TEST if profile == "core-node" else rust_rehearsal_fixture.TESTS
     expires = int(time.time()) + lifetime_seconds
     reserve = {
         "schema": 2, "wave_id": wave_id, "bundle_id": bundle_id, "control_run_id": str(control_run_id),
-        "control_sha": control_sha, "profile": REHEARSAL_PROFILE, "expires": expires, "release_id": str(release_id),
+        "control_sha": control_sha, "profile": profile, "expires": expires, "release_id": str(release_id),
     }
     tracked = _git(request["repository"], "ls-files", "-z")
     source_files = sorted(item for item in tracked.split("\x00") if item)
     bundle_request = {
         "repository": request["repository"], "source_revision": request["source_revision"],
-        "profile": REHEARSAL_PROFILE, "fetch_sha256": _sha256_file(projection), "wave_id": wave_id,
+        "profile": profile, "fetch_sha256": _sha256_file(projection), "wave_id": wave_id,
         "bundle_id": bundle_id, "control_sha": control_sha, "expires": expires, "source_files": source_files,
-        "allowed_files": dict(REHEARSAL_FILE), "allowed_tests": dict(REHEARSAL_TEST), "frames": {},
+        "allowed_files": dict(allowed_files), "allowed_tests": dict(allowed_tests), "frames": {},
     }
     _write_new(root / "reserve.json", bundle.canonical_json(reserve) + b"\n")
     _write_new(root / "bundle-request.json", bundle.canonical_json(bundle_request) + b"\n")
@@ -181,6 +202,7 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="operation", required=True)
     source = sub.add_parser("source")
     source.add_argument("--directory", required=True)
+    source.add_argument("--profile", choices=("core-node", "core-rust"), default=DEFAULT_REHEARSAL_PROFILE)
     requests = sub.add_parser("requests")
     requests.add_argument("--directory", required=True)
     requests.add_argument("--control-sha", required=True)
@@ -200,7 +222,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.operation == "source":
-            print("rehearsal_source=ready revision=" + build_source(args.directory))
+            print("rehearsal_source=ready profile=%s revision=%s" % (
+                args.profile, build_source(args.directory, args.profile)))
         elif args.operation == "requests":
             expires = build_requests(args.directory, args.control_sha, args.control_run_id, args.wave_id,
                                      args.bundle_id, args.release_id, args.lifetime_seconds)

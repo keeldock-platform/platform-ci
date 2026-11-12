@@ -1,6 +1,7 @@
 """The rehearsal and owner request builders produce inputs the real tools accept."""
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -50,6 +51,58 @@ class RehearsalBuilderTests(unittest.TestCase):
             self.assertEqual(json.loads(projection)["profile"], "core-node")
             with self.assertRaises(rehearsal.Refusal):
                 rehearsal.build_source(owner)
+
+    def test_rust_source_projects_its_committed_locks_and_builds_requests_for_the_encrypted_lane(self):
+        if bundle.AESGCM is None:
+            self.skipTest("cryptography is required")
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = _private_directory(temporary)
+            revision = rehearsal.build_source(owner, "core-rust")
+            request = json.loads((owner / "projection-request.json").read_text(encoding="utf-8"))
+            self.assertEqual(request["source_revision"], revision)
+            self.assertEqual(request["profile"], "core-rust")
+            self.assertEqual(request["tools"], {"cargo": "1.99.1", "rustc": "1.99.1"})
+            self.assertEqual(request["lockfiles"], ["Cargo.lock", "fuzz/Cargo.lock", "runtime/Cargo.lock"])
+            source = Path(request["repository"])
+            for relative in request["lockfiles"]:
+                self.assertIn(relative, subprocess.run(
+                    ["git", "-C", str(source), "ls-files"], check=True,
+                    stdout=subprocess.PIPE).stdout.decode("utf-8").splitlines())
+            self.assertIn("crates/support", (source / "Cargo.toml").read_text(encoding="ascii"))
+            root_source = (source / "src/lib.rs").read_text(encoding="ascii")
+            self.assertIn("SYNTHETIC_SOURCE_CANARY_7f8c", root_source)
+            self.assertIn("KEYCANARY-73A10X", root_source)
+            projection_path = owner / "projection.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(project.main(["--request", str(owner / "projection-request.json"),
+                                               "--output", str(projection_path)]), 0)
+            projection = bundle.strict_json(projection_path.read_bytes())
+            self.assertEqual(projection["profile"], "core-rust")
+            self.assertEqual({item["name"] for item in projection["cargo"]}, {"fastrand", "itoa"})
+            expires = rehearsal.build_requests(owner, CONTROL_SHA, "1234", WAVE, BUNDLE, "77", 3000)
+            reserve = json.loads((owner / "reserve.json").read_text(encoding="utf-8"))
+            bundle_request = json.loads((owner / "bundle-request.json").read_text(encoding="utf-8"))
+            self.assertEqual(reserve["profile"], "core-rust")
+            self.assertEqual(reserve["expires"], expires)
+            self.assertEqual(bundle_request["profile"], "core-rust")
+            self.assertEqual(bundle_request["allowed_files"], {})
+            self.assertEqual(bundle_request["allowed_tests"], rehearsal.rust_rehearsal_fixture.TESTS)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(bundle.main(["create", "--request", str(owner / "bundle-request.json"),
+                                              "--ciphertext", str(owner / "bundle.enc"),
+                                              "--key-file", str(owner / "key.hex")]), 0)
+            key = bundle.read_key_file(owner / "key.hex")
+            bindings = {
+                "format": "kd-public-devlane-aesgcm-v1", "repository_id": "1430960557",
+                "control_sha": CONTROL_SHA, "workflow_path": ".github/workflows/devlane-encrypted.yml",
+                "profile": "core-rust", "wave_id": WAVE, "bundle_id": BUNDLE,
+                "fetch_sha256": bundle_request_digest(owner), "expires": expires,
+            }
+            archive = bundle.parse_envelope((owner / "bundle.enc").read_bytes(), key, bindings)
+            with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as opened:
+                names = set(opened.getnames())
+            self.assertTrue(set(request["lockfiles"]).issubset(names))
+            self.assertIn("runtime/crates/services/listener/src/lib.rs", names)
 
     def test_directory_must_be_owner_only_and_outside_every_checkout(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -205,6 +258,20 @@ class ProcedureDocumentTests(unittest.TestCase):
                         ("coordinator", "mark-secret-installed"), ("coordinator", "reconcile-dispatch")):
             self.assertNotIn(retired, seen)
 
+    def test_rust_rehearsal_procedure_and_workflow_cover_the_same_profile_path(self):
+        for phrase in (
+            "rehearsal.py source --directory \"$DEVLANE_PRIVATE\" --profile core-rust",
+            "three committed `Cargo.lock` files", "`itoa` and `fastrand`",
+            "all 22 non-SemVer suites pass", "DEVLANE_SEMVER_EXECUTION",
+            "production schema-2 Rust preparation and SemVer execution path",
+        ):
+            self.assertIn(phrase, self.text)
+        workflow = (self.root / ".github/workflows/devlane-encrypted.yml").read_text(encoding="utf-8")
+        self.assertIn("- core-rust", workflow)
+        self.assertIn("if: ${{ inputs.profile == 'core-rust' }}", workflow)
+        self.assertIn('--profile "$DEVLANE_PROFILE"', workflow)
+        self.assertEqual(rehearsal.build_source.__defaults__, ("core-node",))
+
     def test_the_procedure_states_the_integrated_dispatch_and_recovery_contract(self):
         for phrase in ("Install the key, dispatch once, reconcile and arm timed revocation as one coordinator operation",
                        "DEVLANE_DECRYPT_KEY", "devlane-decrypt", "dispatch-wave", "300-second reconciliation deadline",
@@ -286,11 +353,39 @@ def bundle_request_digest(owner):
 
 
 class ProductionFailureDiagnosticsTests(unittest.TestCase):
+    def test_committed_rust_fixture_passes_the_e2e_projection_and_archive_contract(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            files = dict(test_e2e.RUST_FIXTURE_SOURCES)
+            projection, projection_bytes = test_e2e._rust_projection(
+                files["Cargo.lock"], files["fuzz/Cargo.lock"], files["runtime/Cargo.lock"])
+            lock_hashes = {path: hashlib.sha256(files[path]).hexdigest() for path in test_e2e.RUST_LOCKFILES}
+            snapshot = {
+                "schema": 1, "toolchain": test_e2e.RUST_VERSION,
+                "lockfiles": {path: {"sha256": lock_hashes[path], "size": len(files[path])}
+                              for path in test_e2e.RUST_LOCKFILES},
+                "projection_sha256": hashlib.sha256(projection_bytes).hexdigest(),
+            }
+            for relative, payload in files.items():
+                destination = root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(payload)
+            (root / ".devlane-projection.json").write_bytes(projection_bytes)
+            (root / ".devlane-lock-snapshot.json").write_bytes(bundle.canonical_json(snapshot) + b"\n")
+            with mock.patch.object(test_e2e, "CONTROL_SHA", CONTROL_SHA):
+                archive = test_e2e._validate_rust_fixture(
+                    root, files, projection, projection_bytes, snapshot)
+            manifest, archived_files, _ = bundle.inspect_archive(archive, {
+                "profile": "core-rust", "fetch_sha256": snapshot["projection_sha256"],
+            })
+            self.assertEqual(set(manifest["original_lockfiles"]), set(test_e2e.RUST_LOCKFILES))
+            self.assertEqual({path: archived_files[path] for path in test_e2e.RUST_LOCKFILES},
+                             {path: files[path] for path in test_e2e.RUST_LOCKFILES})
+
     def test_fixture_loader_checks_the_real_snapshot_before_projection_validation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             files = dict(test_e2e.RUST_FIXTURE_SOURCES)
-            files.update(test_e2e._rust_fixture_source_map())
             files.update({name: b"synthetic-lock-loader-only" for name in test_e2e.RUST_LOCKFILES})
             for name, body in files.items():
                 target = root / name
