@@ -23,6 +23,8 @@ import network_probe
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+RUST_PROFILES = ("core-rust", "local-sync-rust")
+ENCRYPTED_PROFILES = ("core-node", *RUST_PROFILES, "desktop")
 REPOSITORY = "keeldock-platform/platform-ci"
 REPOSITORY_ID = 1430960557
 WORKFLOW_PATH = ".github/workflows/devlane-encrypted.yml"
@@ -367,12 +369,12 @@ class _Grammar:
             exact = exact | {"rust_matrix_fixture=loaded committed_locks=3 matrix_coverage_ids=23"}
         if step_name == "Install fixed Rust acceptance toolchain":
             exact = exact | {"rust_matrix_fixture=loaded committed_locks=3 matrix_coverage_ids=23"}
-        if step_name == "Prepare dependencies before the cut" and self.identity.get("profile") == "core-rust":
+        if step_name == "Prepare dependencies before the cut" and self.identity.get("profile") in RUST_PROFILES:
             exact = exact | {"rust_offline_tools=installed"}
         if step_name == "Install pinned Rust toolchain" and self.identity.get("profile") == "desktop":
             exact = {"rust_toolchain=prepared"}
         if (step_name == "Prepare hosted Linux isolation state" and self.kind == "encrypted"
-                and self.identity.get("profile") == "core-rust"):
+                and self.identity.get("profile") in RUST_PROFILES):
             exact = exact | {"devlane_cgroup_v2=ready"}
         if line in exact:
             public_counts[line] = public_counts.get(line, 0) + 1
@@ -1025,7 +1027,7 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         _refuse()
     if records:
         profile = identity.get("profile")
-        if profile not in ("core-node", "core-rust", "desktop"):
+        if profile not in ENCRYPTED_PROFILES:
             _refuse()
         validate_summary_records(records, profile)
     if kind == "encrypted" and job_name == RUN_JOB:
@@ -1253,7 +1255,7 @@ def audit_environment(env):
             or not re.fullmatch(r"[a-f0-9]{40}", env["CI_SHA"])
             or not DECIMAL.fullmatch(env["CI_CONTROL_RUN_ID"])
             or not DECIMAL.fullmatch(env["GITHUB_RUN_ID"]) or env["GITHUB_RUN_ATTEMPT"] != "1"
-            or env["DEVLANE_PROFILE"] not in ("core-node", "core-rust", "desktop")
+            or env["DEVLANE_PROFILE"] not in ENCRYPTED_PROFILES
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{7,63}", env["DEVLANE_WAVE_ID"])
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{7,63}", env["DEVLANE_BUNDLE_ID"])
             or not SHA256.fullmatch(env["DEVLANE_CACHE_BASELINE_SHA256"])):

@@ -22,7 +22,7 @@ def _coverage(suite, *, failed=0):
 
 
 class RustReportMappingTests(unittest.TestCase):
-    def _fixture(self, root, records):
+    def _fixture(self, root, records, profile_name="core-rust", matrix=None):
         control = root / "control"
         report = root / "scratch/reports/rust-matrix.jsonl"
         raw = root / "workspace/raw"
@@ -30,7 +30,7 @@ class RustReportMappingTests(unittest.TestCase):
         report.parent.mkdir(parents=True)
         raw.mkdir(parents=True)
         (control / "profiles.json").write_text(json.dumps({
-            "profiles": {"core-rust": {"rust_matrix": rust_matrix_runner.EXPECTED_MATRIX}},
+            "profiles": {profile_name: {"rust_matrix": matrix or rust_matrix_runner.EXPECTED_MATRIX}},
         }), encoding="ascii")
         report.write_bytes(b"".join(
             json.dumps(row, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
@@ -55,6 +55,25 @@ class RustReportMappingTests(unittest.TestCase):
             self.assertIn(b'"suite":"listener-all-features"', joined)
             self.assertNotIn(b"SYNTHETIC_SOURCE_CANARY", joined)
             self.assertNotIn(b"SYNTHETIC_KEY_CANARY", joined)
+
+    def test_local_sync_report_requires_all_fixed_coverage_and_uses_local_sync_catalog(self):
+        matrix = rust_matrix_runner.LOCAL_SYNC_MATRIX
+        records = []
+        for suite in matrix["coverage_ids"]:
+            records.append({
+                "kind": "coverage", "stage": rust_matrix_runner._stage_for(suite), "suite": suite,
+                "total": 1, "passed": 1, "failed": 0, "ignored": 0,
+            })
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._fixture(root, records, "local-sync-rust", matrix)
+            manifest = {"allowed_files": {}, "allowed_tests": {}, "frames": {}}
+            public = supervisor._adapter_records(
+                root, "local-sync-rust", manifest, [], {}, {"rust_matrix": 0},
+            )
+        self.assertEqual(len(public), 4)
+        self.assertIn(b'"suite":"local-sync-all-features"', b"\n".join(public))
+        self.assertNotIn(b"local-sync/crates", b"\n".join(public))
 
     def test_vet_child_uses_the_pinned_rust_toolchain_environment(self):
         with tempfile.TemporaryDirectory() as temporary:

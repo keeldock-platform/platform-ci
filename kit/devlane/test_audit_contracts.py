@@ -75,6 +75,10 @@ def _step_outputs(step, identity, kind, records):
         return ["tauri_linux_dependencies=installed"]
     if name == "Install pinned Rust toolchain" and identity["profile"] == "desktop":
         return ["rust_toolchain=prepared"]
+    if name == "Install pinned Rust toolchain" and identity["profile"] in audit.RUST_PROFILES:
+        return ["rust_offline_tools=prepared"]
+    if name == "Prepare dependencies before the cut" and identity["profile"] in audit.RUST_PROFILES:
+        return ["dependency_preparation=complete", "rust_offline_tools=installed"]
     key = None
     if uses.startswith("actions/cache/restore"):
         key = _with_value(step, "key", identity, kind)
@@ -90,7 +94,7 @@ def _step_outputs(step, identity, kind, records):
     outputs = {
         "Fetch public control and validate dispatch": ["dispatch_context=validated"] if kind == "encrypted" else [],
         "Prepare hosted Linux isolation state": ["devlane_swap=disabled"] + (
-            ["devlane_cgroup_v2=ready"] if kind == "encrypted" and identity["profile"] == "core-rust" else []
+            ["devlane_cgroup_v2=ready"] if kind == "encrypted" and identity["profile"] in audit.RUST_PROFILES else []
         ),
         "Verify exact source-free control evidence": ["devlane_permit=verify_control=pass"],
         "Claim this bundle for one run before decryption": ["devlane_permit=claim=pass"],
@@ -141,7 +145,7 @@ def _render_log(job_key, identity=None, *, records=(), kind="encrypted", skip=("
     else:
         skipped.add("Install Tauri Linux build dependencies")
     for step in job["steps"]:
-        if step["name"] in skipped or (step["uses"] and "setup-node" in step["uses"] and identity["profile"] == "core-rust"):
+        if step["name"] in skipped or (step["uses"] and "setup-node" in step["uses"] and identity["profile"] in audit.RUST_PROFILES):
             continue
         lines.append(MARK + "[section]Starting: " + step["name"])
         if step["run"]:
@@ -451,6 +455,19 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         for label, changed in mutations.items():
             with self.subTest(label), self.assertRaises(audit.AuditRefusal):
                 audit.validate_job_log_surface(changed, "devlane-synthetic", identity, workflow="synthetic")
+
+        local_sync = dict(IDENTITY, profile="local-sync-rust")
+        profile = json.loads((Path(__file__).resolve().parents[2] / "ci/devlane-profiles.json").read_text())[
+            "profiles"]["local-sync-rust"]
+        rows = [
+            _record(kind="coverage", stage=stage, suite=suite,
+                    total=1, passed=1, failed=0, ignored=0)
+            for suite in profile["rust_matrix"]["coverage_ids"]
+            for stage in ["format" if suite.startswith("fmt-") else "audit" if suite.startswith("audit-") else "unit"]
+        ]
+        rows.sort()
+        audit.validate_job_log_surface(
+            _render_log(audit.RUN_JOB, local_sync, records=rows), audit.RUN_JOB, local_sync)
 
     def test_host_preflight_receipts_are_bound_to_the_right_step_and_profile(self):
         rust = dict(IDENTITY, profile="core-rust")

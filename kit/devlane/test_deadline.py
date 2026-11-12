@@ -460,7 +460,7 @@ class DeadlineTests(unittest.TestCase):
         preflight = next(step for step in encrypted_steps
                          if step["name"] == "Prepare hosted Linux isolation state")
         source = "\n".join(preflight["run"])
-        self.assertIn('if [[ "$DEVLANE_PROFILE" == "core-rust" ]]', source)
+        self.assertIn('if [[ "$DEVLANE_PROFILE" == "core-rust" || "$DEVLANE_PROFILE" == "local-sync-rust" ]]', source)
         self.assertIn("timeout --signal=TERM --kill-after=5s 30s sudo -n python3 -B -c", source)
         self.assertIn("/sys/fs/cgroup", source)
         self.assertIn("cgroup.procs", source)

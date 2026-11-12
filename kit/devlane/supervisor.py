@@ -395,7 +395,7 @@ SYNTHETIC_NODE_UNIT_DIAGNOSTIC_REASONS = frozenset(("report-missing", "adapter-f
 def _synthetic_failure_reason(summary, profile):
     if type(summary) is not bytes or len(summary) > MAX_SUMMARY:
         return ""
-    if profile not in ("core-node", "core-rust"):
+    if profile not in bundle.ENCRYPTED_PROFILES:
         return ""
     for line in summary.splitlines():
         try:
@@ -408,9 +408,9 @@ def _synthetic_failure_reason(summary, profile):
             subreason = record.get("subreason")
             if (profile == "core-node" and subreason in SYNTHETIC_NODE_UNIT_DIAGNOSTIC_REASONS):
                 return subreason
-            if (profile == "core-rust" and subreason in ("report-missing", "adapter-failed")):
+            if (profile in bundle.RUST_PROFILES and subreason in ("report-missing", "adapter-failed")):
                 return "rust-matrix-" + subreason
-        if profile == "core-rust" and type(record) is dict:
+        if profile in bundle.RUST_PROFILES and type(record) is dict:
             if (record.get("kind") == "control" and record.get("status") == "fail"
                     and record.get("stage") != "semver"):
                 return "rust-matrix-failed"
@@ -576,7 +576,7 @@ def _synthetic_diagnostic_reports(root):
 def _capture_source_free_failure_diagnostics(root, destination, owner_uid, wave_class, profile, summary,
                                             *, execution_failed=False):
     """Copy bounded synthetic-only diagnostics before the private namespace is shredded."""
-    if profile not in ("core-node", "core-rust"):
+    if profile not in bundle.ENCRYPTED_PROFILES:
         return False
     subreason = _synthetic_failure_reason(summary, profile)
     if not subreason and execution_failed:
@@ -647,7 +647,7 @@ def _capture_source_free_failure_diagnostics(root, destination, owner_uid, wave_
                 if profile == "core-node" else MAX_SYNTHETIC_DIAGNOSTIC_LOGS)
     for log_path in candidates[:max_logs]:
         max_tail_lines = (MAX_SYNTHETIC_RUST_DIAGNOSTIC_TAIL_LINES
-                          if profile == "core-rust" else MAX_SYNTHETIC_DIAGNOSTIC_TAIL_LINES)
+                          if profile in bundle.RUST_PROFILES else MAX_SYNTHETIC_DIAGNOSTIC_TAIL_LINES)
         tail = _synthetic_diagnostic_log_tail(log_path, max_tail_lines)
         if tail is not None:
             logs.append({"name": log_path.name,
@@ -1488,7 +1488,7 @@ def _copy_prepared_dependencies(root, profile, *, registry_v2=False):
         destination = root / "workspace/source/node_modules"
         _copy_prepared_tree(source, destination)
         _chown_tree(destination)
-    if profile in ("core-rust", "desktop"):
+    if profile in bundle.RUST_TOOL_PROFILES:
         vendor = root / ("prepared/cargo-local-registry" if registry_v2 else "prepared/cargo-vendor")
         if not vendor.is_dir() or vendor.is_symlink():
             _refuse("cargo-vendor-missing")
@@ -1564,14 +1564,14 @@ def _preflight_tools(profile, projection, tool_paths, owner_uid=None):
         _refuse("node-snapshot-id")
     if profile == "desktop" and not node_vendor_source.SESSION_ID.fullmatch(paths.get("node_vendor_id") or ""):
         _refuse("node-snapshot-id")
-    if profile in ("core-rust", "desktop") and (not paths.get("cargo") or not paths.get("rustc")):
+    if profile in bundle.RUST_TOOL_PROFILES and (not paths.get("cargo") or not paths.get("rustc")):
         _refuse("rust-toolchain-missing")
     if type(projection) is not dict or type(projection.get("tools")) is not dict:
         _refuse("tool-manifest-invalid")
     required = (
         {"node", "npm"} if profile == "core-node" else
-        {"cargo", "rustc"} if profile == "core-rust" else
-        {"node", "npm", "cargo", "rustc"} if profile == "desktop" else set()
+        {"node", "npm", "cargo", "rustc"} if profile == "desktop" else
+        {"cargo", "rustc"} if profile in bundle.RUST_PROFILES else set()
     )
     if set(projection["tools"]) != required:
         _refuse("tool-manifest-invalid")
@@ -1756,7 +1756,7 @@ def _adapter_lines(output, result, stage, *, rule):
 def _adapter_records(root, profile, manifest, outcomes, tools, adapter_results=None):
     adapter_results = adapter_results or {}
     records = []
-    if profile == "core-rust":
+    if profile in bundle.RUST_PROFILES:
         output = root / "scratch/reports/rust-matrix.jsonl"
         result = adapter_results.get("rust_matrix", 125)
         failure_subreason = "adapter-failed"
@@ -1775,7 +1775,7 @@ def _adapter_records(root, profile, manifest, outcomes, tools, adapter_results=N
                 _refuse("rust-matrix-report-invalid")
             profile_path = root / "control/profiles.json"
             profile_document = bundle.strict_json(_read_regular(profile_path, 1024 * 1024), 1024 * 1024)
-            matrix = profile_document["profiles"]["core-rust"]["rust_matrix"]
+            matrix = profile_document["profiles"][profile]["rust_matrix"]
             expected = matrix["coverage_ids"]
             coverage = [record for record in records if record.get("kind") == "coverage"]
             suites = [record.get("suite") for record in coverage]
@@ -2416,8 +2416,9 @@ class Service:
                         "Cargo.lock", "fuzz/Cargo.lock", "runtime/Cargo.lock"}:
                     _refuse("cargo-workspace-lock-set")
                 return
-            lock_path = source / "Cargo.lock"
-            if "Cargo.lock" not in self.manifest["original_lockfiles"]:
+            primary_lock = "local-sync/Cargo.lock" if self.context["profile"] == "local-sync-rust" else "Cargo.lock"
+            lock_path = source / primary_lock
+            if primary_lock not in self.manifest["original_lockfiles"]:
                 _refuse("cargo-lock-binding-missing")
             try:
                 manifest, lock, _ = fetch.project_cargo_lock(lock_path.read_bytes())
@@ -2425,6 +2426,11 @@ class Service:
                 _refuse("cargo-lock-projection-invalid")
             if manifest != self.projection_value["cargo_manifest"] or lock != self.projection_value["cargo_lock"]:
                 _refuse("cargo-projection-mismatch")
+            if self.context["profile"] == "local-sync-rust":
+                if (set(self.manifest["original_lockfiles"]) != {primary_lock}
+                        or self.projection_value["cargo_workspaces"]):
+                    _refuse("cargo-workspace-lock-set")
+                return
             workspace_locks = ["fuzz/Cargo.lock", "runtime/Cargo.lock"]
             if set(self.manifest["original_lockfiles"]) != {"Cargo.lock", *workspace_locks}:
                 _refuse("cargo-workspace-lock-set")
@@ -2456,11 +2462,13 @@ class Service:
         source_root = self.root / "workspace/source"
         commands = profile.get("commands")
         stages = profile.get("stages")
-        if profile_name == "core-rust":
-            if self.manifest["schema"] == 2:
+        if profile_name in bundle.RUST_PROFILES:
+            if profile_name == "core-rust" and self.manifest["schema"] == 2:
                 if not self.baseline_staged:
                     _refuse("execution-order")
-            if commands != [] or stages != ["format", "deny", "audit", "vet", "unit", "semver"]:
+            expected_stages = (["format", "deny", "audit", "vet", "unit", "semver"]
+                               if profile_name == "core-rust" else ["format", "audit", "unit"])
+            if commands != [] or stages != expected_stages:
                 _refuse("profile-command-set")
             output = self.root / "scratch/reports/rust-matrix.jsonl"
             if os.path.lexists(output):
@@ -3713,7 +3721,7 @@ def _serve(args):
 def _source_free_diagnostics_context(context):
     return (type(context) is dict
             and context.get("wave_class") == fetch.SOURCE_FREE_WAVE_CLASS
-            and context.get("profile") in ("core-node", "core-rust"))
+            and context.get("profile") in bundle.ENCRYPTED_PROFILES)
 
 
 def _start(args):
@@ -3781,7 +3789,7 @@ def _start(args):
             "cargo": getattr(args, "cargo_path") or shutil.which("cargo") or "",
             "rustc": getattr(args, "rustc_path") or shutil.which("rustc") or "",
         }
-    if context["profile"] in ("core-rust", "desktop"):
+    if context["profile"] in bundle.RUST_TOOL_PROFILES:
         try:
             for name in ("cargo", "rustc"):
                 """Real toolchain binaries only: a rustup proxy cannot run in the offline root."""

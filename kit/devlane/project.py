@@ -98,7 +98,7 @@ def build_projection(request):
     if type(request) is not dict:
         bundle._refuse("projection-request-shape")
     profile = request.get("profile")
-    if profile not in ("core-node", "core-rust", "desktop"):
+    if profile not in bundle.ENCRYPTED_PROFILES:
         bundle._refuse("projection-profile")
     if profile == "core-rust" and type(request) is dict and request.get("schema") == 2:
         expected = {"schema", "profile", "control_sha", "tools", "source_sets", "manifest_constraints"}
@@ -146,8 +146,8 @@ def build_projection(request):
         bundle._refuse("projection-tool-versions")
     expected_tools = (
         {"node", "npm"} if profile == "core-node" else
-        {"cargo", "rustc"} if profile == "core-rust" else
-        {"node", "npm", "cargo", "rustc"}
+        {"node", "npm", "cargo", "rustc"} if profile == "desktop" else
+        {"cargo", "rustc"}
     )
     if set(tools) != expected_tools:
         bundle._refuse("projection-tool-versions")
@@ -162,6 +162,8 @@ def build_projection(request):
         bundle._refuse("projection-rust-lockfile-set")
     if profile == "desktop" and lockfiles != ["package-lock.json", "Cargo.lock"]:
         bundle._refuse("projection-desktop-lockfile-set")
+    if profile == "local-sync-rust" and lockfiles != ["local-sync/Cargo.lock"]:
+        bundle._refuse("projection-rust-lockfile-set")
     tree = bundle.subprocess.run(
         ["git", "-C", str(repository), "ls-tree", "-r", "-z", "--full-tree", revision],
         check=False, stdout=bundle.subprocess.PIPE, stderr=bundle.subprocess.DEVNULL, timeout=60,
@@ -207,12 +209,13 @@ def build_projection(request):
             "npm": npm, "cargo": [], "playwright": request["playwright"],
             "npm_package": package, "npm_lock": lock, "cargo_workspaces": [],
         }
-    elif profile == "core-rust":
+    elif profile in ("core-rust", "local-sync-rust"):
         manifest, lock, cargo = fetch.project_cargo_lock(lock_bytes)
         workspaces = []
-        for path, payload in zip(lockfiles[1:], lock_payloads[1:]):
-            workspace_manifest, workspace_lock, _ = fetch.project_cargo_lock(payload)
-            workspaces.append({"path": path, "manifest": workspace_manifest, "lock": workspace_lock})
+        if profile == "core-rust":
+            for path, payload in zip(lockfiles[1:], lock_payloads[1:]):
+                workspace_manifest, workspace_lock, _ = fetch.project_cargo_lock(payload)
+                workspaces.append({"path": path, "manifest": workspace_manifest, "lock": workspace_lock})
         result = {
             "schema": 1, "profile": profile, "tools": tools,
             "npm": [], "cargo": cargo, "playwright": [],

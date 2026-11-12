@@ -48,6 +48,18 @@ EXPECTED_MATRIX = {
         "fuzz-replay-default", "fuzz-replay-all-features", "semver-runtime",
     ],
 }
+LOCAL_SYNC_MATRIX = {
+    "schema": 1,
+    "toolchain": "1.99.1",
+    "tool_versions": {"cargo_deny": "0.20.2", "cargo_audit": "0.22.2", "cargo_vet": "0.10.3"},
+    "workspaces": [
+        {"id": "local-sync", "manifest": "/workspace/source/local-sync/Cargo.toml",
+         "lock": "/workspace/source/local-sync/Cargo.lock", "mode": "workspace"},
+    ],
+    "feature_sets": ["default", "all"],
+    "test_requirements": {"zero_ignored": True, "run_every_discovered_test": True},
+    "coverage_ids": ["fmt-local-sync", "audit-local-sync", "local-sync-default", "local-sync-all-features"],
+}
 MAX_CAPTURE = 256 * 1024 * 1024
 TOOLS_ROOT = "/prepared/devlane-tools"
 SOURCE_ROOT = "/workspace/source"
@@ -310,8 +322,9 @@ def _semver_check(records, deadline):
 
 
 def run(matrix, config_path, report_path, deadline):
-    if matrix != EXPECTED_MATRIX:
+    if matrix not in (EXPECTED_MATRIX, LOCAL_SYNC_MATRIX):
         raise MatrixRefusal("matrix-profile-mismatch")
+    local_sync = matrix == LOCAL_SYNC_MATRIX
     if type(deadline) not in (float, int):
         raise MatrixRefusal("total-deadline-invalid")
     records = []
@@ -328,32 +341,36 @@ def run(matrix, config_path, report_path, deadline):
     deny = Path(TOOLS_ROOT) / "cargo-deny"
     audit = Path(TOOLS_ROOT) / "cargo-audit"
     vet = Path(TOOLS_ROOT) / "cargo-vet"
-    for workspace in workspaces:
-        identifier = workspace["id"]
-        deny_args = [str(deny), "--manifest-path", workspace["manifest"], "--config",
-                     SOURCE_ROOT + "/deny.toml", "--workspace", "--all-features", "--offline", "--locked", "check"]
-        _simple_check(records, "deny-" + identifier, deny_args, deadline, timeout=1800)
+    if not local_sync:
+        for workspace in workspaces:
+            identifier = workspace["id"]
+            deny_args = [str(deny), "--manifest-path", workspace["manifest"], "--config",
+                         SOURCE_ROOT + "/deny.toml", "--workspace", "--all-features", "--offline", "--locked", "check"]
+            _simple_check(records, "deny-" + identifier, deny_args, deadline, timeout=1800)
     for workspace in workspaces:
         identifier = workspace["id"]
         audit_args = [str(audit), "audit", "--deny", "unsound", "--no-fetch", "--no-yanked", "--db",
                       "/scratch/cargo-home/advisory-dbs/" + ADVISORY_DB_DIRECTORY,
                       "--file", workspace["lock"]]
         _simple_check(records, "audit-" + identifier, audit_args, deadline, timeout=900)
-    for workspace in workspaces:
-        identifier = workspace["id"]
-        store = SOURCE_ROOT + ("/runtime/supply-chain" if identifier == "runtime" else "/supply-chain")
-        vet_args = [str(vet), "vet", "check", "--manifest-path", workspace["manifest"],
-                    "--store-path", store, "--locked", "--frozen"]
-        _simple_check(records, "vet-" + identifier, vet_args, deadline, timeout=900)
+    if not local_sync:
+        for workspace in workspaces:
+            identifier = workspace["id"]
+            store = SOURCE_ROOT + ("/runtime/supply-chain" if identifier == "runtime" else "/supply-chain")
+            vet_args = [str(vet), "vet", "check", "--manifest-path", workspace["manifest"],
+                        "--store-path", store, "--locked", "--frozen"]
+            _simple_check(records, "vet-" + identifier, vet_args, deadline, timeout=900)
     arms = [(item["id"], item["manifest"], item["mode"]) for item in workspaces]
-    arms.append((matrix["listener"]["id"], matrix["listener"]["manifest"], matrix["listener"]["mode"]))
+    if not local_sync:
+        arms.append((matrix["listener"]["id"], matrix["listener"]["manifest"], matrix["listener"]["mode"]))
     for scope, manifest, workspace_mode in arms:
         for feature_set in matrix["feature_sets"]:
             _rust_test_arm(records, scope, manifest, workspace_mode,
                            "all" if feature_set == "all" else "default", config_path, deadline)
-    for feature_set in matrix["feature_sets"]:
-        _fuzz_replay(records, "all" if feature_set == "all" else "default", deadline)
-    _semver_check(records, deadline)
+    if not local_sync:
+        for feature_set in matrix["feature_sets"]:
+            _fuzz_replay(records, "all" if feature_set == "all" else "default", deadline)
+        _semver_check(records, deadline)
     coverage = [record for record in records if record.get("kind") == "coverage"]
     seen = [record.get("suite") for record in coverage]
     coverage_complete = (
@@ -389,7 +406,15 @@ def main(argv=None):
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     try:
         profile_value = bundle.strict_json(Path(args.profile_file).read_bytes(), 1024 * 1024)
-        profile = profile_value["profiles"]["core-rust"]
+        profiles = profile_value["profiles"]
+        profile_name = next(
+            (name for name, matrix in (("core-rust", EXPECTED_MATRIX), ("local-sync-rust", LOCAL_SYNC_MATRIX))
+             if profiles.get(name, {}).get("rust_matrix") == matrix),
+            None,
+        )
+        if profile_name is None:
+            raise MatrixRefusal("matrix-profile-mismatch")
+        profile = profiles[profile_name]
         result = run(profile["rust_matrix"], args.config_path, args.report_path, args.deadline)
         print("rust_matrix=complete")
         return result

@@ -92,6 +92,18 @@ def _artifact(kind, target_test, profile_test, executable):
 
 class RustTestRunnerTests(unittest.TestCase):
 
+    def test_local_sync_scope_accepts_only_its_owner_mapped_test_names(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "tests.json"
+            config.write_text(json.dumps({"tests": [
+                ["local-sync::local-sync/crates/demo/Cargo.toml::tests::one", "case_0001"],
+                ["root::Cargo.toml::tests::one", "case_0002"],
+            ]}), encoding="ascii")
+            self.assertEqual(
+                rust_test_runner._test_map(str(config), "local-sync"),
+                {"local-sync/crates/demo/Cargo.toml::tests::one": "case_0001"},
+            )
+
     def test_deadline_expiring_at_exact_test_spawn_refuses_and_kills_spawned_group(self):
         with tempfile.TemporaryDirectory() as temporary:
             marker = Path(temporary) / "descendant.pid"

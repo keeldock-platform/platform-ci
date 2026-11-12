@@ -75,7 +75,7 @@ def validate_dispatch(identity, expected_profile=None, now=None):
         _fail("run-attempt")
     if type(identity["control_run_id"]) is not str or not re.fullmatch(r"[1-9][0-9]{0,18}", identity["control_run_id"]):
         _fail("control-run-id")
-    if identity["profile"] not in ("core-node", "core-rust", "desktop"):
+    if identity["profile"] not in bundle.ENCRYPTED_PROFILES:
         _fail("profile")
     if expected_profile is not None and identity["profile"] != expected_profile:
         _fail("profile-binding")
@@ -374,7 +374,7 @@ def validate_projection(payload, expected_profile, expected_control_sha=None):
     required = {"schema", "profile", "npm", "cargo", "playwright", "tools", "cargo_workspaces"}
     if expected_profile in ("core-node", "desktop"):
         required |= {"npm_package", "npm_lock"}
-    if expected_profile in ("core-rust", "desktop"):
+    if expected_profile in ("core-rust", "desktop") or expected_profile in bundle.RUST_PROFILES:
         required |= {"cargo_manifest", "cargo_lock"}
     if type(value) is not dict or set(value) != required:
         _fail("projection-shape")
@@ -417,7 +417,8 @@ def validate_projection(payload, expected_profile, expected_control_sha=None):
     for item in cargo_workspaces:
         if type(item) is not dict or set(item) != {"path", "manifest", "lock"}:
             _fail("projection-cargo-workspace")
-        if type(item["path"]) is not str or item["path"] not in ("fuzz/Cargo.lock", "runtime/Cargo.lock"):
+        allowed_workspace_paths = ("fuzz/Cargo.lock", "runtime/Cargo.lock") if expected_profile == "core-rust" else ()
+        if type(item["path"]) is not str or item["path"] not in allowed_workspace_paths:
             _fail("projection-cargo-workspace-path")
         if type(item["manifest"]) is not str or len(item["manifest"]) > 2 * 1024 * 1024:
             _fail("projection-cargo-manifest")
@@ -432,14 +433,14 @@ def validate_projection(payload, expected_profile, expected_control_sha=None):
     tools = value.get("tools")
     expected_tools = (
         {"node", "npm"} if expected_profile == "core-node" else
-        {"cargo", "rustc"} if expected_profile == "core-rust" else
-        {"node", "npm", "cargo", "rustc"} if expected_profile == "desktop" else set()
+        {"node", "npm", "cargo", "rustc"} if expected_profile == "desktop" else
+        {"cargo", "rustc"} if expected_profile in bundle.RUST_PROFILES else set()
     )
     if type(tools) is not dict or set(tools) != expected_tools:
         _fail("projection-tools")
     if expected_profile == "core-node" and tools != {"node": "24.22.1", "npm": "11.19.1"}:
         _fail("projection-tool-version")
-    if expected_profile == "core-rust" and tools != {"cargo": "1.99.1", "rustc": "1.99.1"}:
+    if expected_profile in bundle.RUST_PROFILES and tools != {"cargo": "1.99.1", "rustc": "1.99.1"}:
         _fail("projection-tool-version")
     if expected_profile == "desktop" and tools != {
             "node": "26.8.1", "npm": "11.19.0", "cargo": "1.99.1", "rustc": "1.99.1"}:
@@ -464,6 +465,9 @@ def validate_projection(payload, expected_profile, expected_control_sha=None):
         expected_workspaces = ["fuzz/Cargo.lock", "runtime/Cargo.lock"] if expected_profile == "core-rust" else []
         if [item["path"] for item in cargo_workspaces] != expected_workspaces:
             _fail("projection-cargo-workspace-set")
+    elif expected_profile == "local-sync-rust" and cargo_workspaces:
+        _fail("projection-cargo-workspace-set")
+    if expected_profile in bundle.RUST_TOOL_PROFILES:
         if type(value["cargo_manifest"]) is not str or len(value["cargo_manifest"]) > 2 * 1024 * 1024:
             _fail("projection-cargo-manifest")
         if type(value["cargo_lock"]) is not str or len(value["cargo_lock"]) > 8 * 1024 * 1024:

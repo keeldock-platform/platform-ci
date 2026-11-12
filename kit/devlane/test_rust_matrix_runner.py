@@ -2484,7 +2484,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                              if step["name"] == "Decrypt authenticated bundle")
         self.assertLess(prepare_index, decrypt_index)
         rust_step = workflow.split("- name: Install pinned Rust toolchain", 1)[1].split("- name:", 1)[0]
-        self.assertIn("if: ${{ inputs.profile == 'core-rust' || inputs.profile == 'desktop' }}", rust_step)
+        self.assertIn("if: ${{ inputs.profile == 'core-rust' || inputs.profile == 'desktop' || inputs.profile == 'local-sync-rust' }}", rust_step)
         self.assertFalse(any((step.get("uses") or "").startswith("actions/setup-node@") for step in steps))
         self.assertIn("node_vendor_source.acquire_node_source", inspect.getsource(supervisor.node_tool_prepare.main))
         self.assertNotIn("/opt/hostedtoolcache", workflow)

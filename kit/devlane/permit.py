@@ -87,7 +87,7 @@ def _identity(env):
         _refuse("permit-identity-invalid")
     if (not re.fullmatch(r"[a-f0-9]{40}", env["CI_SHA"])
             or not DECIMAL.fullmatch(env["CI_CONTROL_RUN_ID"])
-            or env["DEVLANE_PROFILE"] not in ("core-node", "core-rust", "desktop")
+            or env["DEVLANE_PROFILE"] not in bundle.ENCRYPTED_PROFILES
             or not bundle.OPAQUE_ID.fullmatch(env["DEVLANE_WAVE_ID"])
             or not bundle.OPAQUE_ID.fullmatch(env["DEVLANE_BUNDLE_ID"])
             or not DECIMAL.fullmatch(env["CI_RUN_ID"]) or env["CI_RUN_ATTEMPT"] != "1"

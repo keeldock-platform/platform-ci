@@ -291,7 +291,7 @@ def reserve_wave(ledger, request):
         _fail("reservation-shape")
     for name in ("wave_id", "bundle_id"):
         _validate_wave_id(request[name], "reservation-id")
-    if (request["profile"] not in ("core-node", "core-rust", "desktop")
+    if (request["profile"] not in bundle.ENCRYPTED_PROFILES
             or not re.fullmatch(r"[1-9][0-9]{0,18}", str(request["control_run_id"]))
             or type(request["control_sha"]) is not str or not bundle.GIT_SHA.fullmatch(request["control_sha"])
             or type(request["expires"]) is not int or not int(time.time()) < request["expires"] <= int(time.time()) + 3600):

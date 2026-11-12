@@ -233,6 +233,22 @@ Record the rehearsal verdict, the commit it ran on and the measured revocation l
 
 This fixture proves the encrypted legacy Rust vendoring and matrix path and that the source-bound SemVer gate still fails closed. It does not exercise the production schema-2 Rust preparation and SemVer execution path, so it cannot authorize private `core-rust` waves. Keep those waves disabled until a reviewed schema-2 source-bound rehearsal can exercise that path on the exact commit on `main`. `core-node` remains governed by its own successful rehearsal criteria.
 
+**Local Sync wave.** Use the fixed `local-sync-rust` profile for the Local Sync workspace. The owner-written `projection-request.json` contains only repository, revision, tool, profile, and lockfile metadata. Fill the repository field with the owner-only absolute checkout path:
+
+```json
+{
+  "schema": 1,
+  "repository": "<owner-only absolute checkout path>",
+  "source_revision": "a39622d7574d99159ff53739be5cf210bd24fb4a",
+  "profile": "local-sync-rust",
+  "tools": {"cargo": "1.99.1", "rustc": "1.99.1"},
+  "playwright": [],
+  "lockfiles": ["local-sync/Cargo.lock"]
+}
+```
+
+Run the projection command from step 3 with that request. The encrypted `bundle-request.json` uses the same owner-only repository path, revision, and profile, plus the projection digest and the owner-selected source and report maps; keep its contents and the source tree in the owner directory. The profile reports `fmt-local-sync`, `audit-local-sync`, and default/all-feature workspace test coverage. The current workspace also has sibling private Core path dependencies referenced outside the checkout. The bundle builder selects one Git repository, so the owner must first bring those pinned path dependencies inside the selected source tree, or a later profile must add a separately bound encrypted source repository input, before the full matrix can pass. Add a reviewed `local-sync/deny.toml` before enabling a deny arm, and a `local-sync/supply-chain` cargo-vet store before enabling vet. This workspace has no fuzz target or SemVer baseline, so those core-rust arms do not apply.
+
 The source-free production-path E2E suite has two deliberate negative controls. Its `real-node/accept-with-failure` variant must exit 1 and emit exactly the `case_0002` test record plus the unit control record with `subreason=vitest-failed`; the harness scans all command output for canaries. Its `synthetic-rust-v1-refusal/accept` variant also expects exit 1 for the single SemVer refusal, with the other 22 matrix coverage rows passing. These are harness assertions; the rehearsal pass criteria above remain unchanged.
 
 **Residual risks the owner has accepted**

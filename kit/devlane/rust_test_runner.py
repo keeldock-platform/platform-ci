@@ -23,7 +23,7 @@ RESULT_LINE = re.compile(
     r"([0-9]+) measured; ([0-9]+) filtered out; finished in [0-9.]+s\Z"
 )
 TEST_ID = re.compile(r"case_[0-9]{4,6}\Z")
-SCOPE_ID = re.compile(r"(?:root|runtime|fuzz|listener)\Z")
+SCOPE_ID = re.compile(r"(?:root|runtime|fuzz|listener|local-sync)\Z")
 FIXED_FAILURE = b'{"code":"DEVLANE_FAILURE","kind":"control","stage":"unit","status":"fail"}\n'
 
 
@@ -413,7 +413,7 @@ def main(argv=None):
     parser.add_argument("log_path")
     parser.add_argument("config_path")
     parser.add_argument("output_path")
-    parser.add_argument("--scope", choices=("root", "runtime", "fuzz", "listener"), required=True)
+    parser.add_argument("--scope", choices=("root", "runtime", "fuzz", "listener", "local-sync"), required=True)
     parser.add_argument("--suite", required=True)
     parser.add_argument("--deadline", type=float, required=True)
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)

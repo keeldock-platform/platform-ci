@@ -311,6 +311,39 @@ class SourceSelectionAcceptanceTests(unittest.TestCase):
                 self.assertEqual([row["path"] for row in manifest["files"]], ["Cargo.lock"])
                 self.assertEqual(files["Cargo.lock"], b"version = 4\n")
 
+    def test_local_sync_bundle_binds_its_nested_lock_and_test_scope(self):
+        revision = "4" * 40
+        paths = (
+            "local-sync/Cargo.lock",
+            "local-sync/crates/demo/Cargo.toml",
+            "local-sync/crates/demo/src/lib.rs",
+        )
+        oids = {path: (str(index) * 40).encode("ascii") for index, path in enumerate(paths, 1)}
+        tree = b"".join(b"100644 blob " + oids[path] + b"\t" + path.encode("ascii") + b"\0" for path in paths)
+        blobs = {
+            oids[paths[0]]: b"version = 3\n",
+            oids[paths[1]]: b"[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+            oids[paths[2]]: b"pub fn demo() {}\n",
+        }
+
+        def git(argv, **_kwargs):
+            result = SimpleNamespace(returncode=0)
+            result.stdout = (revision + "\n").encode("ascii") if "rev-parse" in argv else tree
+            return result
+
+        bindings = {**BINDINGS, "profile": "local-sync-rust"}
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(bundle.subprocess, "run", side_effect=git), \
+                patch.object(bundle, "_git_blob", side_effect=lambda _repository, oid: blobs[oid.encode("ascii")]):
+            archive = bundle.build_source_archive(
+                temporary, revision, "local-sync-rust", FETCH_SHA, list(paths),
+                {paths[2]: "file_0001"},
+                {"local-sync::local-sync/crates/demo/Cargo.toml::tests::one": "case_0001"}, {},
+            )
+        manifest, files, _directories = bundle.inspect_archive(archive, bindings)
+        self.assertEqual(set(manifest["original_lockfiles"]), {"local-sync/Cargo.lock"})
+        self.assertEqual(files["local-sync/Cargo.lock"], b"version = 3\n")
+
 
 class AuthenticatedSourceSetAcceptanceTests(unittest.TestCase):
     def test_current_source_set_binds_full_and_selected_maps_with_one_scoped_exclusion(self):
@@ -824,6 +857,8 @@ class FetchProjectionAcceptanceTests(unittest.TestCase):
             "expires": 2_000_000_000,
         }
         self.assertEqual(fetch.validate_dispatch(identity, now=1_999_999_000), identity)
+        local_sync_identity = {**identity, "profile": "local-sync-rust"}
+        self.assertEqual(fetch.validate_dispatch(local_sync_identity, now=1_999_999_000), local_sync_identity)
         source_free = {**identity, "wave_class": fetch.SOURCE_FREE_WAVE_CLASS}
         self.assertEqual(fetch.validate_dispatch(source_free, now=1_999_999_000), source_free)
         for changed in (
@@ -894,6 +929,41 @@ class FetchProjectionAcceptanceTests(unittest.TestCase):
         self.assertEqual([item["path"] for item in sanitized["cargo_workspaces"]],
                          ["fuzz/Cargo.lock", "runtime/Cargo.lock"])
         self.assertNotIn("private/workspace/path", json.dumps(sanitized))
+
+    def test_local_sync_request_projects_only_its_nested_lockfile(self):
+        lock = (
+            'version = 3\n\n[[package]]\nname = "serde"\nversion = "1.0.200"\n'
+            'source = "registry+https:' + chr(47) * 2 + 'github.com/rust-lang/crates.io-index"\n'
+            'checksum = "' + "a" * 64 + '"\n'
+        ).encode("ascii")
+        tree = b"100644 blob " + b"b" * 40 + b"\tlocal-sync/Cargo.lock\0"
+        result = SimpleNamespace(returncode=0, stdout=tree)
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(project.bundle.subprocess, "run", return_value=result), \
+                patch.object(project.bundle, "_git_blob", return_value=lock):
+            payload = project.build_projection({
+                "schema": 1,
+                "repository": temporary,
+                "source_revision": "c" * 40,
+                "profile": "local-sync-rust",
+                "tools": {"cargo": "1.99.1", "rustc": "1.99.1"},
+                "playwright": [],
+                "lockfiles": ["local-sync/Cargo.lock"],
+            })
+        sanitized = fetch.validate_projection(payload, "local-sync-rust")
+        self.assertEqual(sanitized["cargo_workspaces"], [])
+        self.assertEqual(sanitized["tools"], {"cargo": "1.99.1", "rustc": "1.99.1"})
+        self.assertNotIn("local-sync/Cargo.lock", payload.decode("ascii"))
+        with tempfile.TemporaryDirectory() as temporary, self.assertRaisesRegex(bundle.Refusal, "projection-rust-lockfile-set"):
+            project.build_projection({
+                "schema": 1,
+                "repository": temporary,
+                "source_revision": "c" * 40,
+                "profile": "local-sync-rust",
+                "tools": {"cargo": "1.99.1", "rustc": "1.99.1"},
+                "playwright": [],
+                "lockfiles": ["Cargo.lock"],
+            })
 
 
 class NetworkProbeAcceptanceTests(unittest.TestCase):
@@ -1827,11 +1897,51 @@ class RustMatrixHostConfigurationTests(unittest.TestCase):
                     "vet", "check", "--manifest-path", manifest, "--store-path", store, "--locked", "--frozen",
                 ])
 
+    def test_local_sync_matrix_runs_only_format_audit_and_workspace_test_arms(self):
+        checks = []
+        arms = []
+
+        def simple(records, suite, argv, deadline, timeout=1800):
+            checks.append((suite, argv))
+            records.append({"kind": "coverage", "stage": rust_matrix_runner._stage_for(suite),
+                            "suite": suite, "total": 1, "passed": 1, "failed": 0, "ignored": 0})
+            return True
+
+        def rust_arm(records, scope, manifest, workspace_mode, mode, config, deadline):
+            arms.append((scope, manifest, workspace_mode, mode))
+            suite = scope + ("-all-features" if mode == "all" else "-default")
+            records.append({"kind": "coverage", "stage": "unit", "suite": suite,
+                            "total": 1, "passed": 1, "failed": 0, "ignored": 0})
+            return True
+
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "matrix.jsonl"
+            with patch.object(rust_matrix_runner, "_copy_advisory_database"), \
+                    patch.object(rust_matrix_runner, "_simple_check", side_effect=simple), \
+                    patch.object(rust_matrix_runner, "_rust_test_arm", side_effect=rust_arm), \
+                    patch.object(rust_matrix_runner, "_fuzz_replay") as replay, \
+                    patch.object(rust_matrix_runner, "_semver_check") as semver:
+                result = rust_matrix_runner.run(
+                    rust_matrix_runner.LOCAL_SYNC_MATRIX, "fixed-test-map", str(report), time.monotonic() + 60,
+                )
+        self.assertEqual(result, 0)
+        self.assertEqual([suite for suite, _argv in checks], ["fmt-local-sync", "audit-local-sync"])
+        self.assertEqual(checks[1][1][-2:], ["--file", "/workspace/source/local-sync/Cargo.lock"])
+        self.assertEqual(arms, [
+            ("local-sync", "/workspace/source/local-sync/Cargo.toml", "workspace", "default"),
+            ("local-sync", "/workspace/source/local-sync/Cargo.toml", "workspace", "all"),
+        ])
+        replay.assert_not_called()
+        semver.assert_not_called()
+
     def test_public_fixture_contract_includes_vet_stores_and_licensed_manifests(self):
         root = Path(__file__).resolve().parents[2]
-        profile = json.loads((root / "ci/devlane-profiles.json").read_text(encoding="utf-8"))["profiles"]["core-rust"]
+        profiles = json.loads((root / "ci/devlane-profiles.json").read_text(encoding="utf-8"))["profiles"]
+        profile = profiles["core-rust"]
         matrix = rust_matrix_runner.EXPECTED_MATRIX
         self.assertEqual(profile["rust_matrix"], matrix)
+        self.assertEqual(profiles["local-sync-rust"]["rust_matrix"], rust_matrix_runner.LOCAL_SYNC_MATRIX)
+        self.assertEqual(profiles["local-sync-rust"]["stages"], ["format", "audit", "unit"])
         self.assertEqual(matrix["toolchain"], "1.99.1")
         self.assertEqual(matrix["tool_versions"], {
             "cargo_deny": "0.20.2", "cargo_audit": "0.22.2", "cargo_vet": "0.10.3",

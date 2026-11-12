@@ -11,6 +11,7 @@ on:
           - core-node
           - core-rust
           - desktop
+          - local-sync-rust
       control_run_id:
         description: Successful exact-SHA source-free public control run
         required: true
@@ -234,7 +235,7 @@ jobs:
           if ! python3 -B -c 'from pathlib import Path; lines=Path("/proc/swaps").read_text(encoding="ascii").splitlines(); expected=["Filename", "Type", "Size", "Used", "Priority"]; raise SystemExit(0 if len(lines) == 1 and lines[0].split() == expected else 1)'; then
             refuse swap-remains
           fi
-          if [[ "$DEVLANE_PROFILE" == "core-rust" ]]; then
+          if [[ "$DEVLANE_PROFILE" == "core-rust" || "$DEVLANE_PROFILE" == "local-sync-rust" ]]; then
             if ! timeout --signal=TERM --kill-after=5s 30s sudo -n python3 -B -c '
           import os, stat
           from pathlib import Path
@@ -373,7 +374,7 @@ jobs:
           '
           mkdir -m 700 "$RUN_ROOT/workspace"
       - name: Install pinned Rust toolchain
-        if: ${{ inputs.profile == 'core-rust' || inputs.profile == 'desktop' }}
+        if: ${{ inputs.profile == 'core-rust' || inputs.profile == 'desktop' || inputs.profile == 'local-sync-rust' }}
         run: |
           set -euo pipefail
           rust_version="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
@@ -383,7 +384,7 @@ jobs:
             rustup toolchain install "$rust_version" --profile minimal --component rustfmt >/dev/null 2>&1
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             rustup default "$rust_version" >/dev/null 2>&1
-          if [[ "$DEVLANE_PROFILE" == "core-rust" ]]; then
+          if [[ "$DEVLANE_PROFILE" == "core-rust" || "$DEVLANE_PROFILE" == "local-sync-rust" ]]; then
             python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
               python3 -B kit/devlane/rust_tooling.py fetch --output "$RUN_ROOT/rust-tooling" \
                 --deadline-file "$RUN_ROOT/deadline.json"
@@ -406,7 +407,7 @@ jobs:
           if [[ "$DEVLANE_PROFILE" == "desktop" ]]; then
             node_source_id="$(printf 'devlane-%s-%s' "$CI_RUN_ID" "$CI_RUN_ATTEMPT")"
           fi
-          if [[ "$DEVLANE_PROFILE" == "core-rust" || "$DEVLANE_PROFILE" == "desktop" ]]; then
+          if [[ "$DEVLANE_PROFILE" == "core-rust" || "$DEVLANE_PROFILE" == "desktop" || "$DEVLANE_PROFILE" == "local-sync-rust" ]]; then
             rust_version="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
               python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tools"]["cargo"])' "$RUN_ROOT/projection.json")"
             [[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
@@ -425,7 +426,7 @@ jobs:
               --node-snapshot-id "$node_snapshot_id" \
               --node-source-id "$node_source_id" \
               --deadline-file "$RUN_ROOT/deadline.json"
-          if [[ "$DEVLANE_PROFILE" == "core-rust" ]]; then
+          if [[ "$DEVLANE_PROFILE" == "core-rust" || "$DEVLANE_PROFILE" == "local-sync-rust" ]]; then
             python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
               python3 -B kit/devlane/rust_tooling.py install --source "$RUN_ROOT/rust-tooling" --prepared "$RUN_ROOT/prepared" \
                 --deadline-file "$RUN_ROOT/deadline.json"
@@ -450,7 +451,7 @@ jobs:
           if [[ "$DEVLANE_PROFILE" == "desktop" ]]; then
             node_vendor_id="$(printf 'devlane-%s-%s' "$CI_RUN_ID" "$CI_RUN_ATTEMPT")"
           fi
-          if [[ "$DEVLANE_PROFILE" == "core-rust" || "$DEVLANE_PROFILE" == "desktop" ]]; then
+          if [[ "$DEVLANE_PROFILE" == "core-rust" || "$DEVLANE_PROFILE" == "desktop" || "$DEVLANE_PROFILE" == "local-sync-rust" ]]; then
             rust_version="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
               python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tools"]["cargo"])' "$RUN_ROOT/projection.json")"
             [[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]

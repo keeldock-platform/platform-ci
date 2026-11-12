@@ -115,6 +115,30 @@
       "file_ids": [],
       "diagnostic_codes": ["E0001", "E0002", "E0277", "E0308", "E0425", "E0432", "E0599", "E0609", "TS2322", "DEVLANE_FAILURE"]
     },
+    "local-sync-rust": {
+      "revision": 1,
+      "budget_seconds": 8700,
+      "rust_matrix": {
+        "schema": 1,
+        "toolchain": "1.99.1",
+        "tool_versions": {
+          "cargo_deny": "0.20.2",
+          "cargo_audit": "0.22.2",
+          "cargo_vet": "0.10.3"
+        },
+        "workspaces": [
+          {"id": "local-sync", "manifest": "/workspace/source/local-sync/Cargo.toml", "lock": "/workspace/source/local-sync/Cargo.lock", "mode": "workspace"}
+        ],
+        "feature_sets": ["default", "all"],
+        "test_requirements": {"zero_ignored": true, "run_every_discovered_test": true},
+        "coverage_ids": ["fmt-local-sync", "audit-local-sync", "local-sync-default", "local-sync-all-features"]
+      },
+      "commands": [],
+      "stages": ["format", "audit", "unit"],
+      "test_ids": [],
+      "file_ids": [],
+      "diagnostic_codes": ["E0001", "E0002", "E0277", "E0308", "E0425", "E0432", "E0599", "E0609"]
+    },
     "synthetic": {
       "revision": 1,
       "commands": [],

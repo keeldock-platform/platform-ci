@@ -44,6 +44,9 @@ MANIFEST_FIELDS_V2 = MANIFEST_FIELDS_V1 | {"source_sets"}
 MANIFEST_FIELDS = MANIFEST_FIELDS_V1
 SOURCE_SET_DOMAIN = "keeldock" + "-core/core-rust-candidate-baseline/v1"
 BASELINE_NAMESPACE = ".devlane/baseline-runtime"
+RUST_PROFILES = ("core-rust", "local-sync-rust")
+RUST_TOOL_PROFILES = (*RUST_PROFILES, "desktop")
+ENCRYPTED_PROFILES = ("core-node", *RUST_PROFILES, "desktop")
 CORE_RUST_SOURCE_REVISION = "9d6cc9e68694e17857d7702e83654131804a1bda"
 CORE_RUST_SOURCE_TREE = "958e13e531d1b2601f241a91a9f80a44ac04d889"
 CORE_RUST_FULL_MAP_SHA256 = "d6ef344e2129babea26ac39c04bacf7eb4cbd3d770acb8416b2fe11a1c334eab"
@@ -133,7 +136,7 @@ def _valid_bindings(bindings):
         _refuse("binding-control")
     if bindings.get("workflow_path") != ".github/workflows/devlane-encrypted.yml":
         _refuse("binding-workflow")
-    if bindings.get("profile") not in ("core-node", "core-rust", "desktop"):
+    if bindings.get("profile") not in ENCRYPTED_PROFILES:
         _refuse("binding-profile")
     for name in ("wave_id", "bundle_id"):
         if type(bindings.get(name)) is not str or not OPAQUE_ID.fullmatch(bindings[name]):
@@ -293,6 +296,20 @@ def _manifest(payload, expected, inventory):
         if not required.issubset(found):
             _refuse("inner-rust-test-map-incomplete")
         if set(value["original_lockfiles"]) != {"Cargo.lock", "fuzz/Cargo.lock", "runtime/Cargo.lock"}:
+            _refuse("inner-rust-lockfile-set")
+    elif value["profile"] == "local-sync-rust":
+        found = False
+        for test_name in value["allowed_tests"]:
+            parts = test_name.split("::", 2)
+            if (len(parts) != 3 or parts[0] != "local-sync"
+                    or not parts[1].startswith("local-sync/")
+                    or not parts[1].endswith("Cargo.toml") or ".." in parts[1].split("/")
+                    or "\\" in parts[1] or parts[1] not in inventory or not parts[2]):
+                _refuse("inner-rust-test-scope")
+            found = True
+        if not found:
+            _refuse("inner-rust-test-map-incomplete")
+        if set(value["original_lockfiles"]) != {"local-sync/Cargo.lock"}:
             _refuse("inner-rust-lockfile-set")
     if value["schema"] == 2:
         _validate_core_rust_source_sets(value["source_sets"], inventory)
@@ -659,7 +676,7 @@ def build_source_archive(repository, revision, profile, fetch_sha256, source_fil
     repository = Path(repository).resolve(strict=True)
     if type(revision) is not str or not GIT_SHA.fullmatch(revision):
         _refuse("source-revision-invalid")
-    if profile not in ("core-node", "core-rust", "desktop", "synthetic") or not SHA256.fullmatch(fetch_sha256):
+    if profile not in (*ENCRYPTED_PROFILES, "synthetic") or not SHA256.fullmatch(fetch_sha256):
         _refuse("source-profile-invalid")
     verify = subprocess.run(
         ["git", "-C", str(repository), "rev-parse", "--verify", revision + "^{commit}"],
@@ -695,7 +712,7 @@ def build_source_archive(repository, revision, profile, fetch_sha256, source_fil
     frames = _validate_public_map(frames, 10_000, "source-frame-map")
     if profile == "synthetic":
         _refuse("synthetic-bundle-forbidden")
-    if profile == "core-node" and (not allowed_files or not allowed_tests):
+    if profile in ("core-node", "local-sync-rust") and (not allowed_files or not allowed_tests):
         _refuse("source-allowlist-empty")
     blobs = []
     names = set()

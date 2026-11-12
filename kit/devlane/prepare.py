@@ -761,7 +761,7 @@ def _run_worker(root, projection, profile, output_root, tool_paths, owner_uid, o
             os.chown(current, UID, GID, follow_symlinks=False)
             for name in directories + files:
                 os.chown(str(Path(current) / name), UID, GID, follow_symlinks=False)
-    if profile in ("core-rust", "desktop"):
+    if profile in bundle.RUST_TOOL_PROFILES:
         (work / "cargo-home/config.toml").write_text(
             '[registries.crates-io]\nprotocol = "sparse"\n\n[net]\nretry = 1\n',
             encoding="ascii",
@@ -771,7 +771,7 @@ def _run_worker(root, projection, profile, output_root, tool_paths, owner_uid, o
     path_parts = ["/usr/bin", "/bin"]
     if profile in ("core-node", "desktop"):
         path_parts.insert(0, node_bin)
-    if profile in ("core-rust", "desktop"):
+    if profile in bundle.RUST_TOOL_PROFILES:
         path_parts.insert(0, rust_bin)
     environment = {
         "PATH": ":".join(path_parts), "HOME": "/devlane-home", "TMPDIR": "/work/tmp",
@@ -781,7 +781,7 @@ def _run_worker(root, projection, profile, output_root, tool_paths, owner_uid, o
         "PLAYWRIGHT_BROWSERS_PATH": "/work/prepared/ms-playwright",
         "XDG_CACHE_HOME": "/work/cache", "PYTHONDONTWRITEBYTECODE": "1",
     }
-    if profile in ("core-rust", "desktop"):
+    if profile in bundle.RUST_TOOL_PROFILES:
         environment["LD_LIBRARY_PATH"] = "/tools/rust/lib"
     (work / "tmp").mkdir(mode=0o700, exist_ok=True)
     (work / "cache").mkdir(mode=0o700, exist_ok=True)
@@ -810,7 +810,7 @@ def _run_worker(root, projection, profile, output_root, tool_paths, owner_uid, o
             command = command_prefix + ["node", cli_guest, "install", *projection["playwright"]]
             run(command, timeout=1800, log=work / "prepare-playwright.log", environment=environment,
                 cwd="/")
-    if profile in ("core-rust", "desktop"):
+    if profile in bundle.RUST_TOOL_PROFILES:
         _set_preparation_stage("prepare-cargo-vendor")
         """cargo vendor creates its destination as the unprivileged worker; it vendors every locked package, so feature flags are neither needed nor accepted by this command."""
         manifest_path = "/work/project/Cargo.toml"
@@ -829,7 +829,7 @@ def _run_worker(root, projection, profile, output_root, tool_paths, owner_uid, o
     (prepared / "projection.json").write_bytes(bundle.canonical_json(projection) + b"\n")
     if profile in ("core-node", "desktop"):
         _copy_tree(project / "node_modules", prepared / "node_modules")
-    if profile in ("core-rust", "desktop"):
+    if profile in bundle.RUST_TOOL_PROFILES:
         if not (prepared / "cargo-vendor").is_dir():
             refuse("cargo-vendor-missing")
     if projection["playwright"]:
@@ -899,7 +899,7 @@ def _argument_parser():
     parser = _PreparationArgumentParser()
     parser.add_argument("--projection", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--profile", choices=("core-node", "core-rust", "desktop"), required=True)
+    parser.add_argument("--profile", choices=bundle.ENCRYPTED_PROFILES, required=True)
     parser.add_argument("--control-sha", default="")
     parser.add_argument("--owner-uid", type=int, required=True)
     parser.add_argument("--owner-gid", type=int, required=True)
@@ -987,7 +987,7 @@ def main(argv=None):
             paths = {"node": "", "npm": "",
                      "cargo": args.cargo_path or shutil.which("cargo") or "",
                      "rustc": args.rustc_path or shutil.which("rustc") or ""}
-        if args.profile in ("core-rust", "desktop"):
+        if args.profile in bundle.RUST_TOOL_PROFILES:
             _set_preparation_stage("prepare-rust-toolchain-validation")
             for name in ("cargo", "rustc"):
                 paths[name] = _resolve_rust_tool(paths[name], name)
@@ -1036,9 +1036,9 @@ def main(argv=None):
                     refuse("node-toolchain-version")
                 if node_results[name].returncode != 0 or actual != expected_text:
                     refuse("node-toolchain-version")
-        if args.profile in ("core-rust", "desktop") and (not paths["cargo"] or not paths["rustc"]):
+        if args.profile in bundle.RUST_TOOL_PROFILES and (not paths["cargo"] or not paths["rustc"]):
             refuse("rust-toolchain-missing")
-        if args.profile in ("core-rust", "desktop"):
+        if args.profile in bundle.RUST_TOOL_PROFILES:
             _set_preparation_stage("prepare-rust-version-verification")
             for name in ("cargo", "rustc"):
                 version_result = subprocess.run([paths[name], "--version"], stdout=subprocess.PIPE,
@@ -1050,7 +1050,7 @@ def main(argv=None):
         if args.profile == "core-node":
             _set_preparation_stage("prepare-tool-root-selection")
             tool_roots = {"node": Path(node_tools["root"]), "rust": None}
-        elif args.profile == "core-rust":
+        elif args.profile in bundle.RUST_PROFILES:
             cargo_root = Path(paths["cargo"]).resolve(strict=True).parent.parent
             rustc_path = Path(paths["rustc"]).resolve(strict=True)
             if not rustc_path.is_relative_to(cargo_root):
