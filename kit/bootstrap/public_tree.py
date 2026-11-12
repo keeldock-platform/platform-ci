@@ -380,7 +380,7 @@ SELF_PIN_LINE_PATTERN = re.compile(
 )
 PINNED_FILE_SHA256 = {
     '.gitattributes': '0f2d6e841d5533b577f130d4865e5e6b68f24f3a2325c4bfa2ece6b943b4edbc',
-    'kit/devlane/test_rehearsal.py': 'e007b754793b01fbad0eb7b57de33a9d47f328c43011d3144e1f6727a3141486',
+    'kit/devlane/test_rehearsal.py': '2474afd431228f636b594fc81dc9a355e5e26c91561b5ada99c9b8501c8cb0a2',
     'kit/devlane/rehearsal.py': 'a74dc59bd09d695cab40115ff21b85950dbe64c8f8b71ea0eeff2d83a657cb98',
     'docs/devlane-procedure.md': '8f91bfee608eed7c44d2a605cb6e1ef6b1f9d03fa6f4c8afc8a8bb60e9fef5d9',
     '.github/workflows/appium-ci.yml': '961eaa4fc03e0fe687fa437673116e68479af9437dcb69173444ec57098db2d3',
@@ -406,7 +406,7 @@ PINNED_FILE_SHA256 = {
     '.github/workflows/performance-shadow.yml': '9a64b2eb8240c1806e669de1e7a1fa42a3631d9988a205482872d3af68cc9d46',
     '.github/workflows/windows-native-preflight.yml': 'da294aadfc0e99cbe109aba90f9fb86df65867cd32d3325d26a9e9a5b035e5bb',
     '.github/workflows/windows-source-admission.yml': 'ef10b21b69f841f6c2b69bc22497400e89e959fdfd6e24740a24e4b00139b5a8',
-    'ci/devlane-profiles.json': 'aa0189c7fc0d7912bd49b47c46a3126adfe8aac9174a43032356825216f5eefc',
+    'ci/devlane-profiles.json': 'b827841a8ca660bde0faee7cbb646d1f8a42c4cb0fd75b05937c1d505f40e893',
     'ci/revoked-signer-fingerprints': 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
     'core-ci/linux_quick_return.py': 'b711e81a2779d891cbba6d11becfe07d730331acc71c7ed2a9841f41439b5fd8',
     'core-ci/test_linux_quick_return.py': 'f6653e9db604a7a3a2213c285ab30567f8c39d46632b1650e4a15c4d8ee8b634',
@@ -421,7 +421,7 @@ PINNED_FILE_SHA256 = {
     'kit/bootstrap/policy_linux.py': '0b314a645e43f2aaec58ca23150386b5865e8a27c3101459d00d42370e7d5a5f',
     'kit/bootstrap/policy_npm.py': 'b110b4573b2919003792e05bdcec60a0108f9e2ea1ebc1ce820ff77216271794',
     'kit/bootstrap/policy_rust.py': '4306a55701a5a04c884b2b21091a6d06307134e3570f0d5d65cb103ff84023ec',
-    'kit/bootstrap/public_tree.py': '114fc791b04bbb34bd529a1eb5c26b0d6ebb4d7a202ea6c2d51caf0d97533fe7',
+    'kit/bootstrap/public_tree.py': '33e0d5814134f5cea52d4e20ba8e287ec0e42e7d7aef9680e0ca860ccd4d8724',
     'kit/bootstrap/test_policy_baselines.py': '690980cc3a140970d2b813d854823e3e9f32d8b09db9e25c0ca143140c3af627',
     'kit/bootstrap/test_policy_handoff.py': '3cf707fec6cc1a62e49a948b496fe00765a04ec171fd4cdc57b07d214d3100a2',
     'kit/bootstrap/test_policy_linux.py': 'f1c62480d608d680e73cdbf0ca8b7c83552919bd5de4caa095d5e04e8c3e5f8c',

@@ -395,7 +395,7 @@ class ProductionExecuteFixtureTests(unittest.TestCase):
         config_argument = next(item for item in browser_command if item.startswith("--config="))
         self.assertEqual(browser_command[3:], [
             "--config=/workspace/source/packages/kernel-ui-kit/browser/playwright.config.ts",
-            "--reporter=json", "--output=/scratch/playwright-results", "--trace=off",
+            "--reporter=json", "--output=/scratch/playwright-results/run", "--trace=off",
         ])
         config_path = Path(config_argument.partition("=")[2]).relative_to("/workspace/source").as_posix()
         self.assertIn(config_path, browser)

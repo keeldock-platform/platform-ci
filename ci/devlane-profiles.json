@@ -22,7 +22,7 @@
         ["npm", "--prefix", "/workspace/source/packages/kernel-ui-kit", "test", "--", "--run", "--reporter=json", "--outputFile=/scratch/reports/vitest.json"],
         ["npm", "--prefix", "/workspace/source/packages/kernel-tokens", "run", "check:generated"]
       ],
-      "browser_command": ["node", "/workspace/source/node_modules/@playwright/test/cli.js", "test", "--config=/workspace/source/packages/kernel-ui-kit/browser/playwright.config.ts", "--reporter=json", "--output=/scratch/playwright-results", "--trace=off"],
+      "browser_command": ["node", "/workspace/source/node_modules/@playwright/test/cli.js", "test", "--config=/workspace/source/packages/kernel-ui-kit/browser/playwright.config.ts", "--reporter=json", "--output=/scratch/playwright-results/run", "--trace=off"],
       "stages": ["typecheck", "unit", "style"],
       "test_ids": [],
       "file_ids": [],
