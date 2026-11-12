@@ -1693,11 +1693,10 @@ class RustMatrixHostConfigurationTests(unittest.TestCase):
             ("runtime/supply-chain/audits.toml", bytes((35,)) + b" cargo-vet audits file"),
             ("runtime/supply-chain/imports.lock", bytes((35,)) + b" cargo-vet imports lock"),
         ):
-            self.assertTrue(test_e2e.RUST_FIXTURE_SOURCES[path].startswith(bytes((10,)) + header + b"\n\n"))
-        self.assertEqual(
-            test_e2e.RUST_FIXTURE_SOURCES["supply-chain/imports.lock"],
-            bytes((10,)) + bytes((35,)) + b" cargo-vet imports lock\n\n[audits]\n",
-        )
+            if path.endswith("imports.lock"):
+                self.assertEqual(test_e2e.RUST_FIXTURE_SOURCES[path], bytes((10,)) + header + b"\n")
+            else:
+                self.assertTrue(test_e2e.RUST_FIXTURE_SOURCES[path].startswith(bytes((10,)) + header + b"\n\n"))
         for path in (
             "Cargo.toml", "crates/support/Cargo.toml", "fuzz/Cargo.toml",
             "runtime/crates/services/listener/Cargo.toml",

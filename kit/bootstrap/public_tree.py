@@ -421,13 +421,13 @@ PINNED_FILE_SHA256 = {
     'kit/bootstrap/policy_linux.py': '0b314a645e43f2aaec58ca23150386b5865e8a27c3101459d00d42370e7d5a5f',
     'kit/bootstrap/policy_npm.py': 'b110b4573b2919003792e05bdcec60a0108f9e2ea1ebc1ce820ff77216271794',
     'kit/bootstrap/policy_rust.py': '4306a55701a5a04c884b2b21091a6d06307134e3570f0d5d65cb103ff84023ec',
-    'kit/bootstrap/public_tree.py': 'b5cb2a1cc1984764cd9b8e604447a78bc29785e0f147277a952112d6f034d062',
+    'kit/bootstrap/public_tree.py': '342c72669826658412d03408dd99b06f0e048696e00ef5d7cc39c7c21436e5e4',
     'kit/bootstrap/test_policy_baselines.py': '690980cc3a140970d2b813d854823e3e9f32d8b09db9e25c0ca143140c3af627',
     'kit/bootstrap/test_policy_handoff.py': '3cf707fec6cc1a62e49a948b496fe00765a04ec171fd4cdc57b07d214d3100a2',
     'kit/bootstrap/test_policy_linux.py': 'f1c62480d608d680e73cdbf0ca8b7c83552919bd5de4caa095d5e04e8c3e5f8c',
     'kit/bootstrap/test_policy_npm.py': '8893c4a89ab447a8813806afd2b35bbedbc78d530f1c5a1c8bdf67fc55865eed',
     'kit/bootstrap/test_policy_rust.py': '2465451eb33dec7787807d27ae9ef574b7447a52953c2c3f1951003243b6294a',
-    'kit/bootstrap/test_public_tree.py': '4258a61b3d33d48912076a54ecfde0031586c335c9efcd831b986fc579092c9a',
+    'kit/bootstrap/test_public_tree.py': '8318fca655f8e4694e9f6c692cc1b92d24427bf5105fe7edb27f06ef87af8fc7',
     'kit/ci/feature_states.py': 'e058de49cf9e96b61e8037ee533a095082f3210429586d4183d6c44c4f57d479',
     'kit/ci/future-stage-inventory.json': '185663fbc7c94b010dc4c74f7e6867898b5186a0d88acb95e61414f15cb695aa',
     'kit/ci/future_stage.py': '11023901b556599b0f5f747b84ed540c45eae5a2d2ad65ea3a1ba95f81775d41',
@@ -611,7 +611,7 @@ PINNED_FILE_SHA256 = {
     'kit/devlane/rust_test_runner.py': 'd0e93a2b5c08369464db30a781a4f48abcaebbf1a316e8a2c38dfb1616061727',
     'kit/devlane/safe_json.mjs': '17d44acd9970efeea8b9b2c80d746efc940460008287f75e7dc2a749239ee169',
     'kit/devlane/supervisor.py': 'dc5efb38a20d66287690d9dd91ceefbab574b6369773287cf47f5daf60d3a6a1',
-    'kit/devlane/test_acceptance.py': '339bc909644e2258fe34ad74aab99f35554e5a6b1af63443485b13af5a2e6675',
+    'kit/devlane/test_acceptance.py': 'f73593979b548dac62736f549db2898fce028f80d09e24ec48d912a5a3520581',
     'kit/devlane/test_adapters.mjs': '72eefa32c212af17202c0d0e5df0113327b9649f988f57c1101edd825ff742c0',
     'kit/devlane/test_audit_contracts.py': '9a01b76cf0605205c8bd0f080e21eb85cf73904fb8379ae467a9d014de4e1647',
     'kit/devlane/test_coordinator.py': 'e4a33ee4da1ba16ec84330c6aa70b9af60c69ad537a86cc832bdbea50947711f',
@@ -667,8 +667,8 @@ PINNED_FILE_SHA256 = {
     'kit/devlane/fixtures/core-rust-rehearsal/src/lib.rs': '845d6336d20a5c4206ea3e8cee5e52cf0f285bfdd768dc53ab30d4ba91911833',
     'kit/devlane/fixtures/core-rust-rehearsal/supply-chain/audits.toml': '628720e4cf05595b314bd06d3bb73e6434e3d3be10f1a394dfbbfe6ea248403c',
     'kit/devlane/fixtures/core-rust-rehearsal/supply-chain/config.toml': '6511f4606f1ce0496bb2d7196bcf47bde1dc79d9271048eb8510818fbd77efbd',
-    'kit/devlane/fixtures/core-rust-rehearsal/supply-chain/imports.lock': '3d3dbce7b3b33e22564994798759546403070d8347d9ca3ef7e7ced50cc6cbc5',
-    'kit/devlane/fixtures/core-rust-rehearsal/runtime/supply-chain/imports.lock': '3d3dbce7b3b33e22564994798759546403070d8347d9ca3ef7e7ced50cc6cbc5',
+    'kit/devlane/fixtures/core-rust-rehearsal/supply-chain/imports.lock': 'ff01c4f0f1a725196404edd25fbab0b4ad073de1264fa124b92e2344ec39eb7a',
+    'kit/devlane/fixtures/core-rust-rehearsal/runtime/supply-chain/imports.lock': 'ff01c4f0f1a725196404edd25fbab0b4ad073de1264fa124b92e2344ec39eb7a',
 }
 BINARY_FIXTURE_FILES = frozenset((
     "kit/devlane/fixtures/real-netns-rtnetlink-ipv4-ubuntu2404.bin",
@@ -853,7 +853,11 @@ def inspect_text(text, pool, relative_path=None):
     cargo_vet_store_header = (
         relative_path in PINNED_CARGO_VET_STORE_HEADERS
         and hash_lines == [PINNED_CARGO_VET_STORE_HEADERS[relative_path]]
-        and text.startswith("\n" + PINNED_CARGO_VET_STORE_HEADERS[relative_path] + "\n\n")
+        and (
+            text == "\n" + PINNED_CARGO_VET_STORE_HEADERS[relative_path] + "\n"
+            if relative_path.endswith("/imports.lock")
+            else text.startswith("\n" + PINNED_CARGO_VET_STORE_HEADERS[relative_path] + "\n\n")
+        )
     )
     if hash_lines and not (rust_test_attributes or action_version_comments or cargo_vet_store_header):
         raise PublicTreeError("comment-present")

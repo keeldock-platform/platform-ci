@@ -1427,13 +1427,16 @@ class PublicTreeTests(unittest.TestCase):
         }
         for path, label in headers.items():
             header = hash_sign + " cargo-vet " + label
-            inspect_text("\n" + header + "\n\n", "platform", path)
+            accepted, rejected = ("\n" + header + "\n\n", "\n" + header + "\n")
+            if label == "imports lock":
+                accepted, rejected = rejected, accepted
+            inspect_text(accepted, "platform", path)
             with self.assertRaisesRegex(PublicTreeError, "comment-present"):
                 inspect_text(header + "\n\n", "platform", path)
             with self.assertRaisesRegex(PublicTreeError, "comment-present"):
-                inspect_text("\n" + header + "\n", "platform", path)
+                inspect_text(rejected, "platform", path)
             with self.assertRaisesRegex(PublicTreeError, "comment-present"):
-                inspect_text("\n" + header + "\n\n", "platform", path + ".copy")
+                inspect_text(accepted, "platform", path + ".copy")
             with self.assertRaisesRegex(PublicTreeError, "comment-present"):
                 inspect_text("\n" + header + "\n\n" + header + "\n", "platform", path)
 
