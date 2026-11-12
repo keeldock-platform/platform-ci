@@ -25,6 +25,7 @@ from unittest.mock import Mock, patch
 
 import public_audit
 import network_probe
+import acceptance_diagnostics
 import filter as output_filter
 import fetch
 import rust_matrix_runner
@@ -3115,6 +3116,67 @@ class RustMatrixRunnerTests(unittest.TestCase):
             self.assertFalse(diagnostic_contract.public_preparation_diagnostic(
                 line.replace("oif=lo", "oif=private/path"),
             ))
+        finally:
+            test_e2e.DIAGNOSTICS.reset()
+
+    def test_network_route_detail_reaches_the_printed_acceptance_line(self):
+        route_detail = (
+            "route[table=n9999999999,type=n999,family=6,"
+            "dst=ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/128,"
+            "oif=abcdefghijklmno,proto=n999,scope=n999]"
+        )
+        probe_result = subprocess.CompletedProcess(
+            ["network_probe.py"], 2, b"",
+            ("network_probe_refusal=network-route-unexpected " + route_detail + "\n").encode("ascii"),
+        )
+        service = object.__new__(supervisor.Service)
+        service.root = Path("/source-free/root")
+        service.host_net_inode = 100
+        service.probe_namespace_inode = None
+        with patch.object(supervisor.network_probe, "firewall_snapshot",
+                          return_value={"netns_inode": 200}), \
+                patch.object(supervisor.subprocess, "run", return_value=probe_result), \
+                patch.object(supervisor, "_bounded_timeout", return_value=30):
+            with self.assertRaises(supervisor.SupervisorRefusal) as caught:
+                service._verify_network_cut()
+        self.assertEqual(
+            caught.exception.code,
+            "network-probe-refusal:network-route-unexpected " + route_detail,
+        )
+
+        supervisor_stdout, supervisor_stderr = io.StringIO(), io.StringIO()
+        with patch.object(supervisor, "_rpc", side_effect=caught.exception), \
+                contextlib.redirect_stdout(supervisor_stdout), \
+                contextlib.redirect_stderr(supervisor_stderr):
+            self.assertEqual(supervisor.main(["probe", "--state-dir", "/source-free/state"]), 2)
+        supervisor_result = subprocess.CompletedProcess(
+            ["supervisor.py", "probe"], 2,
+            supervisor_stdout.getvalue().encode("ascii"),
+            supervisor_stderr.getvalue().encode("ascii"),
+        )
+
+        test_e2e.DIAGNOSTICS.reset()
+        try:
+            with self.assertRaises(test_e2e.StartupRefusalMismatch) as e2e_failure:
+                with test_e2e.DIAGNOSTICS.phase("variant-supervisor-probe-check"):
+                    test_e2e._assert_supervisor_probe_pass(supervisor_result)
+            line = test_e2e.DIAGNOSTICS.refusal_line(e2e_failure.exception)
+            self.assertEqual(
+                line,
+                "devlane_production_e2e=refused stage=variant-supervisor-probe-check "
+                "exception=network-probe-refusal:network-route-unexpected " + route_detail,
+            )
+            self.assertTrue(diagnostic_contract.public_preparation_diagnostic(line))
+
+            with tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary) / "acceptance.log"
+                output.write_text(line + "\n", encoding="ascii")
+                printed = io.StringIO()
+                with contextlib.redirect_stdout(printed):
+                    self.assertEqual(acceptance_diagnostics.main([
+                        "--stage", "production-path-e2e", "--file", str(output),
+                    ]), 0)
+                self.assertEqual(printed.getvalue(), line + "\n")
         finally:
             test_e2e.DIAGNOSTICS.reset()
 

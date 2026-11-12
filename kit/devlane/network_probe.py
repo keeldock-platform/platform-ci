@@ -224,34 +224,16 @@ def _check_ipv4_routes(routes):
                        "Metric", "Mask", "MTU", "Window", "IRTT"]
     if not lines or lines[0].split() != expected_header:
         _refuse("network-structure-invalid")
-    route_count = 0
-    for line in lines[1:]:
-        if not line.strip():
-            continue
-        fields = line.split()
-        if len(fields) != 11:
-            _refuse("network-structure-invalid")
-        interface, destination, gateway, flags, refcnt, use, metric, mask = fields[:8]
-        try:
-            route_flags = int(flags, 16)
-            for value in (refcnt, use, metric, *fields[8:]):
-                int(value, 10)
-        except ValueError:
-            _refuse("network-structure-invalid")
-        if (interface != "lo" or _ipv4_route_address(destination) != "127.0.0.0"
-                or _ipv4_route_address(gateway) != "0.0.0.0"
-                or _ipv4_route_address(mask) != "255.0.0.0" or not route_flags & 0x1):
-            _refuse("network-route-unexpected")
-        route_count += 1
-    if route_count != 1:
+    if len(lines) != 1:
         _refuse("network-route-unexpected")
 
 
 def _check_ipv6_routes(routes):
-    route_count = 0
+    local_count = 0
+    null_count = 0
     for line in routes.splitlines():
         if not line.strip():
-            continue
+            _refuse("network-structure-invalid")
         fields = line.split()
         if len(fields) != 10:
             _refuse("network-structure-invalid")
@@ -270,13 +252,24 @@ def _check_ipv6_routes(routes):
             next_hop = str(ipaddress.IPv6Address(bytes.fromhex(next_hop)))
             prefix_length = int(prefix, 16)
             source_prefix_length = int(source_prefix, 16)
+            metric = int(fields[5], 16)
+            route_flags = int(fields[8], 16)
         except (ValueError, ipaddress.AddressValueError):
             _refuse("network-structure-invalid")
-        if (destination != "::1" or prefix_length != 128 or source != "::"
-                or source_prefix_length != 0 or next_hop != "::" or interface != "lo"):
+        if (source != "::" or source_prefix_length != 0 or next_hop != "::"
+                or interface != "lo"):
             _refuse("network-route-unexpected")
-        route_count += 1
-    if route_count != 1:
+        if (destination == "::1" and prefix_length == 128 and metric == 0
+                and route_flags == 0x80200001):
+            local_count += 1
+        elif (destination == "::" and prefix_length == 0 and metric == 0xffffffff
+              and route_flags == 0x00200200):
+            null_count += 1
+            if null_count > 2:
+                _refuse("network-route-unexpected")
+        else:
+            _refuse("network-route-unexpected")
+    if local_count != 1:
         _refuse("network-route-unexpected")
 
 

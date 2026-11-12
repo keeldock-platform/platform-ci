@@ -1,0 +1,37 @@
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3071601Z 7.0.0-1017-azure
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3193899Z == ip -d -4 route show table all
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3202564Z local 127.0.0.0/8 dev lo table local proto kernel scope host src 127.0.0.1 
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3203329Z local 127.0.0.1 dev lo table local proto kernel scope host src 127.0.0.1 
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3203861Z broadcast 127.255.255.255 dev lo table local proto kernel scope link src 127.0.0.1 
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3204491Z == ip -d -6 route show table all
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3221893Z local ::1 dev lo table local proto kernel scope global metric 0 pref medium
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3222385Z == /proc/net/route
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3223296Z Iface	Destination	Gateway 	Flags	RefCnt	Use	Metric	Mask		MTU	Window	IRTT                                                       
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3224573Z == /proc/net/ipv6_route
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3232628Z 00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3233924Z 00000000000000000000000000000001 80 00000000000000000000000000000000 00 00000000000000000000000000000000 00000000 00000002 00000000 80200001       lo
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3235268Z 00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3236155Z == /proc/net/if_inet6
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3240610Z 00000000000000000000000000000001 01 80 10 80       lo
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3242154Z == /sys/class/net/lo/flags
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3249002Z 0x9
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3250503Z == fib_trie
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3257162Z Main:
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3257580Z   +-- 127.0.0.0/8 2 0 2
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3257988Z      +-- 127.0.0.0/31 1 0 0
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3258302Z         |-- 127.0.0.0
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3258558Z            /8 host LOCAL
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3259199Z         |-- 127.0.0.1
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3259455Z            /32 host LOCAL
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3259842Z      |-- 127.255.255.255
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3260239Z         /32 link BROADCAST
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3260635Z Local:
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3260978Z   +-- 127.0.0.0/8 2 0 2
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3261362Z      +-- 127.0.0.0/31 1 0 0
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3261807Z         |-- 127.0.0.0
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3262242Z            /8 host LOCAL
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3262707Z         |-- 127.0.0.1
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3263128Z            /32 host LOCAL
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3263550Z      |-- 127.255.255.255
+dump	Dump loopback-only namespace routes	2026-11-12T01:51:33.3263954Z         /32 link BROADCAST
+dump	Complete job	﻿2026-11-12T01:51:33.3372108Z Cleaning up orphan processes

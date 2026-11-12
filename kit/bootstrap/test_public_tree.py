@@ -908,6 +908,7 @@ class PublicTreeTests(unittest.TestCase):
             "kit/ci/test_perf_shadow.py",
         }
         expected.update({
+            '.gitattributes',
             '.github/workflows/devlane-encrypted.yml',
             '.github/workflows/devlane-synthetic.yml',
             'ci/devlane-profiles.json',
@@ -962,6 +963,7 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/test_coordinator.py',
             'kit/devlane/test_e2e.py',
             'kit/devlane/rust_rehearsal_fixture.py',
+            'kit/devlane/fixtures/real-netns-dump-ubuntu2404.txt',
             'kit/devlane/fixtures/core-rust-rehearsal/Cargo.lock',
             'kit/devlane/fixtures/core-rust-rehearsal/Cargo.toml',
             'kit/devlane/fixtures/core-rust-rehearsal/build.rs',

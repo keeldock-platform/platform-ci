@@ -3,6 +3,7 @@
 import errno
 import ipaddress
 from pathlib import Path
+import re
 import struct
 import tempfile
 from types import SimpleNamespace
@@ -41,14 +42,13 @@ Local:
               |-- 127.0.0.1
                  /32 host LOCAL
 """
-IPV4_ROUTE = """\
-Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT
-lo\t0000007F\t00000000\t0001\t0\t0\t0\t000000FF\t0\t0\t0
-"""
+IPV4_ROUTE = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT                                                       \n"
 IPV6_ROUTE = """\
-00000000000000000000000000000001 80 00000000000000000000000000000000 00 00000000000000000000000000000000 00000000 00000000 00000000 00000000 lo
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo
+00000000000000000000000000000001 80 00000000000000000000000000000000 00 00000000000000000000000000000000 00000000 00000002 00000000 80200001       lo
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo
 """
-IPV6_ADDRESS = "00000000000000000000000000000001 01 80 10 80 lo\n"
+IPV6_ADDRESS = "00000000000000000000000000000001 01 80 10 80       lo\n"
 KERNEL_68_ROUTES = {
     network_probe.socket.AF_INET: (
         ("127.0.0.0", 8, network_probe.RTN_LOCAL, network_probe.RT_SCOPE_HOST),
@@ -66,7 +66,8 @@ Inter-|   Receive                                                |  Transmit
 """
 
 
-def _proc_sys_fixture(testcase):
+def _proc_sys_fixture(testcase, *, fib_trie=FIB_TRIE, ipv4_route=IPV4_ROUTE,
+                      ipv6_route=IPV6_ROUTE, ipv6_address=IPV6_ADDRESS, flags="0x9\n"):
     temporary = tempfile.TemporaryDirectory()
     testcase.addCleanup(temporary.cleanup)
     base = Path(temporary.name)
@@ -76,19 +77,41 @@ def _proc_sys_fixture(testcase):
     net.mkdir(parents=True)
     (proc / "net").symlink_to("self/net")
     (net / "dev").write_text(NET_DEV, encoding="ascii")
-    (net / "fib_trie").write_text(FIB_TRIE, encoding="ascii")
-    (net / "route").write_text(IPV4_ROUTE, encoding="ascii")
-    (net / "ipv6_route").write_text(IPV6_ROUTE, encoding="ascii")
-    (net / "if_inet6").write_text(IPV6_ADDRESS, encoding="ascii")
+    (net / "fib_trie").write_text(fib_trie, encoding="ascii")
+    (net / "route").write_text(ipv4_route, encoding="ascii")
+    (net / "ipv6_route").write_text(ipv6_route, encoding="ascii")
+    (net / "if_inet6").write_text(ipv6_address, encoding="ascii")
     device = sysfs / "devices/virtual/net/lo"
     device.mkdir(parents=True)
-    (device / "flags").write_text("0x9\n", encoding="ascii")
+    (device / "flags").write_text(flags, encoding="ascii")
     (device / "type").write_text("772\n", encoding="ascii")
     (device / "ifindex").write_text("1\n", encoding="ascii")
     net_class = sysfs / "class/net"
     net_class.mkdir(parents=True)
     (net_class / "lo").symlink_to("../../devices/virtual/net/lo")
     return proc, net_class, net
+
+
+def _real_netns_dump_sections():
+    fixture = Path(__file__).with_name("fixtures") / "real-netns-dump-ubuntu2404.txt"
+    sections = {}
+    section = None
+    for line in fixture.read_text(encoding="utf-8").splitlines():
+        columns = line.split("\t", 2)
+        if (len(columns) != 3 or columns[0] != "dump"
+                or columns[1] != "Dump loopback-only namespace routes"):
+            continue
+        timestamp_and_payload = columns[2]
+        if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z .*", timestamp_and_payload) is None:
+            continue
+        payload = timestamp_and_payload.split("Z ", 1)[1]
+        if payload.startswith("== "):
+            section = payload[3:]
+            sections[section] = []
+        elif section is not None:
+            sections[section].append(payload)
+    return {name: "\n".join(lines) + ("\n" if lines else "")
+            for name, lines in sections.items()}
 
 
 def _fixture_snapshot(testcase, proc, net_class):
@@ -308,6 +331,95 @@ class NetworkProbeTests(unittest.TestCase):
         with self.assertRaisesRegex(network_probe.ProbeRefusal, "network-route-unexpected"):
             _fixture_snapshot(self, proc, net_class)
 
+    def test_real_ubuntu2404_netns_dump_and_negative_route_fixtures(self):
+        sections = _real_netns_dump_sections()
+        self.assertEqual(sections["/proc/net/route"], IPV4_ROUTE)
+        self.assertEqual(sections["/proc/net/ipv6_route"], IPV6_ROUTE)
+        self.assertEqual(sections["/proc/net/if_inet6"], IPV6_ADDRESS)
+        self.assertEqual(sections["/sys/class/net/lo/flags"], "0x9\n")
+        self.assertEqual(
+            network_probe._ipv4_local_addresses(sections["fib_trie"]),
+            {("127.0.0.0", 8), ("127.0.0.1", 32)},
+        )
+        proc, net_class, net = _proc_sys_fixture(
+            self,
+            fib_trie=sections["fib_trie"],
+            ipv4_route=sections["/proc/net/route"],
+            ipv6_route=sections["/proc/net/ipv6_route"],
+            ipv6_address=sections["/proc/net/if_inet6"],
+            flags=sections["/sys/class/net/lo/flags"],
+        )
+
+        class RouteSocket:
+            def __init__(self):
+                self.responses = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def settimeout(self, _timeout):
+                pass
+
+            def bind(self, address):
+                if address != (0, 0):
+                    raise AssertionError("route socket binding changed")
+
+            def sendto(self, request, _address):
+                _length, kind, flags, sequence, _pid = struct.unpack_from("=IHHII", request)
+                if kind != network_probe.RTM_GETROUTE or flags != (
+                        network_probe.NLM_F_REQUEST | network_probe.NLM_F_DUMP):
+                    raise AssertionError("route dump request changed")
+                family = request[16]
+                self.responses = [
+                    *(_netlink_frame(network_probe.RTM_NEWROUTE, payload, sequence)
+                      for payload in _kernel_68_payloads(family)),
+                    _netlink_frame(network_probe.NLMSG_DONE, b"", sequence),
+                ]
+
+            def recvfrom(self, _maximum):
+                return self.responses.pop(0), (0, 0)
+
+        with patch.object(network_probe, "PROC_ROOT", str(proc)), \
+                patch.object(network_probe, "SYS_CLASS_NET", str(net_class)), \
+                patch.object(network_probe.os, "stat", return_value=SimpleNamespace(st_ino=200)), \
+                patch.object(network_probe.socket, "socket", side_effect=lambda *_: RouteSocket()):
+            self.assertEqual(network_probe.structural_snapshot(HOST_NET), {
+                "netns_inode": 200, "interfaces": ["lo"], "routes": 0,
+            })
+
+        (net / "route").write_text(
+            sections["/proc/net/route"]
+            + "lo\t0000007F\t00000000\t0001\t0\t0\t0\t000000FF\t0\t0\t0\n",
+            encoding="ascii",
+        )
+        with self.assertRaisesRegex(network_probe.ProbeRefusal, "network-route-unexpected"):
+            _fixture_snapshot(self, proc, net_class)
+        (net / "route").write_text(sections["/proc/net/route"], encoding="ascii")
+
+        null_route = sections["/proc/net/ipv6_route"].splitlines()[0] + "\n"
+        (net / "ipv6_route").write_text(
+            sections["/proc/net/ipv6_route"] + null_route, encoding="ascii",
+        )
+        with self.assertRaisesRegex(network_probe.ProbeRefusal, "network-route-unexpected"):
+            _fixture_snapshot(self, proc, net_class)
+        (net / "ipv6_route").write_text(
+            sections["/proc/net/ipv6_route"].replace(" ffffffff ", " 00000000 ", 1),
+            encoding="ascii",
+        )
+        with self.assertRaisesRegex(network_probe.ProbeRefusal, "network-route-unexpected"):
+            _fixture_snapshot(self, proc, net_class)
+        (net / "ipv6_route").write_text(sections["/proc/net/ipv6_route"], encoding="ascii")
+
+        (net / "fib_trie").write_text(
+            sections["fib_trie"] + "        |-- 10.0.0.2\n           /32 host LOCAL\n",
+            encoding="ascii",
+        )
+        with self.assertRaisesRegex(network_probe.ProbeRefusal, "network-address-unexpected"):
+            _fixture_snapshot(self, proc, net_class)
+
     def test_structural_readback_requires_exact_loopback_flags(self):
         proc, net_class, _net = _proc_sys_fixture(self)
         link_flags = net_class / "lo/flags"
@@ -333,7 +445,8 @@ class NetworkProbeTests(unittest.TestCase):
             _fixture_snapshot(self, proc, net_class)
         for address_flags in ("00", "81"):
             (net / "if_inet6").write_text(
-                IPV6_ADDRESS.replace(" 80 lo", " " + address_flags + " lo"), encoding="ascii",
+                IPV6_ADDRESS.replace(" 80       lo", " " + address_flags + "       lo"),
+                encoding="ascii",
             )
             with self.subTest(address_flags=address_flags), self.assertRaisesRegex(
                     network_probe.ProbeRefusal, "network-address-unexpected"):
