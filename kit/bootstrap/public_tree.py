@@ -421,13 +421,13 @@ PINNED_FILE_SHA256 = {
     'kit/bootstrap/policy_linux.py': '0b314a645e43f2aaec58ca23150386b5865e8a27c3101459d00d42370e7d5a5f',
     'kit/bootstrap/policy_npm.py': 'b110b4573b2919003792e05bdcec60a0108f9e2ea1ebc1ce820ff77216271794',
     'kit/bootstrap/policy_rust.py': '4306a55701a5a04c884b2b21091a6d06307134e3570f0d5d65cb103ff84023ec',
-    'kit/bootstrap/public_tree.py': '907a45983a2dc7f432c331c2a5b95aa9a7e9e1d570d9b211a1ba4f2ffb3bb033',
+    'kit/bootstrap/public_tree.py': 'b5cb2a1cc1984764cd9b8e604447a78bc29785e0f147277a952112d6f034d062',
     'kit/bootstrap/test_policy_baselines.py': '690980cc3a140970d2b813d854823e3e9f32d8b09db9e25c0ca143140c3af627',
     'kit/bootstrap/test_policy_handoff.py': '3cf707fec6cc1a62e49a948b496fe00765a04ec171fd4cdc57b07d214d3100a2',
     'kit/bootstrap/test_policy_linux.py': 'f1c62480d608d680e73cdbf0ca8b7c83552919bd5de4caa095d5e04e8c3e5f8c',
     'kit/bootstrap/test_policy_npm.py': '8893c4a89ab447a8813806afd2b35bbedbc78d530f1c5a1c8bdf67fc55865eed',
     'kit/bootstrap/test_policy_rust.py': '2465451eb33dec7787807d27ae9ef574b7447a52953c2c3f1951003243b6294a',
-    'kit/bootstrap/test_public_tree.py': '96025c67abac1b45ea1b2847393fe408e4acfab05128c53d81bd221c587427b0',
+    'kit/bootstrap/test_public_tree.py': '4258a61b3d33d48912076a54ecfde0031586c335c9efcd831b986fc579092c9a',
     'kit/ci/feature_states.py': 'e058de49cf9e96b61e8037ee533a095082f3210429586d4183d6c44c4f57d479',
     'kit/ci/future-stage-inventory.json': '185663fbc7c94b010dc4c74f7e6867898b5186a0d88acb95e61414f15cb695aa',
     'kit/ci/future_stage.py': '11023901b556599b0f5f747b84ed540c45eae5a2d2ad65ea3a1ba95f81775d41',
@@ -611,7 +611,7 @@ PINNED_FILE_SHA256 = {
     'kit/devlane/rust_test_runner.py': 'd0e93a2b5c08369464db30a781a4f48abcaebbf1a316e8a2c38dfb1616061727',
     'kit/devlane/safe_json.mjs': '17d44acd9970efeea8b9b2c80d746efc940460008287f75e7dc2a749239ee169',
     'kit/devlane/supervisor.py': 'dc5efb38a20d66287690d9dd91ceefbab574b6369773287cf47f5daf60d3a6a1',
-    'kit/devlane/test_acceptance.py': '06001c0a488302078ec2dde67e5e617e98a3a8b4d6982676f41f2c160247ef51',
+    'kit/devlane/test_acceptance.py': '339bc909644e2258fe34ad74aab99f35554e5a6b1af63443485b13af5a2e6675',
     'kit/devlane/test_adapters.mjs': '72eefa32c212af17202c0d0e5df0113327b9649f988f57c1101edd825ff742c0',
     'kit/devlane/test_audit_contracts.py': '9a01b76cf0605205c8bd0f080e21eb85cf73904fb8379ae467a9d014de4e1647',
     'kit/devlane/test_coordinator.py': 'e4a33ee4da1ba16ec84330c6aa70b9af60c69ad537a86cc832bdbea50947711f',
@@ -648,27 +648,27 @@ PINNED_FILE_SHA256 = {
     'kit/devlane/fixtures/real-netns-rtnetlink-ipv4-ubuntu2404.bin': '14e9c17acac01882acc4cfe9b5e90d63e4aff226e625058300bdfe55e90b9f2c',
     'kit/devlane/fixtures/real-netns-rtnetlink-ipv6-ubuntu2404.bin': '76b8fc1db99045e71f24f9ba84253df4b0d03b7e2e8d9b5c5372f80c57bde024',
     'kit/devlane/fixtures/core-rust-rehearsal/Cargo.lock': '5a188f2fa3aac2d7a5422b178e0efb5c7deae6dcc5dd7133c7bfa2df2c5e4e95',
-    'kit/devlane/fixtures/core-rust-rehearsal/Cargo.toml': '224559f809a8c0ad83a65ac1533021bf52d677e6a4917e46dd801800f62e1c6a',
+    'kit/devlane/fixtures/core-rust-rehearsal/Cargo.toml': 'b7d06db7992bd2554161a9792ae15941c8b5c2016d23311571ae4c21c2feba5c',
     'kit/devlane/fixtures/core-rust-rehearsal/build.rs': '990a2d90dced8c4bc2885071889c305b864c70bfa70c78e2518b835ad1f769a4',
-    'kit/devlane/fixtures/core-rust-rehearsal/crates/support/Cargo.toml': 'eaadaf49a916ea97529333e729e69c79912b6d78dee8024376ba0c2d699bb74b',
+    'kit/devlane/fixtures/core-rust-rehearsal/crates/support/Cargo.toml': '308645a2b3887a75f0b1a8fa57902d9f629ee569504e19a6ef7349af00adcca0',
     'kit/devlane/fixtures/core-rust-rehearsal/crates/support/src/lib.rs': 'b5baf6d15d3e047af8a9db2a690a6126b13edea2494538e9893baf6160fc4e86',
     'kit/devlane/fixtures/core-rust-rehearsal/deny.toml': '991face3dfdaf807d4cb425f8aa8c3b6c0286874519d2527d03d5b4b635a5f43',
     'kit/devlane/fixtures/core-rust-rehearsal/fuzz/Cargo.lock': '6d5c674ec012532f178f84b2cc216e80699e888277d67750180ef2b66bef706c',
-    'kit/devlane/fixtures/core-rust-rehearsal/fuzz/Cargo.toml': '795d61d15f6d5bf4e4a2141b7006ef3526f7845de02a4a359f61b1c9592020c4',
+    'kit/devlane/fixtures/core-rust-rehearsal/fuzz/Cargo.toml': 'cd01602ab9435b59a7c6c117dc671aecd373160e80d81c39517cdd5e698cf568',
     'kit/devlane/fixtures/core-rust-rehearsal/fuzz/corpus/valid-array.json': 'fa1822cf964944168ed1b27f202824922f045d5a479c5629900410a6a5be0001',
     'kit/devlane/fixtures/core-rust-rehearsal/fuzz/corpus/valid-object.json': '317fa3b56b76822840892e4846f9165b03bd8199c9cd3882ae14ba855f44cc24',
     'kit/devlane/fixtures/core-rust-rehearsal/fuzz/src/main.rs': '354a548b87809a075616fa1cc65c49c6b79a577b1033662ad2091b0e395e5be8',
     'kit/devlane/fixtures/core-rust-rehearsal/runtime/Cargo.lock': '089e3cc0c3abb7d93ad8b20b9ef08b98bf1f10af076935ac824f3f9b556bd21c',
     'kit/devlane/fixtures/core-rust-rehearsal/runtime/Cargo.toml': 'b809bf2ea62dca2ee4d388ca2f2ae306a4890b3f6c0d83de8b839775494ee191',
-    'kit/devlane/fixtures/core-rust-rehearsal/runtime/crates/services/listener/Cargo.toml': '6e9afc84a1d18c541c898508b2d793e9f8818da0396401d203bc7e075c9372a7',
+    'kit/devlane/fixtures/core-rust-rehearsal/runtime/crates/services/listener/Cargo.toml': '3a9a69094ebfcfc6509c0373c2a93612f2d16929a7c90c4b67bf5908996358c8',
     'kit/devlane/fixtures/core-rust-rehearsal/runtime/crates/services/listener/src/lib.rs': '09838534254715563720c2cd0744b95272d7280a7bb874ffecb3433c8e6dc173',
-    'kit/devlane/fixtures/core-rust-rehearsal/runtime/supply-chain/audits.toml': 'a9fdcc6aa4dd88fec7855db96a34f6b91bb02924f5b51f7384e3af0725a07012',
-    'kit/devlane/fixtures/core-rust-rehearsal/runtime/supply-chain/config.toml': '67affe3e857543b9b68f327913afc351d6f2d11c5f45df75cc2894f7be7bb4ee',
+    'kit/devlane/fixtures/core-rust-rehearsal/runtime/supply-chain/audits.toml': '628720e4cf05595b314bd06d3bb73e6434e3d3be10f1a394dfbbfe6ea248403c',
+    'kit/devlane/fixtures/core-rust-rehearsal/runtime/supply-chain/config.toml': '59a01b16d2e3411ebc1685b0a6ccfddb633695e3fe0f18780b519f9fdf373a03',
     'kit/devlane/fixtures/core-rust-rehearsal/src/lib.rs': '845d6336d20a5c4206ea3e8cee5e52cf0f285bfdd768dc53ab30d4ba91911833',
-    'kit/devlane/fixtures/core-rust-rehearsal/supply-chain/audits.toml': 'a9fdcc6aa4dd88fec7855db96a34f6b91bb02924f5b51f7384e3af0725a07012',
-    'kit/devlane/fixtures/core-rust-rehearsal/supply-chain/config.toml': '1169b2e5585159b4b14a3c290a6ce6774d119a3c7c9375b452975fa3fa4e84b8',
-    'kit/devlane/fixtures/core-rust-rehearsal/supply-chain/imports.lock': 'ff01c4f0f1a725196404edd25fbab0b4ad073de1264fa124b92e2344ec39eb7a',
-    'kit/devlane/fixtures/core-rust-rehearsal/runtime/supply-chain/imports.lock': 'ff01c4f0f1a725196404edd25fbab0b4ad073de1264fa124b92e2344ec39eb7a',
+    'kit/devlane/fixtures/core-rust-rehearsal/supply-chain/audits.toml': '628720e4cf05595b314bd06d3bb73e6434e3d3be10f1a394dfbbfe6ea248403c',
+    'kit/devlane/fixtures/core-rust-rehearsal/supply-chain/config.toml': '6511f4606f1ce0496bb2d7196bcf47bde1dc79d9271048eb8510818fbd77efbd',
+    'kit/devlane/fixtures/core-rust-rehearsal/supply-chain/imports.lock': '3d3dbce7b3b33e22564994798759546403070d8347d9ca3ef7e7ced50cc6cbc5',
+    'kit/devlane/fixtures/core-rust-rehearsal/runtime/supply-chain/imports.lock': '3d3dbce7b3b33e22564994798759546403070d8347d9ca3ef7e7ced50cc6cbc5',
 }
 BINARY_FIXTURE_FILES = frozenset((
     "kit/devlane/fixtures/real-netns-rtnetlink-ipv4-ubuntu2404.bin",
@@ -853,7 +853,7 @@ def inspect_text(text, pool, relative_path=None):
     cargo_vet_store_header = (
         relative_path in PINNED_CARGO_VET_STORE_HEADERS
         and hash_lines == [PINNED_CARGO_VET_STORE_HEADERS[relative_path]]
-        and text.startswith("\n" + PINNED_CARGO_VET_STORE_HEADERS[relative_path] + "\n")
+        and text.startswith("\n" + PINNED_CARGO_VET_STORE_HEADERS[relative_path] + "\n\n")
     )
     if hash_lines and not (rust_test_attributes or action_version_comments or cargo_vet_store_header):
         raise PublicTreeError("comment-present")

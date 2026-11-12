@@ -1427,11 +1427,15 @@ class PublicTreeTests(unittest.TestCase):
         }
         for path, label in headers.items():
             header = hash_sign + " cargo-vet " + label
-            inspect_text("\n" + header + "\n", "platform", path)
+            inspect_text("\n" + header + "\n\n", "platform", path)
             with self.assertRaisesRegex(PublicTreeError, "comment-present"):
-                inspect_text("\n" + header + "\n", "platform", path + ".copy")
+                inspect_text(header + "\n\n", "platform", path)
             with self.assertRaisesRegex(PublicTreeError, "comment-present"):
-                inspect_text("\n" + header + "\n" + header + "\n", "platform", path)
+                inspect_text("\n" + header + "\n", "platform", path)
+            with self.assertRaisesRegex(PublicTreeError, "comment-present"):
+                inspect_text("\n" + header + "\n\n", "platform", path + ".copy")
+            with self.assertRaisesRegex(PublicTreeError, "comment-present"):
+                inspect_text("\n" + header + "\n\n" + header + "\n", "platform", path)
 
     def test_rust_rehearsal_allows_only_test_attributes_in_its_fixed_sources(self):
         path = "kit/devlane/fixtures/core-rust-rehearsal/src/lib.rs"

@@ -1685,8 +1685,19 @@ class RustMatrixHostConfigurationTests(unittest.TestCase):
             "runtime/supply-chain/imports.lock",
         ):
             self.assertIn(path, test_e2e.RUST_FIXTURE_SOURCES)
-        self.assertTrue(test_e2e.RUST_FIXTURE_SOURCES["supply-chain/imports.lock"].startswith(b"\n"))
-        self.assertTrue(test_e2e.RUST_FIXTURE_SOURCES["runtime/supply-chain/imports.lock"].startswith(b"\n"))
+        for path, header in (
+            ("supply-chain/config.toml", bytes((35,)) + b" cargo-vet config file"),
+            ("supply-chain/audits.toml", bytes((35,)) + b" cargo-vet audits file"),
+            ("supply-chain/imports.lock", bytes((35,)) + b" cargo-vet imports lock"),
+            ("runtime/supply-chain/config.toml", bytes((35,)) + b" cargo-vet config file"),
+            ("runtime/supply-chain/audits.toml", bytes((35,)) + b" cargo-vet audits file"),
+            ("runtime/supply-chain/imports.lock", bytes((35,)) + b" cargo-vet imports lock"),
+        ):
+            self.assertTrue(test_e2e.RUST_FIXTURE_SOURCES[path].startswith(bytes((10,)) + header + b"\n\n"))
+        self.assertEqual(
+            test_e2e.RUST_FIXTURE_SOURCES["supply-chain/imports.lock"],
+            bytes((10,)) + bytes((35,)) + b" cargo-vet imports lock\n\n[audits]\n",
+        )
         for path in (
             "Cargo.toml", "crates/support/Cargo.toml", "fuzz/Cargo.toml",
             "runtime/crates/services/listener/Cargo.toml",
@@ -1694,6 +1705,7 @@ class RustMatrixHostConfigurationTests(unittest.TestCase):
             with self.subTest(manifest=path):
                 manifest = tomllib.loads(test_e2e.RUST_FIXTURE_SOURCES[path].decode("utf-8"))
                 self.assertEqual(manifest["package"]["license"], "MIT")
+                self.assertFalse(manifest["package"]["publish"])
         self.assertTrue(set(test_e2e.RUST_LOCKFILES).issubset(test_e2e.RUST_FIXTURE_SOURCES))
         _manifest, _lock, dependencies = fetch.project_cargo_lock(test_e2e.RUST_FIXTURE_SOURCES["Cargo.lock"])
         self.assertEqual({(row["name"], row["version"]) for row in dependencies},
@@ -1734,6 +1746,51 @@ class RustMatrixHostConfigurationTests(unittest.TestCase):
 
 
 class RealLockfileAndFixtureTests(unittest.TestCase):
+    def test_rust_summary_counts_only_allow_the_semver_refusal_arm_to_fail(self):
+        suites = rust_matrix_runner.EXPECTED_MATRIX["coverage_ids"]
+        scenario = {"profile": "core-rust", "allowed_files": {}, "allowed_tests": {}, "frames": {}}
+
+        def summary(refusal=False, failing_suite=None):
+            rows = []
+            for suite in suites:
+                stage = ("format" if suite.startswith("fmt-") else
+                         "deny" if suite.startswith("deny-") else
+                         "audit" if suite.startswith("audit-") else
+                         "vet" if suite.startswith("vet-") else
+                         "semver" if suite == "semver-runtime" else "unit")
+                fails = (suite == failing_suite
+                         or (refusal and suite == "semver-runtime"))
+                rows.append({
+                    "kind": "coverage", "stage": stage, "suite": suite,
+                    "total": 1, "passed": 0 if fails else 1,
+                    "failed": 1 if fails else 0, "ignored": 0,
+                })
+            if refusal:
+                rows.append({
+                    "kind": "control", "stage": "semver", "status": "fail",
+                    "code": "DEVLANE_SEMVER_EXECUTION",
+                })
+            return b"".join(sorted(
+                json.dumps(row, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+                for row in rows
+            ))
+
+        passing = test_e2e._summary_records(summary(), scenario)
+        self.assertEqual(len([row for row in passing if row["kind"] == "coverage"]), 23)
+
+        refusal_scenario = {**scenario, "expect_semver_execution_refusal": True}
+        refused = test_e2e._summary_records(summary(refusal=True), refusal_scenario)
+        semver = next(row for row in refused if row.get("suite") == "semver-runtime")
+        self.assertEqual([semver[name] for name in ("total", "passed", "failed", "ignored")], [1, 0, 1, 0])
+        for suite in suites:
+            if suite == "semver-runtime":
+                continue
+            with self.subTest(failing_suite=suite), self.assertRaisesRegex(
+                    RuntimeError, "rust-matrix-summary-counts"):
+                test_e2e._summary_records(summary(refusal=True, failing_suite=suite), refusal_scenario)
+        with self.assertRaisesRegex(RuntimeError, "rust-matrix-summary-counts"):
+            test_e2e._summary_records(summary(failing_suite="semver-runtime"), scenario)
+
     def test_every_e2e_node_fixture_passes_the_production_projection_validators(self):
         """Fails on the old fixture (a stripped lock refused with npm-lock-shape) and on the old validator (real lock metadata refused: license, libc, nested node_modules, `||` ranges)."""
         for scenario in test_e2e.scenarios():
