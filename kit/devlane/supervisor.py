@@ -428,7 +428,7 @@ def _mount_minimal_root(root, workspace, prepared, control_root):
     _mount_tmpfs(root, "2g", "0755", "nosuid,nodev")
     for name in (
         "bin", "sbin", "lib", "lib64", "usr", "opt", "etc", "dev", "proc", "run",
-        "tmp", "home", "devlane-home", "control", "prepared", "workspace", "scratch", "var", "tools",
+        "tmp", "home", "devlane-home", "control", "prepared", "workspace", "scratch", "var", "tools", "sys",
     ):
         _ensure_directory(root / name, 0o755)
     for host, guest in (("/usr", root / "usr"), ("/lib", root / "lib"), ("/lib64", root / "lib64")):
@@ -466,8 +466,10 @@ def _mount_minimal_root(root, workspace, prepared, control_root):
     _mount_bind(control_root / "kit/devlane", root / "control/devlane", readonly=True)
     (root / "control/profiles.json").write_text("{}", encoding="ascii")
     _mount_bind(control_root / "ci/devlane-profiles.json", root / "control/profiles.json", readonly=True)
-    _run(["mount", "-t", "proc", "-o", "hidepid=2,subset=pid", "proc", str(root / "proc")])
+    _run(["mount", "-t", "proc", "-o", "ro,hidepid=2,subset=pid", "proc", str(root / "proc")])
     MOUNT_TARGETS.append(root / "proc")
+    _run(["mount", "-t", "sysfs", "-o", "ro,nosuid,nodev,noexec", "sysfs", str(root / "sys")])
+    MOUNT_TARGETS.append(root / "sys")
     _ensure_directory(root / "devlane-home", 0o700)
     os.chown(str(root / "devlane-home"), WORKER_UID, WORKER_GID)
     _ensure_directory(root / "workspace/source", 0o700)
@@ -1323,7 +1325,7 @@ class Service:
         if self.tool_info["rust_root"]:
             _mount_bind(self.tool_info["rust_root"], self.root / "tools/rust", readonly=True)
         self.mounts = [
-            self.root / "proc", self.root / "dev/shm", self.root / "dev", self.root / "workspace",
+            self.root / "proc", self.root / "sys", self.root / "dev/shm", self.root / "dev", self.root / "workspace",
             self.root / "scratch", self.root / "prepared", self.root / "control/profiles.json",
             self.root / "control/devlane", self.root / "etc/ssl/certs",
             self.root / "tools/rust", self.root / "tools/node", self.root / "lib64", self.root / "lib",
