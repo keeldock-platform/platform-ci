@@ -38,10 +38,11 @@ MACOS_RUNNER_HOME = chr(47) + "Users" + chr(47) + "runner"
 MACOS_TMP = MACOS_RUNNER_HOME + "/work/_temp"
 
 
-def _env_value(name, identity=IDENTITY, kind="encrypted"):
+def _env_value(name, identity=IDENTITY, kind="encrypted", job_runner=None):
     runner = identity.get("runner", "ubuntu-24.04")
-    runner_home = MACOS_RUNNER_HOME if runner == "macos-15" else RUNNER_HOME
-    runner_temp = MACOS_TMP if runner == "macos-15" else TMP
+    execution_runner = job_runner or runner
+    runner_home = MACOS_RUNNER_HOME if execution_runner == "macos-15" else RUNNER_HOME
+    runner_temp = MACOS_TMP if execution_runner == "macos-15" else TMP
     values = {
         "CI_REPOSITORY": audit.REPOSITORY, "CI_REPOSITORY_ID": str(audit.REPOSITORY_ID),
         "CI_REF": "refs/heads/main", "CI_SHA": identity["control_sha"], "CI_SERVER_URL": "https://github.com",
@@ -264,7 +265,7 @@ def _render_real_runner_encrypted_log(identity, job_key=audit.RUN_JOB):
         lines.append(marker + "[group]Run " + (run[0].strip() if run else uses))
         if run:
             lines.extend("\x1b[36;1m" + line + "\x1b[0m" for line in run)
-            shell = "/bin/bash" if identity.get("runner", "ubuntu-24.04") == "macos-15" else "/usr/bin/bash"
+            shell = "/bin/bash" if platform_runner == "macos-15" else "/usr/bin/bash"
             lines.append("shell: " + shell + " --noprofile --norc -e -o pipefail {0}")
         else:
             lines.append("with:")
@@ -279,7 +280,7 @@ def _render_real_runner_encrypted_log(identity, job_key=audit.RUN_JOB):
         env_names = grammar.expected_env_names(step)
         if env_names:
             lines.append("env:")
-            lines.extend("  %s: %s" % (key, _env_value(key, identity, "encrypted"))
+            lines.extend("  %s: %s" % (key, _env_value(key, identity, "encrypted", platform_runner))
                          for key in sorted(env_names))
         lines.append(marker + "[endgroup]")
         lines.extend(_step_outputs(step, identity, "encrypted", ()))
@@ -638,6 +639,14 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         audit.validate_job_contract(jobs, identity, "core-node")
         log = _render_real_runner_encrypted_log(identity)
         audit.validate_job_log_surface(log, audit.RUN_JOB, identity)
+        audit_log = _render_real_runner_encrypted_log(identity, job_key=audit.AUDIT_JOB)
+        audit.validate_job_log_surface(audit_log, audit.AUDIT_JOB, identity)
+        self.assertIn(b"Ubuntu2404-Readme.md", audit_log)
+        self.assertNotIn(b"macos-15-arm64-Readme.md", audit_log)
+        wrong_audit_image = audit_log.replace(b"ubuntu24/20261101.360/images/ubuntu/Ubuntu2404-Readme.md",
+                                               b"macos-15-arm64/20261104.0514/images/macos/macos-15-arm64-Readme.md")
+        with self.assertRaises(audit.AuditRefusal):
+            audit.validate_job_log_surface(wrong_audit_image, audit.AUDIT_JOB, identity)
         changed = log.replace(b"Cloud: MacCloud", b"Cloud: Azure", 1)
         with self.assertRaises(audit.AuditRefusal):
             audit.validate_job_log_surface(changed, audit.RUN_JOB, identity)

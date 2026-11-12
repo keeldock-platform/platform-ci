@@ -30,6 +30,15 @@ REPOSITORY_ID = 1430960557
 WORKFLOW_PATH = ".github/workflows/devlane-encrypted.yml"
 LEGACY_ENCRYPTED_CONTROL_SHA = "fe3c58f903ad23006c4bda62a3945207f5f525ab"
 LEGACY_ENCRYPTED_WORKFLOW_PATH = "kit/devlane/fixtures/encrypted-workflow-43284558151.yml"
+LEGACY_ENCRYPTED_WORKFLOWS = {
+    LEGACY_ENCRYPTED_CONTROL_SHA: LEGACY_ENCRYPTED_WORKFLOW_PATH,
+    "f0ddd39554b2e48fbad7e61126319f5ffcdd2b84":
+        "kit/devlane/fixtures/encrypted-workflow-f0ddd39554b2e48fbad7e61126319f5ffcdd2b84.yml",
+}
+
+
+def _legacy_encrypted_workflow_path(identity):
+    return LEGACY_ENCRYPTED_WORKFLOWS.get(identity.get("control_sha"))
 RUN_JOB = "devlane-encrypted-run"
 DECRYPT_ENVIRONMENT = "devlane-decrypt"
 AUDIT_JOB = "devlane-encrypted-audit"
@@ -764,35 +773,43 @@ def _hosted_preamble(lines, grammar, job_name, identity, workflow_path):
             "cache_baseline_sha256": identity.get("cache_baseline_sha256"),
         }
     maybe_environment()
-    if take() != LOG_MARKER + "[group] Inputs":
-        _refuse()
+    input_group_present = index < len(lines) and lines[index] == LOG_MARKER + "[group] Inputs"
+    if not input_group_present:
+        if grammar.kind != "encrypted" or job_runner != "ubuntu-24.04":
+            _refuse()
+        expected_inputs = {}
+    else:
+        if take() != LOG_MARKER + "[group] Inputs":
+            _refuse()
     observed_inputs = {}
     input_lines = []
-    while index < len(lines) and lines[index] != LOG_MARKER + "[endgroup]":
-        line = take()
-        if not line.startswith("  "):
+    if input_group_present:
+        while index < len(lines) and lines[index] != LOG_MARKER + "[endgroup]":
+            line = take()
+            if not line.startswith("  "):
+                _refuse()
+            key, separator, value = line[2:].partition(": ")
+            if not separator or key in observed_inputs or key not in expected_inputs:
+                _refuse()
+            expected = expected_inputs[key]
+            if expected is not None:
+                valid = value == str(expected)
+            elif key.endswith("_asset_id") or key.endswith("_size") or key == "expires":
+                valid = DECIMAL.fullmatch(value) is not None
+            elif key.endswith("_sha256"):
+                valid = SHA256.fullmatch(value) is not None
+            else:
+                valid = False
+            if not valid:
+                _refuse()
+            observed_inputs[key] = value
+            input_lines.append(line)
+    if input_group_present:
+        if take() != LOG_MARKER + "[endgroup]" or set(observed_inputs) != set(expected_inputs):
             _refuse()
-        key, separator, value = line[2:].partition(": ")
-        if not separator or key in observed_inputs or key not in expected_inputs:
-            _refuse()
-        expected = expected_inputs[key]
-        if expected is not None:
-            valid = value == str(expected)
-        elif key.endswith("_asset_id") or key.endswith("_size") or key == "expires":
-            valid = DECIMAL.fullmatch(value) is not None
-        elif key.endswith("_sha256"):
-            valid = SHA256.fullmatch(value) is not None
-        else:
-            valid = False
-        if not valid:
-            _refuse()
-        observed_inputs[key] = value
-        input_lines.append(line)
-    if take() != LOG_MARKER + "[endgroup]" or set(observed_inputs) != set(expected_inputs):
-        _refuse()
-    canonical.append(LOG_MARKER + "[group] Inputs")
-    canonical.extend(input_lines)
-    canonical.append(LOG_MARKER + "[endgroup]")
+        canonical.append(LOG_MARKER + "[group] Inputs")
+        canonical.extend(input_lines)
+        canonical.append(LOG_MARKER + "[endgroup]")
 
     expected_job_name = ("devlane-synthetic / devlane-synthetic"
                          if grammar.kind == "synthetic" else job_name)
@@ -1014,9 +1031,9 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
     if any(ord(char) < 32 and char != "\n" or 127 <= ord(char) <= 159 for char in text):
         _refuse()
     kind = "synthetic" if workflow == "synthetic" else "encrypted"
+    legacy_workflow = _legacy_encrypted_workflow_path(identity) if kind == "encrypted" else None
     workflow_path = (".github/workflows/devlane-synthetic.yml" if kind == "synthetic"
-                     else str(REPOSITORY_ROOT / LEGACY_ENCRYPTED_WORKFLOW_PATH)
-                     if identity.get("control_sha") == LEGACY_ENCRYPTED_CONTROL_SHA
+                     else str(REPOSITORY_ROOT / legacy_workflow) if legacy_workflow
                      else ".github/workflows/devlane-encrypted.yml")
     job_key = job_name if kind == "encrypted" else "devlane-synthetic"
     grammar = _Grammar(workflow_path, job_key, identity, kind)
@@ -1276,10 +1293,9 @@ def _steps(job):
 
 
 def _expected_step_names(profile, identity=None):
-    if (type(identity) is dict
-            and identity.get("control_sha") == LEGACY_ENCRYPTED_CONTROL_SHA
-            and profile in ("core-node", "core-rust")):
-        legacy = parse_workflow(REPOSITORY_ROOT / LEGACY_ENCRYPTED_WORKFLOW_PATH)
+    legacy_workflow = _legacy_encrypted_workflow_path(identity) if type(identity) is dict else None
+    if legacy_workflow and profile in ("core-node", "core-rust"):
+        legacy = parse_workflow(REPOSITORY_ROOT / legacy_workflow)
         return [step["name"] for step in legacy[RUN_JOB]["steps"]]
     return list(STEP_NAMES)
 

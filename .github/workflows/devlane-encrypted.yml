@@ -391,7 +391,6 @@ jobs:
             python3 -B kit/devlane/fetch.py check-projection --file "$RUN_ROOT/projection.json" \
               --profile "$DEVLANE_PROFILE" --control-sha "$CI_SHA"
           '
-          mkdir -m 700 "$RUN_ROOT/workspace"
       - name: Install pinned Rust toolchain
         if: ${{ inputs.profile == 'core-rust' || inputs.profile == 'desktop' || inputs.profile == 'local-sync-rust' }}
         run: |
@@ -414,8 +413,9 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$DEVLANE_RUNNER" == "macos-15" ]]; then
+            python_bin="$(python3 -B -c 'import sys; print(sys.executable)')"
             python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
-              python3 -B kit/devlane/sandbox_macos.py prepare \
+              sudo -n "$python_bin" -B kit/devlane/sandbox_macos.py prepare \
                 --state-dir "$RUN_ROOT/state" --projection "$RUN_ROOT/projection.json" \
                 --output "$RUN_ROOT/prepared" --profile "$DEVLANE_PROFILE" \
                 --control-sha "$CI_SHA" --deadline-file "$RUN_ROOT/deadline.json"

@@ -34,7 +34,11 @@ import test_e2e
 
 
 WORKFLOW_ROOT = Path(__file__).resolve().parents[2]
-WORKFLOW_SCRIPT = re.compile(r"(?=\bpython3\s+-B\s+(kit/devlane/[A-Za-z0-9_.-]+\.py)\b([^\n]*))")
+WORKFLOW_SCRIPT = re.compile(
+    r"(?=(?:\bpython3\s+-B\s+|\bsudo\s+-n\s+(?:--preserve-env=[A-Za-z0-9_,]+\s+)?"
+    r"['\"]?\$python_bin['\"]?\s+-B\s+)"
+    r"(kit/devlane/[A-Za-z0-9_.-]+\.py)\b([^\n]*))",
+)
 
 
 def _workflow_script_invocations():
@@ -603,7 +607,7 @@ class DeadlineTests(unittest.TestCase):
             ("devlane-encrypted.yml", "devlane-encrypted-run", "prepare.py"): 1,
             ("devlane-encrypted.yml", "devlane-encrypted-run", "rust_tooling.py"): 2,
             ("devlane-encrypted.yml", "devlane-encrypted-run", "supervisor.py"): 4,
-            ("devlane-encrypted.yml", "devlane-encrypted-run", "sandbox_macos.py"): 2,
+            ("devlane-encrypted.yml", "devlane-encrypted-run", "sandbox_macos.py"): 7,
             ("devlane-encrypted.yml", "devlane-encrypted-audit", "public_audit.py"): 1,
         })
         self.assertEqual(Counter((workflow, job, script) for workflow, job, _step, script, _args in calls),
@@ -775,6 +779,12 @@ class DeadlineTests(unittest.TestCase):
                         "preflight": ("--state-dir", "--workspace", "--profile", "--run-id", "--control-sha"),
                         "prepare": ("--state-dir", "--projection", "--output", "--profile",
                                     "--control-sha", "--deadline-file"),
+                        "start": ("--state-dir", "--context", "--workspace", "--prepared", "--bundle",
+                                  "--projection", "--deadline-file", "--positive-control", "--run-id"),
+                        "probe": ("--state-dir",),
+                        "decrypt": ("--state-dir", "--context", "--bundle", "--projection", "--deadline-file"),
+                        "execute": ("--state-dir", "--context", "--deadline-file"),
+                        "cleanup": ("--state-dir", "--root", "--runner-temp", "--workspace", "--run-id"),
                     }[arguments[0]]
                     for option in required:
                         self._assert_required_argument(sandbox_macos.main, arguments, option)

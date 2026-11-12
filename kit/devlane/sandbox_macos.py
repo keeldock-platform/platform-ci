@@ -40,17 +40,28 @@ PROFILE_FILE = "ci/devlane-profiles.json"
 SBPL_FILE = "worker.sb"
 STATE_FILE = "worker.json"
 IDENTITY_FILE = "identity.json"
+CLEANUP_INTENT_FILE = "cleanup-intent.json"
 PF_STATE_FILE = "pf.json"
 ANCHOR_NAME = "com.apple/devlane-private"
 MACOS_ROOT_DIRECTORY = chr(47) + "private" + chr(47) + "var" + chr(47) + "root"
 
 
+DECRYPT_REFUSAL_CODES = frozenset((
+    "archive-invalid", "auth-tag", "binding-mismatch", "crypto-unavailable",
+    "decrypt-failed", "decrypt-timeout", "expired", "invalid-envelope", "key-format",
+    "request-invalid", "truncated",
+))
+
+
 class Refusal(ValueError):
-    pass
+    def __init__(self, code="supervisor-failed", decrypt_refusal=None):
+        super().__init__(code)
+        self.code = code
+        self.decrypt_refusal = decrypt_refusal
 
 
-def _refuse(code="supervisor-failed"):
-    raise Refusal(code)
+def _refuse(code="supervisor-failed", *, decrypt_refusal=None):
+    raise Refusal(code, decrypt_refusal=decrypt_refusal)
 
 
 def _safe_path(value, *, must_exist=False):
@@ -91,17 +102,28 @@ def _read_json(path, maximum=65536):
 
 def _write_json(path, value, *, mode=0o600, exclusive=True):
     target = Path(path)
-    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-    flags |= os.O_EXCL if exclusive else os.O_TRUNC
+    directory_descriptor = descriptor = None
     try:
-        descriptor = os.open(str(target), flags, mode)
+        directory_descriptor = os.open(
+            str(target.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        flags |= os.O_EXCL if exclusive else os.O_TRUNC
+        descriptor = os.open(target.name, flags, mode, dir_fd=directory_descriptor)
         with os.fdopen(descriptor, "wb") as output:
+            descriptor = None
             output.write(bundle.canonical_json(value) + b"\n")
             output.flush()
             os.fsync(output.fileno())
-        os.chmod(target, mode)
+            os.fchmod(output.fileno(), mode)
+        os.fsync(directory_descriptor)
     except (OSError, bundle.Refusal):
         _refuse("state-directory-permissions")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
 
 
 def _state_paths(state_dir):
@@ -124,6 +146,20 @@ def _identity(state):
             or re.fullmatch(WORKER_NAME_PREFIX + r"[0-9]{1,19}", value["account"]) is None
             or type(value.get("host_identity")) is not dict):
         _refuse("dispatch-context-invalid")
+    return value
+
+
+def _cleanup_intent(state):
+    value = _read_json(state / CLEANUP_INTENT_FILE, 2048)
+    fields = {"schema", "run_id", "runner_uid", "uid", "gid", "account", "home"}
+    if (type(value) is not dict or set(value) != fields or value.get("schema") != 1
+            or not RUN_ID_RE.fullmatch(str(value.get("run_id", "")))
+            or type(value.get("runner_uid")) is not int or value["runner_uid"] <= 0
+            or type(value.get("uid")) is not int or not 1 <= value["uid"] < 60000
+            or value.get("gid") != WORKER_GROUP
+            or value.get("account") != WORKER_NAME_PREFIX + str(value["run_id"])
+            or value.get("home") != str(state.parent / "worker-home")):
+        _refuse("cleanup-intent-invalid")
     return value
 
 
@@ -334,6 +370,63 @@ def _validate_projection_file(path, profile, control_sha):
     return value
 
 
+def preparation_profile_text(*, project, prepared, cache, home, temporary, node, npm_cli):
+    node_root = Path(node).parent
+    npm_root = Path(npm_cli).parent.parent
+    readable = {
+        "/System/Library", "/System/Volumes/Preboot/Cryptexes/OS", "/usr/lib", "/usr/share",
+        "/usr/bin", "/bin", "/dev", str(node_root), str(npm_root), str(project),
+        str(prepared), str(cache), str(home), str(temporary),
+    }
+    executable = {"/bin/sh", "/bin/bash", "/usr/bin/env", "/usr/bin/sandbox-exec", str(node)}
+    writable = {str(project), str(prepared), str(cache), str(home), str(temporary)}
+    lines = [
+        "(version 1)", "(deny default)", "(allow process-fork)",
+        "(allow network-outbound)", "(deny network-inbound)",
+        "(allow signal (target same-sandbox))",
+    ]
+    lines.extend("(allow process-exec (literal " + _quote(path) + "))" for path in sorted(executable))
+    lines.extend("(allow file-read* (subpath " + _quote(path) + "))" for path in sorted(readable))
+    lines.extend("(allow file-write* (subpath " + _quote(path) + "))" for path in sorted(writable))
+    lines.extend((
+        "(allow file-read* (literal \"/dev/null\") (literal \"/dev/urandom\") "
+        + "(literal \"/dev/random\") (literal \"/dev/zero\"))",
+        "(allow file-map-executable (subpath " + _quote(project) + ") (subpath " + _quote(prepared) + "))",
+    ))
+    return "\n".join(lines) + "\n"
+
+
+def _run_preparation_process(argv, *, ident, profile, cwd, env, output, timeout):
+    command = ["/usr/bin/sandbox-exec", "-f", str(profile), *map(str, argv)]
+    process = None
+    try:
+        process = subprocess.Popen(
+            command, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+            env=env, close_fds=True, start_new_session=True,
+            user=ident["uid"], group=ident["gid"], extra_groups=(), preexec_fn=_worker_limits,
+        )
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if process is not None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    _refuse("process-cleanup-incomplete")
+        _refuse("total-deadline-exhausted")
+    except (OSError, subprocess.SubprocessError, TypeError):
+        _refuse("dependency-preparation-refused")
+    _terminate_worker_processes(ident["uid"])
+    return process.returncode
+
+
 def _readonly_tree(root):
     base = Path(root)
     for current, directories, files in os.walk(base, topdown=False, followlinks=False):
@@ -376,57 +469,66 @@ def _tree_limits(root, *, max_files=250000, max_bytes=4 * 1024 * 1024 * 1024):
 
 
 def _prepare(state, projection_path, output_path, profile, control_sha, deadline_file):
+    if os.geteuid() != 0:
+        _refuse("macos-root-required")
     ident = _identity(state)
     if profile != PROFILE_NAME:
         _refuse("profile-unknown")
     deadline_budget.remaining(deadline_file)
     projection = _validate_projection_file(projection_path, profile, control_sha)
+    root = state.parent
     output = _safe_path(output_path)
-    if output.exists() or output.is_symlink():
-        _refuse("prepared-output-exists")
-    project = state.parent / "preparation-project"
-    prepared = state.parent / "prepared"
+    project = root / "preparation-project"
+    prepared = root / "prepared"
+    cache = root / "preparation-npm-cache"
+    home = root / "preparation-home"
+    temporary = root / "preparation-tmp"
+    profile_path = root / "preparation.sb"
+    log = root / "preparation.log"
+    if output != prepared:
+        _refuse("prepared-output-invalid")
+    for path in (project, prepared, cache, profile_path, log):
+        if path.exists() or path.is_symlink():
+            _refuse("prepared-output-exists")
+    for path in (home, temporary):
+        try:
+            info = path.lstat()
+        except OSError:
+            _refuse("preparation-path-invalid")
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            _refuse("preparation-path-invalid")
     project.mkdir(mode=0o700)
     prepared.mkdir(mode=0o700)
+    cache.mkdir(mode=0o700)
     (project / "package.json").write_bytes(bundle.canonical_json(projection["npm_package"]) + b"\n")
     (project / "package-lock.json").write_bytes(bundle.canonical_json(projection["npm_lock"]) + b"\n")
     (project / ".npmrc").write_text(
         "ignore-scripts=true\naudit=false\nfund=false\nupdate-notifier=false\nregistry=https://registry.npmjs.org/\n",
         encoding="ascii",
     )
-    cache = state.parent / "preparation-npm-cache"
-    cache.mkdir(mode=0o700)
+    for path in (project, prepared, cache, home, temporary):
+        _chown_tree(path, ident["uid"], ident["gid"])
+    profile_path.write_text(preparation_profile_text(
+        project=project, prepared=prepared, cache=cache, home=home, temporary=temporary,
+        node=ident["node"], npm_cli=ident["npm_cli"],
+    ), encoding="utf-8")
+    os.chmod(profile_path, 0o444)
     env = {
         "PATH": str(Path(ident["node"]).parent) + ":/usr/bin:/bin",
-        "HOME": str(state.parent / "preparation-home"), "TMPDIR": str(state.parent / "preparation-tmp"),
-        "NPM_CONFIG_CACHE": str(cache), "NPM_CONFIG_IGNORE_SCRIPTS": "true", "NPM_CONFIG_AUDIT": "false",
-        "NPM_CONFIG_FUND": "false", "NPM_CONFIG_UPDATE_NOTIFIER": "false", "CI": "1", "LC_ALL": "C", "LANG": "C",
+        "HOME": str(home), "TMPDIR": str(temporary), "NPM_CONFIG_CACHE": str(cache),
+        "NPM_CONFIG_IGNORE_SCRIPTS": "true", "NPM_CONFIG_AUDIT": "false",
+        "NPM_CONFIG_FUND": "false", "NPM_CONFIG_UPDATE_NOTIFIER": "false",
+        "CI": "1", "LC_ALL": "C", "LANG": "C",
         "PLAYWRIGHT_BROWSERS_PATH": str(prepared / "ms-playwright"),
     }
-    log = state.parent / "preparation.log"
     timeout = min(3600, deadline_budget.remaining(deadline_file))
     with log.open("xb") as output_log:
-        try:
-            process = subprocess.Popen(
-                [ident["node"], ident["npm_cli"], "ci", "--ignore-scripts", "--include=dev", "--include=optional",
-                 "--no-audit", "--no-fund"], cwd=str(project), stdin=subprocess.DEVNULL,
-                stdout=output_log, stderr=subprocess.STDOUT, env=env, close_fds=True, start_new_session=True,
-            )
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            if "process" in locals():
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                    process.wait(timeout=2)
-                except (OSError, subprocess.TimeoutExpired):
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except OSError:
-                        pass
-            _refuse("total-deadline-exhausted")
-        except (OSError, subprocess.SubprocessError):
-            _refuse("supervisor-operation-failed")
-    if log.stat().st_size > MAX_LOG_BYTES or process.returncode != 0:
+        code = _run_preparation_process(
+            (ident["node"], ident["npm_cli"], "ci", "--ignore-scripts", "--include=dev",
+             "--include=optional", "--no-audit", "--no-fund"),
+            ident=ident, profile=profile_path, cwd=project, env=env, output=output_log, timeout=timeout,
+        )
+    if log.stat().st_size > MAX_LOG_BYTES or code != 0:
         _refuse("dependency-preparation-refused")
     if projection["playwright"]:
         candidates = (
@@ -437,16 +539,12 @@ def _prepare(state, projection_path, output_path, profile, control_sha, deadline
         if cli is None:
             _refuse("prepared-input-invalid")
         with log.open("ab") as output_log:
-            try:
-                process = subprocess.Popen(
-                    [ident["node"], str(cli), "install", *projection["playwright"]], cwd=str(project),
-                    stdin=subprocess.DEVNULL, stdout=output_log, stderr=subprocess.STDOUT, env=env,
-                    close_fds=True, start_new_session=True,
-                )
-                process.wait(timeout=min(1800, deadline_budget.remaining(deadline_file)))
-            except (OSError, subprocess.SubprocessError):
-                _refuse("dependency-preparation-refused")
-        if process.returncode != 0 or log.stat().st_size > MAX_LOG_BYTES:
+            code = _run_preparation_process(
+                (ident["node"], cli, "install", *projection["playwright"]),
+                ident=ident, profile=profile_path, cwd=project, env=env, output=output_log,
+                timeout=min(1800, deadline_budget.remaining(deadline_file)),
+            )
+        if code != 0 or log.stat().st_size > MAX_LOG_BYTES:
             _refuse("dependency-preparation-refused")
         if not (prepared / "ms-playwright").is_dir():
             _refuse("prepared-input-invalid")
@@ -457,15 +555,17 @@ def _prepare(state, projection_path, output_path, profile, control_sha, deadline
     (prepared / "projection.json").write_bytes(bundle.canonical_json(projection) + b"\n")
     _tree_limits(prepared)
     _readonly_tree(prepared)
-    if output != prepared:
-        shutil.move(str(prepared), str(output))
     try:
         shutil.rmtree(project)
         shutil.rmtree(cache)
+        shutil.rmtree(home)
+        shutil.rmtree(temporary)
+        profile_path.unlink()
         log.unlink()
     except OSError:
         _refuse("cleanup-incomplete")
     print("dependency_preparation=complete")
+
 
 
 def _quote(path):
@@ -480,7 +580,7 @@ def profile_text(*, workspace, prepared, scratch, home, control, node, developer
     allowed_reads = {
         "/System/Library", "/System/Volumes/Preboot/Cryptexes/OS", "/usr/lib", "/usr/share", "/usr/bin",
         "/bin", str(Path(workspace)), str(Path(prepared)), str(Path(control)), str(Path(home)),
-        str(Path(developer)), str(node_root), str(Path(workspace).parent / "trusted"),
+        str(Path(developer)), str(node_root), str(Path(workspace).parent / "trusted"), str(Path(scratch)),
     }
     if npm_cli is not None:
         allowed_reads.add(str(Path(npm_cli).parent.parent))
@@ -498,14 +598,18 @@ def profile_text(*, workspace, prepared, scratch, home, control, node, developer
     }
     lines.extend("(allow process-exec (subpath " + _quote(path) + "))" for path in sorted(process_roots))
     lines.extend("(allow file-read* (subpath " + _quote(path) + "))" for path in sorted(allowed_reads))
+    scratch_writes = {
+        str(Path(scratch) / "reports"), str(Path(scratch) / "playwright-results"),
+        str(Path(scratch) / "tmp"), str(Path(scratch) / "npm-cache"),
+    }
+    write_roots = {str(Path(workspace) / "source"), str(Path(home)), *scratch_writes}
     lines.extend((
         "(allow file-read* (literal \"/dev/null\") (literal \"/dev/urandom\") "
         + "(literal \"/dev/random\") (literal \"/dev/zero\"))",
-        "(allow file-write* (subpath " + _quote(Path(workspace) / "source") + ") (subpath " + _quote(scratch) + ") "
-        + "(subpath " + _quote(home) + ") (literal \"/dev/null\") (literal \"/dev/dtracehelper\"))",
+        "(allow file-write* " + " ".join("(subpath " + _quote(path) + ")" for path in sorted(write_roots))
+        + " (literal \"/dev/null\") (literal \"/dev/dtracehelper\"))",
         "(allow file-map-executable (subpath " + _quote(Path(prepared) / "node_modules") + ") "
-        + "(subpath " + _quote(Path(workspace) / "source") + ") "
-        + "(subpath " + _quote(scratch) + "))",
+        + "(subpath " + _quote(Path(workspace) / "source") + "))",
         "(allow sysctl-read (sysctl-name \"hw.machine\") (sysctl-name \"hw.ncpu\") (sysctl-name \"kern.ostype\") "
         + "(sysctl-name \"kern.osrelease\") (sysctl-name \"kern.osversion\"))",
     ))
@@ -713,39 +817,33 @@ def _root_identity(args):
         "image_version": host.image_version, "architecture": host.architecture,
     }
     home = str(state.parent / "worker-home")
-    try:
-        os.mkdir(home, 0o700)
-        result = boundary_guard._run_command(("/usr/bin/dscl", ".", "-create", "/Users/" + account), timeout=10)
+    intent = {
+        "schema": 1, "run_id": run_id, "runner_uid": runner_uid,
+        "uid": uid, "gid": WORKER_GROUP, "account": account, "home": home,
+    }
+    _write_json(state / CLEANUP_INTENT_FILE, intent, mode=0o644)
+    os.mkdir(home, 0o700)
+    result = boundary_guard._run_command(("/usr/bin/dscl", ".", "-create", "/Users/" + account), timeout=10)
+    if result.returncode != 0 or result.stderr:
+        _refuse("macos-identity-unavailable")
+    for key, value in (("UniqueID", str(uid)), ("PrimaryGroupID", str(WORKER_GROUP)),
+                       ("NFSHomeDirectory", home), ("UserShell", "/usr/bin/false"),
+                       ("RealName", "Private Devlane Worker"), ("IsHidden", "1")):
+        result = boundary_guard._run_command(("/usr/bin/dscl", ".", "-create", "/Users/" + account, key, value), timeout=10)
         if result.returncode != 0 or result.stderr:
             _refuse("macos-identity-unavailable")
-        for key, value in (("UniqueID", str(uid)), ("PrimaryGroupID", str(WORKER_GROUP)),
-                           ("NFSHomeDirectory", home), ("UserShell", "/usr/bin/false"),
-                           ("RealName", "Private Devlane Worker"), ("IsHidden", "1")):
-            result = boundary_guard._run_command(("/usr/bin/dscl", ".", "-create", "/Users/" + account, key, value), timeout=10)
-            if result.returncode != 0 or result.stderr:
-                _refuse("macos-identity-unavailable")
-        os.chown(home, uid, WORKER_GROUP)
-        os.chmod(home, 0o700)
-        actual_uid = boundary_guard._run_command(("/usr/bin/id", "-u", account), timeout=5)
-        if actual_uid.returncode != 0 or actual_uid.stderr or actual_uid.stdout != (str(uid) + "\n").encode("ascii"):
-            _refuse("macos-identity-unavailable")
-        _write_json(state / IDENTITY_FILE, {
-            "schema": 1, "run_id": run_id, "runner_uid": runner_uid, "uid": uid,
-            "gid": WORKER_GROUP, "account": account, "home": home, "node": args.node, "npm_cli": args.npm_cli,
-            "node_sha256": args.node_sha256, "npm_sha256": args.npm_sha256,
-            "developer_directory": args.developer_directory, "clang": args.clang,
-            "host_identity": host_identity,
-        }, mode=0o644)
-    except BaseException:
-        try:
-            boundary_guard._run_command(("/usr/bin/dscl", ".", "-delete", "/Users/" + account), timeout=10)
-        except Exception:
-            pass
-        try:
-            shutil.rmtree(home)
-        except OSError:
-            pass
-        raise
+    os.chown(home, uid, WORKER_GROUP)
+    os.chmod(home, 0o700)
+    actual_uid = boundary_guard._run_command(("/usr/bin/id", "-u", account), timeout=5)
+    if actual_uid.returncode != 0 or actual_uid.stderr or actual_uid.stdout != (str(uid) + "\n").encode("ascii"):
+        _refuse("macos-identity-unavailable")
+    _write_json(state / IDENTITY_FILE, {
+        "schema": 1, "run_id": run_id, "runner_uid": runner_uid, "uid": uid,
+        "gid": WORKER_GROUP, "account": account, "home": home, "node": args.node, "npm_cli": args.npm_cli,
+        "node_sha256": args.node_sha256, "npm_sha256": args.npm_sha256,
+        "developer_directory": args.developer_directory, "clang": args.clang,
+        "host_identity": host_identity,
+    }, mode=0o644)
     return 0
 
 
@@ -807,38 +905,65 @@ def _validate_profile(state, worker):
 def _deny_probe(state, worker, ident):
     root = state.parent
     path = root / SBPL_FILE
-    script = (
-        "const fs=require('node:fs'); const net=require('node:net');\n"
-        "const [scratch,outside]=process.argv.slice(1); const result={};\n"
-        "try { fs.writeFileSync(scratch+'/seatbelt-write','ok'); result.inside_write=true; } "
-        "catch { result.inside_write=false; }\n"
-        "try { fs.writeFileSync(outside,'no'); result.outside_write=false; } "
-        "catch (error) { result.outside_write=['EACCES','EPERM'].includes(error.code); }\n"
-        "try { fs.readFileSync(outside); result.outside_read=false; } "
-        "catch (error) { result.outside_read=['EACCES','EPERM'].includes(error.code); }\n"
-        "const socket=net.createConnection({host:'192.0.2.1',port:443,timeout:500});\n"
-        "socket.on('connect',()=>{result.network=false;socket.destroy();finish();});\n"
-        "socket.on('timeout',()=>{result.network=false;socket.destroy();finish();});\n"
-        "socket.on('error',error=>{result.network=['EACCES','EPERM'].includes(error.code);finish();});\n"
-        "let finished=false; function finish(){if(finished)return;finished=true;"
-        "process.stdout.write('KD-SBPL:'+JSON.stringify(result)+'\\n');}\n"
-    )
+    fake_user = chr(47) + "Users" + chr(47) + "devlane-probe-" + ident["run_id"]
+    fake_keychain = fake_user + "/Library/Keychains/devlane-probe-" + ident["run_id"] + ".keychain-db"
+    fake_folders = (chr(47) + "private" + chr(47) + "var" + chr(47) + "folders/devlane-probe-"
+                    + ident["run_id"] + "/T/probe-file")
     outside_dir = root / "outside-canary-dir"
     outside = outside_dir / "outside-canary"
-    if outside_dir.exists() or outside_dir.is_symlink():
+    detached = Path(worker["scratch"]) / "detached-probe-marker"
+    raw_canary = Path(worker["scratch"]) / "raw" / "probe.log"
+    if any(item.exists() or item.is_symlink() for item in (outside_dir, detached, raw_canary)):
         _refuse("positive-control-failed")
     outside_dir.mkdir(mode=0o700)
     outside.write_bytes(b"outside-canary")
+    raw_canary.write_bytes(b"probe-log-readable")
     os.chown(outside_dir, worker["worker_uid"], worker["worker_gid"])
     os.chown(outside, worker["worker_uid"], worker["worker_gid"])
     os.chmod(outside_dir, 0o700)
     os.chmod(outside, 0o600)
+    os.chmod(raw_canary, 0o444)
+    script = (
+        "const fs=require('node:fs');const net=require('node:net');const dgram=require('node:dgram');"
+        "const child=require('node:child_process');"
+        "const [scratch,outside,fakeUser,fakeKeychain,fakeFolders,detached,rawLog]=process.argv.slice(1);"
+        "const result={};const denied=e=>['EACCES','EPERM'].includes(e.code);"
+        "try{fs.writeFileSync(scratch+'/reports/vitest.json',JSON.stringify({numPassedTests:1}));"
+        "result.inside_write=true;}catch{result.inside_write=false;}"
+        "try{result.scratch_report_read=JSON.parse(fs.readFileSync(scratch+'/reports/vitest.json','utf8')).numPassedTests===1;}"
+        "catch{result.scratch_report_read=false;}"
+        "try{result.raw_log_read=fs.readFileSync(rawLog,'utf8')==='probe-log-readable';}catch{result.raw_log_read=false;}"
+        "try{fs.writeFileSync(outside,'no');result.outside_write=false;}catch(e){result.outside_write=denied(e);}"
+        "try{fs.readFileSync(outside);result.outside_read=false;}catch(e){result.outside_read=denied(e);}"
+        "const deniedRead=p=>{try{const fd=fs.openSync(p,'r');fs.closeSync(fd);return false;}"
+        "catch(e){return denied(e);}};"
+        "result.other_home_read=deniedRead(fakeUser+'/probe-file');"
+        "result.keychain_read=deniedRead(fakeKeychain);"
+        "result.private_folders_read=deniedRead(fakeFolders);"
+        "const tcp=(host,family)=>new Promise(resolve=>{let done=false;const finish=value=>{if(done)return;done=true;resolve(value);};"
+        "const s=net.createConnection({host,port:9,family,timeout:700});"
+        "s.on('connect',()=>{s.destroy();finish(false);});s.on('timeout',()=>{s.destroy();finish(false);});"
+        "s.on('error',e=>finish(denied(e)));});"
+        "const udp=(kind,address)=>new Promise(resolve=>{let done=false;const finish=value=>{if(done)return;done=true;"
+        "try{s.close();}catch{}resolve(value);};const s=dgram.createSocket(kind);s.on('error',e=>finish(denied(e)));"
+        "s.send(Buffer.from('probe'),9,address,e=>finish(e?denied(e):false));"
+        "setTimeout(()=>finish(false),700);});"
+        "try{child.spawn(process.execPath,['-e',\"setTimeout(()=>require('node:fs').writeFileSync(process.argv[1],'alive'),1200)\",detached],"
+        "{detached:true,stdio:'ignore'}).unref();result.detached_spawned=true;}catch{result.detached_spawned=false;}"
+        "Promise.all([tcp('192.0.2.1',4),tcp('2001:db8::1',6),tcp('127.0.0.1',4),"
+        "udp('udp4','192.0.2.1'),udp('udp6','2001:db8::1')]).then(values=>{"
+        "[result.ipv4_network,result.ipv6_network,result.loopback_network,result.udp4_network,result.udp6_network]=values;"
+        "process.stdout.write('KD-SBPL:'+JSON.stringify(result)+'\n');});"
+    )
     command = ("/usr/bin/sandbox-exec", "-f", str(path), worker["node"], "-e", script,
-               worker["scratch"], str(outside))
+               worker["scratch"], str(outside), fake_user, fake_keychain, fake_folders,
+               str(detached), str(raw_canary))
     code, stdout, stderr = _run(
         command, env={"PATH": "/usr/bin:/bin", "HOME": ident["home"], "TMPDIR": worker["scratch"], "LC_ALL": "C"},
         user=worker["worker_uid"], group=worker["worker_gid"], timeout=20, capture_limit=4096,
     )
+    _terminate_worker_processes(worker["worker_uid"])
+    time.sleep(1.3)
     try:
         row = [line[len(b"KD-SBPL:"):] for line in stdout.splitlines() if line.startswith(b"KD-SBPL:")]
         result = json.loads(row[0].decode("ascii")) if len(row) == 1 else None
@@ -849,13 +974,20 @@ def _deny_probe(state, worker, ident):
         unchanged = outside.read_bytes() == b"outside-canary"
         outside.unlink()
         outside_dir.rmdir()
-        (Path(worker["scratch"]) / "seatbelt-write").unlink(missing_ok=True)
+        raw_canary.unlink()
+        (Path(worker["scratch"]) / "reports" / "vitest.json").unlink(missing_ok=True)
     except OSError:
         _refuse("positive-control-failed")
-    if (code != 0 or stderr or not unchanged or result != {
-            "inside_write": True, "outside_write": True, "outside_read": True, "network": True,
-    } or outside.exists()):
+    expected = {
+        "inside_write": True, "scratch_report_read": True, "raw_log_read": True,
+        "outside_write": True, "outside_read": True, "other_home_read": True,
+        "keychain_read": True, "private_folders_read": True, "ipv4_network": True,
+        "ipv6_network": True, "loopback_network": True, "udp4_network": True,
+        "udp6_network": True, "detached_spawned": True,
+    }
+    if code != 0 or stderr or not unchanged or result != expected or detached.exists() or outside.exists():
         _refuse("positive-control-failed")
+
 
 
 def _start(state, context_path, workspace, prepared_path, bundle_path, projection_path, positive_path,
@@ -890,6 +1022,11 @@ def _start(state, context_path, workspace, prepared_path, bundle_path, projectio
     (root / "scratch" / "tmp" / "vitest-cache").mkdir(mode=0o700)
     _chown_tree(root / "workspace", ident["uid"], ident["gid"])
     _chown_tree(root / "scratch", ident["uid"], ident["gid"])
+    os.chown(root / "scratch", 0, 0)
+    os.chmod(root / "scratch", 0o755)
+    raw_directory = root / "scratch" / "raw"
+    os.chown(raw_directory, 0, 0)
+    os.chmod(raw_directory, 0o755)
     _install_pf(state, ident)
     state_value = _build_profile(state, ident, context, workspace)
     state_value["pf_rules_file"] = _read_json(state / PF_STATE_FILE, 8192)["rules_file"]
@@ -921,6 +1058,27 @@ def _expected_envelope(context):
     }
 
 
+def _public_decrypt_refusal(error):
+    code = str(error) if isinstance(error, bundle.Refusal) else ""
+    if code == "authentication-failed":
+        return "auth-tag"
+    if code == "key-invalid":
+        return "key-format"
+    if code == "request-expired":
+        return "expired"
+    if code in ("envelope-truncated", "decrypt-input"):
+        return "truncated"
+    if code == "crypto-unavailable":
+        return "crypto-unavailable"
+    if code in ("binding-mismatch", "inner-binding-mismatch") or code.startswith("binding-"):
+        return "binding-mismatch"
+    if code == "ciphertext-size":
+        return "invalid-envelope"
+    if code == "decrypt-request" or code.startswith("json-"):
+        return "request-invalid"
+    return "archive-invalid"
+
+
 def _decrypt(state, context_path, bundle_path, projection_path, deadline_file):
     if os.geteuid() != 0:
         _refuse("macos-root-required")
@@ -931,9 +1089,10 @@ def _decrypt(state, context_path, bundle_path, projection_path, deadline_file):
     context = _validate_context(context_path)
     _check_public_control(state, context, context["profile"], context["control_sha"])
     _probe_pf(state, ident)
+    _terminate_worker_processes(ident["uid"])
     key_hex = os.environ.get("DEVLANE_DECRYPT_KEY", "")
     if re.fullmatch(r"[a-f0-9]{64}", key_hex) is None:
-        _refuse("decrypt-key-unavailable")
+        _refuse("decrypt-rejected", decrypt_refusal="key-format")
     if _sha256_file(bundle_path, bundle.MAX_CIPHERTEXT) != context["bundle_sha256"]:
         _refuse("bundle-binding-mismatch")
     projection = _validate_projection_file(projection_path, context["profile"], context["control_sha"])
@@ -949,22 +1108,24 @@ def _decrypt(state, context_path, bundle_path, projection_path, deadline_file):
         source.mkdir(mode=0o700, parents=False, exist_ok=False)
         manifest = bundle.extract_authenticated_archive(archive, source, _expected_envelope(context))
         archive = b""
-    except (OSError, bundle.Refusal, deadline_budget.DeadlineRefusal):
-        _refuse("decrypt-rejected")
+    except deadline_budget.DeadlineRefusal:
+        _refuse("decrypt-timeout", decrypt_refusal="decrypt-timeout")
+    except (OSError, bundle.Refusal) as error:
+        _refuse("decrypt-rejected", decrypt_refusal=_public_decrypt_refusal(error))
     finally:
         for index in range(len(key)):
             key[index] = 0
     if ("package-lock.json" not in manifest["original_lockfiles"] or "package.json" not in manifest["files"]):
-        _refuse("npm-lock-binding-missing")
+        _refuse("decrypt-rejected", decrypt_refusal="archive-invalid")
     try:
         package_path = source / "package.json"
         lock_path = source / "package-lock.json"
         fetch.validate_npm_manifest_binding(package_path.read_bytes(), projection["npm_package"])
         package, lock, _ = fetch.project_npm_lock(lock_path.read_bytes())
     except (OSError, fetch.Refusal):
-        _refuse("npm-lock-projection-invalid")
+        _refuse("decrypt-rejected", decrypt_refusal="binding-mismatch")
     if package != projection["npm_package"] or lock != projection["npm_lock"]:
-        _refuse("npm-projection-mismatch")
+        _refuse("decrypt-rejected", decrypt_refusal="binding-mismatch")
     _copy_tree_safe(Path(worker["prepared"]) / "node_modules", source / "node_modules")
     trusted = state.parent / "trusted"
     trusted.mkdir(mode=0o700)
@@ -1014,21 +1175,40 @@ def _worker_env(worker, ident):
 
 def _capture_command(argv, *, worker, ident, stage, timeout):
     scratch = Path(worker["scratch"])
-    target = scratch / "raw" / (stage + ".log")
-    if target.exists() or target.is_symlink():
+    raw_directory = scratch / "raw"
+    target_name = stage + ".log"
+    if Path(target_name).name != target_name:
         _refuse("report-file-exists")
     env = _worker_env(worker, ident)
     if argv and argv[0] == "npm":
         argv = [worker["node"], worker["npm_cli"], *argv[1:]]
     command = ["/usr/bin/sandbox-exec", "-f", str(state_path(worker).parent / SBPL_FILE), *argv]
+    directory_descriptor = descriptor = None
     try:
-        with target.open("xb") as output:
+        directory_descriptor = os.open(
+            str(raw_directory), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        directory_metadata = os.fstat(directory_descriptor)
+        if (not stat.S_ISDIR(directory_metadata.st_mode) or directory_metadata.st_uid != 0
+                or directory_metadata.st_mode & 0o022):
+            _refuse("report-file-invalid")
+        descriptor = os.open(
+            target_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600, dir_fd=directory_descriptor,
+        )
+        with os.fdopen(descriptor, "wb") as output:
+            descriptor = None
             process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
                                        cwd=str(Path(worker["source"])), env=env, close_fds=True,
                                        start_new_session=True, user=worker["worker_uid"],
                                        group=worker["worker_gid"], extra_groups=(),
                                        preexec_fn=_worker_limits)
             process.wait(timeout=timeout)
+            _stop_process_group(process.pid)
+            _terminate_worker_processes(worker["worker_uid"])
+            if os.fstat(output.fileno()).st_size > MAX_LOG_BYTES:
+                return 125
+            _finalize_capture_log(output.fileno(), worker["worker_uid"], worker["worker_gid"])
     except subprocess.TimeoutExpired:
         try:
             os.killpg(process.pid, signal.SIGTERM)
@@ -1042,18 +1222,26 @@ def _capture_command(argv, *, worker, ident, stage, timeout):
             _stop_process_group(process.pid)
         except Refusal:
             return 125
+        _terminate_worker_processes(worker["worker_uid"])
         return 124
-    except (OSError, subprocess.SubprocessError, TypeError):
-        return 125
-    try:
-        _stop_process_group(process.pid)
     except Refusal:
         return 125
-    if target.stat().st_size > MAX_LOG_BYTES:
+    except (OSError, subprocess.SubprocessError, TypeError):
         return 125
-    os.chown(target, worker["worker_uid"], worker["worker_gid"])
-    os.chmod(target, 0o400)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
     return process.returncode
+
+
+def _finalize_capture_log(descriptor, uid, gid):
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        _refuse("report-file-invalid")
+    os.fchown(descriptor, uid, gid)
+    os.fchmod(descriptor, 0o444)
 
 
 def _worker_limits():
@@ -1086,6 +1274,46 @@ def _stop_process_group(process_group):
     _refuse("process-cleanup-incomplete")
 
 
+def _worker_process_ids(uid):
+    code, stdout, stderr = _run(
+        ("/bin/ps", "-axo", "uid=,pid="),
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "HOME": "/var/empty"},
+        timeout=10, capture_limit=MAX_OUTPUT_BYTES,
+    )
+    if code != 0 or stderr:
+        _refuse("cleanup-process-inventory")
+    try:
+        rows = [line.split() for line in stdout.decode("ascii", "strict").splitlines() if line.strip()]
+        if any(len(row) != 2 or not row[0].isdecimal() or not row[1].isdecimal() for row in rows):
+            _refuse("cleanup-process-inventory")
+        return [int(row[1]) for row in rows if int(row[0]) == uid]
+    except UnicodeDecodeError:
+        _refuse("cleanup-process-inventory")
+
+
+def _terminate_worker_processes(uid):
+    if type(uid) is not int or not 1 <= uid < 60000:
+        _refuse("cleanup-process-inventory")
+    for _attempt in range(3):
+        if not _worker_process_ids(uid):
+            return
+        for signame in ("TERM", "KILL"):
+            result = _run(
+                ("/usr/bin/pkill", "-" + signame, "-U", str(uid)),
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "HOME": "/var/empty"},
+                timeout=10, capture_limit=4096,
+            )
+            if result[0] not in (0, 1) or result[2]:
+                _refuse("cleanup-process-termination")
+            deadline = time.monotonic() + (1.5 if signame == "TERM" else 2.0)
+            while time.monotonic() < deadline:
+                if not _worker_process_ids(uid):
+                    return
+                time.sleep(0.05)
+    if _worker_process_ids(uid):
+        _refuse("cleanup-process-incomplete")
+
+
 def state_path(worker):
     source = Path(worker["source"])
     return source.parents[1] / "state"
@@ -1110,6 +1338,20 @@ def _read_jsonl(path, maximum=output_filter.MAX_RAW_CAPTURE_BYTES):
         return lines
     except OSError:
         _refuse("report-file-unavailable")
+
+
+def _filter_summary(records, allowlists, required_frames=()):
+    serialized = []
+    for record in records:
+        if type(record) is bytes:
+            serialized.append(record)
+        elif type(record) is dict:
+            serialized.append(bundle.canonical_json(record))
+        else:
+            _refuse("summary-record-invalid")
+    summary = output_filter.filter_records(serialized, allowlists, required_frames)
+    output_filter.validate_public_summary(summary, allowlists, required_frames)
+    return summary
 
 
 def _execute(state, context_path, deadline_file):
@@ -1200,19 +1442,18 @@ def _execute(state, context_path, deadline_file):
     source = Path(worker["source"])
     try:
         allowlists = linux_supervisor._manifest_allowlists(manifest, profile, source)
-        summary = output_filter.filter_records(records, allowlists, manifest["frames"].values())
+        summary = _filter_summary(records, allowlists, manifest["frames"].values())
     except Exception:
         fallback = [{"kind": "control", "stage": "unit", "status": "fail", "subreason": "filter-refused"}]
-        summary = output_filter.filter_records(fallback, {
+        fallback_allowlists = {
             "files": {}, "tests": {}, "frames": {}, "stages": profile["stages"],
             "codes": ["DEVLANE_FAILURE"], "suites": [], "max_lines": {},
-        })
+        }
+        try:
+            summary = _filter_summary(fallback, fallback_allowlists)
+        except Exception:
+            _refuse("summary-response-invalid")
         outcomes.append(("filter", 1))
-    if not output_filter.validate_public_summary(summary, allowlists if "allowlists" in locals() else {
-            "files": {}, "tests": {}, "frames": {}, "stages": profile["stages"],
-            "codes": ["DEVLANE_FAILURE"], "suites": [], "max_lines": {},
-    }):
-        _refuse("summary-response-invalid")
     worker["execution_complete"] = True
     _write_state(state, worker)
     sys.stdout.buffer.write(summary)
@@ -1263,6 +1504,59 @@ def _clean_tree(root):
         _refuse("cleanup-incomplete")
 
 
+
+def _directory_users():
+    result = boundary_guard._run_command(("/usr/bin/dscl", ".", "-list", "/Users"), timeout=10)
+    if result.returncode != 0 or result.stderr:
+        _refuse("cleanup-incomplete")
+    try:
+        names = result.stdout.decode("ascii", "strict").splitlines()
+    except UnicodeDecodeError:
+        _refuse("cleanup-incomplete")
+    if any(not name or any(character.isspace() for character in name) for name in names):
+        _refuse("cleanup-incomplete")
+    return set(names)
+
+
+def _worker_account_attributes(account):
+    result = boundary_guard._run_command(
+        ("/usr/bin/dscl", ".", "-read", "/Users/" + account,
+         "UniqueID", "PrimaryGroupID", "NFSHomeDirectory"), timeout=5,
+    )
+    if result.returncode != 0 or result.stderr:
+        _refuse("cleanup-incomplete")
+    attributes = {}
+    try:
+        for line in result.stdout.decode("ascii", "strict").splitlines():
+            if not line:
+                continue
+            key, separator, value = line.partition(": ")
+            if not separator or key not in ("UniqueID", "PrimaryGroupID", "NFSHomeDirectory") or key in attributes:
+                _refuse("cleanup-incomplete")
+            attributes[key] = value
+    except UnicodeDecodeError:
+        _refuse("cleanup-incomplete")
+    return attributes
+
+
+def _delete_worker_account(intent):
+    names = _directory_users()
+    account = intent["account"]
+    if account not in names:
+        return
+    attributes = _worker_account_attributes(account)
+    for name, expected in (("UniqueID", str(intent["uid"])),
+                           ("PrimaryGroupID", str(intent["gid"])),
+                           ("NFSHomeDirectory", intent["home"])):
+        if name in attributes and attributes[name] != expected:
+            _refuse("cleanup-incomplete")
+    deleted = boundary_guard._run_command(("/usr/bin/dscl", ".", "-delete", "/Users/" + account), timeout=10)
+    if deleted.returncode != 0 or deleted.stderr:
+        _refuse("cleanup-incomplete")
+    if account in _directory_users():
+        _refuse("cleanup-incomplete")
+
+
 def _root_cleanup(state_dir, root_dir, runner_temp, workspace, run_id):
     if os.geteuid() != 0:
         _refuse("macos-root-required")
@@ -1275,31 +1569,83 @@ def _root_cleanup(state_dir, root_dir, runner_temp, workspace, run_id):
             or requested_state != root / "state" or not 0 < workspace_uid < 60000):
         _refuse("cleanup-root-invalid")
     state = root / "state"
-    ident = None
-    if state.is_symlink():
+    if state.is_symlink() or state.exists() and not state.is_dir():
         _refuse("cleanup-root-invalid")
-    if state.is_dir() and (state / IDENTITY_FILE).is_file():
-        ident = _identity(state)
-        pf_path = state / PF_STATE_FILE
-        if pf_path.is_file():
-            guard, record = _pf_guard_from_file(state, ident)
-            guard.close()
+    errors = []
+    intent = None
+    identity = None
+    intent_path = state / CLEANUP_INTENT_FILE
+    identity_path = state / IDENTITY_FILE
+    if intent_path.is_file() and not intent_path.is_symlink():
+        intent = _cleanup_intent(state)
+    if identity_path.is_file() and not identity_path.is_symlink():
+        try:
+            identity = _identity(state)
+        except Refusal:
+            if intent is None:
+                raise
+        if identity is not None:
+            identity_intent = {
+                "schema": 1, "run_id": identity["run_id"], "runner_uid": identity["runner_uid"],
+                "uid": identity["uid"], "gid": identity["gid"], "account": identity["account"],
+                "home": identity["home"],
+            }
+            if intent is not None and intent != identity_intent:
+                _refuse("cleanup-intent-invalid")
+            intent = identity_intent
+    if intent is not None and intent["run_id"] != run_id:
+        _refuse("cleanup-intent-invalid")
+    if intent is None:
+        account = WORKER_NAME_PREFIX + run_id
+        if account in _directory_users():
+            errors.append("cleanup-intent-missing")
+    workers_gone = True
+    if intent is not None:
+        try:
+            _terminate_worker_processes(intent["uid"])
+        except Refusal:
+            workers_gone = False
+            errors.append("worker-processes")
+    pf_path = state / PF_STATE_FILE
+    if pf_path.is_file() and not pf_path.is_symlink():
+        if workers_gone and identity is not None:
             try:
+                guard, record = _pf_guard_from_file(state, identity)
+                guard.close()
                 Path(record["rules_file"]).unlink(missing_ok=True)
                 pf_path.unlink(missing_ok=True)
-            except OSError:
-                _refuse("cleanup-incomplete")
-        deleted = boundary_guard._run_command(
-            ("/usr/bin/dscl", ".", "-delete", "/Users/" + ident["account"]), timeout=10)
-        if deleted.returncode != 0 or deleted.stderr:
-            _refuse("cleanup-incomplete")
-        listing = boundary_guard._run_command(("/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"), timeout=10)
-        if listing.returncode != 0 or listing.stderr:
-            _refuse("cleanup-incomplete")
-        if _account_is_listed(listing.stdout, ident["account"]):
-            _refuse("cleanup-incomplete")
-    _clean_tree(root)
+            except Exception:
+                errors.append("firewall")
+        else:
+            errors.append("firewall")
+    if intent is not None and workers_gone:
+        try:
+            _delete_worker_account(intent)
+        except Exception:
+            errors.append("account")
+    elif intent is not None:
+        errors.append("account")
+    if workers_gone:
+        try:
+            _clean_tree(root)
+        except Exception:
+            errors.append("tree")
+    else:
+        errors.append("tree")
     if root.exists() or root.is_symlink():
+        errors.append("tree-remains")
+    if intent is not None:
+        try:
+            if intent["account"] in _directory_users():
+                errors.append("account-remains")
+        except Exception:
+            errors.append("account-check")
+        try:
+            if _worker_process_ids(intent["uid"]):
+                errors.append("worker-processes-remain")
+        except Exception:
+            errors.append("worker-process-check")
+    if errors:
         _refuse("cleanup-incomplete")
     print("cleanup_receipt=confirmed")
     return 0
@@ -1406,6 +1752,14 @@ def main(argv=None):
         if args.operation == "root-pf-cleanup":
             return _root_pf_cleanup(args)
         _refuse("control-operation-invalid")
+    except Refusal as error:
+        if args.operation == "decrypt":
+            print("devlane_supervisor_refusal=" + error.code, file=sys.stderr)
+            if error.decrypt_refusal in DECRYPT_REFUSAL_CODES:
+                print("decrypt_refusal=" + error.decrypt_refusal, file=sys.stderr)
+        else:
+            print("devlane_supervisor_refusal=supervisor-failed", file=sys.stderr)
+        return 2
     except Exception:
         print("devlane_supervisor_refusal=supervisor-failed", file=sys.stderr)
         return 2

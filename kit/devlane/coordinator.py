@@ -27,7 +27,7 @@ import public_audit
 
 
 LEDGER_FIELDS = {
-    "schema", "wave_id", "bundle_id", "control_run_id", "control_sha", "profile",
+    "schema", "wave_id", "bundle_id", "control_run_id", "control_sha", "profile", "runner",
     "release_id", "bundle_asset_name", "projection_asset_name", "bundle_asset_id",
     "bundle_sha256", "bundle_size", "projection_asset_id", "projection_sha256",
     "projection_size", "expires", "cache_baseline_sha256", "state", "created_at", "updated_at",
@@ -98,6 +98,8 @@ def _read(path):
         if descriptor is not None:
             os.close(descriptor)
     if type(record) is not dict or set(record) != LEDGER_FIELDS or record.get("schema") != 2:
+        _fail("ledger-record-invalid")
+    if record.get("runner") not in (None, "ubuntu-24.04", "macos-15"):
         _fail("ledger-record-invalid")
     return record
 
@@ -328,7 +330,7 @@ def reserve_wave(ledger, request):
         record = {
             "schema": 2, "wave_id": request["wave_id"], "bundle_id": request["bundle_id"],
             "control_run_id": control_run_id, "control_sha": request["control_sha"],
-            "profile": request["profile"], "release_id": request["release_id"],
+            "profile": request["profile"], "runner": None, "release_id": request["release_id"],
             "bundle_asset_name": "devlane-" + request["wave_id"] + "-" + request["bundle_id"] + ".enc",
             "projection_asset_name": "devlane-" + request["wave_id"] + "-" + request["bundle_id"] + ".projection.json",
             "bundle_asset_id": None, "bundle_sha256": None, "bundle_size": None,
@@ -1058,9 +1060,12 @@ def _terminal_audit_disposition(run_id, record, run, root=None):
             return "refused"
         identity = {"run_id": run_id, "control_sha": record["control_sha"],
                     "control_run_id": record["control_run_id"],
-                    "profile": record["profile"], "wave_id": record["wave_id"],
+                    "profile": record["profile"], "runner": record.get("runner") or "ubuntu-24.04",
+                    "wave_id": record["wave_id"],
                     "bundle_id": record["bundle_id"], "cache_baseline_sha256": record["cache_baseline_sha256"]}
-        public = public_audit.validate_final_public_surfaces(GitHubAPI(_cli_token()), jobs, identity, record["profile"])
+        public = public_audit.validate_final_public_surfaces(
+            public_audit.GitHubAPI(_cli_token()), jobs, identity, record["profile"],
+        )
         if response.get("total_count") != 2:
             return "refused"
         _verify_wave_marker(run_id, record, run)
@@ -1481,6 +1486,10 @@ def dispatch_wave(ledger, wave_id, key_file, *, runner="ubuntu-24.04", poll_seco
             _fail("dispatch-wave-state")
         if runner not in ("ubuntu-24.04", "macos-15") or runner == "macos-15" and record["profile"] != "core-node":
             _fail("runner-profile-unsupported")
+        if record.get("runner") not in (None, runner):
+            _fail("runner-binding-mismatch")
+        record["runner"] = runner
+        _write_atomic(root / (wave_id + ".json"), record)
         _verify_remote_main(record["control_sha"])
         _verify_secret_absent()
         transition(ledger, wave_id, "mark-secret-installing")

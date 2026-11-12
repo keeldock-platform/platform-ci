@@ -36,7 +36,7 @@ def _request(wave_id="wave-test-0001", bundle_id="bundle-test-0001"):
 def _ledger_record(wave_id="wave-test-0001", bundle_id="bundle-test-0001", state="assets-staged"):
     return {
         "schema": 2, "wave_id": wave_id, "bundle_id": bundle_id, "control_run_id": "12345",
-        "control_sha": CONTROL_SHA, "profile": "core-node", "release_id": "77",
+        "control_sha": CONTROL_SHA, "profile": "core-node", "runner": None, "release_id": "77",
         "bundle_asset_name": "devlane-" + wave_id + "-" + bundle_id + ".enc",
         "projection_asset_name": "devlane-" + wave_id + "-" + bundle_id + ".projection.json",
         "bundle_asset_id": "111", "bundle_sha256": BUNDLE_SHA, "bundle_size": 1024,
@@ -68,7 +68,9 @@ class MacWorkerSourceFreeAcceptanceTests(unittest.TestCase):
         self.assertIn("(deny network*)", profile)
         self.assertIn("(deny lsopen)", profile)
         self.assertIn("(deny mach-lookup)", profile)
-        self.assertIn('(allow file-write* (subpath "/tmp/workspace/source")', profile)
+        write_rule = next(line for line in profile.splitlines() if line.startswith("(allow file-write* "))
+        self.assertIn('(subpath "/tmp/workspace/source")', write_rule)
+        self.assertNotIn('(subpath "/tmp/workspace")', write_rule)
         self.assertNotIn('(allow file-write* (subpath "/tmp")', profile)
 
     def test_worker_cleanup_parser_rejects_malformed_directory_service_rows(self):
@@ -337,6 +339,30 @@ class RunLifecycleTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(coordinator, "_verify_wave_marker"))
             stack.enter_context(mock.patch.object(coordinator, "_terminal_audit_disposition", return_value=disposition))
         return stack
+
+    def test_terminal_audit_receives_the_runner_persisted_on_the_wave(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = self._ledger(temporary)
+            record = _ledger_record(state="run-attached")
+            record.update({"runner": "macos-15", "run_id": "54321", "authorized_run_id": "54321",
+                           "run_attempt": 1})
+            _write_record(ledger, record)
+            run = {"id": 54321, "path": coordinator.fetch.WORKFLOW_PATH, "head_branch": "main",
+                   "head_sha": CONTROL_SHA, "event": "workflow_dispatch", "run_attempt": 1}
+            response = {"total_count": 2, "jobs": [{"name": "run"}, {"name": "audit"}]}
+            observed = {}
+
+            def validate(_api, _jobs, identity, _profile):
+                observed.update(identity)
+                return {"records": []}
+
+            with mock.patch.object(coordinator, "_gh_json", return_value=response), \
+                    mock.patch.object(coordinator, "_verify_wave_marker"), \
+                    mock.patch.object(coordinator.public_audit, "validate_final_public_surfaces", side_effect=validate), \
+                    mock.patch.object(coordinator, "_preserve_diagnostics"), \
+                    mock.patch.object(coordinator, "_cli_token", return_value="opaque"):
+                self.assertEqual(coordinator._terminal_audit_disposition("54321", record, run, ledger), "accepted")
+            self.assertEqual(observed["runner"], "macos-15")
 
     def test_run_deleted_but_ledger_stale_is_reconciled_from_absence(self):
         """Fails on the old code: the 404 run made identity validation fail and logs, artifacts and run stayed delete-pending forever (reproduced as cleanup-incomplete)."""
@@ -888,6 +914,7 @@ class SingleDispatchOwnerTests(unittest.TestCase):
             self.assertEqual(sum("workflow" in command for command in calls), 1)
             self.assertGreaterEqual(len(revoked), 1)
             self.assertFalse(key_path.exists())
+            self.assertEqual(coordinator._read(ledger / "wave-test-0001.json")["runner"], "ubuntu-24.04")
             self.assertEqual(coordinator._read(ledger / "wave-test-0001.json")["dispatch_result"], "ambiguous")
 
     def test_pending_forever_hits_absolute_deadline_and_revokes_without_run_guess(self):

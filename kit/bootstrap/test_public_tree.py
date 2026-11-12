@@ -1026,6 +1026,7 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/fixtures/encrypted-run-43284558151-jobs.json.hex',
             'kit/devlane/fixtures/encrypted-run-43284558151.log.hex',
             'kit/devlane/fixtures/encrypted-workflow-43284558151.yml',
+            'kit/devlane/fixtures/encrypted-workflow-f0ddd39554b2e48fbad7e61126319f5ffcdd2b84.yml',
             'kit/devlane/fixtures/encrypted-audit-43296698158.log.hex',
             'kit/devlane/fixtures/encrypted-run-43296698158-identity.json',
             'kit/devlane/fixtures/encrypted-run-43296698158-jobs.json.hex',
