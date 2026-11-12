@@ -4,6 +4,7 @@ import argparse
 import errno
 import json
 import os
+import re
 import select
 import socket
 import ssl
@@ -14,6 +15,35 @@ import time
 
 class ProbeRefusal(ValueError):
     pass
+
+
+REFUSAL_CODES = frozenset((
+    "descriptor-probe-unavailable", "external-connectivity", "external-probe-error",
+    "external-probe-result-invalid", "firewall-chain-set", "firewall-invalid",
+    "firewall-policy", "firewall-rule-family", "firewall-rule-set", "firewall-rule-shape",
+    "firewall-unavailable", "inherited-socket", "loopback-unavailable",
+    "network-address-unexpected", "network-interface-unexpected",
+    "network-namespace-not-isolated", "network-namespace-unavailable",
+    "network-route-unexpected", "network-structure-invalid", "network-structure-unexpected",
+    "positive-control-error", "positive-control-unavailable", "probe-evidence-shape",
+    "probe-failed", "probe-identity", "probe-not-unprivileged", "probe-tool-failed",
+    "probe-tool-invalid", "probe-tool-unavailable", "proxy-environment",
+))
+MAX_REFUSAL_OUTPUT_BYTES = 128
+_REFUSAL_OUTPUT = re.compile(rb"network_probe_refusal=([a-z0-9-]{1,64})\n\Z")
+
+
+def refusal_code_from_result(returncode, stdout, stderr):
+    """Return only the probe's fixed, one-line refusal code from a bounded result."""
+    if (type(returncode) is not int or returncode != 2 or type(stdout) is not bytes
+            or stdout or type(stderr) is not bytes or not stderr
+            or len(stderr) > MAX_REFUSAL_OUTPUT_BYTES):
+        return None
+    match = _REFUSAL_OUTPUT.fullmatch(stderr)
+    if match is None:
+        return None
+    code = match.group(1).decode("ascii")
+    return code if code in REFUSAL_CODES else None
 
 
 def _refuse(code):

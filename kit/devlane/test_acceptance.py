@@ -710,6 +710,18 @@ class PostCutBaselineStagingAcceptanceTests(unittest.TestCase):
                     elif path.exists() and not path.is_symlink():
                         path.chmod(0o600)
 
+    def test_network_cut_is_rechecked_before_execute_and_filter_but_not_required_for_cleanup(self):
+        execute_source = inspect.getsource(supervisor.Service._execute)
+        verify = execute_source.index("self._verify_network_cut()")
+        self.assertLess(verify, execute_source.index("_run_profile_command("))
+        self.assertLess(verify, execute_source.index("output_filter.filter_records("))
+        decrypt_source = inspect.getsource(supervisor.Service._decrypt)
+        self.assertLess(decrypt_source.index("self._verify_network_cut()"),
+                        decrypt_source.index("subprocess.Popen("))
+        cleanup_source = inspect.getsource(supervisor.Service._cleanup)
+        self.assertNotIn("_verify_network_cut()", cleanup_source)
+        self.assertIn("_shred_tree", cleanup_source)
+
     def test_symlinked_baseline_is_refused_without_touching_external_canary(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

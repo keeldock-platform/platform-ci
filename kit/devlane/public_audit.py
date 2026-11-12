@@ -19,6 +19,7 @@ from macos_public_audit import (
     cache_inventory_digest,
 )
 import diagnostic_contract
+import network_probe
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -93,10 +94,16 @@ PUBLIC_CODES = frozenset({
     "DEVLANE_FAILURE",
 })
 REFUSAL_LINE = re.compile(
-    r"(?:devlane_refusal|devlane_supervisor_refusal|dependency_preparation_refusal|network_probe_refusal)"
+    r"(?:(?:devlane_refusal|devlane_supervisor_refusal|dependency_preparation_refusal)"
     r"=(?:[a-z0-9-]{1,64}|node-snapshot-manifest-invalid:"
     r"(?:link-row-path|source-row-kind|manifest-open|manifest-metadata|manifest-race|"
-    r"manifest-missing|manifest-shape|manifest-digest|unlisted-site))\Z"
+    r"manifest-missing|manifest-shape|manifest-digest|unlisted-site))|"
+    r"network_probe_refusal=(?:"
+    + "|".join(re.escape(code) for code in sorted(network_probe.REFUSAL_CODES))
+    + r")|"
+    r"devlane_supervisor_refusal=network-probe-refusal:(?:"
+    + "|".join(re.escape(code) for code in sorted(network_probe.REFUSAL_CODES))
+    + r"))\Z"
 )
 def cache_line_patterns(key):
     """Output lines of the pinned cache actions, bound to the one key the step may use."""

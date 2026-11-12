@@ -2,6 +2,8 @@
 
 import re
 
+import network_probe
+
 
 PREPARATION_STAGES = frozenset((
     "prepare-argument-parse", "prepare-deadline-check", "prepare-platform-check",
@@ -120,12 +122,18 @@ TOOLING_E2E_PHASES = frozenset((
     "tool-cargo-semver-checks-version", "tool-cargo-semver-checks-copy",
     "scenario-tool-install", "scenario-tool-verify",
 ))
-PUBLIC_DIAGNOSTIC_PHASES = PREPARATION_STAGES | TOOLING_E2E_PHASES
+NETWORK_PROBE_E2E_STAGES = frozenset(("variant-supervisor-probe-check",))
+NETWORK_PROBE_E2E_CATEGORIES = frozenset((
+    "network-probe-command-failed", "network-probe-output-invalid",
+    *("network-probe-refusal:" + code for code in network_probe.REFUSAL_CODES),
+))
+PUBLIC_DIAGNOSTIC_PHASES = PREPARATION_STAGES | TOOLING_E2E_PHASES | NETWORK_PROBE_E2E_STAGES
 PREPARATION_E2E_CATEGORIES = frozenset(
     set(PREPARATION_REFUSAL_CODES)
     | {"prepare-" + label for label in PREPARATION_EXCEPTION_LABELS}
     | set(PREPARATION_PARENT_CATEGORIES)
     | {"tooling-refusal"}
+    | NETWORK_PROBE_E2E_CATEGORIES
 )
 
 _REFUSAL_RESULT = re.compile(
@@ -206,6 +214,8 @@ def public_preparation_diagnostic(line):
         return False
     stage, category, reason, version, cleanup = match.groups()
     if stage not in PUBLIC_DIAGNOSTIC_PHASES or category not in PREPARATION_E2E_CATEGORIES:
+        return False
+    if category in NETWORK_PROBE_E2E_CATEGORIES and stage not in NETWORK_PROBE_E2E_STAGES:
         return False
     if category == "tooling-refusal":
         if reason not in TOOLING_REFUSAL_CODES:

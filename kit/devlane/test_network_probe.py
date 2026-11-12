@@ -28,6 +28,23 @@ def _snapshot(*, links=None, routes4=None, probes=None):
 
 
 class NetworkProbeTests(unittest.TestCase):
+    def test_refusal_result_parser_accepts_only_bounded_fixed_codes(self):
+        code = "network-address-unexpected"
+        result = network_probe.refusal_code_from_result(
+            2, b"", ("network_probe_refusal=" + code + "\n").encode("ascii"),
+        )
+        self.assertEqual(result, code)
+        for returncode, stdout, stderr in (
+                (0, b"", b"network_probe_refusal=" + code.encode("ascii") + b"\n"),
+                (2, b"unexpected", b"network_probe_refusal=" + code.encode("ascii") + b"\n"),
+                (2, b"", b"network_probe_refusal=private-path\n"),
+                (2, b"", b"network_probe_refusal=" + code.encode("ascii") + b"\nextra\n"),
+                (2, b"", b"network_probe_refusal=" + code.encode("ascii")
+                 + b"\n" + b"x" * network_probe.MAX_REFUSAL_OUTPUT_BYTES),
+        ):
+            with self.subTest(stderr=stderr[:96]):
+                self.assertIsNone(network_probe.refusal_code_from_result(returncode, stdout, stderr))
+
     def test_reachable_external_control_is_required_before_the_cut(self):
         class Connected:
             def close(self):
@@ -136,6 +153,20 @@ class NetworkProbeTests(unittest.TestCase):
         with patch.object(network_probe.os, "stat", return_value=SimpleNamespace(st_ino=200)), \
                 patch.object(network_probe, "_run_json", side_effect=external_route):
             with self.assertRaisesRegex(network_probe.ProbeRefusal, "network-route-unexpected"):
+                network_probe.structural_snapshot(HOST_NET)
+
+    def test_runner_without_ipv6_loopback_address_is_a_fixed_refusal(self):
+        rows = [
+            [{"ifname": "lo"}],
+            [{"ifname": "lo", "addr_info": [
+                {"family": "inet", "local": "127.0.0.1", "prefixlen": 8,
+                 "scope": "host", "label": "lo"},
+            ]}],
+            [], [], [],
+        ]
+        with patch.object(network_probe.os, "stat", return_value=SimpleNamespace(st_ino=200)), \
+                patch.object(network_probe, "_run_json", side_effect=rows):
+            with self.assertRaisesRegex(network_probe.ProbeRefusal, "network-address-unexpected"):
                 network_probe.structural_snapshot(HOST_NET)
 
     def test_firewall_readback_rejects_external_accept_rules_and_relaxed_policy(self):

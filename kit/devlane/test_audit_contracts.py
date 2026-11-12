@@ -552,6 +552,34 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 refused, {"run_id": "12345", "control_sha": SHA, "ref": "refs/heads/devlane/d211-1110"},
             )
 
+    def test_network_probe_refusals_are_bounded_and_auditor_allowlisted(self):
+        root = Path(__file__).resolve().parents[2]
+        grammar = audit._Grammar(
+            root / ".github/workflows/devlane-synthetic.yml", "devlane-synthetic",
+            {"run_id": "12345", "control_sha": SHA}, "synthetic",
+        )
+        for code in sorted(audit.network_probe.REFUSAL_CODES):
+            supervisor_line = "devlane_supervisor_refusal=network-probe-refusal:" + code
+            self.assertTrue(audit.REFUSAL_LINE.fullmatch(supervisor_line))
+            self.assertTrue(audit.REFUSAL_LINE.fullmatch("network_probe_refusal=" + code))
+        valid = (
+            "devlane_production_e2e=refused stage=variant-supervisor-probe-check "
+            "exception=network-probe-refusal:network-address-unexpected"
+        )
+        self.assertTrue(diagnostic_contract.public_preparation_diagnostic(valid))
+        self.assertTrue(grammar.step_output_ok(
+            "Run full source-free production-path acceptance", valid, {},
+        ))
+        for invalid in (
+            valid.replace("network-address-unexpected", "private-path"),
+            valid.replace("variant-supervisor-probe-check", "variant-decrypt"),
+            "devlane_supervisor_refusal=network-probe-refusal:private-path",
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertFalse(diagnostic_contract.public_preparation_diagnostic(invalid))
+                self.assertFalse(audit.REFUSAL_LINE.fullmatch(invalid))
+        self.assertFalse(audit.REFUSAL_LINE.fullmatch("network_probe_refusal=private-path"))
+
     def test_reviewed_step_name_lists_match_the_workflow_files(self):
         root = Path(__file__).resolve().parents[2]
         encrypted = audit.parse_workflow(root / ".github/workflows/devlane-encrypted.yml")

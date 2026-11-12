@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import public_audit
+import network_probe
 import filter as output_filter
 import rust_matrix_runner
 import rust_tooling
@@ -3014,6 +3015,66 @@ class RustMatrixRunnerTests(unittest.TestCase):
         self.assertIsNone(test_e2e._assert_supervisor_refusal(refused, "decrypt-rejected"))
         self.assertNotIn(b"b" * 64, refused.stdout + refused.stderr)
         self.assertTrue(refusing_socket.sent.startswith((len(b'{"op":"decrypt","key":"' + b"b" * 64 + b'"}')).to_bytes(4, "big")))
+
+    def test_network_probe_failure_sites_and_refusal_reason_are_distinct(self):
+        service = object.__new__(supervisor.Service)
+        service.root = Path("/source-free/root")
+        service.host_net_inode = 100
+        service.probe_namespace_inode = None
+
+        def verify(result=None, error=None):
+            with patch.object(supervisor.network_probe, "firewall_snapshot",
+                              return_value={"netns_inode": 200}), \
+                    patch.object(supervisor.subprocess, "run",
+                                 side_effect=error if error is not None else None,
+                                 return_value=result), \
+                    patch.object(supervisor, "_bounded_timeout", return_value=30), \
+                    patch.object(supervisor.os, "stat", return_value=SimpleNamespace(st_ino=200)):
+                return service._verify_network_cut()
+
+        self.assertTrue(verify(subprocess.CompletedProcess(
+            ["network_probe.py"], 0, b"network_probe=pass\n", b"")))
+        refusal = "network-probe-refusal:network-address-unexpected"
+        cases = (
+            (subprocess.CompletedProcess(
+                ["network_probe.py"], 2, b"", b"network_probe_refusal=network-address-unexpected\n"),
+             refusal),
+            (subprocess.CompletedProcess(["network_probe.py"], 2, b"", b"private-path\n"),
+             "network-probe-command-failed"),
+            (subprocess.CompletedProcess(["network_probe.py"], 0, b"wrong\n", b""),
+             "network-probe-output-invalid"),
+        )
+        for result, expected in cases:
+            with self.subTest(expected=expected), self.assertRaises(supervisor.SupervisorRefusal) as caught:
+                verify(result)
+            self.assertEqual(caught.exception.code, expected)
+        with self.assertRaises(supervisor.SupervisorRefusal) as caught:
+            verify(error=subprocess.TimeoutExpired(["network_probe.py"], 30))
+        self.assertEqual(caught.exception.code, "network-probe-command-failed")
+
+    def test_network_probe_diagnostic_preserves_only_fixed_refusal_code(self):
+        code = "network-probe-refusal:network-address-unexpected"
+        result = subprocess.CompletedProcess(
+            ["supervisor.py", "probe"], 2, b"",
+            ("devlane_supervisor_refusal=" + code + "\n").encode("ascii"),
+        )
+        test_e2e.DIAGNOSTICS.reset()
+        try:
+            with self.assertRaises(test_e2e.StartupRefusalMismatch) as caught:
+                with test_e2e.DIAGNOSTICS.phase("variant-supervisor-probe-check"):
+                    test_e2e._assert_supervisor_probe_pass(result)
+            self.assertEqual(caught.exception.category, code)
+            line = test_e2e.DIAGNOSTICS.refusal_line(caught.exception)
+            self.assertEqual(
+                line,
+                "devlane_production_e2e=refused stage=variant-supervisor-probe-check exception=" + code,
+            )
+            self.assertTrue(diagnostic_contract.public_preparation_diagnostic(line))
+            self.assertFalse(diagnostic_contract.public_preparation_diagnostic(
+                line.replace("network-address-unexpected", "private-path"),
+            ))
+        finally:
+            test_e2e.DIAGNOSTICS.reset()
 
     def _write_projection_startup_fixture(self, root):
         workspace = root / "workspace"

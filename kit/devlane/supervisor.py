@@ -104,7 +104,7 @@ REFUSAL_CODES = frozenset((
     "dispatch-context-invalid", "dispatch-context-unavailable", "execution-cancelled", "execution-order",
     "firewall-unavailable", "input-size", "input-unavailable", "key-invalid", "linux-root-required",
     "linux-runner-required", "mount-source-unavailable", "network-namespace-changed",
-    "network-namespace-not-isolated", "network-probe-failed", "node-tool-layout",
+    "network-namespace-not-isolated", "node-tool-layout",
     "node-snapshot-base-invalid", "node-snapshot-base-owner", "node-snapshot-base-unavailable",
     "node-snapshot-content-changed", "node-snapshot-content-invalid", "node-snapshot-deadline",
     "node-snapshot-id", "node-snapshot-layout", "node-snapshot-limit", "node-snapshot-link-invalid",
@@ -144,6 +144,13 @@ REFUSAL_CODES = frozenset((
     "tool-version-unavailable", "total-deadline-exhausted", "total-deadline-unavailable",
     "typescript-report-incomplete",
 ))
+NETWORK_PROBE_REFUSAL_CODES = frozenset(
+    "network-probe-refusal:" + code for code in network_probe.REFUSAL_CODES
+)
+NETWORK_PROBE_DIAGNOSTIC_CODES = NETWORK_PROBE_REFUSAL_CODES | frozenset((
+    "network-probe-command-failed", "network-probe-output-invalid",
+))
+REFUSAL_CODES |= NETWORK_PROBE_DIAGNOSTIC_CODES
 STARTUP_REFUSAL_CODES = frozenset((
     "deadline-file-invalid", "dispatch-context-invalid", "dispatch-context-unavailable",
     "firewall-unavailable", "input-size", "input-unavailable", "linux-root-required",
@@ -1549,17 +1556,28 @@ class Service:
         if self.probe_namespace_inode is not None and firewall["netns_inode"] != self.probe_namespace_inode:
             _refuse("network-namespace-changed")
         try:
-            evidence = _run([
+            result = subprocess.run([
                 "/usr/sbin/chroot", str(self.root), "/usr/bin/setpriv",
                 "--reuid=%d" % WORKER_UID, "--regid=%d" % WORKER_GID,
                 "--clear-groups", "--no-new-privs", "--bounding-set=-all", "--",
                 "/usr/bin/python3", "-B", "-I", "-S", "/control/devlane/network_probe.py",
                 "check", "--host-net-inode", str(self.host_net_inode),
-            ], timeout=30)
-        except SupervisorRefusal:
-            _refuse("network-probe-failed")
-        if evidence.strip() != b"network_probe=pass":
-            _refuse("network-probe-failed")
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                timeout=_bounded_timeout(30), close_fds=True,
+                env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C",
+                     "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            _refuse("network-probe-command-failed")
+        if result.returncode != 0:
+            refusal = network_probe.refusal_code_from_result(
+                result.returncode, result.stdout, result.stderr,
+            )
+            if refusal is not None:
+                _refuse("network-probe-refusal:" + refusal)
+            _refuse("network-probe-command-failed")
+        if result.stdout != b"network_probe=pass\n" or result.stderr:
+            _refuse("network-probe-output-invalid")
         if os.stat("/proc/self/ns/net").st_ino != firewall["netns_inode"]:
             _refuse("network-namespace-changed")
         self.probe_namespace_inode = firewall["netns_inode"]
@@ -1754,6 +1772,7 @@ class Service:
     def _execute(self):
         if not self.probe_passed or not self.decrypted or self.execution_done:
             _refuse("execution-order")
+        self._verify_network_cut()
         profile_name = self.context["profile"]
         profile = self.profile_config["profiles"].get(profile_name)
         expected_revision = 2 if profile_name == "core-rust" else 1
