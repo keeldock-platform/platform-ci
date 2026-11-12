@@ -191,8 +191,40 @@ _E2E_REFUSAL = re.compile(
 _E2E_RUNTIME_ERROR = re.compile(
     r"devlane_production_e2e=refused stage=variant-execute exception=runtime-error "
     r"class=RuntimeError frame=([A-Za-z0-9_-]{1,48}\.py):([1-9][0-9]{0,7}):"
-    r"([A-Za-z_][A-Za-z0-9_]{0,63})\Z"
+    r"([A-Za-z_][A-Za-z0-9_]{0,63})(?: code=([a-z0-9-]{1,64}))?\Z"
 )
+E2E_REQUIRE_CODES = frozenset((
+    "background-process-survived-cleanup", "browser-frame-not-reported", "cancel-target-did-not-start",
+    "cancelled-execute-reported-success", "canary-after-cancel", "canary-in-command-output",
+    "deadline-file-required", "host-cleanup-root-remains", "install-script-canary-lacks-marker",
+    "install-script-canary-missing", "install-script-canary-platform-package-missing", "install-script-ran",
+    "linux-runner-user-required", "linux-tools-required", "node-snapshot-supervisor-unconfirmed",
+    "positive-control-failed", "prepared-cleanup-supervisor-unconfirmed", "prepared-cleanup-tree-remains",
+    "production-path-command-failed", "reviewed-lock-package-missing", "runner-root-already-exists",
+    "rust-fixture-lock-missing", "rust-fixture-output-exists", "rust-fixture-path-required",
+    "rust-fixture-rustfmt-toolchain", "rust-fixture-rustfmt-unavailable", "rust-fixture-rustup-home",
+    "rust-fixture-source-missing", "rust-fixture-toolchain-version", "rust-matrix-advisory-database-binding",
+    "rust-matrix-advisory-database-copy-binding", "rust-matrix-advisory-database-dirty",
+    "rust-matrix-advisory-database-layout", "rust-matrix-advisory-database-missing",
+    "rust-matrix-advisory-database-revision", "rust-matrix-archive-lock-bytes", "rust-matrix-archive-lock-set",
+    "rust-matrix-envelope-lock-binding", "rust-matrix-envelope-lock-set", "rust-matrix-fixture-files",
+    "rust-matrix-fixture-source-binding", "rust-matrix-fixture-vet-policy", "rust-matrix-listener-package",
+    "rust-matrix-lock-snapshot-file-binding", "rust-matrix-lock-snapshot-mismatch",
+    "rust-matrix-lock-snapshot-set", "rust-matrix-lock-snapshot-shape", "rust-matrix-lock-snapshot-size",
+    "rust-matrix-policy-or-replay-fixture", "rust-matrix-projection-file-binding",
+    "rust-matrix-projection-invalid", "rust-matrix-projection-paths", "rust-matrix-projection-snapshot",
+    "rust-matrix-projection-snapshot-shape", "rust-matrix-root-dependency-projection",
+    "rust-matrix-root-projection", "rust-matrix-suite-count", "rust-matrix-suite-set",
+    "rust-matrix-summary-counts", "rust-matrix-summary-coverage-set", "rust-matrix-summary-not-all-pass",
+    "rust-matrix-summary-profile", "rust-matrix-test-map", "rust-matrix-tool-copy-binding",
+    "rust-matrix-tool-layout", "rust-matrix-tool-preparation-missing", "rust-matrix-tool-version",
+    "rust-matrix-toolchain-mismatch", "rust-matrix-tools-layout", "rust-matrix-tools-link",
+    "rust-matrix-tools-missing", "rust-matrix-v1-semver-refusal", "rust-matrix-workspace-dependencies",
+    "rust-matrix-workspace-projection", "rust-matrix-workspace-set", "rust-tool-cleanup-remains",
+    "rustup-unavailable", "summary-after-decrypt-refusal", "summary-limits", "summary-schema-invalid",
+    "supervisor-survived-cleanup", "test-failure-not-mapped", "unexpected-control-failure",
+    "workflow-identity-required",
+))
 TOOLING_REFUSAL_CODES = frozenset((
     "deadline-file-required", "tool-download-failed", "tool-archive-size",
     "tool-digest-mismatch", "tool-archive-members", "tool-archive-path",
@@ -298,10 +330,11 @@ def public_preparation_diagnostic(line):
 
 
 def public_e2e_runtime_diagnostic(line):
-    """Accept the fixed, source-free RuntimeError frame used for execute debugging."""
+    """Accept a fixed RuntimeError frame and, when present, its fixed _require code."""
     if type(line) is not str or len(line.encode("ascii", "ignore")) > MAX_PUBLIC_DIAGNOSTIC_BYTES:
         return False
-    return _E2E_RUNTIME_ERROR.fullmatch(line) is not None
+    match = _E2E_RUNTIME_ERROR.fullmatch(line)
+    return match is not None and (match.group(4) is None or match.group(4) in E2E_REQUIRE_CODES)
 
 
 _E2E_PROGRESS_LINE = re.compile(r"devlane_e2e_progress=(phase|scenario)=([a-z0-9-]{1,64})\Z")

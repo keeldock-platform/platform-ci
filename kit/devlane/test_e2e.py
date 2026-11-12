@@ -208,6 +208,7 @@ class _DiagnosticState:
         self.tooling_version = ""
         self.cleanup_reason = ""
         self.runtime_frame = None
+        self.runtime_code = ""
 
     def reset(self):
         self.first_failure = None
@@ -216,6 +217,7 @@ class _DiagnosticState:
         self.tooling_version = ""
         self.cleanup_reason = ""
         self.runtime_frame = None
+        self.runtime_code = ""
 
     def capture(self, phase, error):
         cleanup_reason = getattr(error, "cleanup_reason", "")
@@ -241,6 +243,9 @@ class _DiagnosticState:
                         self.tooling_version = _public_tool_version_line(error.version_output)
                 if phase == "variant-execute" and type(error) is RuntimeError:
                     self.runtime_frame = _innermost_devlane_frame(error)
+                    if (len(error.args) == 1 and type(error.args[0]) is str
+                            and error.args[0] in diagnostic_contract.E2E_REQUIRE_CODES):
+                        self.runtime_code = error.args[0]
             self.first_failure = (phase, category)
 
     @contextmanager
@@ -264,6 +269,8 @@ class _DiagnosticState:
             basename, line_number, function = self.runtime_frame
             line += (" class=RuntimeError frame=" + basename + ":" + str(line_number)
                      + ":" + function)
+            if self.runtime_code:
+                line += " code=" + self.runtime_code
         elif category == "tooling-refusal":
             reason = self.tooling_reason or "tooling-refusal-unlisted"
             line += " reason=" + reason
@@ -377,6 +384,11 @@ def _require(condition, code):
         raise RuntimeError(code)
 
 
+def _summary_has_valid_terminator(payload):
+    """A filtered success may contain no records; nonempty summaries end on a line boundary."""
+    return type(payload) is bytes and (not payload or payload.endswith(b"\n"))
+
+
 def _bounded_timeout(timeout):
     if DEADLINE_FILE:
         return min(float(timeout), deadline_budget.remaining(DEADLINE_FILE))
@@ -404,7 +416,7 @@ def _run(argv, *, env=None, timeout=900, expected=0, scan=True, cwd=None):
     result = _process_run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, env=env, timeout=timeout,
                             close_fds=True, check=False, cwd=cwd)
-    _require(result.returncode == expected, "production-path-" + Path(argv[0]).name + "-failed")
+    _require(result.returncode == expected, "production-path-command-failed")
     if scan:
         _scan_output(result.stdout + result.stderr, "canary-in-command-output")
     return result
@@ -1456,7 +1468,7 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
                                      and variant == "accept")) else 0
                 result = _run(execute, timeout=60 * 40, expected=expected)
                 with DIAGNOSTICS.phase("variant-summary-validate"):
-                    _require(result.stdout.endswith(b"\n"), "summary-schema-invalid")
+                    _require(_summary_has_valid_terminator(result.stdout), "summary-schema-invalid")
                     records = _summary_records(result.stdout, scenario)
                     if scenario.get("expect_semver_execution_refusal") is True and variant == "accept":
                         _require(any(record.get("kind") == "coverage"

@@ -569,7 +569,7 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
 
     def test_variant_execute_runtime_frame_uses_a_fixed_audited_grammar(self):
         line = ("devlane_production_e2e=refused stage=variant-execute exception=runtime-error "
-                "class=RuntimeError frame=supervisor.py:1824:_execute")
+                "class=RuntimeError frame=supervisor.py:1824:_execute code=summary-schema-invalid")
         self.assertTrue(diagnostic_contract.public_e2e_runtime_diagnostic(line))
         self.assertFalse(diagnostic_contract.public_preparation_diagnostic(line))
         details = acceptance_diagnostics.failure_tail("production-path-e2e", (line + "\n").encode("ascii"))
@@ -583,12 +583,14 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         self.assertTrue(grammar.step_output_ok(
             "Run full source-free production-path acceptance", line, {},
         ))
+        private_frame_path = chr(47) + "private/supervisor.py"
         for invalid in (
-            line.replace("supervisor.py", "/private/supervisor.py"),
+            line.replace("supervisor.py", private_frame_path),
             line.replace("supervisor.py", "../supervisor.py"),
             line.replace("runtime-error", "type-error"),
             line.replace("variant-execute", "variant-decrypt"),
             line.replace(":1824:", ":0:"),
+            line.replace("code=summary-schema-invalid", "code=private-runtime-detail"),
             line + " KEYCANARY-73A10X",
         ):
             with self.subTest(line=invalid):

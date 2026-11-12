@@ -1,5 +1,6 @@
 """The rehearsal and owner request builders produce inputs the real tools accept."""
 
+import ast
 import contextlib
 import hashlib
 import io
@@ -488,22 +489,37 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
     def test_variant_execute_runtime_error_reports_only_its_innermost_devlane_frame(self):
         state = test_e2e._DiagnosticState()
 
-        def throw_runtime_error():
-            raise RuntimeError("private /runner/source KEYCANARY-73A10X")
+        def throw_require_runtime_error():
+            test_e2e._require(False, "summary-schema-invalid")
 
         try:
             with state.phase("variant-execute"):
-                throw_runtime_error()
+                throw_require_runtime_error()
         except RuntimeError as error:
             line = state.refusal_line(error)
         self.assertRegex(
             line,
             r"^devlane_production_e2e=refused stage=variant-execute exception=runtime-error "
-            r"class=RuntimeError frame=test_rehearsal\.py:[1-9][0-9]*:throw_runtime_error$",
+            r"class=RuntimeError frame=test_e2e\.py:[1-9][0-9]*:_require "
+            r"code=summary-schema-invalid$",
         )
         for private in ("/runner", "/source", "KEYCANARY-73A10X", "private"):
             self.assertNotIn(private, line)
         self.assertTrue(test_e2e.diagnostic_contract.public_e2e_runtime_diagnostic(line))
+
+        generic = test_e2e._DiagnosticState()
+
+        def throw_generic_runtime_error():
+            raise RuntimeError("private /runner/source KEYCANARY-73A10X")
+
+        try:
+            with generic.phase("variant-execute"):
+                throw_generic_runtime_error()
+        except RuntimeError as error:
+            generic_line = generic.refusal_line(error)
+        self.assertIn("frame=test_rehearsal.py:", generic_line)
+        self.assertNotIn(" code=", generic_line)
+        self.assertTrue(test_e2e.diagnostic_contract.public_e2e_runtime_diagnostic(generic_line))
 
         outside_frame = test_e2e._DiagnosticState()
         error = RuntimeError("detail")
@@ -511,6 +527,39 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
         self.assertIsNone(outside_frame.runtime_frame)
         self.assertEqual(outside_frame.refusal_line(error),
                          "devlane_production_e2e=refused stage=variant-execute exception=runtime-error")
+
+    def test_e2e_require_code_allowlist_matches_all_fixed_require_call_sites(self):
+        source = Path(test_e2e.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        codes = set()
+        passthrough_require_calls = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            if node.func.id == "_require":
+                self.assertGreaterEqual(len(node.args), 2)
+                code = node.args[1]
+                if isinstance(code, ast.Constant) and type(code.value) is str:
+                    codes.add(code.value)
+                else:
+                    self.assertIsInstance(code, ast.Name)
+                    self.assertEqual(code.id, "code")
+                    passthrough_require_calls.append(node)
+            elif node.func.id == "_scan_output":
+                self.assertGreaterEqual(len(node.args), 2)
+                code = node.args[1]
+                self.assertIsInstance(code, ast.Constant)
+                self.assertIs(type(code.value), str)
+                codes.add(code.value)
+        self.assertEqual(len(passthrough_require_calls), 1)
+        self.assertEqual(codes, test_e2e.diagnostic_contract.E2E_REQUIRE_CODES)
+
+    def test_empty_success_summary_is_a_valid_execute_summary(self):
+        self.assertTrue(test_e2e._summary_has_valid_terminator(b""))
+        self.assertTrue(test_e2e._summary_has_valid_terminator(b'{"kind":"test"}\n'))
+        self.assertFalse(test_e2e._summary_has_valid_terminator(b'{"kind":"test"}'))
+        self.assertFalse(test_e2e._summary_has_valid_terminator(""))
+        self.assertEqual(test_e2e._summary_records(b"", test_e2e.scenarios()[0]), [])
 
     def test_tooling_refusal_reports_allowlisted_reason_and_sanitized_version_probe(self):
         state = test_e2e._DiagnosticState()
