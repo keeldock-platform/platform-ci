@@ -561,9 +561,14 @@ def _synthetic_diagnostic_reports(root):
     return result
 
 
-def _capture_source_free_failure_diagnostics(root, destination, owner_uid, wave_class, profile, summary):
+def _capture_source_free_failure_diagnostics(root, destination, owner_uid, wave_class, profile, summary,
+                                            *, execution_failed=False):
     """Copy bounded synthetic-only diagnostics before the private namespace is shredded."""
+    if profile not in ("core-node", "core-rust"):
+        return False
     subreason = _synthetic_failure_reason(summary, profile)
+    if not subreason and execution_failed:
+        subreason = "execute-failed"
     if (wave_class != fetch.SOURCE_FREE_WAVE_CLASS or not subreason or not destination):
         return False
     path = Path(destination)
@@ -583,10 +588,19 @@ def _capture_source_free_failure_diagnostics(root, destination, owner_uid, wave_
                 )
         except OSError:
             pass
+        scratch_raw = Path(root) / "scratch/raw"
+        try:
+            if stat.S_ISDIR(scratch_raw.lstat().st_mode):
+                candidates.extend(
+                    path for path in sorted(scratch_raw.iterdir(), key=lambda item: item.name)
+                    if path.suffix in (".log", ".stdout", ".stderr")
+                )
+        except OSError:
+            pass
     else:
         raw_root = Path(root) / "scratch/raw"
         candidates = []
-        adapter_requested = _synthetic_rust_adapter_log_requested(summary)
+        adapter_requested = (_synthetic_rust_adapter_log_requested(summary) or execution_failed)
         stems = _synthetic_rust_diagnostic_log_stems(summary)
         if adapter_requested:
             stems.update(_SYNTHETIC_RUST_MATRIX_LOG_STEMS)
@@ -1671,11 +1685,15 @@ class Service:
         self.outcomes = []
         self.mounts = []
 
-    def _capture_failure_diagnostics(self):
-        return _capture_source_free_failure_diagnostics(
-            self.root, self.failure_diagnostics_file, self.owner_uid,
-            self.context.get("wave_class"), self.context.get("profile"), self.summary,
-        )
+    def _capture_failure_diagnostics(self, *, execution_failed=False):
+        try:
+            return _capture_source_free_failure_diagnostics(
+                self.root, self.failure_diagnostics_file, self.owner_uid,
+                self.context.get("wave_class"), self.context.get("profile"), self.summary,
+                execution_failed=execution_failed,
+            )
+        except Exception:
+            return False
 
     def prepare(self):
         self.startup_phase = "deadline"
@@ -2222,9 +2240,9 @@ class Service:
             except output_filter.FilterRefusal:
                 filter_failed = True
                 self.summary = _filter_failure_summary()
-            self._capture_failure_diagnostics()
-            self.execution_done = True
             status = "pass" if result == 0 and not filter_failed and not _summary_failed(self.summary) else "fail"
+            self._capture_failure_diagnostics(execution_failed=(status == "fail"))
+            self.execution_done = True
             catalogs = {
                 "files": sorted(set(self.manifest["allowed_files"].values())),
                 "tests": sorted(set(self.manifest["allowed_tests"].values())),
@@ -2286,9 +2304,9 @@ class Service:
         except output_filter.FilterRefusal:
             filter_failed = True
             self.summary = _filter_failure_summary()
-        self._capture_failure_diagnostics()
-        self.execution_done = True
         status = "pass" if all(code == 0 for _, code in outcomes) and not filter_failed and not _summary_failed(self.summary) else "fail"
+        self._capture_failure_diagnostics(execution_failed=(status == "fail"))
+        self.execution_done = True
         catalogs = {
             "files": sorted(set(self.manifest["allowed_files"].values())),
             "tests": sorted(set(self.manifest["allowed_tests"].values())),
@@ -3326,6 +3344,7 @@ def _serve(args):
         def handle(connection):
             with connection:
                 connection.settimeout(9900)
+                operation = None
                 try:
                     request = bundle.strict_json(_recv_frame(connection), MAX_RPC)
                     operation = request.get("op") if type(request) is dict else None
@@ -3342,6 +3361,8 @@ def _serve(args):
                     if stop:
                         shutdown.set()
                 except SupervisorRefusal as error:
+                    if operation == "execute":
+                        service._capture_failure_diagnostics(execution_failed=True)
                     payload = json.dumps({"ok": False, "code": error.code}, separators=(",", ":")).encode("ascii")
                     try:
                         _send_frame(connection, payload)
@@ -3350,6 +3371,8 @@ def _serve(args):
                     if 'operation' in locals() and operation == "cleanup":
                         shutdown.set()
                 except Exception:
+                    if operation == "execute":
+                        service._capture_failure_diagnostics(execution_failed=True)
                     try:
                         _send_frame(connection, b'{"ok":false,"code":"supervisor-failed"}')
                     except OSError:

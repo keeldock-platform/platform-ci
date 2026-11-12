@@ -160,7 +160,12 @@ function requireTypeScriptPath(candidate) {
   if (!inside(preparedRoot, resolved) || !resolved.endsWith('/typescript/lib/typescript.js')) {
     fail('typescript-unavailable');
   }
-  const stat = fs.lstatSync(resolved);
+  let stat;
+  try {
+    stat = fs.lstatSync(resolved);
+  } catch {
+    fail('typescript-unavailable');
+  }
   if (!stat.isFile() || stat.isSymbolicLink()) fail('typescript-unavailable');
   return resolved;
 }

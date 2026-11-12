@@ -80,6 +80,7 @@ BACKGROUND_MARKER = "DEVLANE_E2E_BACKGROUND_MARKER"
 RUST_VERSION = "1.99.1"
 RUST_LOCKFILES = rust_rehearsal_fixture.LOCKFILES
 PLAYWRIGHT_VERSION = "1.54.2"
+TYPESCRIPT_VERSION = "6.0.3"
 SYNTHETIC_LOCK = ROOT / "kit/confinement/synthetic_project/package-lock.json"
 
 DIAGNOSTIC_PHASES = diagnostic_contract.E2E_PROGRESS_PHASES
@@ -449,7 +450,7 @@ def _run(argv, *, env=None, timeout=900, expected=0, scan=True, cwd=None, diagno
                             close_fds=True, check=False, cwd=cwd)
     if on_result is not None:
         on_result(result)
-    if result.returncode != expected and diagnostic_callsite is not None:
+    if result.returncode != 0 and diagnostic_callsite is not None:
         _report_command_failure(diagnostic_callsite, result)
     _require(result.returncode == expected, "production-path-command-failed")
     if scan:
@@ -466,13 +467,12 @@ def _report_command_failure(callsite, result):
           + " returncode=" + str(result.returncode), flush=True)
     stdout = result.stdout if type(result.stdout) is bytes else b""
     stderr = result.stderr if type(result.stderr) is bytes else b""
-    contains_canary = _contains_output_canary(stdout) or _contains_output_canary(stderr)
-    if (len(stdout) + len(stderr) > diagnostic_contract.MAX_E2E_COMMAND_OUTPUT_BYTES
-            or contains_canary):
-        return
     emitted = set()
     count = 0
     for payload, is_stdout in ((stdout, True), (stderr, False)):
+        if (len(payload) > diagnostic_contract.MAX_E2E_COMMAND_OUTPUT_BYTES
+                or _contains_output_canary(payload)):
+            continue
         for raw_line in payload.splitlines(keepends=True):
             if not raw_line.endswith(b"\n"):
                 continue
@@ -493,38 +493,37 @@ def _report_command_failure(callsite, result):
             break
 
 
-def _synthetic_failure_subreason(summary, profile="core-node"):
-    if type(summary) is not bytes or _contains_output_canary(summary):
-        return ""
+def _synthetic_failure_subreason(summary, profile="core-node", *, execution_failed=False):
     if profile not in ("core-node", "core-rust"):
         return ""
-    for line in summary.splitlines():
-        try:
-            record = output_filter._parse_record(line)
-        except output_filter.FilterRefusal:
-            continue
-        if (record.get("kind") == "control" and record.get("status") == "fail"
-                and record.get("code") == "DEVLANE_FAILURE"):
-            subreason = record.get("subreason")
-            if (profile == "core-node" and record.get("stage") == "unit"
-                    and subreason in ("vitest-failed", "report-missing", "adapter-failed")):
-                return subreason
-            if (profile == "core-rust" and record.get("stage") != "semver"
-                    and subreason in ("report-missing", "adapter-failed")):
-                return "rust-matrix-" + subreason
-        if profile == "core-rust":
-            if record.get("kind") == "test" and record.get("stage") == "unit":
-                return "rust-matrix-failed"
-            if (record.get("kind") == "control" and record.get("stage") == "semver"
-                    and record.get("status") == "fail"):
-                return "rust-matrix-failed"
-            if (record.get("kind") == "coverage"
-                    and type(record.get("failed")) is int and record["failed"] > 0):
-                return "rust-matrix-failed"
-            if (record.get("kind") == "diagnostic"
-                    and record.get("level") == "error"):
-                return "rust-matrix-failed"
-    return ""
+    if type(summary) is bytes and not _contains_output_canary(summary):
+        for line in summary.splitlines():
+            try:
+                record = output_filter._parse_record(line)
+            except output_filter.FilterRefusal:
+                continue
+            if (record.get("kind") == "control" and record.get("status") == "fail"
+                    and record.get("code") == "DEVLANE_FAILURE"):
+                subreason = record.get("subreason")
+                if (profile == "core-node" and record.get("stage") == "unit"
+                        and subreason in ("vitest-failed", "report-missing", "adapter-failed")):
+                    return subreason
+                if (profile == "core-rust" and record.get("stage") != "semver"
+                        and subreason in ("report-missing", "adapter-failed")):
+                    return "rust-matrix-" + subreason
+            if profile == "core-rust":
+                if record.get("kind") == "test" and record.get("stage") == "unit":
+                    return "rust-matrix-failed"
+                if (record.get("kind") == "control" and record.get("stage") == "semver"
+                        and record.get("status") == "fail"):
+                    return "rust-matrix-failed"
+                if (record.get("kind") == "coverage"
+                        and type(record.get("failed")) is int and record["failed"] > 0):
+                    return "rust-matrix-failed"
+                if (record.get("kind") == "diagnostic"
+                        and record.get("level") == "error"):
+                    return "rust-matrix-failed"
+    return "execute-failed" if execution_failed else ""
 
 
 def _safe_diagnostic_name(value, fallback):
@@ -606,10 +605,12 @@ def _print_synthetic_failure_diagnostics(document):
             print(line, flush=True)
 
 
-def _emit_synthetic_failure_diagnostics(path, summary, profile="core-node"):
+def _emit_synthetic_failure_diagnostics(path, summary, profile="core-node", *, execution_failed=False):
     """Print sanitized tails copied by the supervisor for one source-free profile failure."""
     try:
-        subreason = _synthetic_failure_subreason(summary, profile)
+        subreason = _synthetic_failure_subreason(
+            summary, profile, execution_failed=execution_failed,
+        )
         if not subreason:
             return
         document = _read_synthetic_failure_diagnostics(path, subreason)
@@ -1201,7 +1202,7 @@ def _archive(files, profile, projection_sha, allowed_files, allowed_tests, frame
 def scenarios():
     """The scenario table; building it needs the network only for the generated-lock scenarios."""
     result = []
-    node_lock = _node_lock_from_reviewed({"typescript": "6.0.3"})
+    node_lock = _node_lock_from_reviewed({"typescript": TYPESCRIPT_VERSION})
     projection, payload = _node_projection(node_lock)
     result.append({
         "name": "synthetic-node", "profile": "core-node", "projection": projection, "payload": payload,
@@ -1211,7 +1212,7 @@ def scenarios():
         "variants": ("startup-refusal", "accept", "wrong-key", "failing-test", "cancel"),
     })
     real_lock = _node_lock_from_reviewed({
-        "typescript": "6.0.3", "vite": "8.3.5", "vitest": "5.0.5",
+        "typescript": TYPESCRIPT_VERSION, "vite": "8.3.5", "vitest": "5.0.5",
         "esbuild": "0.27.0", "rollup": ROLLUP_VERSION,
     })
     projection, payload = _node_projection(real_lock)
@@ -1229,6 +1230,27 @@ INSTALL_SCRIPT_PACKAGE = "esbuild"
 INSTALL_SCRIPT_VERSION = "0.25.9"
 ROLLUP_VERSION = "4.44.2"
 INSTALL_SCRIPT_PLACEHOLDER_LIMIT = 64 * 1024
+
+
+def _install_script_canary_manifest():
+    return json.dumps({
+        "name": "synthetic-private-canary", "version": "0.0.0", "private": True,
+        "devDependencies": {
+            INSTALL_SCRIPT_PACKAGE: INSTALL_SCRIPT_VERSION,
+            "rollup": ROLLUP_VERSION,
+            "typescript": TYPESCRIPT_VERSION,
+        },
+    })
+
+
+def _browser_manifest():
+    return json.dumps({
+        "name": "synthetic-private-canary", "version": "0.0.0", "private": True,
+        "devDependencies": {
+            "@playwright/test": PLAYWRIGHT_VERSION,
+            "typescript": TYPESCRIPT_VERSION,
+        },
+    })
 
 
 def _install_script_canary_check(prepared_path):
@@ -1266,10 +1288,7 @@ def _validate_linux_native_lock(lock):
 def late_scenarios():
     """Scenarios that resolve packages from the public registries on the hosted runner."""
     result = []
-    canary_manifest = json.dumps({"name": "synthetic-private-canary", "version": "0.0.0", "private": True,
-                                  "devDependencies": {INSTALL_SCRIPT_PACKAGE: INSTALL_SCRIPT_VERSION,
-                                                      "rollup": ROLLUP_VERSION}})
-    canary_lock = _generated_npm_lock(canary_manifest)
+    canary_lock = _generated_npm_lock(_install_script_canary_manifest())
     _require(bool(canary_lock["packages"]["node_modules/" + INSTALL_SCRIPT_PACKAGE].get("hasInstallScript")),
              "install-script-canary-lacks-marker")
     _validate_linux_native_lock(canary_lock)
@@ -1281,9 +1300,7 @@ def late_scenarios():
         "allowed_tests": {"synthetic canary suite accepted test": "case_0001"}, "frames": {},
         "variants": ("accept",), "after_prepare": _install_script_canary_check,
     })
-    browser_manifest = json.dumps({"name": "synthetic-private-canary", "version": "0.0.0", "private": True,
-                                   "devDependencies": {"@playwright/test": PLAYWRIGHT_VERSION}})
-    browser_lock = _generated_npm_lock(browser_manifest)
+    browser_lock = _generated_npm_lock(_browser_manifest())
     projection, payload = _node_projection(browser_lock, playwright=("chromium",))
     result.append({
         "name": "real-browser", "profile": "core-node", "projection": projection, "payload": payload,
@@ -1692,7 +1709,12 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
         with DIAGNOSTICS.phase("variant-execute"):
             if variant == "wrong-key":
                 """A refused decryption must leave execution refused: exit 2 and no summary at all."""
-                refused = _run(execute, expected=2, diagnostic_callsite="supervisor-client:execute")
+                refused = _run(
+                    execute, expected=2, diagnostic_callsite="supervisor-client:execute",
+                    on_result=lambda completed: _emit_synthetic_failure_diagnostics(
+                        diagnostic_path, completed.stdout, profile,
+                        execution_failed=(completed.returncode != 0)),
+                )
                 _require(refused.stdout == b"", "summary-after-decrypt-refusal")
             elif variant == "cancel":
                 wait_budget = _bounded_timeout(180)
@@ -1713,13 +1735,20 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
                     raise RuntimeError("cancelled-execute-did-not-end") from None
                 _require(process.returncode != 0, "cancelled-execute-reported-success")
                 _scan_output(output + errors, "canary-after-cancel")
+                _report_command_failure(
+                    "supervisor-client:execute",
+                    subprocess.CompletedProcess(execute, process.returncode, output, errors),
+                )
+                _emit_synthetic_failure_diagnostics(
+                    diagnostic_path, output, profile, execution_failed=True,
+                )
             else:
                 expected = _expected_execute_status(scenario, variant)
                 result = _run(execute, timeout=60 * 40, expected=expected,
                               diagnostic_callsite="supervisor-client:execute",
-                              on_result=(lambda completed: _emit_synthetic_failure_diagnostics(
-                                  diagnostic_path, completed.stdout, profile))
-                              if scenario["name"] in diagnostic_contract.E2E_PROGRESS_SCENARIOS else None)
+                              on_result=lambda completed: _emit_synthetic_failure_diagnostics(
+                                  diagnostic_path, completed.stdout, profile,
+                                  execution_failed=(completed.returncode != 0)))
                 with DIAGNOSTICS.phase("variant-summary-validate"):
                     _require(_summary_has_valid_terminator(result.stdout), "summary-schema-invalid")
                     records = _summary_records(result.stdout, scenario)

@@ -5,7 +5,7 @@ import test from 'node:test';
 import os from 'node:os';
 import path from 'node:path';
 import { parseStrictJson } from './safe_json.mjs';
-import { compileForTest } from './typescript_reporter.mjs';
+import { compileForTest, runTypeScriptReporter } from './typescript_reporter.mjs';
 
 const idPattern = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
@@ -128,6 +128,27 @@ if (process.env.NODE_TEST_CONTEXT) {
     assert.deepEqual(normalizeVitest({ testResults: [{ assertionResults: [
       { fullName: 'private test input', status: 'failed' },
     ] }] }, [['approved case', 'case_0001']]), fixedFailure('unit'));
+  });
+  test('a missing prepared TypeScript package becomes a fixed refusal', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'devlane-missing-typescript-'));
+    const sourceRoot = path.join(root, 'source');
+    const manifestPath = path.join(root, 'manifest.json');
+    const outputPath = path.join(root, 'typescript.jsonl');
+    fs.mkdirSync(sourceRoot);
+    fs.writeFileSync(path.join(sourceRoot, 'tsconfig.json'), '{"compilerOptions":{}}\n');
+    fs.writeFileSync(path.join(sourceRoot, 'example.ts'), 'export const value = 1;\n');
+    fs.writeFileSync(manifestPath, JSON.stringify({ schema: 1, allowed_files: { 'example.ts': 'file_0001' } }));
+    try {
+      await assert.rejects(runTypeScriptReporter({
+        sourceRoot,
+        manifestPath,
+        outputPath,
+        trustedTypeScriptPath: '/prepared/node_modules/typescript/lib/typescript.js',
+      }), (error) => error?.code === 'typescript-unavailable');
+      assert.equal(fs.existsSync(outputPath), false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
   test('Playwright reports only frame IDs and pass/fail', () => {
     const report = {

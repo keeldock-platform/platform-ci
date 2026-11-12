@@ -1,6 +1,7 @@
 """The rehearsal and owner request builders produce inputs the real tools accept."""
 
 import ast
+import base64
 import contextlib
 import hashlib
 import io
@@ -501,8 +502,10 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             test_e2e._report_command_failure("supervisor-client:execute", canary)
-        self.assertEqual(output.getvalue(),
-                         "devlane_e2e_command=failed call=supervisor-client:execute returncode=1\n")
+        self.assertEqual(output.getvalue().splitlines(), [
+            "devlane_e2e_command=failed call=supervisor-client:execute returncode=1",
+            "devlane_supervisor_refusal=execution-order",
+        ])
 
         oversized = subprocess.CompletedProcess(
             ["supervisor.py", "execute"], 1,
@@ -638,19 +641,28 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
         self.assertIn("os.chown(str(path), WORKER_UID, WORKER_GID)", scratch_source)
 
     def test_run_temp_supervisor_dump_survives_the_workflow_quiet_capture(self):
-        summary = (b'{"code":"DEVLANE_FAILURE","kind":"control","stage":"unit",'
-                   b'"status":"fail","subreason":"vitest-failed"}\n')
+        summary = (b'{"code":"DEVLANE_FAILURE","kind":"control","stage":"typecheck",'
+                   b'"status":"fail"}\n')
         with tempfile.TemporaryDirectory() as temporary:
             runner_temp = Path(temporary)
             root = runner_temp / "namespace-root"
             raw = root / "workspace/raw"
             reports = root / "scratch/reports"
+            scratch_raw = root / "scratch/raw"
             raw.mkdir(parents=True)
             reports.mkdir(parents=True)
-            (raw / "unit.log").write_text("npm test started\n", encoding="ascii")
-            (raw / "unit.stderr.log").write_text(
+            scratch_raw.mkdir(parents=True)
+            for name in ("typecheck.log", "unit.log", "style.log", "audit.log", "install.log",
+                         "typecheck-adapter.log", "adapter-run.log"):
+                (raw / name).write_text(name + " started\n", encoding="ascii")
+            (raw / "typecheck-adapter.log").write_text(
+                "typescript_reporter_refusal=typescript-unavailable\n"
+                "PRIVATE_KEY_CANARY must be skipped\n", encoding="ascii",
+            )
+            (raw / "typecheck.stderr.log").write_text(
                 "Error: spawn /tools/node/bin/node EACCES\n", encoding="ascii",
             )
+            (scratch_raw / "unit.stdout").write_text("worker refusal code=tool-missing\n", encoding="ascii")
             (reports / "vitest.json").write_text("{}", encoding="ascii")
             destination = runner_temp / "devlane-vitest-local-synthetic-node-accept.json"
             service = object.__new__(supervisor.Service)
@@ -663,21 +675,30 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
             }
             service.summary = summary
             with mock.patch.dict(os.environ, {"RUNNER_TEMP": str(runner_temp)}):
-                self.assertTrue(service._capture_failure_diagnostics())
+                self.assertTrue(service._capture_failure_diagnostics(execution_failed=True))
+            stored = bundle.strict_json(destination.read_bytes())
+            self.assertEqual(stored["subreason"], "execute-failed")
+            self.assertTrue({"typecheck.log", "unit.log", "style.log", "audit.log", "install.log",
+                             "typecheck-adapter.log", "adapter-run.log", "unit.stdout"}
+                            <= {item["name"] for item in stored["logs"]})
+            self.assertFalse(any(b"PRIVATE_KEY_CANARY" in base64.b64decode(line)
+                                 for item in stored["logs"] for line in item["lines"]))
 
             metadata = destination.stat()
             self.assertEqual(metadata.st_uid, os.getuid())
             self.assertEqual(metadata.st_mode & 0o777, 0o600)
             driver = runner_temp / "harness-failure.py"
             command_source = (
-                "import sys; sys.stdout.buffer.write(" + repr(summary) + "); sys.exit(1)"
+                "import sys; sys.stdout.buffer.write(" + repr(summary) + "); "
+                "sys.stderr.write('devlane_supervisor_refusal=execution-order\\n'); sys.exit(1)"
             )
             driver.write_text(
                 "import sys\n"
                 "import test_e2e\n"
                 "command = [sys.executable, '-c', " + repr(command_source) + "]\n"
                 "test_e2e._run(command, expected=0, diagnostic_callsite='supervisor-client:execute', "
-                "on_result=lambda result: test_e2e._emit_synthetic_failure_diagnostics(sys.argv[1], result.stdout))\n",
+                "on_result=lambda result: test_e2e._emit_synthetic_failure_diagnostics("
+                "sys.argv[1], result.stdout, execution_failed=(result.returncode != 0)))\n",
                 encoding="ascii",
             )
 
@@ -702,12 +723,20 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr.decode("utf-8", "replace"))
         output_lines = result.stdout.decode("utf-8", "replace").splitlines()
         self.assertIn("devlane_acceptance=refused stage=production-path-e2e", output_lines)
+        self.assertIn("devlane_supervisor_refusal=execution-order", output_lines)
         diagnostic_lines = [line for line in output_lines if line.startswith("devlane_e2e_failure_diag=")]
         self.assertTrue(diagnostic_lines, result.stdout.decode("utf-8", "replace")
                         + result.stderr.decode("utf-8", "replace"))
         self.assertTrue(all(test_e2e.diagnostic_contract.public_e2e_vitest_diagnostic(line)
                             for line in diagnostic_lines))
         self.assertTrue(any("spawn /tools/node/bin/node EACCES" in line for line in diagnostic_lines))
+        self.assertTrue(any("typescript_reporter_refusal=typescript-unavailable" in line
+                            for line in diagnostic_lines))
+        self.assertTrue(any("name=unit.stdout" in line for line in diagnostic_lines))
+        self.assertTrue(any("name=style.log" in line for line in diagnostic_lines))
+        self.assertTrue(any("name=audit.log" in line for line in diagnostic_lines))
+        self.assertTrue(any("name=install.log" in line for line in diagnostic_lines))
+        self.assertNotIn("PRIVATE_KEY_CANARY", "\n".join(output_lines))
         self.assertIn("devlane_e2e_failure_diag=report name=vitest.json kind=file bytes=2", diagnostic_lines)
         self.assertFalse(destination.exists())
 
@@ -731,6 +760,20 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
                 service.summary = payload
                 self.assertFalse(service._capture_failure_diagnostics())
                 self.assertFalse(destination.exists())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "workspace/raw").mkdir(parents=True)
+            (root / "scratch/reports").mkdir(parents=True)
+            destination = root / "devlane-vitest-local-synthetic-node-accept.json"
+            service = object.__new__(supervisor.Service)
+            service.root = root
+            service.failure_diagnostics_file = destination
+            service.owner_uid = os.getuid()
+            service.context = {"wave_class": "encrypted", "profile": "core-node"}
+            service.summary = None
+            self.assertFalse(service._capture_failure_diagnostics(execution_failed=True))
+            self.assertFalse(destination.exists())
 
         semver_summary = (b'{"code":"DEVLANE_SEMVER_EXECUTION","kind":"control",'
                           b'"stage":"semver","status":"fail"}\n')
@@ -973,6 +1016,12 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
         self.assertEqual(test_e2e._synthetic_failure_subreason(
             b'{"code":"DEVLANE_FAILURE","kind":"control","stage":"unit",'
             b'"status":"fail","subreason":"vitest-failed"}\n', "core-rust"), "")
+        self.assertEqual(test_e2e._synthetic_failure_subreason(
+            b'{"code":"DEVLANE_FAILURE","kind":"control","stage":"typecheck",'
+            b'"status":"fail"}\n', execution_failed=True), "execute-failed")
+        self.assertEqual(test_e2e._synthetic_failure_subreason(
+            b'{"code":"DEVLANE_FAILURE","kind":"control","stage":"typecheck",'
+            b'"status":"fail"}\n'), "")
         for summary in (
             b'{"kind":"control","stage":"unit","status":"fail","subreason":"typecheck-failed"}\n',
             b'{"kind":"control","stage":"browser","status":"fail","subreason":"adapter-failed"}\n',

@@ -1801,6 +1801,14 @@ class RealLockfileAndFixtureTests(unittest.TestCase):
                 self.assertEqual(lock, scenario["projection"]["npm_lock"])
                 fetch.validate_projection(scenario["payload"], "core-node")
 
+    def test_late_node_manifests_include_the_typescript_reporter_runtime(self):
+        for builder in (test_e2e._install_script_canary_manifest, test_e2e._browser_manifest):
+            with self.subTest(builder=builder.__name__):
+                manifest = json.loads(builder())
+                self.assertEqual(
+                    manifest["devDependencies"]["typescript"], test_e2e.TYPESCRIPT_VERSION,
+                )
+
     def test_real_npm_lock_metadata_is_accepted_and_only_needed_fields_are_projected(self):
         lock = test_e2e._node_lock_from_reviewed({
             "typescript": "6.0.3", "vite": "8.3.5", "vitest": "5.0.5",
