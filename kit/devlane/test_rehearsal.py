@@ -404,7 +404,7 @@ class ProductionExecuteFixtureTests(unittest.TestCase):
         self.assertIn("video: 'off'", browser_config)
         self.assertIn("trace: 'off'", browser_config)
         self.assertIn("chromiumSandbox: false", browser_config)
-        self.assertIn("args: ['--no-sandbox']", browser_config)
+        self.assertIn("args: ['--no-sandbox', '--no-zygote']", browser_config)
         self.assertIn("packages/kernel-ui-kit/browser/frame.spec.mjs", browser)
         self.assertNotIn("packages/kernel-ui-kit/browser/frame.spec.ts", browser)
 
@@ -610,9 +610,12 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
             raw.mkdir(parents=True)
             (root / "scratch/reports").mkdir(parents=True)
             rows = ["browser diagnostic line %03d" % index for index in range(140)]
-            rows[-2] = "PRIVATE_SOURCE_CANARY must be skipped"
+            long_error = "ERROR:content/browser/zygote_host detail=" + ("x" * 500)
+            rows[120] = long_error
+            long_report_error = "pw:browser chromium stderr=" + ("y" * 500)
+            rows[-2] = ("x" * 400) + "PRIVATE_SOURCE_CANARY must be skipped"
             (raw / "browser.stderr.log").write_text("\n".join(rows) + "\n", encoding="ascii")
-            (raw / "browser.log").write_text("browser stdout detail\n", encoding="ascii")
+            (raw / "browser.log").write_text(long_report_error + "\n", encoding="ascii")
             destination = root / "devlane-vitest-local-synthetic-browser-accept.json"
             service = object.__new__(supervisor.Service)
             service.root = root
@@ -627,9 +630,15 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
             document = bundle.strict_json(destination.read_bytes())
             self.assertEqual(document["subreason"], "execute-failed")
             self.assertEqual(document["logs"][0]["name"], "browser.stderr.log")
+            self.assertEqual(document["logs"][1]["name"], "browser.log")
             raw_tail = [base64.b64decode(line) for line in document["logs"][0]["lines"]]
             self.assertLessEqual(len(raw_tail), supervisor.MAX_SYNTHETIC_DIAGNOSTIC_TAIL_LINES)
-            self.assertTrue(all(len(line) <= supervisor.MAX_SYNTHETIC_DIAGNOSTIC_LINE_BYTES for line in raw_tail))
+            self.assertTrue(all(
+                len(line) <= supervisor.MAX_SYNTHETIC_BROWSER_DIAGNOSTIC_LINE_BYTES for line in raw_tail
+            ))
+            self.assertIn(long_error.encode("ascii"), raw_tail)
+            browser_log_tail = [base64.b64decode(line) for line in document["logs"][1]["lines"]]
+            self.assertIn(long_report_error.encode("ascii"), browser_log_tail)
             self.assertFalse(any(b"PRIVATE_SOURCE_CANARY" in line for line in raw_tail))
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
@@ -639,6 +648,8 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
             rendered = output.getvalue()
             self.assertIn("name=browser.stderr.log", rendered)
             self.assertIn("browser diagnostic line 139", rendered)
+            self.assertIn(long_error, rendered)
+            self.assertIn(long_report_error, rendered)
             self.assertNotIn("PRIVATE_SOURCE_CANARY", rendered)
             self.assertTrue(all(test_e2e.diagnostic_contract.public_e2e_failure_diagnostic(line)
                                 for line in rendered.splitlines()))

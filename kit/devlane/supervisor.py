@@ -47,6 +47,7 @@ MAX_SYNTHETIC_DIAGNOSTIC_TAIL_LINES = 120
 MAX_SYNTHETIC_RUST_DIAGNOSTIC_TAIL_LINES = 40
 MAX_SYNTHETIC_DIAGNOSTIC_TAIL_BYTES = 64 * 1024
 MAX_SYNTHETIC_DIAGNOSTIC_LINE_BYTES = 128
+MAX_SYNTHETIC_BROWSER_DIAGNOSTIC_LINE_BYTES = 1024
 MAX_SYNTHETIC_DIAGNOSTIC_REPORTS = 64
 MAX_SYNTHETIC_DIAGNOSTIC_FILE_BYTES = 4 * 1024 * 1024
 SOCKET_NAME = "control.sock"
@@ -522,9 +523,12 @@ def _synthetic_diagnostic_log_tail(path, max_lines=MAX_SYNTHETIC_DIAGNOSTIC_TAIL
     if lines and lines[-1] == b"":
         lines.pop()
     selected = []
+    line_limit = (MAX_SYNTHETIC_BROWSER_DIAGNOSTIC_LINE_BYTES
+                  if Path(path).name in {"browser.log", "browser.stderr.log"}
+                  else MAX_SYNTHETIC_DIAGNOSTIC_LINE_BYTES)
     for line in lines[-max_lines:]:
         if _synthetic_diagnostic_line_safe(line):
-            selected.append(line[:MAX_SYNTHETIC_DIAGNOSTIC_LINE_BYTES])
+            selected.append(line[:line_limit])
     return selected
 
 

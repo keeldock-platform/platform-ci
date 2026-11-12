@@ -89,6 +89,7 @@ MAX_E2E_RAW_DIAGNOSTIC_LOGS = 48
 MAX_E2E_RAW_DIAGNOSTIC_TAIL_LINES = 120
 MAX_E2E_RAW_DIAGNOSTIC_TAIL_BYTES = 128 * 1024
 MAX_E2E_RAW_DIAGNOSTIC_LINE_BYTES = 128
+MAX_E2E_BROWSER_RAW_DIAGNOSTIC_LINE_BYTES = 1024
 MAX_E2E_REPORT_ENTRIES = 64
 _DIAGNOSTIC_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 
@@ -601,7 +602,10 @@ def _print_synthetic_failure_diagnostics(document):
             text = text.replace("::", ": :").replace(hash_marker + "[", hash_marker + " [")
             text = "".join(character if ord(character) >= 32 and ord(character) != 127 else " "
                            for character in text)
-            text = text.encode("utf-8")[:MAX_E2E_RAW_DIAGNOSTIC_LINE_BYTES].decode("utf-8", "ignore")
+            line_limit = (MAX_E2E_BROWSER_RAW_DIAGNOSTIC_LINE_BYTES
+                          if name in {"browser.log", "browser.stderr.log"}
+                          else MAX_E2E_RAW_DIAGNOSTIC_LINE_BYTES)
+            text = text.encode("utf-8")[:line_limit].decode("utf-8", "ignore")
             encoded = quote(text, safe="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~:/,=@+!?(){} -")
             line = "devlane_e2e_failure_diag=log name=%s line=%d text=%s" % (name, index, encoded)
             if diagnostic_contract.public_e2e_failure_diagnostic(line):
@@ -1144,7 +1148,7 @@ def _browser_source(lock):
     }
     config = ("export default { testDir: '.', reporter: 'json', workers: 1, use: { "
               "screenshot: 'off', video: 'off', trace: 'off', "
-              "launchOptions: { chromiumSandbox: false, args: ['--no-sandbox'] } } };\n")
+              "launchOptions: { chromiumSandbox: false, args: ['--no-sandbox', '--no-zygote'] } } };\n")
     spec = (
         "import { test, expect } from '@playwright/test';\n"
         "test('browser frame accepted', async ({ page }) => {\n"

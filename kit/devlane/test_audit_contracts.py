@@ -701,6 +701,15 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         self.assertFalse(diagnostic_contract.public_e2e_failure_diagnostic(bare_rust_refusal_log_line))
         self.assertFalse(diagnostic_contract.public_e2e_failure_diagnostic(unknown_rust_refusal_log_line))
         self.assertTrue(diagnostic_contract.public_e2e_failure_diagnostic(rust_report_line))
+        long_browser_line = (
+            "devlane_e2e_failure_diag=log name=browser.stderr.log line=1 text=" + ("x" * 500)
+        )
+        long_non_browser_line = long_browser_line.replace("browser.stderr.log", "unit.stderr.log")
+        self.assertTrue(diagnostic_contract.public_e2e_failure_diagnostic(long_browser_line))
+        self.assertFalse(diagnostic_contract.public_e2e_failure_diagnostic(long_non_browser_line))
+        self.assertFalse(diagnostic_contract.public_e2e_failure_diagnostic(
+            long_browser_line + "x" * diagnostic_contract.MAX_E2E_BROWSER_DIAGNOSTIC_BYTES
+        ))
         self.assertEqual(acceptance_diagnostics.failure_tail(
             "production-path-e2e", (log_line + "\n" + report_line + "\n" + rust_log_line + "\n"
                                      + rust_refusal_log_line + "\n" + rust_report_line + "\n").encode("ascii"),

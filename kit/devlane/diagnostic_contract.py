@@ -254,6 +254,7 @@ MAX_E2E_COMMAND_DIAGNOSTIC_LINES = 4
 MAX_E2E_COMMAND_SUMMARY_RECORD_BYTES = 512
 MAX_E2E_VITEST_DIAGNOSTIC_LINES = 2048
 MAX_E2E_VITEST_DIAGNOSTIC_BYTES = 512
+MAX_E2E_BROWSER_DIAGNOSTIC_BYTES = 4096
 _E2E_COMMAND_FAILURE = re.compile(
     r"devlane_e2e_command=failed call=(supervisor-client:execute) "
     r"returncode=(-?(?:0|[1-9][0-9]{0,8}))\Z"
@@ -276,6 +277,10 @@ _E2E_RUST_MATRIX_REFUSAL = re.compile(
 _E2E_FAILURE_DIAGNOSTIC = re.compile(
     r"devlane_e2e_(?:vitest|failure)_diag=log name=[A-Za-z0-9][A-Za-z0-9._-]{0,63} "
     r"line=[1-9][0-9]{0,2} text=((?:[A-Za-z0-9._~:/,=@+!?(){} -]|%[0-9A-F]{2}){0,384})\Z"
+)
+_E2E_BROWSER_FAILURE_DIAGNOSTIC = re.compile(
+    r"devlane_e2e_(?:vitest|failure)_diag=log name=browser(?:\.stderr)?\.log "
+    r"line=[1-9][0-9]{0,2} text=((?:[A-Za-z0-9._~:/,=@+!?(){} -]|%[0-9A-F]{2}){0,3900})\Z"
 )
 _E2E_FAILURE_REPORT_DIAGNOSTIC = re.compile(
     r"devlane_e2e_(?:vitest|failure)_diag=report name=[A-Za-z0-9][A-Za-z0-9._-]{0,63} "
@@ -307,13 +312,18 @@ def public_e2e_failure_diagnostic(line):
         payload = line.encode("ascii", "strict")
     except UnicodeEncodeError:
         return False
-    if (len(payload) > MAX_E2E_VITEST_DIAGNOSTIC_BYTES or "::" in line
+    browser_failure = _E2E_BROWSER_FAILURE_DIAGNOSTIC.fullmatch(line)
+    maximum_bytes = (MAX_E2E_BROWSER_DIAGNOSTIC_BYTES if browser_failure is not None
+                     else MAX_E2E_VITEST_DIAGNOSTIC_BYTES)
+    if (len(payload) > maximum_bytes or "::" in line
             or (chr(35) * 2 + "[") in line
             or any(marker in line for marker in (
                 "SYNTHETIC_SOURCE_CANARY", "PRIVATE_SOURCE_CANARY", "KEYCANARY",
                 "SYNTHETIC_KEY_CANARY", "PRIVATE_KEY_CANARY",
             ))):
         return False
+    if browser_failure is not None:
+        return True
     failure = _E2E_FAILURE_DIAGNOSTIC.fullmatch(line)
     if failure is not None:
         text = failure.group(1)
