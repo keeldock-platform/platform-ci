@@ -395,6 +395,7 @@ class ProductionExecuteFixtureTests(unittest.TestCase):
 
         node_probe = test_e2e._probe_script()
         self.assertIn("/proc/1/root/ho' + 'me/runner", node_probe)
+        self.assertIn("if (process.platform === 'linux')", node_probe)
         self.assertNotIn("/proc/1/root/home", node_probe)
 
         scenarios = test_e2e.scenarios()

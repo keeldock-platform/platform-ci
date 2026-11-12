@@ -181,6 +181,18 @@ class FilterAcceptanceTests(unittest.TestCase):
         with self.assertRaises(public_filter.FilterRefusal):
             public_filter.filter_records(rows, self.allowlists)
 
+    def test_unit_failure_subreason_is_a_fixed_public_vocabulary(self):
+        record = b'{"kind":"control","stage":"unit","status":"fail","code":"DEVLANE_FAILURE","subreason":"adapter-failed"}'
+        expected = b'{"code":"DEVLANE_FAILURE","kind":"control","stage":"unit","status":"fail","subreason":"adapter-failed"}\n'
+        self.assertEqual(public_filter.filter_records([record], self.allowlists), expected)
+        for changed in (
+            record.replace(b"adapter-failed", b"private-adapter-error"),
+            record.replace(b'"stage":"unit"', b'"stage":"typecheck"'),
+            record.replace(b'"status":"fail"', b'"status":"pass"'),
+        ):
+            with self.subTest(changed=changed), self.assertRaises(public_filter.FilterRefusal):
+                public_filter.filter_records([changed], self.allowlists)
+
 
 class EnvelopeAcceptanceTests(unittest.TestCase):
     def test_generated_key_file_is_private_and_exactly_secret_input_bytes(self):
@@ -1062,6 +1074,13 @@ class ReportingFailOpenTests(unittest.TestCase):
     """An adapter report only counts when the adapter demonstrably completed."""
 
     FAILURE = supervisor._control_failure("unit")
+    ADAPTER_FAILURE = supervisor._control_failure("unit", "adapter-failed")
+    REPORT_MISSING = supervisor._control_failure("unit", "report-missing")
+    VITEST_FAILURE = supervisor._control_failure("unit", "vitest-failed")
+    FILTER_FAILURE = b'{"code":"DEVLANE_FAILURE","kind":"control","stage":"unit","status":"fail","subreason":"filter-refused"}\n'
+
+    def test_filter_refusal_has_only_a_fixed_public_subreason(self):
+        self.assertEqual(supervisor._filter_failure_summary(), self.FILTER_FAILURE)
 
     def _root(self):
         temporary = tempfile.TemporaryDirectory()
@@ -1084,7 +1103,7 @@ class ReportingFailOpenTests(unittest.TestCase):
 
             with patch.object(supervisor, "_run_control_adapter", side_effect=timed_out):
                 records = supervisor._adapter_records(root, "core-rust", manifest, [("unit", 0)], {})
-            self.assertEqual(records, [self.FAILURE])
+            self.assertEqual(records, [self.REPORT_MISSING])
 
             (root / "scratch/reports/vitest.json").write_bytes(b"{}")
 
@@ -1095,8 +1114,30 @@ class ReportingFailOpenTests(unittest.TestCase):
             with patch.object(supervisor, "_run_control_adapter", side_effect=node_timed_out):
                 records = supervisor._adapter_records(
                     root, "core-node", manifest, [("typecheck", 0), ("unit", 0)], {}, {"typescript": 0})
-            self.assertIn(self.FAILURE, records)
-            self.assertNotEqual(records, [])
+            self.assertIn(self.ADAPTER_FAILURE, records)
+
+            (root / "scratch/reports/vitest.json").unlink()
+            records = supervisor._adapter_records(
+                root, "core-node", manifest, [("typecheck", 0), ("unit", 1)], {}, {"typescript": 0})
+            self.assertIn(self.REPORT_MISSING, records)
+            self.assertNotIn(self.VITEST_FAILURE, records)
+
+    def test_vitest_nonzero_with_a_valid_adapter_record_has_a_fixed_subreason(self):
+        temporary, root = self._root()
+        with temporary:
+            (root / "scratch/reports/vitest.json").write_text("{}", encoding="ascii")
+            manifest = {"allowed_files": {}, "allowed_tests": {"fixture test": "case_0001"}, "frames": {}}
+
+            def adapter_records(_root, _command, _stage, _tools, _log_name, *, timeout):
+                output = _root / "scratch/reports/adapter.jsonl"
+                output.write_bytes(b'{"kind":"test","stage":"unit","test":"case_0001"}\n')
+                return 0
+
+            with patch.object(supervisor, "_run_control_adapter", side_effect=adapter_records):
+                records = supervisor._adapter_records(
+                    root, "core-node", manifest, [("unit", 1)], {}, {"typescript": 0})
+            self.assertIn(b'{"kind":"test","stage":"unit","test":"case_0001"}', records)
+            self.assertIn(self.VITEST_FAILURE, records)
 
     def test_adapter_status_must_agree_with_a_complete_regular_report(self):
         temporary, root = self._root()
@@ -1107,16 +1148,16 @@ class ReportingFailOpenTests(unittest.TestCase):
             cases = (
                 ("rust clean", b"", 0, "tests", []),
                 ("rust failing test", test_record, 1, "tests", [test_record[:-1]]),
-                ("rust failing status without records", b"", 1, "tests", [self.FAILURE]),
-                ("rust records with clean status", test_record, 0, "tests", [self.FAILURE]),
-                ("adapter refused", control, 2, "tests", [self.FAILURE]),
-                ("signal exit", b"", 137, "tests", [self.FAILURE]),
-                ("interrupted write", test_record[:-4], 1, "tests", [self.FAILURE]),
+                ("rust failing status without records", b"", 1, "tests", [self.ADAPTER_FAILURE]),
+                ("rust records with clean status", test_record, 0, "tests", [self.ADAPTER_FAILURE]),
+                ("adapter refused", control, 2, "tests", [self.ADAPTER_FAILURE]),
+                ("signal exit", b"", 137, "tests", [self.ADAPTER_FAILURE]),
+                ("interrupted write", test_record[:-4], 1, "tests", [self.ADAPTER_FAILURE]),
                 ("node clean", test_record, 0, "node", [test_record[:-1]]),
-                ("node control failure", control, 1, "node", [control[:-1]]),
-                ("node control failure with clean status", control, 0, "node", [self.FAILURE]),
-                ("node failing status without control record", test_record, 1, "node", [self.FAILURE]),
-                ("garbage", b"not-json\n", 0, "node", [self.FAILURE]),
+                ("node control failure", control, 1, "node", [self.ADAPTER_FAILURE]),
+                ("node control failure with clean status", control, 0, "node", [self.ADAPTER_FAILURE]),
+                ("node failing status without control record", test_record, 1, "node", [self.ADAPTER_FAILURE]),
+                ("garbage", b"not-json\n", 0, "node", [self.ADAPTER_FAILURE]),
             )
             for label, payload, status, rule, expected in cases:
                 with self.subTest(label):
@@ -1125,7 +1166,7 @@ class ReportingFailOpenTests(unittest.TestCase):
                     output.write_bytes(payload)
                     self.assertEqual(supervisor._adapter_lines(output, status, "unit", rule=rule), expected)
             output.unlink()
-            self.assertEqual(supervisor._adapter_lines(output, 0, "unit", rule="tests"), [self.FAILURE])
+            self.assertEqual(supervisor._adapter_lines(output, 0, "unit", rule="tests"), [self.ADAPTER_FAILURE])
 
     def test_special_files_are_rejected_without_blocking(self):
         temporary, root = self._root()
@@ -1149,7 +1190,7 @@ class ReportingFailOpenTests(unittest.TestCase):
                 worker.join(5)
                 self.assertFalse(worker.is_alive(), "reading a special file blocked")
                 self.assertEqual(outcome, ["report-file-invalid"])
-                self.assertEqual(supervisor._adapter_lines(path, 0, "unit", rule="tests"), [self.FAILURE])
+                self.assertEqual(supervisor._adapter_lines(path, 0, "unit", rule="tests"), [self.ADAPTER_FAILURE])
 
 
 class CleanupLifecycleTests(unittest.TestCase):

@@ -96,7 +96,7 @@ fn assert_isolation_boundaries() {
         "argument-boundary"
     );
 
-    {
+    if cfg!(target_os = "linux") {
         let environ = fs::read("/proc/self/environ").expect("proc-environ");
         let environ = String::from_utf8_lossy(&environ);
         assert!(
@@ -117,16 +117,12 @@ fn assert_isolation_boundaries() {
             }
         }
 
-        let runner_home = "/ho".to_owned() + "me/runner";
         let proc_runner_home = "/proc/1/root/ho".to_owned() + "me/runner";
-        for forbidden in [
-            runner_home.as_str(),
-            "/run/docker.sock",
-            "/var/run/docker.sock",
-            proc_runner_home.as_str(),
-        ] {
-            assert!(!Path::new(forbidden).exists(), "host-path-boundary");
-        }
+        assert!(
+            !Path::new(&proc_runner_home).exists(),
+            "host-path-boundary"
+        );
+
         let process_count = fs::read_dir("/proc")
             .expect("proc-root")
             .filter_map(Result::ok)
@@ -139,17 +135,25 @@ fn assert_isolation_boundaries() {
             })
             .count();
         assert!(process_count <= 64, "process-visibility-boundary");
+    }
 
-        for root in [
-            "/trusted",
-            "/workspace/source",
-            "/tmp",
-            "/devlane-home",
-            "/scratch/tmp",
-            "/scratch/reports",
-        ] {
-            scan_key_bytes(Path::new(root), &key, 0);
-        }
+    for forbidden in [
+        "/ho".to_owned() + "me/runner",
+        "/run/docker.sock".to_owned(),
+        "/var/run/docker.sock".to_owned(),
+    ] {
+        assert!(!Path::new(&forbidden).exists(), "host-path-boundary");
+    }
+
+    for root in [
+        "/trusted",
+        "/workspace/source",
+        "/tmp",
+        "/devlane-home",
+        "/scratch/tmp",
+        "/scratch/reports",
+    ] {
+        scan_key_bytes(Path::new(root), &key, 0);
     }
 
     let public = SocketAddr::from(([1, 1, 1, 1], 443));

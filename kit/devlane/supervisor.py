@@ -1130,9 +1130,25 @@ def _preflight_tools(profile, projection, tool_paths, owner_uid=None):
     }
 
 
-def _control_failure(stage):
-    return json.dumps({"kind": "control", "stage": stage, "status": "fail",
-                       "code": "DEVLANE_FAILURE"}, separators=(",", ":")).encode("ascii")
+UNIT_FAILURE_SUBREASONS = frozenset((
+    "report-missing", "adapter-failed", "filter-refused", "vitest-failed",
+))
+
+
+def _control_failure(stage, subreason=None):
+    record = {"kind": "control", "stage": stage, "status": "fail", "code": "DEVLANE_FAILURE"}
+    if subreason is not None:
+        if stage != "unit" or subreason not in UNIT_FAILURE_SUBREASONS:
+            raise ValueError("invalid unit failure subreason")
+        record["subreason"] = subreason
+    return json.dumps(record, separators=(",", ":")).encode("ascii")
+
+
+def _filter_failure_summary():
+    return output_filter._ascii_json({
+        "kind": "control", "stage": "unit", "status": "fail", "code": "DEVLANE_FAILURE",
+        "subreason": "filter-refused",
+    })
 
 
 def _adapter_lines(output, result, stage, *, rule):
@@ -1143,16 +1159,17 @@ def _adapter_lines(output, result, stage, *, rule):
     its two defined statuses, left a complete newline-terminated regular file, and its
     status must agree with the records it wrote. Anything else is one fixed failure.
     """
+    failure = _control_failure(stage, "adapter-failed") if stage == "unit" else _control_failure(stage)
     try:
         if result not in (0, 1) or not os.path.lexists(output):
-            return [_control_failure(stage)]
+            return [failure]
         payload = _read_regular(output, output_filter.MAX_RAW_CAPTURE_BYTES)
         if payload and not payload.endswith(b"\n"):
-            return [_control_failure(stage)]
+            return [failure]
         lines = payload.splitlines()
         parsed = [bundle.strict_json(line, output_filter.MAX_RAW_RECORD_BYTES) for line in lines]
         if any(type(item) is not dict for item in parsed):
-            return [_control_failure(stage)]
+            return [failure]
         control_failed = any(item.get("kind") == "control" and item.get("status") == "fail" for item in parsed)
         if rule == "tests":
             """Rust: status 1 means at least one failing test record; 0 means no records at all."""
@@ -1161,10 +1178,12 @@ def _adapter_lines(output, result, stage, *, rule):
             """Node adapters: status 1 means a fixed control failure; otherwise none may appear."""
             consistent = (result == 1) == control_failed
         if not consistent:
-            return [_control_failure(stage)]
+            return [failure]
+        if control_failed:
+            return [failure]
         return lines
     except (SupervisorRefusal, bundle.Refusal, OSError):
-        return [_control_failure(stage)]
+        return [failure]
 
 
 def _adapter_records(root, profile, manifest, outcomes, tools, adapter_results=None):
@@ -1173,8 +1192,12 @@ def _adapter_records(root, profile, manifest, outcomes, tools, adapter_results=N
     if profile == "core-rust":
         output = root / "scratch/reports/rust-matrix.jsonl"
         result = adapter_results.get("rust_matrix", 125)
+        failure_subreason = "adapter-failed"
         try:
-            if result not in (0, 1) or not os.path.lexists(output):
+            if not os.path.lexists(output):
+                failure_subreason = "report-missing"
+                _refuse("rust-matrix-report-unavailable")
+            if result not in (0, 1):
                 _refuse("rust-matrix-report-unavailable")
             payload = _read_regular(output, output_filter.MAX_RAW_CAPTURE_BYTES)
             if payload and not payload.endswith(b"\n"):
@@ -1197,10 +1220,14 @@ def _adapter_records(root, profile, manifest, outcomes, tools, adapter_results=N
                          for record in records)
             if (result == 0) == failed:
                 _refuse("rust-matrix-status-mismatch")
+            for record in records:
+                if (record.get("kind") == "control" and record.get("stage") == "unit"
+                        and record.get("status") == "fail" and "subreason" not in record):
+                    record["subreason"] = "adapter-failed"
             records = [json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
                        for record in records]
         except (SupervisorRefusal, bundle.Refusal, OSError, KeyError, TypeError):
-            records = [_control_failure("unit")]
+            records = [_control_failure("unit", failure_subreason)]
     if profile == "core-node":
         typescript_report = root / "scratch/reports/typescript.jsonl"
         if adapter_results.get("typescript") == 0 and os.path.lexists(typescript_report):
@@ -1223,9 +1250,13 @@ def _adapter_records(root, profile, manifest, outcomes, tools, adapter_results=N
                 "/scratch/reports/vitest.json", "/scratch/reports/adapter.jsonl",
             ]
             result = _run_control_adapter(root, command, "unit", tools, "adapter-run.log", timeout=30)
-            records.extend(_adapter_lines(output, result, "unit", rule="node"))
+            unit_records = _adapter_lines(output, result, "unit", rule="node")
+            records.extend(unit_records)
+            if (any(stage == "unit" and code != 0 for stage, code in outcomes)
+                    and not any(b'"kind":"control"' in record for record in unit_records)):
+                records.append(_control_failure("unit", "vitest-failed"))
         else:
-            records.append(_control_failure("unit"))
+            records.append(_control_failure("unit", "report-missing"))
         if manifest["frames"]:
             output = root / "scratch/reports/playwright.jsonl"
             if os.path.lexists(output):
@@ -1238,7 +1269,7 @@ def _adapter_records(root, profile, manifest, outcomes, tools, adapter_results=N
             result = _run_control_adapter(root, command, "browser", tools, "browser-adapter.log", timeout=30)
             records.extend(_adapter_lines(output, result, "browser", rule="node"))
     for stage, code in outcomes:
-        if code != 0:
+        if code != 0 and not (profile == "core-node" and stage == "unit"):
             records.append(_control_failure(stage))
     return records
 
@@ -1869,9 +1900,7 @@ class Service:
                 filter_failed = False
             except output_filter.FilterRefusal:
                 filter_failed = True
-                self.summary = output_filter._ascii_json({
-                    "kind": "control", "stage": "unit", "status": "fail", "code": "DEVLANE_FAILURE",
-                })
+                self.summary = _filter_failure_summary()
             self.execution_done = True
             status = "pass" if result == 0 and not filter_failed and not _summary_failed(self.summary) else "fail"
             catalogs = {
@@ -1934,9 +1963,7 @@ class Service:
             self.summary = output_filter.filter_records(records, allowlists, self.manifest["frames"].values())
         except output_filter.FilterRefusal:
             filter_failed = True
-            self.summary = output_filter._ascii_json({
-                "kind": "control", "stage": "unit", "status": "fail", "code": "DEVLANE_FAILURE",
-            })
+            self.summary = _filter_failure_summary()
         self.execution_done = True
         status = "pass" if all(code == 0 for _, code in outcomes) and not filter_failed and not _summary_failed(self.summary) else "fail"
         catalogs = {

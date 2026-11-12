@@ -23,9 +23,12 @@ RECORD_FIELDS = {
     "diagnostic": frozenset(("kind", "stage", "code", "file", "line", "level")),
     "test": frozenset(("kind", "stage", "test")),
     "frame": frozenset(("kind", "frame", "status")),
-    "control": frozenset(("kind", "stage", "status", "code")),
+    "control": frozenset(("kind", "stage", "status", "code", "subreason")),
     "coverage": frozenset(("kind", "stage", "suite", "total", "passed", "failed", "ignored")),
 }
+UNIT_FAILURE_SUBREASONS = frozenset((
+    "report-missing", "adapter-failed", "filter-refused", "vitest-failed",
+))
 
 
 class FilterRefusal(ValueError):
@@ -177,11 +180,18 @@ def _normalize(record, allowlists):
     code = record.get("code")
     if stage not in allowlists["stages"] or status not in STATUS:
         _reject("control-identity")
+    subreason = record.get("subreason")
+    if "subreason" in record and (
+            stage != "unit" or status != "fail" or type(subreason) is not str
+            or subreason not in UNIT_FAILURE_SUBREASONS):
+        _reject("control-subreason")
     result = {"kind": "control", "stage": stage, "status": status}
     if code is not None:
         if type(code) is not str or not CODE.fullmatch(code):
             _reject("control-code")
         result["code"] = code if code in allowlists["codes"] else "DEVLANE_FAILURE"
+    if "subreason" in record:
+        result["subreason"] = subreason
     return result
 
 

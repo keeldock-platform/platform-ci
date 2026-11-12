@@ -75,6 +75,9 @@ PUBLIC_FILE_ID = re.compile(r"file_[0-9]{4,6}\Z")
 PUBLIC_TEST_ID = re.compile(r"case_[0-9]{4,6}\Z")
 PUBLIC_SUITE_ID = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 PUBLIC_FRAME_ID = re.compile(r"frame_[0-9]{4,6}\Z")
+PUBLIC_UNIT_FAILURE_SUBREASONS = frozenset((
+    "report-missing", "adapter-failed", "filter-refused", "vitest-failed",
+))
 RUNNER_HOME = chr(47) + "home" + chr(47) + "runner"
 TEMP = RUNNER_HOME + "/work/_temp"
 HOSTED_TOOL_CACHE = "/opt/hostedtoolcache/node/24.22.1/x64"
@@ -413,7 +416,12 @@ def _record_ok(normalized):
                     or any(type(record.get(name)) is not int for name in ("total", "passed", "failed", "ignored"))):
                 return False
         elif kind == "control":
-            if record.get("code") not in (None, *PUBLIC_CODES):
+            if (set(record) - {"kind", "stage", "status", "code", "subreason"}
+                    or record.get("code") not in (None, *PUBLIC_CODES)
+                    or "subreason" in record and (
+                        record.get("stage") != "unit" or record.get("status") != "fail"
+                        or type(record.get("subreason")) is not str
+                        or record.get("subreason") not in PUBLIC_UNIT_FAILURE_SUBREASONS)):
                 return False
         else:
             return False

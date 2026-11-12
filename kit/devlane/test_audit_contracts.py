@@ -803,6 +803,21 @@ class ControlAuditorMutationTests(unittest.TestCase):
         result = control_audit.validate_jobs(_control_jobs(), self.identity)
         self.assertEqual(len(result), 18)
 
+    def test_unit_failure_subreason_is_audited_as_a_fixed_public_enum(self):
+        accepted = '{"code":"DEVLANE_FAILURE","kind":"control","stage":"unit","status":"fail","subreason":"filter-refused"}'
+        self.assertTrue(audit._record_ok(accepted))
+        audit.validate_summary_records([accepted], "core-node")
+        for changed in (
+            accepted.replace("filter-refused", "private-filter-error"),
+            accepted.replace('"stage":"unit"', '"stage":"typecheck"'),
+            accepted.replace('"status":"fail"', '"status":"pass"'),
+            accepted.replace('"subreason":"filter-refused"', '"subreason":"filter-refused","detail":"private"'),
+        ):
+            with self.subTest(changed=changed):
+                self.assertFalse(audit._record_ok(changed))
+                with self.assertRaises(audit.AuditRefusal):
+                    audit.validate_summary_records([changed], "core-node")
+
     def test_control_graph_mutations_are_rejected(self):
         jobs = _control_jobs()
         with self.assertRaises(control_audit.ControlAuditRefusal):

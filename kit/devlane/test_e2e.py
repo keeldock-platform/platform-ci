@@ -801,18 +801,23 @@ const names = Object.keys(process.env);
 if (names.includes('DEVLANE_DECRYPT_KEY') || names.some((name) => name.startsWith('GITHUB_') || name.startsWith('RUNNER_') || name === 'SYNTHETIC_KEY_CANARY' || name.startsWith('ACTIONS_'))) throw new Error('environment-boundary');
 if (Object.values(process.env).some((value) => String(value).includes(KEY_HEX) || String(value).includes(KEY_TEXT))) throw new Error('environment-value-boundary');
 if (process.argv.some((argument) => argument.includes(KEY_TEXT) || argument.includes(KEY_HEX))) throw new Error('argument-boundary');
-for (const name of fs.readdirSync('/proc/self/fd')) {
-  const fd = Number(name);
-  if (fd <= 2) continue;
-  try { if (fs.readlinkSync(`/proc/self/fd/${fd}`).startsWith('socket:[')) throw new Error('descriptor'); }
-  catch (error) { if (error?.message === 'descriptor') throw error; }
+if (process.platform === 'linux') {
+  for (const name of fs.readdirSync('/proc/self/fd')) {
+    const fd = Number(name);
+    if (fd <= 2) continue;
+    try { if (fs.readlinkSync(`/proc/self/fd/${fd}`).startsWith('socket:[')) throw new Error('descriptor'); }
+    catch (error) { if (error?.message === 'descriptor') throw error; }
+  }
+  const runnerHome = '/proc/1/root/ho' + 'me/runner';
+  if (fs.existsSync(runnerHome)) throw new Error('host-path-boundary');
+  const environ = fs.readFileSync('/proc/self/environ', 'utf8');
+  if (environ.includes(KEY_HEX) || environ.includes('DEVLANE_DECRYPT_KEY')) throw new Error('environ-boundary');
+  const visible = fs.readdirSync('/proc').filter((name) => /^[0-9]+$/.test(name));
+  if (visible.length > 64) throw new Error('process-visibility-boundary');
 }
-const runnerHome = '/proc/1/root/ho' + 'me/runner';
-for (const forbidden of ['/ho' + 'me/runner', '/run/docker.sock', '/var/run/docker.sock', runnerHome]) {
+for (const forbidden of ['/ho' + 'me/runner', '/run/docker.sock', '/var/run/docker.sock']) {
   if (fs.existsSync(forbidden)) throw new Error('host-path-boundary');
 }
-const environ = fs.readFileSync('/proc/self/environ', 'utf8');
-if (environ.includes(KEY_HEX) || environ.includes('DEVLANE_DECRYPT_KEY')) throw new Error('environ-boundary');
 function walk(directory, depth) {
   if (depth > 6) return;
   let entries = [];
@@ -828,8 +833,6 @@ function walk(directory, depth) {
   }
 }
 for (const root of ['/trusted', '/workspace/source', '/tmp', '/devlane-home', '/scratch/tmp', '/scratch/reports']) walk(root, 0);
-const visible = fs.readdirSync('/proc').filter((name) => /^[0-9]+$/.test(name));
-if (visible.length > 64) throw new Error('process-visibility-boundary');
 '''.replace("__KEY_CANARY__", json.dumps(KEY_CANARY.decode("ascii"))).replace("__KEY_BYTES__", json.dumps(list(KEY_BYTES)))
 
 
