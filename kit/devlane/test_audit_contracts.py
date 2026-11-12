@@ -175,9 +175,9 @@ def _render_log(job_key, identity=None, *, records=(), kind="encrypted", skip=("
     return "".join(stamp + line + "\n" for line in lines).encode("utf-8")
 
 
-def _render_real_runner_encrypted_log(identity):
+def _render_real_runner_encrypted_log(identity, job_key=audit.RUN_JOB):
     grammar = audit._Grammar(
-        ".github/workflows/devlane-encrypted.yml", audit.RUN_JOB, identity, "encrypted",
+        ".github/workflows/devlane-encrypted.yml", job_key, identity, "encrypted",
     )
     marker = audit.LOG_MARKER
     lines = ["Current runner version: '2.338.2'"]
@@ -197,11 +197,17 @@ def _render_real_runner_encrypted_log(identity):
         "Included Software: %s/blob/ubuntu24/20261101.360/images/ubuntu/Ubuntu2404-Readme.md" % runner_images,
         "Image Release: %s/releases/tag/ubuntu24%%2F20261101.360" % runner_images,
     ])
-    group("GITHUB_TOKEN Permissions", ["Metadata: read"])
-    lines.extend((
-        "Secret source: Actions", "Deployment environment: devlane-decrypt", "Cache mode: write",
-        "Prepare workflow directory", "Prepare all required actions", "Getting action download info",
-    ))
+    permissions = ["Metadata: read"]
+    if job_key == audit.AUDIT_JOB:
+        permissions = ["Actions: read", "Checks: read", "Metadata: read"]
+    group("GITHUB_TOKEN Permissions", permissions)
+    lines.append("Secret source: Actions")
+    if job_key == audit.RUN_JOB:
+        lines.append("Deployment environment: devlane-decrypt")
+    lines.extend(("Cache mode: write", "Prepare workflow directory", "Prepare all required actions"))
+    if any((step["uses"] or "") and not (step["uses"] or "").startswith("./")
+           for step in grammar.steps):
+        lines.append("Getting action download info")
     seen = set()
     for step in grammar.steps:
         uses = step["uses"] or ""
@@ -211,16 +217,7 @@ def _render_real_runner_encrypted_log(identity):
             if repository not in seen:
                 seen.add(repository)
                 lines.append("Download action repository '%s' (SHA:%s)" % (repository, revision))
-    inputs = {
-        "profile": identity["profile"], "control_run_id": identity["control_run_id"],
-        "wave_id": identity["wave_id"], "bundle_id": identity["bundle_id"],
-        "bundle_asset_id": "111", "bundle_sha256": "c" * 64, "bundle_size": "4096",
-        "projection_asset_id": "222", "projection_sha256": "d" * 64, "projection_size": "512",
-        "expires": "2000000000", "cache_baseline_sha256": identity["cache_baseline_sha256"],
-    }
-    lines.extend([marker + "[group] Inputs"])
-    lines.extend("  %s: %s" % (key, value) for key, value in inputs.items())
-    lines.extend((marker + "[endgroup]", "Complete job name: " + audit.RUN_JOB))
+    lines.append("Complete job name: " + job_key)
 
     for step in grammar.steps:
         if step["name"] == "Install pinned Rust toolchain":
@@ -424,6 +421,96 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         with self.assertRaises(audit.AuditRefusal):
             audit.validate_job_log_surface(log.replace(b"\x1b[36;1m", b"\x1b[31m", 1),
                                            audit.RUN_JOB, IDENTITY)
+
+    def test_real_encrypted_rehearsal_logs_and_two_job_graph_match_github_output(self):
+        fixtures = Path(__file__).resolve().parent / "fixtures"
+        identity = json.loads((fixtures / "encrypted-run-43284558151-identity.json").read_text(
+            encoding="utf-8"))
+        run_log = bytes.fromhex((fixtures / "encrypted-run-43284558151.log.hex").read_text(
+            encoding="ascii"))
+        audit_log = bytes.fromhex((fixtures / "encrypted-audit-43284558151.log.hex").read_text(
+            encoding="ascii"))
+        run_result = audit.validate_job_log_surface(run_log, audit.RUN_JOB, identity, completed=True)
+        self.assertEqual(run_result["records"], [])
+        audit.validate_dispatch_marker(run_log, identity)
+        stage_diagnostic_log = run_log.replace(
+            b"devlane_supervisor_refusal=network-probe-command-failed\n",
+            b"network_probe_refusal=probe-stage-failed\n"
+            b"devlane_supervisor_refusal=network-probe-stage-failed\n",
+            1,
+        )
+        audit.validate_job_log_surface(stage_diagnostic_log, audit.RUN_JOB, identity, completed=True)
+
+        run_jobs = json.loads(bytes.fromhex(
+            (fixtures / "encrypted-run-43284558151-jobs.json.hex").read_text(
+                encoding="ascii"),
+        ).decode("utf-8"))["jobs"]
+        jobs, audit_passed = audit.validate_terminal_job_contract(run_jobs, identity, "core-node")
+        self.assertFalse(audit_passed)
+        run_job = jobs[audit.RUN_JOB]
+        audit_job = jobs[audit.AUDIT_JOB]
+        step_by_name = {step["name"]: step for step in run_job["steps"]}
+        self.assertEqual(run_job["conclusion"], "failure")
+        self.assertEqual(step_by_name["Probe isolation before decryption"]["conclusion"], "failure")
+        self.assertEqual(step_by_name["Decrypt authenticated bundle"]["conclusion"], "skipped")
+        self.assertEqual(step_by_name["Execute offline profile and filter public summary"]["conclusion"], "skipped")
+        self.assertEqual(step_by_name["Shred runner-local workspace"]["conclusion"], "success")
+        self.assertEqual(audit_job["conclusion"], "failure")
+        self.assertEqual(audit_job["steps"][-2]["conclusion"], "failure")
+        inconsistent_audit_jobs = copy.deepcopy(run_jobs)
+        inconsistent_audit_jobs[1]["conclusion"] = "success"
+        with self.assertRaises(audit.AuditRefusal):
+            audit.validate_terminal_job_contract(inconsistent_audit_jobs, identity, "core-node")
+
+        raw_audit = audit_log.decode("utf-8-sig")
+        for sequence in audit.ANSI_SGR:
+            raw_audit = raw_audit.replace(sequence.decode("ascii"), "")
+        audit_lines = [audit.TIME_PREFIX.sub("", line, count=1).rstrip() for line in raw_audit.splitlines()]
+        workflow_path = audit.REPOSITORY_ROOT / audit.LEGACY_ENCRYPTED_WORKFLOW_PATH
+        grammar = audit._Grammar(workflow_path, audit.AUDIT_JOB, identity, "encrypted")
+        _canonical, position = audit._hosted_preamble(
+            audit_lines, grammar, audit.AUDIT_JOB, identity, str(workflow_path),
+        )
+        self.assertTrue(audit_lines[position].startswith(audit.LOG_MARKER + "[group]Run "))
+        with self.assertRaises(audit.AuditRefusal):
+            audit.validate_job_log_surface(audit_log, audit.AUDIT_JOB, identity, completed=True)
+
+        success_log = _render_real_runner_encrypted_log(IDENTITY)
+        success_audit_log = _render_real_runner_encrypted_log(IDENTITY, job_key=audit.AUDIT_JOB)
+        audit.validate_job_log_surface(success_log, audit.RUN_JOB, IDENTITY, completed=True)
+        audit.validate_job_log_surface(success_audit_log, audit.AUDIT_JOB, IDENTITY, completed=True)
+        success_jobs = _encrypted_jobs()
+        success_jobs[1]["status"] = "completed"
+        success_jobs[1]["conclusion"] = "success"
+        success_jobs[1]["steps"][-2].update({"status": "completed", "conclusion": "success"})
+        success_jobs[1]["steps"][-1].update({"status": "completed", "conclusion": "success"})
+        _success_by_name, success_audit_passed = audit.validate_terminal_job_contract(
+            success_jobs, IDENTITY, "core-node",
+        )
+        self.assertTrue(success_audit_passed)
+
+        for label, changed in (
+                ("free text", run_log.replace(b"devlane_swap=disabled",
+                                               b"devlane_swap=disabled\nfree text injected", 1)),
+                ("path", run_log.replace(
+                    b"devlane_swap=disabled",
+                    b"devlane_swap=disabled\n" + bytes((47,)).join(
+                        (b"home", b"runner", b"work", b"foreign", b"private"),
+                    ), 1)),
+                ("unknown escape", run_log.replace(b"devlane_swap=disabled",
+                                                    b"devlane_swap=disabled\x1b[2J", 1)),
+                ("wrong process exit code", run_log.replace(
+                    b"Process completed with exit code 2.",
+                    b"Process completed with exit code 3.", 1)),
+                ("missing process exit code", run_log.replace(
+                    audit.LOG_MARKER.encode("ascii") + b"[error]Process completed with exit code 2.\n",
+                    b"", 1)),
+                ("mismatched probe diagnosis", run_log.replace(
+                    b"devlane_supervisor_refusal=network-probe-command-failed",
+                    b"network_probe_refusal=probe-command-failed\n"
+                    b"devlane_supervisor_refusal=network-probe-output-invalid", 1))):
+            with self.subTest(label=label), self.assertRaises(audit.AuditRefusal):
+                audit.validate_job_log_surface(changed, audit.RUN_JOB, identity, completed=True)
 
     def test_real_github_synthetic_log_fixture_is_accepted_and_closed(self):
         fixture = Path(__file__).resolve().parent / "fixtures/control-synthetic-43245798187.log.hex"
@@ -970,13 +1057,19 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
     def test_network_probe_refusals_are_bounded_and_auditor_allowlisted(self):
         root = Path(__file__).resolve().parents[2]
         grammar = audit._Grammar(
-            root / ".github/workflows/devlane-synthetic.yml", "devlane-synthetic",
-            {"run_id": "12345", "control_sha": SHA}, "synthetic",
+            root / ".github/workflows/devlane-encrypted.yml", audit.RUN_JOB, IDENTITY, "encrypted",
         )
         for code in sorted(audit.network_probe.REFUSAL_CODES):
             supervisor_line = "devlane_supervisor_refusal=network-probe-refusal:" + code
-            self.assertTrue(audit.REFUSAL_LINE.fullmatch(supervisor_line))
-            self.assertTrue(audit.REFUSAL_LINE.fullmatch("network_probe_refusal=" + code))
+            self.assertTrue(grammar.step_output_ok(
+                "Probe isolation before decryption", supervisor_line, {},
+            ))
+            self.assertTrue(grammar.step_output_ok(
+                "Probe isolation before decryption", "network_probe_refusal=" + code, {},
+            ))
+            self.assertFalse(audit.REFUSAL_LINE.fullmatch("network_probe_refusal=" + code))
+            self.assertFalse(grammar.step_output_ok("Prepare hosted Linux isolation state",
+                                                    "network_probe_refusal=" + code, {}))
         valid = (
             "devlane_production_e2e=refused stage=variant-supervisor-probe-check "
             "exception=network-probe-refusal:network-address-unexpected"
@@ -992,15 +1085,16 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         ):
             with self.subTest(invalid=invalid):
                 self.assertFalse(diagnostic_contract.public_preparation_diagnostic(invalid))
-                self.assertFalse(audit.REFUSAL_LINE.fullmatch(invalid))
+                self.assertFalse(grammar.step_output_ok("Probe isolation before decryption", invalid, {}))
         self.assertFalse(audit.REFUSAL_LINE.fullmatch("network_probe_refusal=private-path"))
 
         structure_refusal = "network-structure-invalid:netlink-message-port-id"
-        self.assertTrue(audit.REFUSAL_LINE.fullmatch(
-            "network_probe_refusal=" + structure_refusal,
+        self.assertTrue(grammar.step_output_ok(
+            "Probe isolation before decryption", "network_probe_refusal=" + structure_refusal, {},
         ))
-        self.assertTrue(audit.REFUSAL_LINE.fullmatch(
-            "devlane_supervisor_refusal=network-probe-refusal:" + structure_refusal,
+        self.assertTrue(grammar.step_output_ok(
+            "Probe isolation before decryption", "devlane_supervisor_refusal=network-probe-refusal:"
+            + structure_refusal, {},
         ))
         structure_line = (
             "devlane_production_e2e=refused stage=variant-supervisor-probe-check "
@@ -1024,9 +1118,12 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             "exception=network-probe-refusal:" + route_refusal
         )
         self.assertTrue(diagnostic_contract.public_preparation_diagnostic(route_line))
-        self.assertTrue(audit.REFUSAL_LINE.fullmatch("network_probe_refusal=" + route_refusal))
-        self.assertTrue(audit.REFUSAL_LINE.fullmatch(
-            "devlane_supervisor_refusal=network-probe-refusal:" + route_refusal,
+        self.assertTrue(grammar.step_output_ok(
+            "Probe isolation before decryption", "network_probe_refusal=" + route_refusal, {},
+        ))
+        self.assertTrue(grammar.step_output_ok(
+            "Probe isolation before decryption", "devlane_supervisor_refusal=network-probe-refusal:"
+            + route_refusal, {},
         ))
         for malformed in (
                 route_line.replace("oif=lo", "oif=private/path"),

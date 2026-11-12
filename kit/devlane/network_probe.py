@@ -52,6 +52,8 @@ REFUSAL_CODES = frozenset((
     "positive-control-error", "positive-control-unavailable", "probe-evidence-shape",
     "probe-failed", "probe-identity", "probe-not-unprivileged", "probe-tool-failed",
     "probe-tool-invalid", "probe-tool-unavailable", "proxy-environment",
+    "probe-command-failed", "probe-command-timeout", "probe-command-unavailable",
+    "probe-output-invalid", "probe-stage-failed", "network-namespace-changed",
     *("network-structure-invalid:" + suffix for suffix in NETWORK_STRUCTURE_INVALID_SUFFIXES),
 ))
 MAX_REFUSAL_OUTPUT_BYTES = 512

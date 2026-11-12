@@ -53,6 +53,7 @@ MAX_SYNTHETIC_DIAGNOSTIC_REPORTS = 64
 MAX_SYNTHETIC_DIAGNOSTIC_FILE_BYTES = 4 * 1024 * 1024
 MAX_BROWSER_CGROUP_VALUE_BYTES = 1024
 MAX_BROWSER_FAILURE_DIAGNOSTIC_BYTES = 8 * 1024
+MAX_NETWORK_PROBE_COPY_BYTES = 256 * 1024
 CHROMIUM_RENDERER_FAILURE = re.compile(
     rb"(?:renderer|render) process.{0,160}(?:exit|crash|gone|signal|terminat|kill)|"
     rb"(?:exit|crash|gone|signal|terminat|kill).{0,160}(?:renderer|render) process",
@@ -126,6 +127,7 @@ REFUSAL_CODES = frozenset((
     "dispatch-context-invalid", "dispatch-context-unavailable", "execution-cancelled", "execution-order",
     "firewall-unavailable", "input-size", "input-unavailable", "key-invalid", "linux-root-required",
     "linux-runner-required", "mount-source-unavailable", "network-namespace-changed",
+    "network-probe-stage-failed",
     "network-namespace-not-isolated", "node-tool-layout",
     "node-snapshot-base-invalid", "node-snapshot-base-owner", "node-snapshot-base-unavailable",
     "node-snapshot-content-changed", "node-snapshot-content-invalid", "node-snapshot-deadline",
@@ -170,14 +172,14 @@ NETWORK_PROBE_REFUSAL_CODES = frozenset(
     "network-probe-refusal:" + code for code in network_probe.REFUSAL_CODES
 )
 NETWORK_PROBE_DIAGNOSTIC_CODES = NETWORK_PROBE_REFUSAL_CODES | frozenset((
-    "network-probe-command-failed", "network-probe-output-invalid",
+    "network-probe-command-failed", "network-probe-output-invalid", "network-probe-stage-failed",
 ))
 REFUSAL_CODES |= NETWORK_PROBE_DIAGNOSTIC_CODES
 REFUSAL_CODES |= frozenset("cleanup-incomplete:" + reason for reason in CLEANUP_SUBREASONS)
 STARTUP_REFUSAL_CODES = frozenset((
     "deadline-file-invalid", "dispatch-context-invalid", "dispatch-context-unavailable",
     "firewall-unavailable", "input-size", "input-unavailable", "linux-root-required",
-    "linux-runner-required", "mount-source-unavailable", "node-tool-layout",
+    "linux-runner-required", "mount-source-unavailable", "network-probe-stage-failed", "node-tool-layout",
     "node-snapshot-base-invalid", "node-snapshot-base-owner", "node-snapshot-base-unavailable",
     "node-snapshot-content-changed", "node-snapshot-content-invalid", "node-snapshot-deadline",
     "node-snapshot-id", "node-snapshot-layout", "node-snapshot-limit", "node-snapshot-link-invalid",
@@ -214,7 +216,7 @@ STARTUP_REFUSAL_CODES = frozenset((
 ))
 STARTUP_DIAGNOSTIC_PHASES = frozenset((
     "construct", "deadline", "projection", "linux", "swap", "priv-mount", "firewall",
-    "root-mount", "bundle-bind", "tools", "profile", "versions", "socket", "listen",
+    "root-mount", "probe-stage", "bundle-bind", "tools", "profile", "versions", "socket", "listen",
     "ready", "serve", "parent",
 ))
 _STARTUP_EXCEPTION_LABELS = {
@@ -274,6 +276,17 @@ class SemverCgroupJob:
 
 def _refuse(code):
     raise SupervisorRefusal(code)
+
+
+def _report_network_probe_refusal(message):
+    """Emit a fixed probe result only; never copy arbitrary child output into the job log."""
+    try:
+        payload = ("network_probe_refusal=" + message + "\n").encode("ascii")
+        if network_probe.refusal_code_from_result(2, b"", payload) is None:
+            message = "probe-failed"
+    except (AttributeError, UnicodeError, TypeError):
+        message = "probe-failed"
+    print("network_probe_refusal=" + message, file=sys.stderr)
 
 
 def _bounded_timeout(timeout, *, cleanup=False):
@@ -752,6 +765,73 @@ def _mount_tmpfs(destination, size, mode="0700", options=""):
 def _mount_fs(argv, destination):
     _run(argv)
     MOUNT_TARGETS.append(Path(destination))
+
+
+def _stage_network_probe(root, source=None):
+    """Copy the trusted probe into the chroot with traversal and read bits for uid 65534."""
+    source = Path(network_probe.__file__ if source is None else source)
+    destination = Path(root) / "control/network_probe.py"
+    descriptor = None
+    staged = None
+    destination_created = False
+    try:
+        _ensure_directory(destination.parent, 0o755)
+        source = source.resolve(strict=True)
+        descriptor = os.open(
+            str(source), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_NETWORK_PROBE_COPY_BYTES:
+            _report_network_probe_refusal("probe-stage-failed")
+            _refuse("network-probe-stage-failed")
+        payload = bytearray()
+        while len(payload) <= MAX_NETWORK_PROBE_COPY_BYTES:
+            chunk = os.read(descriptor, min(64 * 1024, MAX_NETWORK_PROBE_COPY_BYTES + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        if len(payload) > MAX_NETWORK_PROBE_COPY_BYTES:
+            _report_network_probe_refusal("probe-stage-failed")
+            _refuse("network-probe-stage-failed")
+        os.close(descriptor)
+        descriptor = None
+        staged = os.open(
+            str(destination), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), 0o444,
+        )
+        destination_created = True
+        view = memoryview(payload)
+        while view:
+            written = os.write(staged, view)
+            if written <= 0:
+                raise OSError("network-probe-stage-write")
+            view = view[written:]
+        os.fchmod(staged, 0o444)
+        os.fsync(staged)
+        os.close(staged)
+        staged = None
+        return destination
+    except SupervisorRefusal:
+        raise
+    except OSError:
+        if staged is not None:
+            try:
+                os.close(staged)
+            except OSError:
+                pass
+        if destination_created:
+            try:
+                destination.unlink()
+            except OSError:
+                pass
+        _report_network_probe_refusal("probe-stage-failed")
+        _refuse("network-probe-stage-failed")
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _make_worker_devices(dev):
@@ -1956,6 +2036,8 @@ class Service:
         _configure_firewall()
         self.startup_phase = "root-mount"
         _mount_minimal_root(self.root, self.workspace, self.prepared, self.workspace)
+        self.startup_phase = "probe-stage"
+        _stage_network_probe(self.root)
         self.startup_phase = "bundle-bind"
         _mount_bind(self.bundle_path, self.root / "control/bundle.enc", readonly=True)
         self.startup_phase = "tools"
@@ -2195,35 +2277,47 @@ class Service:
         try:
             firewall = network_probe.firewall_snapshot()
         except network_probe.ProbeRefusal:
+            _report_network_probe_refusal("firewall-unavailable")
             _refuse("firewall-unavailable")
         if firewall["netns_inode"] == self.host_net_inode:
+            _report_network_probe_refusal("network-namespace-not-isolated")
             _refuse("network-namespace-not-isolated")
         if self.probe_namespace_inode is not None and firewall["netns_inode"] != self.probe_namespace_inode:
+            _report_network_probe_refusal("network-namespace-changed")
             _refuse("network-namespace-changed")
         try:
             result = subprocess.run([
                 "/usr/sbin/chroot", str(self.root), "/usr/bin/setpriv",
                 "--reuid=%d" % WORKER_UID, "--regid=%d" % WORKER_GID,
                 "--clear-groups", "--no-new-privs", "--bounding-set=-all", "--",
-                "/usr/bin/python3", "-B", "-I", "-S", "/control/devlane/network_probe.py",
+                "/usr/bin/python3", "-B", "-I", "-S", "/control/network_probe.py",
                 "check", "--host-net-inode", str(self.host_net_inode),
             ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
                 timeout=_bounded_timeout(30), close_fds=True,
+                cwd=str(self.root),
                 env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C",
                      "PYTHONDONTWRITEBYTECODE": "1"},
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except subprocess.TimeoutExpired:
+            _report_network_probe_refusal("probe-command-timeout")
+            _refuse("network-probe-command-failed")
+        except OSError:
+            _report_network_probe_refusal("probe-command-unavailable")
             _refuse("network-probe-command-failed")
         if result.returncode != 0:
             refusal = network_probe.refusal_message_from_result(
                 result.returncode, result.stdout, result.stderr,
             )
             if refusal is not None:
+                _report_network_probe_refusal(refusal)
                 _refuse("network-probe-refusal:" + refusal)
+            _report_network_probe_refusal("probe-command-failed")
             _refuse("network-probe-command-failed")
         if result.stdout != b"network_probe=pass\n" or result.stderr:
+            _report_network_probe_refusal("probe-output-invalid")
             _refuse("network-probe-output-invalid")
         if os.stat("/proc/self/ns/net").st_ino != firewall["netns_inode"]:
+            _report_network_probe_refusal("network-namespace-changed")
             _refuse("network-namespace-changed")
         self.probe_namespace_inode = firewall["netns_inode"]
         return True

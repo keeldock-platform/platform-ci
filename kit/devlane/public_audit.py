@@ -28,6 +28,8 @@ ENCRYPTED_PROFILES = ("core-node", *RUST_PROFILES, "desktop")
 REPOSITORY = "keeldock-platform/platform-ci"
 REPOSITORY_ID = 1430960557
 WORKFLOW_PATH = ".github/workflows/devlane-encrypted.yml"
+LEGACY_ENCRYPTED_CONTROL_SHA = "fe3c58f903ad23006c4bda62a3945207f5f525ab"
+LEGACY_ENCRYPTED_WORKFLOW_PATH = "kit/devlane/fixtures/encrypted-workflow-43284558151.yml"
 RUN_JOB = "devlane-encrypted-run"
 DECRYPT_ENVIRONMENT = "devlane-decrypt"
 AUDIT_JOB = "devlane-encrypted-audit"
@@ -104,18 +106,14 @@ REFUSAL_LINE = re.compile(
     r"(?:(?:devlane_refusal|devlane_supervisor_refusal|dependency_preparation_refusal)"
     r"=(?:[a-z0-9-]{1,64}|node-snapshot-manifest-invalid:"
     r"(?:link-row-path|source-row-kind|manifest-open|manifest-metadata|manifest-race|"
-    r"manifest-missing|manifest-shape|manifest-digest|unlisted-site))|"
-    r"network_probe_refusal=(?:"
-    + "|".join(re.escape(code) for code in sorted(
-        network_probe.REFUSAL_CODES - {"network-route-unexpected"},
-    ))
-    + r"|network-route-unexpected(?: " + network_probe.ROUTE_DIAGNOSTIC_PATTERN + r")?)|"
-    r"devlane_supervisor_refusal=network-probe-refusal:(?:"
-    + "|".join(re.escape(code) for code in sorted(
-        network_probe.REFUSAL_CODES - {"network-route-unexpected"},
-    ))
-    + r"|network-route-unexpected(?: " + network_probe.ROUTE_DIAGNOSTIC_PATTERN + r")?))\Z"
+    r"manifest-missing|manifest-shape|manifest-digest|unlisted-site)))\Z"
 )
+NETWORK_PROBE_SUPERVISOR_PREFIX = "devlane_supervisor_refusal=network-probe-refusal:"
+NETWORK_PROBE_SUPERVISOR_CODES = {
+    "devlane_supervisor_refusal=network-probe-command-failed": "probe-command-failed",
+    "devlane_supervisor_refusal=network-probe-output-invalid": "probe-output-invalid",
+    "devlane_supervisor_refusal=network-probe-stage-failed": "probe-stage-failed",
+}
 def cache_line_patterns(key):
     """Output lines of the pinned cache actions, bound to the one key the step may use."""
     escaped = re.escape(key)
@@ -298,7 +296,9 @@ class _Grammar:
     def with_value_ok(self, step, key, value):
         if key == "token" and (step["uses"] or "").startswith("actions/setup-node@"):
             return value == "***"
-        if (step["uses"] or "").startswith("actions/cache/") and key in ("enableCrossOsArchive", "lookup-only"):
+        if ((step["uses"] or "").startswith("actions/cache/")
+                and key in ("enableCrossOsArchive", "lookup-only", "fail-on-cache-miss")
+                and key not in step["with"]):
             return value == "false"
         declared = step["with"].get(key)
         if declared is None:
@@ -376,6 +376,41 @@ class _Grammar:
         if (step_name == "Prepare hosted Linux isolation state" and self.kind == "encrypted"
                 and self.identity.get("profile") in RUST_PROFILES):
             exact = exact | {"devlane_cgroup_v2=ready"}
+        if line.startswith("network_probe_refusal="):
+            if step_name != "Probe isolation before decryption":
+                return False
+            try:
+                payload = (line + "\n").encode("ascii")
+            except UnicodeError:
+                return False
+            if network_probe.refusal_code_from_result(2, b"", payload) is None:
+                return False
+            public_counts["network_probe_refusal"] = public_counts.get("network_probe_refusal", 0) + 1
+            public_counts["network_probe_refusal_code"] = line[len("network_probe_refusal="):]
+            return public_counts["network_probe_refusal"] == 1
+        if line.startswith(NETWORK_PROBE_SUPERVISOR_PREFIX):
+            if step_name != "Probe isolation before decryption":
+                return False
+            message = line[len(NETWORK_PROBE_SUPERVISOR_PREFIX):]
+            try:
+                payload = ("network_probe_refusal=" + message + "\n").encode("ascii")
+            except UnicodeError:
+                return False
+            if network_probe.refusal_code_from_result(2, b"", payload) is None:
+                return False
+            public_counts["network_probe_supervisor_refusal"] = public_counts.get(
+                "network_probe_supervisor_refusal", 0,
+            ) + 1
+            public_counts["network_probe_supervisor_refusal_code"] = message
+            return public_counts["network_probe_supervisor_refusal"] == 1
+        if line in NETWORK_PROBE_SUPERVISOR_CODES:
+            if step_name != "Probe isolation before decryption":
+                return False
+            public_counts["network_probe_supervisor_refusal"] = public_counts.get(
+                "network_probe_supervisor_refusal", 0,
+            ) + 1
+            public_counts["network_probe_supervisor_refusal_code"] = NETWORK_PROBE_SUPERVISOR_CODES[line]
+            return public_counts["network_probe_supervisor_refusal"] == 1
         if line in exact:
             public_counts[line] = public_counts.get(line, 0) + 1
             return public_counts[line] == 1
@@ -541,7 +576,10 @@ def _hosted_preamble(lines, grammar, job_name, identity, workflow_path):
             not re.fullmatch(pattern, value)
             for pattern, value in zip(image_patterns, runner_image)):
         _refuse()
-    if group("GITHUB_TOKEN Permissions") != ["Metadata: read"]:
+    permissions = ["Metadata: read"]
+    if grammar.kind == "encrypted" and job_name == AUDIT_JOB:
+        permissions = ["Actions: read", "Checks: read", "Metadata: read"]
+    if group("GITHUB_TOKEN Permissions") != permissions:
         _refuse()
 
     canonical = [LOG_MARKER + "[section]Starting: Set up job"]
@@ -549,7 +587,7 @@ def _hosted_preamble(lines, grammar, job_name, identity, workflow_path):
             ("Runner Image Provisioner", provisioner),
             ("Operating System", operating_system),
             ("Runner Image", runner_image),
-            ("GITHUB_TOKEN Permissions", ["Metadata: read"])):
+            ("GITHUB_TOKEN Permissions", permissions)):
         canonical.append(LOG_MARKER + "[group]" + name)
         canonical.extend(value for value in values if not value.startswith("Worker ID:"))
         canonical.append(LOG_MARKER + "[endgroup]")
@@ -567,12 +605,14 @@ def _hosted_preamble(lines, grammar, job_name, identity, workflow_path):
             environment_seen = True
             canonical.append(environment)
 
-    fixed_preamble = (
+    fixed_preamble = [
         "Secret source: Actions",
         "Prepare workflow directory",
         "Prepare all required actions",
-        "Getting action download info",
-    )
+    ]
+    if any((step["uses"] or "") and not (step["uses"] or "").startswith("./")
+           for step in grammar.steps):
+        fixed_preamble.append("Getting action download info")
     maybe_environment()
     if take() != fixed_preamble[0]:
         _refuse()
@@ -624,53 +664,31 @@ def _hosted_preamble(lines, grammar, job_name, identity, workflow_path):
     elif expected_workflow is not None:
         _refuse()
 
+    maybe_environment()
     if grammar.kind == "synthetic":
         expected_inputs = {"control_wave_id": identity.get("wave_id")}
-    else:
-        expected_inputs = {
-            "profile": identity.get("profile"),
-            "control_run_id": identity.get("control_run_id"),
-            "wave_id": identity.get("wave_id"),
-            "bundle_id": identity.get("bundle_id"),
-            "bundle_asset_id": None,
-            "bundle_sha256": None,
-            "bundle_size": None,
-            "projection_asset_id": None,
-            "projection_sha256": None,
-            "projection_size": None,
-            "expires": None,
-            "cache_baseline_sha256": identity.get("cache_baseline_sha256"),
-        }
-    maybe_environment()
-    if take() != LOG_MARKER + "[group] Inputs":
+        if take() != LOG_MARKER + "[group] Inputs":
+            _refuse()
+        observed_inputs = {}
+        input_lines = []
+        while index < len(lines) and lines[index] != LOG_MARKER + "[endgroup]":
+            line = take()
+            if not line.startswith("  "):
+                _refuse()
+            key, separator, value = line[2:].partition(": ")
+            if not separator or key in observed_inputs or key not in expected_inputs:
+                _refuse()
+            if key != "control_wave_id" or value != str(expected_inputs[key]):
+                _refuse()
+            observed_inputs[key] = value
+            input_lines.append(line)
+        if take() != LOG_MARKER + "[endgroup]" or set(observed_inputs) != set(expected_inputs):
+            _refuse()
+        canonical.append(LOG_MARKER + "[group] Inputs")
+        canonical.extend(input_lines)
+        canonical.append(LOG_MARKER + "[endgroup]")
+    elif index < len(lines) and lines[index] == LOG_MARKER + "[group] Inputs":
         _refuse()
-    observed_inputs = {}
-    input_lines = []
-    while index < len(lines) and lines[index] != LOG_MARKER + "[endgroup]":
-        line = take()
-        if not line.startswith("  "):
-            _refuse()
-        key, separator, value = line[2:].partition(": ")
-        if not separator or key in observed_inputs or key not in expected_inputs:
-            _refuse()
-        expected = expected_inputs[key]
-        if expected is not None:
-            valid = value == str(expected)
-        elif key.endswith("_asset_id") or key.endswith("_size") or key == "expires":
-            valid = DECIMAL.fullmatch(value) is not None
-        elif key.endswith("_sha256"):
-            valid = SHA256.fullmatch(value) is not None
-        else:
-            valid = False
-        if not valid:
-            _refuse()
-        observed_inputs[key] = value
-        input_lines.append(line)
-    if take() != LOG_MARKER + "[endgroup]" or set(observed_inputs) != set(expected_inputs):
-        _refuse()
-    canonical.append(LOG_MARKER + "[group] Inputs")
-    canonical.extend(input_lines)
-    canonical.append(LOG_MARKER + "[endgroup]")
 
     maybe_environment()
     expected_job_name = ("devlane-synthetic / devlane-synthetic"
@@ -735,7 +753,8 @@ def _parse_hosted_step_block(block, step, grammar):
             uses = step["uses"] or ""
             implicit_input = (
                 key == "token" and uses.startswith("actions/setup-node@")
-                or key in ("enableCrossOsArchive", "lookup-only") and uses.startswith("actions/cache/")
+                or key in ("enableCrossOsArchive", "lookup-only", "fail-on-cache-miss")
+                and uses.startswith("actions/cache/")
             )
             if (key in observed_with or not implicit_input and key not in expected_with
                     or not grammar.with_value_ok(step, key, value)):
@@ -817,6 +836,10 @@ def _canonicalize_github_hosted_log(text, grammar, job_name, identity, workflow_
                 post_output.append(line)
                 index += 1
                 continue
+            if re.fullmatch(LOG_MARKER + r"\[error\]Process completed with exit code [0-9]+\.", line):
+                output.append(line)
+                index += 1
+                continue
             if line == LOG_MARKER + "[group]Environment details":
                 index += 1
                 env_details = []
@@ -887,6 +910,8 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         _refuse()
     kind = "synthetic" if workflow == "synthetic" else "encrypted"
     workflow_path = (".github/workflows/devlane-synthetic.yml" if kind == "synthetic"
+                     else str(REPOSITORY_ROOT / LEGACY_ENCRYPTED_WORKFLOW_PATH)
+                     if identity.get("control_sha") == LEGACY_ENCRYPTED_CONTROL_SHA
                      else ".github/workflows/devlane-encrypted.yml")
     job_key = job_name if kind == "encrypted" else "devlane-synthetic"
     grammar = _Grammar(workflow_path, job_key, identity, kind)
@@ -1011,8 +1036,17 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
                 mode = None
                 continue
             _refuse()
-        if re.fullmatch(r"\x23\x23\[error\]Process completed with exit code [0-9]+\.", normalized):
+        if normalized == LOG_MARKER + "[error]Process completed with exit code 2.":
+            if (step_name != "Probe isolation before decryption"
+                    or not (counts.get("network_probe_refusal")
+                            or counts.get("network_probe_supervisor_refusal"))):
+                _refuse()
+            counts["network_probe_failed_exit"] = counts.get("network_probe_failed_exit", 0) + 1
+            if counts["network_probe_failed_exit"] != 1:
+                _refuse()
             continue
+        if normalized.startswith(LOG_MARKER + "[error]"):
+            _refuse()
         if normalized.startswith("{"):
             if step_name != "Execute offline profile and filter public summary" or not _record_ok(normalized):
                 _refuse()
@@ -1031,7 +1065,19 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
             _refuse()
         validate_summary_records(records, profile)
     if kind == "encrypted" and job_name == RUN_JOB:
+        if (counts.get("network_probe_refusal_code") is not None
+                and counts.get("network_probe_supervisor_refusal_code") is not None
+                and counts["network_probe_refusal_code"] != counts["network_probe_supervisor_refusal_code"]):
+            _refuse()
         if counts.get("dispatch") != 1 or counts.get("permit") != 1:
+            _refuse()
+        probe_refusal_count = counts.get("network_probe_refusal", 0) + (
+            1 if counts.get("network_probe_supervisor_refusal")
+            and not counts.get("network_probe_refusal") else 0
+        )
+        if counts.get("network_cut_probe=pass", 0) + probe_refusal_count != 1:
+            _refuse()
+        if probe_refusal_count != counts.get("network_probe_failed_exit", 0):
             _refuse()
         cleanup_line = "cleanup_receipt=confirmed"
         if counts.get(cleanup_line) != 1 or (completed and counts.get(
@@ -1096,7 +1142,12 @@ def _steps(job):
     return [step for step in values if step.get("name") not in ("Set up job", "Complete job")]
 
 
-def _expected_step_names(profile):
+def _expected_step_names(profile, identity=None):
+    if (type(identity) is dict
+            and identity.get("control_sha") == LEGACY_ENCRYPTED_CONTROL_SHA
+            and profile in ("core-node", "core-rust")):
+        legacy = parse_workflow(REPOSITORY_ROOT / LEGACY_ENCRYPTED_WORKFLOW_PATH)
+        return [step["name"] for step in legacy[RUN_JOB]["steps"]]
     return list(STEP_NAMES)
 
 
@@ -1129,7 +1180,7 @@ def validate_job_contract(jobs, identity, profile):
             or audit_steps[1].get("status") != "in_progress" or audit_steps[1].get("conclusion") is not None):
         _refuse()
     steps = _steps(run_job)
-    expected_names = _expected_step_names(profile)
+    expected_names = _expected_step_names(profile, identity)
     if [step.get("name") for step in steps] != expected_names:
         _refuse()
     step_by_name = {step["name"]: step for step in steps}
@@ -1139,8 +1190,26 @@ def validate_job_contract(jobs, identity, profile):
     cleanup_step = step_by_name["Shred runner-local workspace"]
     if cleanup_step.get("status") != "completed" or cleanup_step.get("conclusion") != "success":
         _refuse()
+    probe_failure = step_by_name["Probe isolation before decryption"]
+    decrypt_step = step_by_name["Decrypt authenticated bundle"]
+    execute_step = step_by_name["Execute offline profile and filter public summary"]
+    failed_before_decrypt = (
+        run_job.get("conclusion") == "failure"
+        and probe_failure.get("status") == "completed" and probe_failure.get("conclusion") == "failure"
+        and decrypt_step.get("status") == "completed" and decrypt_step.get("conclusion") == "skipped"
+        and execute_step.get("status") == "completed" and execute_step.get("conclusion") == "skipped"
+    )
     cancelled = run_job["conclusion"] in ("cancelled", "timed_out")
     for name, step in step_by_name.items():
+        if failed_before_decrypt and name == "Probe isolation before decryption":
+            if step.get("status") != "completed" or step.get("conclusion") != "failure":
+                _refuse()
+            continue
+        if failed_before_decrypt and name in (
+                "Decrypt authenticated bundle", "Execute offline profile and filter public summary"):
+            if step.get("status") != "completed" or step.get("conclusion") != "skipped":
+                _refuse()
+            continue
         if ((skipped_tool_step is not None and name == skipped_tool_step)
                 or (skipped_desktop_dependency_step is not None and name == skipped_desktop_dependency_step)):
             if step.get("status") != "completed" or step.get("conclusion") != "skipped":
@@ -1156,7 +1225,7 @@ def validate_job_contract(jobs, identity, profile):
         _refuse()
     if run_job["conclusion"] in ("success", "failure"):
         expected_run_conclusion = (
-            "failure" if step_by_name["Execute offline profile and filter public summary"].get("conclusion") == "failure"
+            "failure" if failed_before_decrypt or execute_step.get("conclusion") == "failure"
             else "success"
         )
         if run_job.get("conclusion") != expected_run_conclusion:
@@ -1187,6 +1256,10 @@ def validate_terminal_job_contract(jobs, identity, profile):
     if audit_job.get("status") != "completed" or audit_job.get("conclusion") not in {
         "success", "failure", "cancelled", "timed_out",
     }:
+        _refuse()
+    if (audit_job["conclusion"] == "success"
+            and any(step.get("status") != "completed" or step.get("conclusion") != "success"
+                    for step in audit_steps)):
         _refuse()
     normalized = []
     for job in jobs:

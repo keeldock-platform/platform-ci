@@ -3075,6 +3075,15 @@ class RustMatrixRunnerTests(unittest.TestCase):
                     patch.object(supervisor.os, "stat", return_value=SimpleNamespace(st_ino=200)):
                 return service._verify_network_cut()
 
+        def verify_with_diagnostic(result=None, error=None):
+            output = io.StringIO()
+            with contextlib.redirect_stderr(output):
+                try:
+                    verify(result, error)
+                except supervisor.SupervisorRefusal as refusal:
+                    return refusal, output.getvalue()
+            self.fail("probe unexpectedly passed")
+
         self.assertTrue(verify(subprocess.CompletedProcess(
             ["network_probe.py"], 0, b"network_probe=pass\n", b"")))
         refusal = "network-probe-refusal:network-address-unexpected"
@@ -3088,9 +3097,17 @@ class RustMatrixRunnerTests(unittest.TestCase):
              "network-probe-output-invalid"),
         )
         for result, expected in cases:
-            with self.subTest(expected=expected), self.assertRaises(supervisor.SupervisorRefusal) as caught:
-                verify(result)
-            self.assertEqual(caught.exception.code, expected)
+            with self.subTest(expected=expected):
+                caught, diagnostic = verify_with_diagnostic(result)
+                self.assertEqual(caught.code, expected)
+                expected_probe_code = (
+                    "network_probe_refusal=network-address-unexpected\n"
+                    if expected == refusal else
+                    "network_probe_refusal=probe-output-invalid\n"
+                    if expected == "network-probe-output-invalid" else
+                    "network_probe_refusal=probe-command-failed\n"
+                )
+                self.assertEqual(diagnostic, expected_probe_code)
 
         route_detail = (
             "route[table=main,type=unicast,family=4,dst=0.0.0.0/0,"
@@ -3100,13 +3117,29 @@ class RustMatrixRunnerTests(unittest.TestCase):
             ["network_probe.py"], 2, b"",
             ("network_probe_refusal=network-route-unexpected " + route_detail + "\n").encode("ascii"),
         )
-        with self.assertRaises(supervisor.SupervisorRefusal) as caught:
-            verify(detailed)
-        self.assertEqual(caught.exception.code,
+        caught, diagnostic = verify_with_diagnostic(detailed)
+        self.assertEqual(caught.code,
                          "network-probe-refusal:network-route-unexpected " + route_detail)
-        with self.assertRaises(supervisor.SupervisorRefusal) as caught:
-            verify(error=subprocess.TimeoutExpired(["network_probe.py"], 30))
-        self.assertEqual(caught.exception.code, "network-probe-command-failed")
+        self.assertEqual(diagnostic, "network_probe_refusal=network-route-unexpected " + route_detail + "\n")
+        caught, diagnostic = verify_with_diagnostic(error=subprocess.TimeoutExpired(["network_probe.py"], 30))
+        self.assertEqual(caught.code, "network-probe-command-failed")
+        self.assertEqual(diagnostic, "network_probe_refusal=probe-command-timeout\n")
+
+    def test_supervisor_probe_uses_staged_chroot_copy_and_namespace_root_as_working_directory(self):
+        service = object.__new__(supervisor.Service)
+        service.root = Path("/source-free/root")
+        service.host_net_inode = 100
+        service.probe_namespace_inode = None
+        result = subprocess.CompletedProcess(["network_probe.py"], 0, b"network_probe=pass\n", b"")
+        runner = Mock(return_value=result)
+        with patch.object(supervisor.network_probe, "firewall_snapshot", return_value={"netns_inode": 200}), \
+                patch.object(supervisor.subprocess, "run", runner), \
+                patch.object(supervisor, "_bounded_timeout", return_value=30), \
+                patch.object(supervisor.os, "stat", return_value=SimpleNamespace(st_ino=200)):
+            service._verify_network_cut()
+        argv = runner.call_args.args[0]
+        self.assertEqual(argv[13], "/control/network_probe.py")
+        self.assertEqual(runner.call_args.kwargs["cwd"], str(service.root))
 
     def test_network_probe_diagnostic_preserves_only_fixed_refusal_code(self):
         code = "network-probe-refusal:network-address-unexpected"

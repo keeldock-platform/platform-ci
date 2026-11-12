@@ -1,0 +1,16 @@
+{
+  "bundle_asset_id": "740685171",
+  "bundle_id": "bundle-20261112184011-af290f8e",
+  "bundle_sha256": "d633239d2dcf71d23c362b604bd884018f3d22621d59c7fd083e82c581fde16d",
+  "bundle_size": 3442,
+  "cache_baseline_sha256": "87ea5def2e1505d55f621327fa36b1bcdc9a376e781fd979c72baaf88b50e9af",
+  "control_run_id": "43282252713",
+  "control_sha": "fe3c58f903ad23006c4bda62a3945207f5f525ab",
+  "expires": 1794512898,
+  "profile": "core-node",
+  "projection_asset_id": "740685167",
+  "projection_sha256": "47afc4356d6c9a9ab2244686cf4b61ac29dbabcaa2782dc9cb0eac60eb0380ff",
+  "projection_size": 996,
+  "run_id": "43284558151",
+  "wave_id": "wave-20261112184011-d635b489"
+}

@@ -4,6 +4,7 @@ import ast
 import errno
 import ipaddress
 import inspect
+import os
 from pathlib import Path
 import re
 import struct
@@ -192,6 +193,9 @@ class NetworkProbeTests(unittest.TestCase):
         self.assertIn('str(root / "sys")', source)
         self.assertIn('_mount_fs(["mount", "-t", "proc"', source)
         self.assertIn('_mount_fs(["mount", "-t", "sysfs"', source)
+        self.assertIn('"/control/network_probe.py"', source)
+        self.assertIn('cwd=str(self.root)', source)
+        self.assertIn('_stage_network_probe(self.root)', source)
         self.assertIn('MOUNT_TARGETS.append(Path(destination))', inspect.getsource(supervisor._mount_fs))
         cleanup_source = inspect.getsource(supervisor.Service._cleanup)
         self.assertIn('mount_reason = _unmount_tracked_mounts()', cleanup_source)
@@ -200,6 +204,49 @@ class NetworkProbeTests(unittest.TestCase):
         self.assertIn('--make-rprivate', inspect.getsource(supervisor._mount_private))
         self.assertIn('--make-rprivate', Path(network_probe.__file__).with_name("prepare.py").read_text(
             encoding="utf-8"))
+
+    def test_supervisor_stages_a_probe_copy_readable_by_the_dropped_worker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "root"
+            (root / "control").mkdir(parents=True, mode=0o755)
+            checkout = Path(temporary) / "checkout"
+            checkout.mkdir(mode=0o700)
+            source = checkout / "network_probe.py"
+            source.write_bytes(b"trusted probe payload\n")
+            source.chmod(0o600)
+            staged = supervisor._stage_network_probe(root, source)
+            self.assertEqual(staged.read_bytes(), source.read_bytes())
+            self.assertEqual(os.stat(staged).st_mode & 0o777, 0o444)
+            self.assertEqual(os.stat(staged.parent).st_mode & 0o777, 0o755)
+            self.assertEqual(staged.relative_to(root).as_posix(), "control/network_probe.py")
+
+    def test_probe_stage_failure_prints_only_a_fixed_diagnostic(self):
+        from contextlib import redirect_stderr
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = StringIO()
+            with redirect_stderr(output), self.assertRaises(supervisor.SupervisorRefusal) as caught:
+                supervisor._stage_network_probe(Path(temporary) / "root", Path(temporary) / "missing.py")
+        self.assertEqual(caught.exception.code, "network-probe-stage-failed")
+        self.assertEqual(output.getvalue(), "network_probe_refusal=probe-stage-failed\n")
+
+    def test_probe_stage_refusal_preserves_an_existing_destination(self):
+        from contextlib import redirect_stderr
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "root"
+            destination = root / "control/network_probe.py"
+            destination.parent.mkdir(parents=True, mode=0o755)
+            destination.write_bytes(b"preexisting file\n")
+            source = Path(temporary) / "probe.py"
+            source.write_bytes(b"trusted probe payload\n")
+            output = StringIO()
+            with redirect_stderr(output), self.assertRaises(supervisor.SupervisorRefusal):
+                supervisor._stage_network_probe(root, source)
+            self.assertEqual(destination.read_bytes(), b"preexisting file\n")
+        self.assertEqual(output.getvalue(), "network_probe_refusal=probe-stage-failed\n")
 
     def test_probe_proc_and_sys_mounts_are_unmounted_leaf_first(self):
         root = Path("/probe/root")
