@@ -59,8 +59,13 @@ def validate_dispatch(identity, expected_profile=None, now=None):
         "bundle_asset_id", "bundle_sha256", "bundle_size", "projection_asset_id",
         "projection_sha256", "projection_size", "expires",
     }
-    if set(identity) not in (required, required | {"wave_class"}):
+    if set(identity) not in (required, required | {"wave_class"}, required | {"platform"},
+                             required | {"wave_class", "platform"}):
         _fail("dispatch-shape")
+    identity = dict(identity)
+    identity.setdefault("platform", "linux")
+    if identity["platform"] not in ("linux", "windows"):
+        _fail("dispatch-platform")
     if "wave_class" in identity and identity["wave_class"] != SOURCE_FREE_WAVE_CLASS:
         _fail("dispatch-wave-class")
     if identity["repository"] != REPOSITORY or identity["repository_id"] != REPOSITORY_ID:
@@ -211,6 +216,7 @@ def context_from_environment(environ):
         "control_run_id": required("CI_CONTROL_RUN_ID"),
         "workflow_path": WORKFLOW_PATH,
         "run_attempt": decimal("CI_RUN_ATTEMPT", 1),
+        "platform": environ.get("DEVLANE_PLATFORM", "linux"),
         "profile": required("DEVLANE_PROFILE"),
         "wave_id": required("DEVLANE_WAVE_ID"),
         "bundle_id": required("DEVLANE_BUNDLE_ID"),
