@@ -30,8 +30,13 @@ import owned_tree_cleanup
 UID = 65534
 GID = 65534
 MAX_LOG = 256 * 1024 * 1024
+MAX_PREPARATION_FILE_SIZE = 512 * 1024 * 1024
+MAX_PREPARATION_LOG_TAIL_BYTES = 32768
+MAX_PREPARATION_LOG_TAIL_LINES = 48
+MAX_PREPARATION_LOG_LINE_TEXT = 200
 MOUNT_TARGETS = []
 DEADLINE_FILE = ""
+SOURCE_FREE_DIAGNOSTICS = False
 """Package lifecycle scripts never run during preparation, at three independent layers: the project .npmrc, this environment, and the explicit install flag. A package that declares an install script is installed as inert files."""
 NPMRC_TEXT = ("ignore-scripts=true\naudit=false\nfund=false\nupdate-notifier=false\n"
               "registry=https://registry.npmjs.org/\n")
@@ -354,10 +359,83 @@ def _bounded_timeout(cap, *, cleanup=False):
         refuse("total-deadline-exhausted")
 
 
+def _preparation_log_has_canary(path):
+    key_bytes = b"KEYCANARY-73A10X" + bytes(range(16))
+    markers = (
+        b"SYNTHETIC_SOURCE_CANARY", b"PRIVATE_SOURCE_CANARY", b"SYNTHETIC_KEY_CANARY",
+        b"PRIVATE_KEY_CANARY", b"KEYCANARY-73A10X", key_bytes.hex().encode("ascii"),
+        b"::add-mask::", b"::error::", b"::set-output", bytes((35, 35, 91)),
+    )
+    overlap = max(len(marker) for marker in markers) - 1
+    carry = b""
+    with Path(path).open("rb") as source:
+        while True:
+            chunk = source.read(65536)
+            if not chunk:
+                return False
+            sample = carry + chunk
+            if any(marker in sample for marker in markers):
+                return True
+            carry = sample[-overlap:]
+
+
+def _preparation_log_text(payload):
+    text = payload.decode("utf-8", "replace")
+    safe = []
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ._/:,@=!?()+-"
+    for character in text:
+        if character == "\t":
+            safe.append(" ")
+        elif character in allowed:
+            safe.append(character)
+        else:
+            safe.append("_")
+    text = "".join(safe).replace("::", ": :")
+    return " ".join(text.split())[:MAX_PREPARATION_LOG_LINE_TEXT] or "blank"
+
+
+def _emit_preparation_log_diagnostics(path, stage):
+    if (not SOURCE_FREE_DIAGNOSTICS or stage not in diagnostic_contract.PREPARATION_LOG_DIAGNOSTIC_STAGES):
+        return
+    try:
+        target = Path(path)
+        metadata = target.stat()
+        if not target.is_file() or metadata.st_size > MAX_PREPARATION_FILE_SIZE:
+            return
+        if _preparation_log_has_canary(target):
+            records = ["devlane_preparation_detail stage=%s index=0 text=canary-redacted" % stage]
+        else:
+            with target.open("rb") as source:
+                start = max(0, metadata.st_size - MAX_PREPARATION_LOG_TAIL_BYTES)
+                source.seek(start)
+                payload = source.read(MAX_PREPARATION_LOG_TAIL_BYTES)
+            omitted = start > 0
+            if omitted:
+                payload = payload.split(b"\n", 1)[-1]
+            lines = payload.splitlines()[-MAX_PREPARATION_LOG_TAIL_LINES:]
+            records = []
+            if omitted:
+                records.append("devlane_preparation_detail stage=%s index=0 text=earlier-log-content-omitted" % stage)
+            if not lines:
+                lines = [b"empty preparation log"]
+            first_index = 1 if omitted else 0
+            records.extend(
+                "devlane_preparation_detail stage=%s index=%d text=%s" % (
+                    stage, first_index + index, _preparation_log_text(line),
+                )
+                for index, line in enumerate(lines)
+            )
+        for line in records:
+            print(line, flush=True)
+    except OSError:
+        return
+
+
 def run(argv, *, timeout, log, environment, cwd=None):
     target = Path(log)
     target.parent.mkdir(parents=True, exist_ok=True)
     bounded = _bounded_timeout(timeout)
+    failure = None
     with target.open("xb") as output:
         try:
             process = subprocess.Popen(
@@ -372,14 +450,18 @@ def run(argv, *, timeout, log, environment, cwd=None):
                 pass
             process.wait(timeout=5)
             _kill_children()
-            refuse("preparation-timeout")
+            failure = "preparation-timeout"
         except OSError:
             _kill_children()
-            refuse("preparation-tool-unavailable")
+            failure = "preparation-tool-unavailable"
+    if failure is not None:
+        _emit_preparation_log_diagnostics(target, PREPARATION_STAGE)
+        refuse(failure)
     if target.stat().st_size > MAX_LOG:
         refuse("preparation-log-size")
     _kill_children()
     if code != 0:
+        _emit_preparation_log_diagnostics(target, PREPARATION_STAGE)
         refuse("preparation-failed")
 
 
@@ -402,7 +484,7 @@ def _kill_children():
 
 def _limits():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_LOG, MAX_LOG))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_PREPARATION_FILE_SIZE, MAX_PREPARATION_FILE_SIZE))
     resource.setrlimit(resource.RLIMIT_NOFILE, (8192, 8192))
     resource.setrlimit(resource.RLIMIT_NPROC, (256, 256))
     resource.setrlimit(resource.RLIMIT_CPU, (1800, 1800))
@@ -813,6 +895,7 @@ def _argument_parser():
     parser.add_argument("--owner-gid", type=int, required=True)
     parser.add_argument("--deadline-file", required=True)
     parser.add_argument("--node-snapshot-id", default="")
+    parser.add_argument("--source-free-diagnostics", action="store_true")
     for name in ("cargo", "rustc"):
         parser.add_argument("--" + name + "-path", default="")
     return parser
@@ -820,7 +903,9 @@ def _argument_parser():
 
 def main(argv=None):
     global DEADLINE_FILE
+    global SOURCE_FREE_DIAGNOSTICS
     MOUNT_TARGETS.clear()
+    SOURCE_FREE_DIAGNOSTICS = False
     _set_preparation_stage("prepare-argument-parse")
     parser = _argument_parser()
     root = None
@@ -836,6 +921,7 @@ def main(argv=None):
     try:
         args = parser.parse_args(argv)
         DEADLINE_FILE = args.deadline_file
+        SOURCE_FREE_DIAGNOSTICS = args.source_free_diagnostics
         _set_preparation_stage("prepare-deadline-check")
         deadline_budget.remaining(DEADLINE_FILE)
         _set_preparation_stage("prepare-platform-check")

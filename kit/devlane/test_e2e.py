@@ -333,7 +333,7 @@ def _phase_call(name, callback, *args, **kwargs):
         return callback(*args, **kwargs)
 
 
-def _run_preparation(argv, timeout=60 * 60):
+def _run_preparation(argv, timeout=60 * 60, *, source_free_diagnostics=False):
     try:
         result = _process_run(
             argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -351,6 +351,21 @@ def _run_preparation(argv, timeout=60 * 60):
         raise PreparationRefusalMismatch("prepare-launch", category) from None
     if _contains_output_canary(result.stdout + result.stderr):
         raise PreparationRefusalMismatch("prepare-protocol", "preparation-output-canary")
+    if source_free_diagnostics and result.returncode == 2:
+        details = diagnostic_contract.parse_preparation_log_diagnostics(result.stdout)
+        if details:
+            failure = diagnostic_contract.parse_preparation_result(
+                result.returncode, b"", result.stderr,
+            )
+            detail_stage = details[0].split(" stage=", 1)[1].split(" index=", 1)[0]
+            if (failure is not None and failure[0] == detail_stage
+                    and failure[0] in diagnostic_contract.PREPARATION_LOG_DIAGNOSTIC_STAGES
+                    and failure[1] in (
+                        "preparation-failed", "preparation-timeout", "preparation-tool-unavailable",
+                    )):
+                for line in details:
+                    print(line, file=sys.stderr, flush=True)
+                raise PreparationRefusalMismatch(*failure)
     failure = diagnostic_contract.parse_preparation_result(
         result.returncode, result.stdout, result.stderr,
     )
@@ -1343,6 +1358,7 @@ def _prepare(profile, projection_path, prepared_path):
         "--owner-uid", str(os.getuid()), "--owner-gid", str(os.getgid()),
         "--deadline-file", DEADLINE_FILE,
     ]
+    command.append("--source-free-diagnostics")
     snapshot_id = ""
     if profile == "core-node":
         if RUN_ID.isdecimal() and RUN_ATTEMPT.isdecimal() and RUN_ATTEMPT != "0":
@@ -1356,7 +1372,7 @@ def _prepare(profile, projection_path, prepared_path):
         path = paths[name]
         command.extend(("--" + name + "-path", path))
     try:
-        _run_preparation(command)
+        _run_preparation(command, source_free_diagnostics=True)
         if not prepared_path.is_dir() or prepared_path.is_symlink():
             raise PreparationRefusalMismatch("prepare-prepared-output-copy", "prepared-tree-missing")
     except Exception as error:

@@ -366,9 +366,17 @@ TOOLING_REFUSAL_CODES = frozenset((
     "advisory-database-revision", "tool-tree-invalid", "tool-destination-exists",
     "advisory-database-link", "tooling-refusal-unlisted",
 ))
-MAX_PREPARATION_OUTPUT_BYTES = 512
+MAX_PREPARATION_OUTPUT_BYTES = 24576
 MAX_PUBLIC_DIAGNOSTIC_BYTES = 384
 MAX_ACCEPTANCE_DETAIL_BYTES = 384
+PREPARATION_LOG_DIAGNOSTIC_STAGES = frozenset((
+    "prepare-dependency-install", "prepare-playwright-install", "prepare-cargo-vendor",
+))
+PREPARATION_LOG_DIAGNOSTIC_LINES = 48
+_PREPARATION_LOG_DIAGNOSTIC = re.compile(
+    r"devlane_preparation_detail stage=([a-z0-9-]{1,48}) "
+    r"index=(0|[1-9][0-9]{0,2}) text=([A-Za-z0-9 ._/:,@=!?()+-]{1,200})\Z"
+)
 _ACCEPTANCE_DETAIL = re.compile(
     r"devlane_acceptance_detail stage=([a-z0-9-]{1,64}) index=(0|[1-9][0-9]{0,2}) text=([ -~]{1,256})\Z"
 )
@@ -427,6 +435,47 @@ def parse_preparation_result(returncode, stdout, stderr):
             return stage, "prepare-" + label, cleanup, cleanup_reason
         return stage, "prepare-" + label, cleanup
     return "prepare-protocol", "preparation-output-invalid", "not-needed"
+
+
+def parse_preparation_log_diagnostics(payload):
+    """Accept only bounded, scrubbed detail records from source-free preparation logs."""
+    if type(payload) is not bytes or len(payload) > MAX_PREPARATION_OUTPUT_BYTES:
+        return None
+    if not payload:
+        return ()
+    if not payload.endswith(b"\n"):
+        return None
+    lines = payload[:-1].split(b"\n")
+    if not 1 <= len(lines) <= PREPARATION_LOG_DIAGNOSTIC_LINES + 1:
+        return None
+    accepted = []
+    selected_stage = None
+    previous_index = -1
+    hash_group = chr(35) * 2 + "["
+    for raw_line in lines:
+        try:
+            line = raw_line.decode("ascii", "strict")
+        except UnicodeDecodeError:
+            return None
+        match = _PREPARATION_LOG_DIAGNOSTIC.fullmatch(line)
+        if match is None:
+            return None
+        stage, index, text = match.groups()
+        if (stage not in PREPARATION_LOG_DIAGNOSTIC_STAGES or "::" in text
+                or hash_group in text
+                or any(marker in text for marker in (
+                    "SYNTHETIC_SOURCE_CANARY", "PRIVATE_SOURCE_CANARY",
+                    "SYNTHETIC_KEY_CANARY", "PRIVATE_KEY_CANARY", "KEYCANARY",
+                ))):
+            return None
+        number = int(index)
+        if (selected_stage is not None and stage != selected_stage) or number <= previous_index \
+                or number > PREPARATION_LOG_DIAGNOSTIC_LINES:
+            return None
+        selected_stage = stage
+        previous_index = number
+        accepted.append(line)
+    return tuple(accepted)
 
 
 def public_preparation_diagnostic(line):

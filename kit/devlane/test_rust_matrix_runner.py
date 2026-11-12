@@ -2860,7 +2860,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                 "cargo": "/toolchain/bin/cargo", "rustc": "/toolchain/bin/rustc",
             }
 
-            def prepare(command):
+            def prepare(command, **_kwargs):
                 captured["command"] = list(command)
                 prepared.mkdir()
 

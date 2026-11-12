@@ -1001,6 +1001,194 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
         self.assertTrue(all(test_e2e.diagnostic_contract.public_e2e_failure_diagnostic(line)
                             for line in diagnostics))
 
+    def test_preparation_log_sideband_is_bounded_and_canary_scanned(self):
+        preparation = supervisor.node_tool_prepare
+        prior = preparation.SOURCE_FREE_DIAGNOSTICS
+        prior_stage = preparation.PREPARATION_STAGE
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                log = Path(temporary) / "prepare-playwright.log"
+                log.write_bytes(b"ordinary preparation output\n" * 2000)
+                preparation.SOURCE_FREE_DIAGNOSTICS = False
+                hidden = io.StringIO()
+                with contextlib.redirect_stdout(hidden):
+                    preparation._emit_preparation_log_diagnostics(log, "prepare-playwright-install")
+                self.assertEqual(hidden.getvalue(), "")
+
+                preparation.SOURCE_FREE_DIAGNOSTICS = True
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    preparation._emit_preparation_log_diagnostics(log, "prepare-playwright-install")
+                records = output.getvalue().encode("ascii")
+                parsed = test_e2e.diagnostic_contract.parse_preparation_log_diagnostics(records)
+                self.assertIsNotNone(parsed)
+                self.assertLessEqual(len(parsed), test_e2e.diagnostic_contract.PREPARATION_LOG_DIAGNOSTIC_LINES + 1)
+                self.assertLessEqual(len(records), test_e2e.diagnostic_contract.MAX_PREPARATION_OUTPUT_BYTES)
+                self.assertTrue(all("ordinary preparation output" in line
+                                    or "earlier-log-content-omitted" in line for line in parsed))
+
+                log.write_bytes(b"PRIVATE_SOURCE_CANARY\n" + b"ordinary preparation output\n" * 2000)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    preparation._emit_preparation_log_diagnostics(log, "prepare-playwright-install")
+                self.assertEqual(output.getvalue(),
+                                 "devlane_preparation_detail stage=prepare-playwright-install "
+                                 "index=0 text=canary-redacted\n")
+                self.assertNotIn("PRIVATE_SOURCE_CANARY", output.getvalue())
+
+                preparation.PREPARATION_STAGE = "prepare-playwright-install"
+                cases = (
+                    ("failed", "preparation-failed", b"download failed\n"),
+                    ("timeout", "preparation-timeout", b"download timed out\n"),
+                    ("unavailable", "preparation-tool-unavailable", b""),
+                )
+                for label, code, payload in cases:
+                    log = Path(temporary) / (label + ".log")
+                    emitted = io.StringIO()
+
+                    class FailedProcess:
+                        pid = 987654
+
+                        def __init__(self, _argv, **kwargs):
+                            if payload:
+                                kwargs["stdout"].write(payload)
+                            self.wait_count = 0
+
+                        def wait(self, timeout=None):
+                            self.wait_count += 1
+                            if label == "timeout" and self.wait_count == 1:
+                                raise subprocess.TimeoutExpired("prepare", timeout)
+                            return 1
+
+                    unavailable = OSError("tool unavailable") if label == "unavailable" else FailedProcess
+                    with self.subTest(label=label), \
+                            mock.patch.object(preparation, "_bounded_timeout", return_value=10), \
+                            mock.patch.object(preparation, "_kill_children"), \
+                            mock.patch.object(preparation.os, "killpg"), \
+                            mock.patch.object(preparation.subprocess, "Popen", side_effect=unavailable), \
+                            contextlib.redirect_stdout(emitted):
+                        with self.assertRaises(supervisor.bundle.Refusal) as caught:
+                            preparation.run(["tool"], timeout=10, log=log, environment={})
+                    self.assertEqual(caught.exception.args[0], code)
+                    parsed = test_e2e.diagnostic_contract.parse_preparation_log_diagnostics(
+                        emitted.getvalue().encode("ascii"),
+                    )
+                    self.assertIsNotNone(parsed)
+                    self.assertTrue(all("stage=prepare-playwright-install" in line for line in parsed))
+        finally:
+            preparation.SOURCE_FREE_DIAGNOSTICS = prior
+            preparation.PREPARATION_STAGE = prior_stage
+
+    def test_preparation_file_size_limit_covers_the_pinned_chromium_binary(self):
+        preparation = supervisor.node_tool_prepare
+        pinned_chromium_bytes = 458078440
+        self.assertGreater(preparation.MAX_PREPARATION_FILE_SIZE, pinned_chromium_bytes)
+        self.assertLess(preparation.MAX_LOG, pinned_chromium_bytes)
+        prepare_directory = str(Path(preparation.__file__).resolve().parent)
+        with tempfile.TemporaryDirectory() as temporary:
+            target = str(Path(temporary) / "chromium")
+            program = (
+                "import pathlib,sys; sys.path.insert(0, " + repr(prepare_directory) + "); "
+                "import prepare; prepare._limits(); file=pathlib.Path(sys.argv[1]).open('wb'); "
+                "file.truncate(458078440); file.close(); print(pathlib.Path(sys.argv[1]).stat().st_size)"
+            )
+            old_program = program.replace(
+                "prepare._limits()",
+                "__import__('resource').setrlimit(__import__('resource').RLIMIT_FSIZE, "
+                "(prepare.MAX_LOG, prepare.MAX_LOG))",
+            )
+            old_target = str(Path(temporary) / "old-limit-chromium")
+            old_result = subprocess.run(
+                [sys.executable, "-B", "-c", old_program, old_target], stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True, check=False,
+            )
+            self.assertNotEqual(old_result.returncode, 0)
+            result = subprocess.run(
+                [sys.executable, "-B", "-c", program, target], stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+            self.assertEqual(result.stdout, b"458078440\n")
+
+    def test_harness_emits_only_matching_source_free_preparation_log_details(self):
+        detail = ("devlane_preparation_detail stage=prepare-playwright-install index=1 "
+                  "text=chrome-linux/chrome write failed with EFBIG\n").encode("ascii")
+        refusal = ("dependency_preparation_refusal=stage=prepare-playwright-install "
+                   "code=preparation-failed cleanup=confirmed\n").encode("ascii")
+        with mock.patch.object(test_e2e, "_process_run", return_value=subprocess.CompletedProcess(
+                ["prepare.py"], 2, detail, refusal)):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(test_e2e.PreparationRefusalMismatch) as caught:
+                    test_e2e._run_preparation(["prepare.py"], source_free_diagnostics=True)
+        self.assertEqual(caught.exception.phase, "prepare-playwright-install")
+        self.assertEqual(caught.exception.category, "preparation-failed")
+        self.assertEqual(stderr.getvalue(), detail.decode("ascii"))
+
+        with mock.patch.object(test_e2e, "_process_run", return_value=subprocess.CompletedProcess(
+                ["prepare.py"], 2, detail, refusal)):
+            with self.assertRaises(test_e2e.PreparationRefusalMismatch) as caught:
+                test_e2e._run_preparation(["prepare.py"])
+        self.assertEqual(caught.exception.category, "preparation-output-invalid")
+
+        canary_detail = ("devlane_preparation_detail stage=prepare-playwright-install index=1 "
+                         "text=KEYCANARY-73A10X-redacted\n").encode("ascii")
+        with mock.patch.object(test_e2e, "_process_run", return_value=subprocess.CompletedProcess(
+                ["prepare.py"], 2, canary_detail, refusal)):
+            with self.assertRaises(test_e2e.PreparationRefusalMismatch) as caught:
+                test_e2e._run_preparation(["prepare.py"], source_free_diagnostics=True)
+        self.assertEqual(caught.exception.category, "preparation-output-canary")
+
+    def test_preparation_log_diagnostics_survive_real_quiet_capture(self):
+        detail = ("devlane_preparation_detail stage=prepare-playwright-install index=1 "
+                  "text=chrome-linux/chrome write failed with EFBIG\n").encode("ascii")
+        refusal = ("dependency_preparation_refusal=stage=prepare-playwright-install "
+                   "code=preparation-failed cleanup=confirmed\n").encode("ascii")
+        with tempfile.TemporaryDirectory() as temporary:
+            runner_temp = Path(temporary)
+            driver = runner_temp / "harness-preparation-failure.py"
+            completed = "subprocess.CompletedProcess(['prepare.py'], 2, " + repr(detail) + ", " + repr(refusal) + ")"
+            driver.write_text(
+                "import subprocess, sys\n"
+                "from unittest.mock import patch\n"
+                "import test_e2e\n"
+                "completed = " + completed + "\n"
+                "with patch.object(test_e2e, '_process_run', return_value=completed):\n"
+                "    try:\n"
+                "        test_e2e._run_preparation(['prepare.py'], source_free_diagnostics=True)\n"
+                "    except test_e2e.PreparationRefusalMismatch:\n"
+                "        print('devlane_production_e2e=refused stage=prepare-playwright-install "
+                "exception=preparation-failed', file=sys.stderr)\n"
+                "        raise SystemExit(1)\n"
+                "raise SystemExit(0)\n",
+                encoding="ascii",
+            )
+            workflow = (test_e2e.ROOT / ".github/workflows/devlane-synthetic.yml").read_text(encoding="utf-8")
+            workflow_lines = workflow.splitlines()
+            start = next(index for index, line in enumerate(workflow_lines) if line.strip() == "quiet() {")
+            end = next(index for index in range(start + 1, len(workflow_lines))
+                       if workflow_lines[index].strip() == "}")
+            quiet_function = textwrap.dedent("\n".join(workflow_lines[start:end + 1]))
+            shell = (quiet_function + "\nquiet production-path-e2e python3 -B "
+                     + shlex.quote(str(driver)))
+            environment = os.environ.copy()
+            environment["RUNNER_TEMP"] = str(runner_temp)
+            environment["PYTHONPATH"] = str(Path(test_e2e.__file__).resolve().parent)
+            result = subprocess.run(
+                ["/bin/bash", "-c", shell], cwd=test_e2e.ROOT, env=environment,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                close_fds=True, check=False,
+            )
+
+        self.assertEqual(result.returncode, 1, result.stderr.decode("utf-8", "replace"))
+        lines = result.stdout.decode("utf-8", "replace").splitlines()
+        self.assertIn("devlane_acceptance=refused stage=production-path-e2e", lines)
+        self.assertTrue(any("devlane_preparation_detail stage=prepare-playwright-install "
+                            "index=1 text=chrome-linux/chrome write failed with EFBIG" in line
+                            for line in lines))
+        self.assertTrue(all(test_e2e.diagnostic_contract.public_acceptance_detail(line) for line in lines
+                            if line.startswith("devlane_acceptance_detail ")))
+
     def test_unit_failure_raw_diagnostics_only_run_for_the_fixed_failure_reasons(self):
         for subreason in ("vitest-failed", "report-missing", "adapter-failed"):
             summary = ('{"code":"DEVLANE_FAILURE","kind":"control","stage":"unit",'
