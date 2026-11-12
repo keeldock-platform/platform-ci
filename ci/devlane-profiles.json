@@ -68,6 +68,53 @@
       "file_ids": [],
       "diagnostic_codes": ["E0001", "E0002", "E0277", "E0308", "E0425", "E0432", "E0599", "E0609", "DEVLANE_SEMVER_FINDINGS", "DEVLANE_SEMVER_EXECUTION"]
     },
+    "desktop": {
+      "revision": 1,
+      "budget_seconds": 8700,
+      "toolchain": {
+        "node": "26.8.1",
+        "npm": "11.19.0",
+        "rust": "1.99.1"
+      },
+      "system_dependencies": [
+        "libwebkit2gtk-4.1-dev",
+        "build-essential",
+        "curl",
+        "wget",
+        "file",
+        "libxdo-dev",
+        "libssl-dev",
+        "libayatana-appindicator3-dev",
+        "librsvg2-dev"
+      ],
+      "commands": [
+        ["cargo", "fmt", "--all", "--", "--check"],
+        ["cargo", "clippy", "--locked", "--offline", "--workspace", "--all-targets", "--", "-D", "warnings"],
+        ["cargo", "clippy", "--locked", "--offline", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"],
+        ["cargo", "test", "--locked", "--offline", "--workspace"],
+        ["cargo", "test", "--locked", "--offline", "--workspace", "--all-features"],
+        ["npm", "--prefix", "/workspace/source", "run", "typecheck"],
+        ["npm", "--prefix", "/workspace/source", "run", "test"],
+        ["/usr/bin/bash", "/workspace/source/scripts/build-edition.sh", "minimal"],
+        ["/usr/bin/bash", "/workspace/source/scripts/build-edition.sh", "git-only"],
+        ["/usr/bin/bash", "/workspace/source/scripts/build-edition.sh", "all-tools-so-far"]
+      ],
+      "stages": [
+        "format",
+        "unit",
+        "unit",
+        "unit",
+        "unit",
+        "typecheck",
+        "unit",
+        "unit",
+        "unit",
+        "unit"
+      ],
+      "test_ids": [],
+      "file_ids": [],
+      "diagnostic_codes": ["E0001", "E0002", "E0277", "E0308", "E0425", "E0432", "E0599", "E0609", "TS2322", "DEVLANE_FAILURE"]
+    },
     "synthetic": {
       "revision": 1,
       "commands": [],

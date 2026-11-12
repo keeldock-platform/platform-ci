@@ -604,6 +604,16 @@ def _project_files(projection, project):
                             ("package-lock.json", projection["npm_lock"])):
             (project / name).write_bytes(bundle.canonical_json(value) + b"\n")
         (project / ".npmrc").write_text(NPMRC_TEXT, encoding="ascii")
+    elif projection["profile"] == "desktop":
+        for name, value in (("package.json", projection["npm_package"]),
+                            ("package-lock.json", projection["npm_lock"])):
+            (project / name).write_bytes(bundle.canonical_json(value) + b"\n")
+        (project / ".npmrc").write_text(NPMRC_TEXT, encoding="ascii")
+        (project / "Cargo.toml").write_text(projection["cargo_manifest"], encoding="utf-8")
+        (project / "Cargo.lock").write_text(projection["cargo_lock"], encoding="utf-8")
+        (project / "src").mkdir(mode=0o755)
+        (project / "src/lib.rs").write_text(
+            chr(35) + "![allow(dead_code)]\npub fn devlane_fixture() {}\n", encoding="ascii")
     else:
         (project / "Cargo.toml").write_text(projection["cargo_manifest"], encoding="utf-8")
         (project / "Cargo.lock").write_text(projection["cargo_lock"], encoding="utf-8")
@@ -751,7 +761,7 @@ def _run_worker(root, projection, profile, output_root, tool_paths, owner_uid, o
             os.chown(current, UID, GID, follow_symlinks=False)
             for name in directories + files:
                 os.chown(str(Path(current) / name), UID, GID, follow_symlinks=False)
-    if profile == "core-rust":
+    if profile in ("core-rust", "desktop"):
         (work / "cargo-home/config.toml").write_text(
             '[registries.crates-io]\nprotocol = "sparse"\n\n[net]\nretry = 1\n',
             encoding="ascii",
@@ -759,9 +769,9 @@ def _run_worker(root, projection, profile, output_root, tool_paths, owner_uid, o
     node_bin = "/tools/node/bin"
     rust_bin = "/tools/rust/bin"
     path_parts = ["/usr/bin", "/bin"]
-    if profile == "core-node":
+    if profile in ("core-node", "desktop"):
         path_parts.insert(0, node_bin)
-    else:
+    if profile in ("core-rust", "desktop"):
         path_parts.insert(0, rust_bin)
     environment = {
         "PATH": ":".join(path_parts), "HOME": "/devlane-home", "TMPDIR": "/work/tmp",
@@ -771,7 +781,7 @@ def _run_worker(root, projection, profile, output_root, tool_paths, owner_uid, o
         "PLAYWRIGHT_BROWSERS_PATH": "/work/prepared/ms-playwright",
         "XDG_CACHE_HOME": "/work/cache", "PYTHONDONTWRITEBYTECODE": "1",
     }
-    if profile == "core-rust":
+    if profile in ("core-rust", "desktop"):
         environment["LD_LIBRARY_PATH"] = "/tools/rust/lib"
     (work / "tmp").mkdir(mode=0o700, exist_ok=True)
     (work / "cache").mkdir(mode=0o700, exist_ok=True)
@@ -782,7 +792,7 @@ def _run_worker(root, projection, profile, output_root, tool_paths, owner_uid, o
         "--reuid=65534", "--regid=65534", "--clear-groups", "--no-new-privs", "--bounding-set=-all", "--",
         "/bin/sh", "-c", 'cd /work/project && exec "$@"', "devlane-prepare",
     ]
-    if profile == "core-node":
+    if profile in ("core-node", "desktop"):
         _set_preparation_stage("prepare-dependency-install")
         command = command_prefix + ["npm", "--prefix", "/work/project", *NPM_CI_ARGUMENTS]
         run(command, timeout=3600, log=work / "prepare-npm.log", environment=environment,
@@ -800,11 +810,11 @@ def _run_worker(root, projection, profile, output_root, tool_paths, owner_uid, o
             command = command_prefix + ["node", cli_guest, "install", *projection["playwright"]]
             run(command, timeout=1800, log=work / "prepare-playwright.log", environment=environment,
                 cwd="/")
-    else:
+    if profile in ("core-rust", "desktop"):
         _set_preparation_stage("prepare-cargo-vendor")
         """cargo vendor creates its destination as the unprivileged worker; it vendors every locked package, so feature flags are neither needed nor accepted by this command."""
-        command = command_prefix + ["cargo", "vendor", "--locked",
-                                    "--manifest-path", "/work/project/Cargo.toml"]
+        manifest_path = "/work/project/Cargo.toml"
+        command = command_prefix + ["cargo", "vendor", "--locked", "--manifest-path", manifest_path]
         for index in range(1, len(projection["cargo_workspaces"]) + 1):
             command.extend(("--sync", "/work/project/sync-%03d/Cargo.toml" % index))
         command.append("/work/prepared/cargo-vendor")
@@ -817,9 +827,9 @@ def _run_worker(root, projection, profile, output_root, tool_paths, owner_uid, o
         )
         (prepared / "cargo-config.toml").write_text(config, encoding="ascii")
     (prepared / "projection.json").write_bytes(bundle.canonical_json(projection) + b"\n")
-    if profile == "core-node":
+    if profile in ("core-node", "desktop"):
         _copy_tree(project / "node_modules", prepared / "node_modules")
-    else:
+    if profile in ("core-rust", "desktop"):
         if not (prepared / "cargo-vendor").is_dir():
             refuse("cargo-vendor-missing")
     if projection["playwright"]:
@@ -889,12 +899,13 @@ def _argument_parser():
     parser = _PreparationArgumentParser()
     parser.add_argument("--projection", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--profile", choices=("core-node", "core-rust"), required=True)
+    parser.add_argument("--profile", choices=("core-node", "core-rust", "desktop"), required=True)
     parser.add_argument("--control-sha", default="")
     parser.add_argument("--owner-uid", type=int, required=True)
     parser.add_argument("--owner-gid", type=int, required=True)
     parser.add_argument("--deadline-file", required=True)
     parser.add_argument("--node-snapshot-id", default="")
+    parser.add_argument("--node-source-id", default="")
     parser.add_argument("--source-free-diagnostics", action="store_true")
     for name in ("cargo", "rustc"):
         parser.add_argument("--" + name + "-path", default="")
@@ -937,33 +948,46 @@ def main(argv=None):
             projection_path.read_bytes(), args.profile,
             expected_control_sha=args.control_sha or None,
         )
-        if projection["tools"] != ({"node": NODE_VERSION, "npm": NPM_VERSION} if args.profile == "core-node" else projection["tools"]):
+        expected_node_tools = (
+            {"node": NODE_VERSION, "npm": NPM_VERSION} if args.profile == "core-node" else
+            {"node": node_vendor_source.DESKTOP_NODE_VERSION,
+             "npm": node_vendor_source.DESKTOP_NPM_VERSION} if args.profile == "desktop" else None
+        )
+        if expected_node_tools is not None and any(
+                projection["tools"].get(name) != version for name, version in expected_node_tools.items()):
             refuse("toolchain-version")
         _set_preparation_stage("prepare-toolchain-selection")
-        if args.profile == "core-node":
-            if not node_tool_snapshot.valid_snapshot_id(args.node_snapshot_id):
+        if args.profile in ("core-node", "desktop"):
+            source_id = args.node_snapshot_id if args.profile == "core-node" else args.node_source_id
+            if (args.profile == "core-node" and not node_tool_snapshot.valid_snapshot_id(source_id)
+                    or args.profile == "desktop" and not node_vendor_source.SESSION_ID.fullmatch(source_id or "")):
                 refuse("node-snapshot-id")
-            node_snapshot_id = args.node_snapshot_id
+            if args.profile == "core-node" and args.node_source_id:
+                refuse("node-snapshot-id")
+            if args.profile == "desktop" and args.node_snapshot_id:
+                refuse("node-snapshot-id")
+            node_snapshot_id = source_id
             _set_preparation_stage("prepare-node-vendor-acquisition")
-            vendor_source = node_vendor_source.acquire_node_source(node_snapshot_id, DEADLINE_FILE)
+            vendor_source = node_vendor_source.acquire_node_source(node_snapshot_id, DEADLINE_FILE, args.profile)
             node_vendor_source_created = True
-            expected_cache = node_vendor_source.PROTECTED_BASE / node_snapshot_id / "cache"
-            expected_node_root = expected_cache / "node" / NODE_VERSION / "x64"
-            if (vendor_source.cache_root != expected_cache or vendor_source.node_root != expected_node_root
-                    or vendor_source.node != expected_node_root / "bin/node"
-                    or vendor_source.npm != expected_node_root / "bin/npm"
-                    or vendor_source.archive_sha256 != node_vendor_source.ARCHIVE_SHA256
-                    or vendor_source.preparation_id != node_tool_snapshot.PREPARATION_ID):
-                refuse("node-tool-layout")
+            if args.profile == "core-node":
+                expected_cache = node_vendor_source.PROTECTED_BASE / node_snapshot_id / "cache"
+                expected_node_root = expected_cache / "node" / NODE_VERSION / "x64"
+                if (vendor_source.cache_root != expected_cache or vendor_source.node_root != expected_node_root
+                        or vendor_source.node != expected_node_root / "bin/node"
+                        or vendor_source.npm != expected_node_root / "bin/npm"
+                        or vendor_source.archive_sha256 != node_vendor_source.ARCHIVE_SHA256
+                        or vendor_source.preparation_id != node_tool_snapshot.PREPARATION_ID):
+                    refuse("node-tool-layout")
             paths = {"node": str(vendor_source.node), "npm": str(vendor_source.npm),
                      "cargo": "", "rustc": ""}
         else:
-            if args.node_snapshot_id:
+            if args.node_snapshot_id or args.node_source_id:
                 refuse("node-snapshot-id")
             paths = {"node": "", "npm": "",
                      "cargo": args.cargo_path or shutil.which("cargo") or "",
                      "rustc": args.rustc_path or shutil.which("rustc") or ""}
-        if args.profile == "core-rust":
+        if args.profile in ("core-rust", "desktop"):
             _set_preparation_stage("prepare-rust-toolchain-validation")
             for name in ("cargo", "rustc"):
                 paths[name] = _resolve_rust_tool(paths[name], name)
@@ -996,9 +1020,25 @@ def main(argv=None):
             node_vendor_source_created = False
             paths["node"] = node_tools["node"]
             paths["npm"] = node_tools["npm"]
-        elif not paths["cargo"] or not paths["rustc"]:
+        elif args.profile == "desktop":
+            _set_preparation_stage("prepare-node-version-verification")
+            node_tools = {
+                "node": paths["node"], "npm": paths["npm"],
+                "npm_cli": str(vendor_source.node_root / "lib/node_modules/npm/bin/npm-cli.js"),
+                "root": str(vendor_source.node_root),
+            }
+            node_results = run_node_versions(node_tools, _prepare_node_version_process)
+            for name, expected in expected_node_tools.items():
+                expected_text = ("v" + expected) if name == "node" else expected
+                try:
+                    actual = node_results[name].stdout.decode("ascii", "strict").strip()
+                except UnicodeDecodeError:
+                    refuse("node-toolchain-version")
+                if node_results[name].returncode != 0 or actual != expected_text:
+                    refuse("node-toolchain-version")
+        if args.profile in ("core-rust", "desktop") and (not paths["cargo"] or not paths["rustc"]):
             refuse("rust-toolchain-missing")
-        if args.profile == "core-rust":
+        if args.profile in ("core-rust", "desktop"):
             _set_preparation_stage("prepare-rust-version-verification")
             for name in ("cargo", "rustc"):
                 version_result = subprocess.run([paths[name], "--version"], stdout=subprocess.PIPE,
@@ -1010,12 +1050,19 @@ def main(argv=None):
         if args.profile == "core-node":
             _set_preparation_stage("prepare-tool-root-selection")
             tool_roots = {"node": Path(node_tools["root"]), "rust": None}
-        else:
+        elif args.profile == "core-rust":
             cargo_root = Path(paths["cargo"]).resolve(strict=True).parent.parent
             rustc_path = Path(paths["rustc"]).resolve(strict=True)
             if not rustc_path.is_relative_to(cargo_root):
                 refuse("rust-tool-layout")
             tool_roots = {"node": None, "rust": cargo_root}
+            _set_preparation_stage("prepare-tool-root-selection")
+        else:
+            cargo_root = Path(paths["cargo"]).resolve(strict=True).parent.parent
+            rustc_path = Path(paths["rustc"]).resolve(strict=True)
+            if not rustc_path.is_relative_to(cargo_root):
+                refuse("rust-tool-layout")
+            tool_roots = {"node": vendor_source.node_root, "rust": cargo_root}
             _set_preparation_stage("prepare-tool-root-selection")
         root = Path(tempfile.mkdtemp(prefix="kd-devlane-prep-", dir="/tmp"))
         cleanup = "confirmed"
@@ -1064,7 +1111,8 @@ def main(argv=None):
                     cleanup_reason = cleanup_reason or "tree-remove"
             else:
                 clean = False
-        if node_vendor_source_created and vendor_source is not None:
+        if (node_vendor_source_created and vendor_source is not None
+                and (failure is not None or args.profile != "desktop")):
             _set_preparation_stage("prepare-node-vendor-cleanup")
             try:
                 _remove_node_vendor_source(vendor_source)

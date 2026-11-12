@@ -71,6 +71,10 @@ def _with_value(step, key, identity, kind):
 
 def _step_outputs(step, identity, kind, records):
     name, uses = step["name"], step.get("uses") or ""
+    if name == "Install Tauri Linux build dependencies" and identity["profile"] == "desktop":
+        return ["tauri_linux_dependencies=installed"]
+    if name == "Install pinned Rust toolchain" and identity["profile"] == "desktop":
+        return ["rust_toolchain=prepared"]
     key = None
     if uses.startswith("actions/cache/restore"):
         key = _with_value(step, "key", identity, kind)
@@ -131,8 +135,13 @@ def _render_log(job_key, identity=None, *, records=(), kind="encrypted", skip=("
              "Secret source: Actions", "Prepare workflow directory", "Prepare all required actions",
              "Getting action download info", "Complete job name: " + job_key,
              MARK + "[section]Finishing: Set up job"]
+    skipped = set(skip)
+    if identity["profile"] == "desktop":
+        skipped.discard("Install pinned Rust toolchain")
+    else:
+        skipped.add("Install Tauri Linux build dependencies")
     for step in job["steps"]:
-        if step["name"] in skip or (step["uses"] and "setup-node" in step["uses"] and identity["profile"] == "core-rust"):
+        if step["name"] in skipped or (step["uses"] and "setup-node" in step["uses"] and identity["profile"] == "core-rust"):
             continue
         lines.append(MARK + "[section]Starting: " + step["name"])
         if step["run"]:
@@ -244,12 +253,13 @@ def _record(**fields):
     return json.dumps(fields, sort_keys=True, separators=(",", ":"))
 
 
-def _encrypted_jobs():
+def _encrypted_jobs(profile="core-node"):
     names = audit._expected_step_names("core-node")
     steps = []
     for name in names:
         conclusion = "success"
-        if name == "Install pinned Rust toolchain":
+        if ((name == "Install pinned Rust toolchain" and profile == "core-node")
+                or (name == "Install Tauri Linux build dependencies" and profile != "desktop")):
             conclusion = "skipped"
         steps.append({"name": name, "status": "completed", "conclusion": conclusion})
     return [
@@ -328,6 +338,19 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         result = audit.validate_job_contract(jobs, IDENTITY, "core-node")
         self.assertEqual(set(result), {audit.RUN_JOB, audit.AUDIT_JOB})
 
+    def test_desktop_contract_runs_tauri_dependencies_and_pinned_rust_setup(self):
+        identity = dict(IDENTITY, profile="desktop")
+        jobs = _encrypted_jobs("desktop")
+        result = audit.validate_job_contract(jobs, identity, "desktop")
+        self.assertEqual(set(result), {audit.RUN_JOB, audit.AUDIT_JOB})
+        grammar = audit._Grammar(
+            ".github/workflows/devlane-encrypted.yml", audit.RUN_JOB, identity, "encrypted",
+        )
+        self.assertTrue(grammar.step_output_ok(
+            "Install Tauri Linux build dependencies", "tauri_linux_dependencies=installed", {}))
+        self.assertTrue(grammar.step_output_ok(
+            "Install pinned Rust toolchain", "rust_toolchain=prepared", {}))
+
     def test_extra_job_wrong_attempt_wrong_step_and_missing_cleanup_are_rejected(self):
         mutations = []
         jobs = _encrypted_jobs()
@@ -375,6 +398,9 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         rust = dict(IDENTITY, profile="core-rust")
         audit.validate_job_log_surface(
             _render_log(audit.RUN_JOB, rust, skip=("Set up pinned Node toolchain",)), audit.RUN_JOB, rust)
+        desktop = dict(IDENTITY, profile="desktop")
+        audit.validate_job_log_surface(
+            _render_log(audit.RUN_JOB, desktop), audit.RUN_JOB, desktop)
 
     def test_known_github_sgr_is_accepted_on_the_encrypted_lane_log_path(self):
         log = self._valid_run_log()

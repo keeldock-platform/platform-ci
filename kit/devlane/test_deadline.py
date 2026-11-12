@@ -721,7 +721,8 @@ class DeadlineTests(unittest.TestCase):
                         run_id = "parser-run-0001"
                         run_root = base / ("devlane-" + run_id)
                         safe_arguments = [value.replace("$RUN_ROOT", str(run_root)).replace(
-                            "$RUNNER_TEMP", str(base)).replace("$node_snapshot_id", "devlane-run-1")
+                            "$RUNNER_TEMP", str(base)).replace("$node_snapshot_id", "devlane-run-1").replace(
+                            "$node_vendor_id", "devlane-vendor-1")
                             for value in arguments]
                         for option in ("--root", "--runner-temp", "--deadline-file"):
                             self._assert_required_argument(host_cleanup.main, safe_arguments, option)
@@ -729,10 +730,12 @@ class DeadlineTests(unittest.TestCase):
                         with patch.dict(os.environ, {"GITHUB_RUN_ID": run_id}), \
                                 patch.object(host_cleanup, "_confirm_supervisor_absent"), \
                                 patch.object(host_cleanup, "clean_node_snapshot", return_value=True) as remove_snapshot, \
+                                patch.object(host_cleanup, "clean_node_vendor_source", return_value=True) as remove_vendor, \
                                 contextlib.redirect_stdout(output):
                             self.assertEqual(host_cleanup.main(safe_arguments), 0)
                         self.assertEqual(output.getvalue().strip(), "cleanup_receipt=confirmed")
                         remove_snapshot.assert_called_once_with("devlane-run-1", str(run_root / "deadline.json"))
+                        remove_vendor.assert_called_once_with("devlane-vendor-1")
                         self.assertFalse(run_root.exists())
                 elif script == "supervisor.py":
                     required = {

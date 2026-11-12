@@ -145,7 +145,7 @@ def clean_node_vendor_source(snapshot_id, *, control_uid=0):
     return True
 
 
-def clean(root_arg, runner_temp, deadline_file, node_snapshot_id=""):
+def clean(root_arg, runner_temp, deadline_file, node_snapshot_id="", node_vendor_id=""):
     root = Path(root_arg)
     base = Path(runner_temp)
     if not root.is_absolute() or not base.is_absolute() or root.parent != base:
@@ -158,6 +158,8 @@ def clean(root_arg, runner_temp, deadline_file, node_snapshot_id=""):
         _confirm_supervisor_absent(root / "state")
         if node_snapshot_id:
             clean_node_snapshot(node_snapshot_id, deadline_file)
+        if node_vendor_id:
+            clean_node_vendor_source(node_vendor_id)
         print("cleanup_receipt=confirmed")
         return
     try:
@@ -195,6 +197,8 @@ def clean(root_arg, runner_temp, deadline_file, node_snapshot_id=""):
         _fail("tree-remove")
     if node_snapshot_id:
         clean_node_snapshot(node_snapshot_id, deadline_file)
+    if node_vendor_id:
+        clean_node_vendor_source(node_vendor_id)
     try:
         shutil.rmtree(root)
     except OSError:
@@ -210,6 +214,7 @@ def _argument_parser():
     parser.add_argument("--runner-temp", default="")
     parser.add_argument("--deadline-file", required=True)
     parser.add_argument("--node-snapshot-id", default="")
+    parser.add_argument("--node-vendor-id", default="")
     parser.add_argument("--owner-uid", type=int)
     parser.add_argument("--snapshot-only", action="store_true")
     return parser
@@ -235,13 +240,14 @@ def main(argv=None):
             node_tool_snapshot.remove_snapshot(
                 args.node_snapshot_id, args.deadline_file, owner_uid=args.owner_uid,
             )
-            clean_node_vendor_source(args.node_snapshot_id)
+            clean_node_vendor_source(args.node_vendor_id or args.node_snapshot_id)
             print("node_snapshot_cleanup=confirmed")
             print("node_vendor_cleanup=confirmed")
             return 0
         if not args.root or not args.runner_temp:
             _fail()
-        clean(args.root, args.runner_temp, args.deadline_file, args.node_snapshot_id)
+        clean(args.root, args.runner_temp, args.deadline_file, args.node_snapshot_id,
+              args.node_vendor_id)
         return 0
     except Exception as error:
         reason = getattr(error, "cleanup_reason", "")

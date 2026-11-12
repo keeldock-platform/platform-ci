@@ -26,6 +26,12 @@ ARCHIVE_URL = "https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-x64.tar.xz"
 ARCHIVE_SHA256 = "6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6"
 PROTECTED_BASE = Path("/run/platform-ci-devlane/node-vendor")
 PREPARATION_ID = "nodejs-dist-v24.22.1-linux-x64-sha256"
+DESKTOP_NODE_VERSION = "26.8.1"
+DESKTOP_NPM_VERSION = "11.19.0"
+DESKTOP_ARCHIVE_PREFIX = "node-v26.8.1-linux-x64"
+DESKTOP_ARCHIVE_URL = "https://nodejs.org/dist/v26.8.1/node-v26.8.1-linux-x64.tar.xz"
+DESKTOP_ARCHIVE_SHA256 = "3e301118d7df53d563b7e96c1617545f26e2f76f9724be668d6cab65c15dda5d"
+DESKTOP_PREPARATION_ID = "nodejs-dist-v26.8.1-linux-x64-sha256"
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 MAX_EXPANDED_BYTES = 512 * 1024 * 1024
 MAX_FILE_BYTES = 256 * 1024 * 1024
@@ -51,10 +57,34 @@ class VendorSource:
     npm: Path
     archive_sha256: str
     preparation_id: str
+    node_version: str = NODE_VERSION
+    npm_version: str = NPM_VERSION
 
 
 def _fail(code):
     raise VendorNodeRefusal(code)
+
+
+def _distribution(profile):
+    if profile == "desktop":
+        return {
+            "node_version": DESKTOP_NODE_VERSION,
+            "npm_version": DESKTOP_NPM_VERSION,
+            "archive_prefix": DESKTOP_ARCHIVE_PREFIX,
+            "archive_url": DESKTOP_ARCHIVE_URL,
+            "archive_sha256": DESKTOP_ARCHIVE_SHA256,
+            "preparation_id": DESKTOP_PREPARATION_ID,
+        }
+    if profile in (None, "core-node"):
+        return {
+            "node_version": NODE_VERSION,
+            "npm_version": NPM_VERSION,
+            "archive_prefix": ARCHIVE_PREFIX,
+            "archive_url": ARCHIVE_URL,
+            "archive_sha256": ARCHIVE_SHA256,
+            "preparation_id": PREPARATION_ID,
+        }
+    _fail("vendor-node-profile")
 
 
 def _tick(remaining):
@@ -100,10 +130,11 @@ def _open_protected_base():
         raise
 
 
-def _download(path, remaining):
+def _download(path, remaining, profile=None):
+    distribution = _distribution(profile)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW | CLOEXEC, 0o600)
     try:
-        request = Request(ARCHIVE_URL, headers={"User-Agent": "platform-ci-devlane/1"})
+        request = Request(distribution["archive_url"], headers={"User-Agent": "platform-ci-devlane/1"})
         with urlopen(request, timeout=_tick(remaining)) as response:
             final = urlsplit(response.geturl())
             if (response.status != 200 or final.scheme != "https" or final.hostname != "nodejs.org"
@@ -132,7 +163,8 @@ def _download(path, remaining):
         os.close(fd)
 
 
-def _verified_archive(path, remaining, owner_uid):
+def _verified_archive(path, remaining, owner_uid, profile=None):
+    distribution = _distribution(profile)
     fd = os.open(path, os.O_RDONLY | NOFOLLOW | NONBLOCK | CLOEXEC)
     try:
         before = os.fstat(fd)
@@ -153,7 +185,7 @@ def _verified_archive(path, remaining, owner_uid):
         after = os.fstat(fd)
         token = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
         if (size != before.st_size or token(before) != token(after)
-                or digest.hexdigest() != ARCHIVE_SHA256):
+                or digest.hexdigest() != distribution["archive_sha256"]):
             _fail("vendor-node-checksum")
         os.lseek(fd, 0, os.SEEK_SET)
         return fd
@@ -162,11 +194,11 @@ def _verified_archive(path, remaining, owner_uid):
         raise
 
 
-def _parts(member):
+def _parts(member, archive_prefix=ARCHIVE_PREFIX):
     name = member.name.rstrip("/") if member.isdir() else member.name
     parts = name.split("/")
     if (len(name.encode("utf-8")) > 2048 or len(parts) > MAX_DEPTH
-            or not parts or parts[0] != ARCHIVE_PREFIX
+            or not parts or parts[0] != archive_prefix
             or any(part in ("", ".", "..") or "\\" in part or "\x00" in part for part in parts)):
         _fail("vendor-node-member-path")
     if len(parts) == 1 and not member.isdir():
@@ -251,7 +283,8 @@ def _finish_links(root, root_fd, links, remaining, owner_uid):
             _fail("vendor-node-link")
 
 
-def _extract(fd, root, remaining, owner_uid):
+def _extract(fd, root, remaining, owner_uid, profile=None):
+    archive_prefix = _distribution(profile)["archive_prefix"]
     root.mkdir(mode=0o700)
     root_fd = os.open(root, os.O_RDONLY | DIRECTORY | NOFOLLOW | CLOEXEC)
     seen = set()
@@ -261,7 +294,7 @@ def _extract(fd, root, remaining, owner_uid):
         with os.fdopen(os.dup(fd), "rb") as source, tarfile.open(fileobj=source, mode="r:xz") as archive:
             for member in archive:
                 _tick(remaining)
-                parts = _parts(member)
+                parts = _parts(member, archive_prefix)
                 key = "/".join(parts)
                 if key in seen or len(seen) >= MAX_ENTRIES:
                     _fail("vendor-node-member-count")
@@ -316,7 +349,7 @@ def _layout(node_root):
         _fail("vendor-node-layout")
 
 
-def acquire_node_source(snapshot_id, deadline_file):
+def acquire_node_source(snapshot_id, deadline_file, profile="core-node"):
     """Return a fresh verified source for the existing Node snapshot producer.
 
     Call only in trusted preparation before decrypting or executing any candidate.
@@ -325,6 +358,7 @@ def acquire_node_source(snapshot_id, deadline_file):
     """
     if sys.platform != "linux" or os.geteuid() != 0 or SESSION_ID.fullmatch(snapshot_id or "") is None:
         _fail("vendor-node-platform-or-id")
+    distribution = _distribution(profile)
     import deadline
     remaining = lambda: deadline.remaining(deadline_file)
     _tick(remaining)
@@ -335,17 +369,66 @@ def acquire_node_source(snapshot_id, deadline_file):
         os.close(base_fd)
     area = PROTECTED_BASE / snapshot_id
     archive = area / "node.tar.xz"
-    _download(archive, remaining)
-    fd = _verified_archive(archive, remaining, 0)
+    _download(archive, remaining, profile)
+    fd = _verified_archive(archive, remaining, 0, profile)
     cache = area / "cache"
-    node_root = cache / "node" / NODE_VERSION / "x64"
+    node_root = cache / "node" / distribution["node_version"] / "x64"
     try:
         node_root.parent.mkdir(parents=True, mode=0o700)
-        _extract(fd, node_root, remaining, 0)
+        _extract(fd, node_root, remaining, 0, profile)
     finally:
         os.close(fd)
     _layout(node_root)
     _seal(node_root, remaining)
     _tick(remaining)
     return VendorSource(cache, node_root, node_root / "bin/node", node_root / "bin/npm",
-                        ARCHIVE_SHA256, PREPARATION_ID)
+                        distribution["archive_sha256"], distribution["preparation_id"],
+                        distribution["node_version"], distribution["npm_version"])
+
+
+def source_node_root(snapshot_id, profile="desktop"):
+    if SESSION_ID.fullmatch(snapshot_id or "") is None:
+        _fail("vendor-node-platform-or-id")
+    distribution = _distribution(profile)
+    area = PROTECTED_BASE / snapshot_id
+    paths = (
+        Path("/run"), Path("/run/platform-ci-devlane"), PROTECTED_BASE, area,
+        area / "cache", area / "cache/node",
+        area / "cache/node" / distribution["node_version"],
+    )
+    for path in paths:
+        try:
+            metadata = os.lstat(path)
+        except OSError:
+            _fail("vendor-node-layout")
+        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0
+                or stat.S_IMODE(metadata.st_mode) & 0o022):
+            _fail("vendor-node-layout")
+    root = area / "cache/node" / distribution["node_version"] / "x64"
+    try:
+        metadata = os.lstat(root)
+    except OSError:
+        _fail("vendor-node-layout")
+    if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o555):
+        _fail("vendor-node-layout")
+    _layout(root)
+    for name in ("bin", "lib", "lib/node_modules", "lib/node_modules/npm",
+                 "lib/node_modules/npm/bin"):
+        try:
+            metadata = os.lstat(root / name)
+        except OSError:
+            _fail("vendor-node-layout")
+        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0
+                or stat.S_IMODE(metadata.st_mode) != 0o555):
+            _fail("vendor-node-layout")
+    for name in ("bin/node", "lib/node_modules/npm/bin/npm-cli.js"):
+        try:
+            metadata = os.lstat(root / name)
+        except OSError:
+            _fail("vendor-node-layout")
+        expected_mode = 0o555 if name == "bin/node" else 0o444
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0
+                or stat.S_IMODE(metadata.st_mode) != expected_mode):
+            _fail("vendor-node-layout")
+    return root

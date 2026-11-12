@@ -98,7 +98,7 @@ def build_projection(request):
     if type(request) is not dict:
         bundle._refuse("projection-request-shape")
     profile = request.get("profile")
-    if profile not in ("core-node", "core-rust"):
+    if profile not in ("core-node", "core-rust", "desktop"):
         bundle._refuse("projection-profile")
     if profile == "core-rust" and type(request) is dict and request.get("schema") == 2:
         expected = {"schema", "profile", "control_sha", "tools", "source_sets", "manifest_constraints"}
@@ -144,7 +144,11 @@ def build_projection(request):
     tools = request["tools"]
     if type(tools) is not dict:
         bundle._refuse("projection-tool-versions")
-    expected_tools = {"node", "npm"} if profile == "core-node" else {"cargo", "rustc"}
+    expected_tools = (
+        {"node", "npm"} if profile == "core-node" else
+        {"cargo", "rustc"} if profile == "core-rust" else
+        {"node", "npm", "cargo", "rustc"}
+    )
     if set(tools) != expected_tools:
         bundle._refuse("projection-tool-versions")
     lockfiles = [request["lockfile"]] if profile == "core-node" else request["lockfiles"]
@@ -156,6 +160,8 @@ def build_projection(request):
         bundle._refuse("projection-lockfile-duplicate")
     if profile == "core-rust" and lockfiles != ["Cargo.lock", "fuzz/Cargo.lock", "runtime/Cargo.lock"]:
         bundle._refuse("projection-rust-lockfile-set")
+    if profile == "desktop" and lockfiles != ["package-lock.json", "Cargo.lock"]:
+        bundle._refuse("projection-desktop-lockfile-set")
     tree = bundle.subprocess.run(
         ["git", "-C", str(repository), "ls-tree", "-r", "-z", "--full-tree", revision],
         check=False, stdout=bundle.subprocess.PIPE, stderr=bundle.subprocess.DEVNULL, timeout=60,
@@ -178,6 +184,20 @@ def build_projection(request):
             blob_ids[name] = object_id.decode("ascii")
     if set(blob_ids) != set(lockfiles):
         bundle._refuse("projection-lockfile-missing")
+    if profile == "desktop":
+        tree_paths = {}
+        for row in tree.stdout.split(b"\x00"):
+            if not row:
+                continue
+            try:
+                metadata, raw_path = row.split(b"\t", 1)
+                mode, kind, _object_id = metadata.split(b" ", 2)
+                tree_paths[raw_path.decode("utf-8", "strict")] = (mode, kind)
+            except (ValueError, UnicodeDecodeError):
+                bundle._refuse("projection-tree-entry")
+        if any(tree_paths.get(name) != (b"100644", b"blob")
+               for name in ("Cargo.toml", "src-tauri/Cargo.toml")):
+            bundle._refuse("projection-desktop-manifest-missing")
     lock_payloads = [bundle._git_blob(repository, blob_ids[name]) for name in lockfiles]
     lock_bytes = lock_payloads[0]
     if profile == "core-node":
@@ -187,7 +207,7 @@ def build_projection(request):
             "npm": npm, "cargo": [], "playwright": request["playwright"],
             "npm_package": package, "npm_lock": lock, "cargo_workspaces": [],
         }
-    else:
+    elif profile == "core-rust":
         manifest, lock, cargo = fetch.project_cargo_lock(lock_bytes)
         workspaces = []
         for path, payload in zip(lockfiles[1:], lock_payloads[1:]):
@@ -198,6 +218,16 @@ def build_projection(request):
             "npm": [], "cargo": cargo, "playwright": [],
             "cargo_manifest": manifest, "cargo_lock": lock,
             "cargo_workspaces": workspaces,
+        }
+    else:
+        npm_package, npm_lock, npm = fetch.project_npm_lock(lock_payloads[0])
+        cargo_manifest, cargo_lock, cargo = fetch.project_cargo_lock(lock_payloads[1])
+        result = {
+            "schema": 1, "profile": profile, "tools": tools,
+            "npm": npm, "cargo": cargo, "playwright": [],
+            "npm_package": npm_package, "npm_lock": npm_lock,
+            "cargo_manifest": cargo_manifest, "cargo_lock": cargo_lock,
+            "cargo_workspaces": [],
         }
     serialized = bundle.canonical_json(result)
     fetch.validate_projection(serialized, profile)

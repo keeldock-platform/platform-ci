@@ -280,7 +280,7 @@ class ProcedureDocumentTests(unittest.TestCase):
             self.assertIn(phrase, self.text)
         workflow = (self.root / ".github/workflows/devlane-encrypted.yml").read_text(encoding="utf-8")
         self.assertIn("- core-rust", workflow)
-        self.assertIn("if: ${{ inputs.profile == 'core-rust' }}", workflow)
+        self.assertIn("if: ${{ inputs.profile == 'core-rust' || inputs.profile == 'desktop' }}", workflow)
         self.assertIn('--profile "$DEVLANE_PROFILE"', workflow)
         self.assertEqual(rehearsal.build_source.__defaults__, ("core-node",))
 

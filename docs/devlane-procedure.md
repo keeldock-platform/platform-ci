@@ -245,3 +245,14 @@ The source-free production-path E2E suite has two deliberate negative controls. 
 - Step names. Some check step names still read "protected-branch dispatch" although the source-free control now accepts any `refs/heads/` branch. The names are fixed in the exact policy templates and auditors; they are cosmetic and renaming them is deferred.
 - Revocation window. The key stays installed until the decrypt step concludes (step 8). Revoking earlier, once the run job's setup step completes (secrets are handed to the runner at assignment), would shrink that window and is deferred until the rehearsal can prove it on a real run.
 - Hosted behavior. Secret masking and injection, run deletion semantics and the exact hosted log format are proven only by a real dispatch, which is why the rehearsal is required.
+
+Desktop wave
+------------
+
+The desktop profile is Linux-only and targets the encrypted Ubuntu 24.04 runner. The projection request is owner-only and contains metadata, paths and lockfile names; it never contains source file contents. Use schema 1 with the exact repository path and source commit, profile "desktop", tool pins Node 26.8.1, npm 11.19.0, Cargo 1.99.1 and rustc 1.99.1, an empty playwright list, and lockfiles exactly package-lock.json and Cargo.lock. The project command reads those two lockfiles from the immutable Git revision and emits sanitized package coordinates.
+
+The encrypted bundle request uses the existing schema 1 fields: repository, source revision, profile, projection digest, wave and bundle identifiers, control SHA, expiry, selected source paths, public file and test maps, and frame map. Select the two lockfiles and the source files required by the fixed commands. Keep both the projection request and bundle request in the owner directory. Never paste source, manifests, lockfile contents, or archive data into this procedure or the public platform repository.
+
+Preparation verifies the pinned Node archive, runs npm ci with lifecycle scripts disabled, and runs cargo vendor --locked from the sanitized Cargo projection. The offline command set runs Cargo format, clippy and tests with default and all features, npm typecheck and test, then scripts/build-edition.sh for minimal, git-only and all-tools-so-far. The runner installs the fixed Ubuntu Tauri prerequisites: WebKitGTK 4.1, the native build tools, curl, wget, file, xdo, OpenSSL, Ayatana appindicator and librsvg development packages.
+
+The desktop reference at the time of this procedure does not define npm typecheck or test scripts. Add and verify those scripts in the desktop repository before a rehearsal. A successful Linux rehearsal is required before any private desktop wave. Native encrypted execution on macOS and Windows remains a later design item.

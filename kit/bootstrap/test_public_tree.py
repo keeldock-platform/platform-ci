@@ -1003,6 +1003,7 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/test_linux_runtime.py',
             'kit/devlane/test_rust_report.py',
             'kit/devlane/test_rust_test_runner.py',
+            'kit/devlane/test_desktop_profile.py',
             'kit/devlane/deadline.py',
             'kit/devlane/rust_matrix_runner.py',
             'kit/devlane/rust_tooling.py',

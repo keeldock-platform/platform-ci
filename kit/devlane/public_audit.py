@@ -44,6 +44,7 @@ STEP_NAMES = (
     "Reserve work time for persisted permit cache restore",
     "Restore and verify persisted one-run permit",
     "Verify permit and emit bound dispatch marker",
+    "Install Tauri Linux build dependencies",
     "Fetch ciphertext and sanitized dependency projection",
     "Install pinned Rust toolchain",
     "Prepare dependencies before the cut",
@@ -345,6 +346,7 @@ class _Grammar:
             "Verify exact source-free control evidence": {"devlane_permit=verify_control=pass"},
             "Claim this bundle for one run before decryption": {"devlane_permit=claim=pass"},
             "Install pinned Rust toolchain": {"rust_offline_tools=prepared"},
+            "Install Tauri Linux build dependencies": {"tauri_linux_dependencies=installed"},
             "Prepare dependencies before the cut": {"dependency_preparation=complete"},
             "Prove public connectivity before the cut": {"network_positive_control=pass"},
             "Cut network and start the isolated supervisor": {"offline_supervisor=ready"},
@@ -367,6 +369,8 @@ class _Grammar:
             exact = exact | {"rust_matrix_fixture=loaded committed_locks=3 matrix_coverage_ids=23"}
         if step_name == "Prepare dependencies before the cut" and self.identity.get("profile") == "core-rust":
             exact = exact | {"rust_offline_tools=installed"}
+        if step_name == "Install pinned Rust toolchain" and self.identity.get("profile") == "desktop":
+            exact = {"rust_toolchain=prepared"}
         if (step_name == "Prepare hosted Linux isolation state" and self.kind == "encrypted"
                 and self.identity.get("profile") == "core-rust"):
             exact = exact | {"devlane_cgroup_v2=ready"}
@@ -1021,7 +1025,7 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         _refuse()
     if records:
         profile = identity.get("profile")
-        if profile not in ("core-node", "core-rust"):
+        if profile not in ("core-node", "core-rust", "desktop"):
             _refuse()
         validate_summary_records(records, profile)
     if kind == "encrypted" and job_name == RUN_JOB:
@@ -1129,12 +1133,14 @@ def validate_job_contract(jobs, identity, profile):
     step_by_name = {step["name"]: step for step in steps}
     expected_tool_step = "Prepare dependencies before the cut" if profile == "core-node" else "Install pinned Rust toolchain"
     skipped_tool_step = "Install pinned Rust toolchain" if profile == "core-node" else None
+    skipped_desktop_dependency_step = "Install Tauri Linux build dependencies" if profile != "desktop" else None
     cleanup_step = step_by_name["Shred runner-local workspace"]
     if cleanup_step.get("status") != "completed" or cleanup_step.get("conclusion") != "success":
         _refuse()
     cancelled = run_job["conclusion"] in ("cancelled", "timed_out")
     for name, step in step_by_name.items():
-        if skipped_tool_step is not None and name == skipped_tool_step:
+        if ((skipped_tool_step is not None and name == skipped_tool_step)
+                or (skipped_desktop_dependency_step is not None and name == skipped_desktop_dependency_step)):
             if step.get("status") != "completed" or step.get("conclusion") != "skipped":
                 _refuse()
             continue
@@ -1247,7 +1253,7 @@ def audit_environment(env):
             or not re.fullmatch(r"[a-f0-9]{40}", env["CI_SHA"])
             or not DECIMAL.fullmatch(env["CI_CONTROL_RUN_ID"])
             or not DECIMAL.fullmatch(env["GITHUB_RUN_ID"]) or env["GITHUB_RUN_ATTEMPT"] != "1"
-            or env["DEVLANE_PROFILE"] not in ("core-node", "core-rust")
+            or env["DEVLANE_PROFILE"] not in ("core-node", "core-rust", "desktop")
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{7,63}", env["DEVLANE_WAVE_ID"])
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{7,63}", env["DEVLANE_BUNDLE_ID"])
             or not SHA256.fullmatch(env["DEVLANE_CACHE_BASELINE_SHA256"])):

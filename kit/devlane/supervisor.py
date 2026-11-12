@@ -37,6 +37,7 @@ import filter as output_filter
 import network_probe
 import prepare as node_tool_prepare
 import node_tool_snapshot
+import node_vendor_source
 
 
 MAX_RPC = 32 * 1024
@@ -1482,12 +1483,12 @@ def _prepare_writable_scratch(root, *, registry_v2=False):
 
 
 def _copy_prepared_dependencies(root, profile, *, registry_v2=False):
-    if profile == "core-node":
+    if profile in ("core-node", "desktop"):
         source = root / "prepared/node_modules"
         destination = root / "workspace/source/node_modules"
         _copy_prepared_tree(source, destination)
         _chown_tree(destination)
-    elif profile == "core-rust":
+    if profile in ("core-rust", "desktop"):
         vendor = root / ("prepared/cargo-local-registry" if registry_v2 else "prepared/cargo-vendor")
         if not vendor.is_dir() or vendor.is_symlink():
             _refuse("cargo-vendor-missing")
@@ -1561,11 +1562,17 @@ def _preflight_tools(profile, projection, tool_paths, owner_uid=None):
     paths = dict(tool_paths)
     if profile == "core-node" and not node_tool_snapshot.valid_snapshot_id(paths.get("node_snapshot_id")):
         _refuse("node-snapshot-id")
-    if profile == "core-rust" and (not paths["cargo"] or not paths["rustc"]):
+    if profile == "desktop" and not node_vendor_source.SESSION_ID.fullmatch(paths.get("node_vendor_id") or ""):
+        _refuse("node-snapshot-id")
+    if profile in ("core-rust", "desktop") and (not paths.get("cargo") or not paths.get("rustc")):
         _refuse("rust-toolchain-missing")
     if type(projection) is not dict or type(projection.get("tools")) is not dict:
         _refuse("tool-manifest-invalid")
-    required = {"node", "npm"} if profile == "core-node" else ({"cargo", "rustc"} if profile == "core-rust" else set())
+    required = (
+        {"node", "npm"} if profile == "core-node" else
+        {"cargo", "rustc"} if profile == "core-rust" else
+        {"node", "npm", "cargo", "rustc"} if profile == "desktop" else set()
+    )
     if set(projection["tools"]) != required:
         _refuse("tool-manifest-invalid")
     node_root = None
@@ -1574,6 +1581,32 @@ def _preflight_tools(profile, projection, tool_paths, owner_uid=None):
         node_tool_info, node_versions = _node_snapshot_versions(paths["node_snapshot_id"], owner_uid)
         node_root = Path(node_tool_info["root"])
         paths.update({name: node_tool_info[name] for name in ("node", "npm", "npm_cli")})
+    elif profile == "desktop":
+        try:
+            node_root = node_vendor_source.source_node_root(paths["node_vendor_id"], "desktop")
+        except node_vendor_source.VendorNodeRefusal:
+            _refuse("node-toolchain-missing")
+        paths.update({
+            "node": str(node_root / "bin/node"),
+            "npm": str(node_root / "bin/npm"),
+            "npm_cli": str(node_root / "lib/node_modules/npm/bin/npm-cli.js"),
+        })
+        node_tool_info = {name: paths[name] for name in ("node", "npm", "npm_cli")}
+        try:
+            results = node_tool_prepare.run_node_versions(
+                node_tool_info,
+                lambda argv, *, env: subprocess.run(
+                    argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, timeout=_bounded_timeout(10),
+                    check=False, env=env),
+            )
+            node_versions = {}
+            for name, result in results.items():
+                if result.returncode != 0:
+                    _refuse("tool-version-unavailable")
+                node_versions[name] = result.stdout.decode("ascii", "strict").strip()
+        except (OSError, subprocess.SubprocessError, UnicodeDecodeError, bundle.Refusal):
+            _refuse("tool-version-unavailable")
     for name in ("node", "npm", "cargo", "rustc"):
         path = paths.get(name)
         if path is None or path == "":
@@ -1588,7 +1621,7 @@ def _preflight_tools(profile, projection, tool_paths, owner_uid=None):
         if name not in paths or not paths[name] or type(expected_version) is not str:
             _refuse("tool-manifest-invalid")
         expected_text = ("v" + expected_version) if name == "node" else expected_version
-        if profile == "core-node":
+        if profile in ("core-node", "desktop") and name in ("node", "npm"):
             actual_version = node_versions[name]
         else:
             try:
@@ -1608,7 +1641,7 @@ def _preflight_tools(profile, projection, tool_paths, owner_uid=None):
             _refuse("tool-version-mismatch")
         if name != "node" and actual_version != expected_version:
             _refuse("tool-version-mismatch")
-        _hash_file(paths["npm_cli"] if profile == "core-node" and name == "npm" else paths[name],
+        _hash_file(paths["npm_cli"] if profile in ("core-node", "desktop") and name == "npm" else paths[name],
                    256 * 1024 * 1024)
     rust_root = None
     if node_root:
@@ -1623,6 +1656,7 @@ def _preflight_tools(profile, projection, tool_paths, owner_uid=None):
         "paths": paths,
         "node_root": node_root,
         "node_snapshot_id": paths.get("node_snapshot_id", ""),
+        "node_vendor_id": paths.get("node_vendor_id", ""),
         "rust_root": rust_root,
     }
 
@@ -2341,6 +2375,32 @@ class Service:
                 _refuse("npm-lock-projection-invalid")
             if package != self.projection_value["npm_package"] or lock != self.projection_value["npm_lock"]:
                 _refuse("npm-projection-mismatch")
+        elif self.context["profile"] == "desktop":
+            package_path = source / "package.json"
+            npm_lock_path = source / "package-lock.json"
+            cargo_root_manifest_path = source / "Cargo.toml"
+            cargo_manifest_path = source / "src-tauri/Cargo.toml"
+            cargo_lock_path = source / "Cargo.lock"
+            if (package_path.is_symlink() or not package_path.is_file()
+                    or npm_lock_path.is_symlink() or not npm_lock_path.is_file()
+                    or cargo_root_manifest_path.is_symlink() or not cargo_root_manifest_path.is_file()
+                    or cargo_manifest_path.is_symlink() or not cargo_manifest_path.is_file()
+                    or cargo_lock_path.is_symlink() or not cargo_lock_path.is_file()
+                    or set(self.manifest["original_lockfiles"]) != {
+                        "package-lock.json", "Cargo.lock"}):
+                _refuse("cargo-lock-binding-missing")
+            try:
+                fetch.validate_npm_manifest_binding(
+                    package_path.read_bytes(), self.projection_value["npm_package"])
+                package, npm_lock, _ = fetch.project_npm_lock(npm_lock_path.read_bytes())
+                cargo_manifest, cargo_lock, _ = fetch.project_cargo_lock(cargo_lock_path.read_bytes())
+            except (OSError, fetch.Refusal):
+                _refuse("cargo-lock-projection-invalid")
+            if (package != self.projection_value["npm_package"]
+                    or npm_lock != self.projection_value["npm_lock"]
+                    or cargo_manifest != self.projection_value["cargo_manifest"]
+                    or cargo_lock != self.projection_value["cargo_lock"]):
+                _refuse("cargo-projection-mismatch")
         else:
             if self.manifest["schema"] == 2:
                 try:
@@ -2479,7 +2539,8 @@ class Service:
                 if stage == "browser" and self.manifest["frames"]:
                     _run_browser_smoke(self.root, self.tool_info, deadline=self.deadline_file)
                 browser_debug = stage == "browser"
-                result = _run_profile_command(self.root, command, stage, "/workspace/raw/" + stage + ".log",
+                log_id = stage + "-" + str(index) if profile_name == "desktop" else stage
+                result = _run_profile_command(self.root, command, stage, "/workspace/raw/" + log_id + ".log",
                                               self.tool_info, timeout=phase_timeout, deadline=self.deadline_file,
                                               browser_debug=browser_debug)
             if result == 130:
@@ -3525,6 +3586,7 @@ def _serve(args):
             args.state_dir, args.context, args.workspace, args.prepared,
             args.bundle, args.projection, args.host_net_inode, args.owner_uid,
             {"node_snapshot_id": args.node_snapshot_id or "",
+             "node_vendor_id": args.node_vendor_id or "",
              "cargo": args.cargo_path or None, "rustc": args.rustc_path or None}, args.deadline_file,
             getattr(args, "failure_diagnostics_file", None),
         )
@@ -3699,16 +3761,27 @@ def _start(args):
         if not node_tool_snapshot.valid_snapshot_id(args.node_snapshot_id):
             _refuse("node-snapshot-id")
         tool_paths = {
-            "node_snapshot_id": args.node_snapshot_id, "cargo": "", "rustc": "",
+            "node_snapshot_id": args.node_snapshot_id, "node_vendor_id": "",
+            "cargo": "", "rustc": "",
         }
-    else:
-        if args.node_snapshot_id:
+    elif context["profile"] == "desktop":
+        if (args.node_snapshot_id
+                or not node_vendor_source.SESSION_ID.fullmatch(args.node_vendor_id or "")):
             _refuse("node-snapshot-id")
         tool_paths = {
+            "node_snapshot_id": "", "node_vendor_id": args.node_vendor_id,
             "cargo": getattr(args, "cargo_path") or shutil.which("cargo") or "",
             "rustc": getattr(args, "rustc_path") or shutil.which("rustc") or "",
         }
-    if context["profile"] == "core-rust":
+    else:
+        if args.node_snapshot_id or args.node_vendor_id:
+            _refuse("node-snapshot-id")
+        tool_paths = {
+            "node_vendor_id": "",
+            "cargo": getattr(args, "cargo_path") or shutil.which("cargo") or "",
+            "rustc": getattr(args, "rustc_path") or shutil.which("rustc") or "",
+        }
+    if context["profile"] in ("core-rust", "desktop"):
         try:
             for name in ("cargo", "rustc"):
                 """Real toolchain binaries only: a rustup proxy cannot run in the offline root."""
@@ -3736,6 +3809,7 @@ def _start(args):
         "--deadline-file", str(Path(args.deadline_file).resolve(strict=True)),
         "--host-net-inode", str(host_net_inode), "--owner-uid", str(os.getuid()),
         "--node-snapshot-id", tool_paths.get("node_snapshot_id", ""),
+        "--node-vendor-id", tool_paths.get("node_vendor_id", ""),
         "--cargo-path", tool_paths["cargo"], "--rustc-path", tool_paths["rustc"],
     ])
     if failure_diagnostics_file:
@@ -3899,6 +3973,7 @@ def _argument_parser():
     start.add_argument("--deadline-file", required=True)
     start.add_argument("--failure-diagnostics-file", default="")
     start.add_argument("--node-snapshot-id", default="")
+    start.add_argument("--node-vendor-id", default="")
     for name in ("cargo-path", "rustc-path"):
         start.add_argument("--" + name, default="")
     client = sub.add_parser("_serve")
@@ -3909,6 +3984,7 @@ def _argument_parser():
     client.add_argument("--host-net-inode", type=int, required=True)
     client.add_argument("--owner-uid", type=int, required=True)
     client.add_argument("--node-snapshot-id", default="")
+    client.add_argument("--node-vendor-id", default="")
     for name in ("cargo-path", "rustc-path"):
         client.add_argument("--" + name, default="")
     for operation in ("probe", "decrypt", "execute", "cleanup"):

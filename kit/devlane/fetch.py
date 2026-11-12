@@ -75,7 +75,7 @@ def validate_dispatch(identity, expected_profile=None, now=None):
         _fail("run-attempt")
     if type(identity["control_run_id"]) is not str or not re.fullmatch(r"[1-9][0-9]{0,18}", identity["control_run_id"]):
         _fail("control-run-id")
-    if identity["profile"] not in ("core-node", "core-rust"):
+    if identity["profile"] not in ("core-node", "core-rust", "desktop"):
         _fail("profile")
     if expected_profile is not None and identity["profile"] != expected_profile:
         _fail("profile-binding")
@@ -372,9 +372,9 @@ def validate_projection(payload, expected_profile, expected_control_sha=None):
     if expected_profile == "core-rust" and type(value) is dict and value.get("schema") == 2:
         return _validate_core_rust_v2_projection(value, expected_control_sha)
     required = {"schema", "profile", "npm", "cargo", "playwright", "tools", "cargo_workspaces"}
-    if expected_profile == "core-node":
+    if expected_profile in ("core-node", "desktop"):
         required |= {"npm_package", "npm_lock"}
-    elif expected_profile == "core-rust":
+    if expected_profile in ("core-rust", "desktop"):
         required |= {"cargo_manifest", "cargo_lock"}
     if type(value) is not dict or set(value) != required:
         _fail("projection-shape")
@@ -430,17 +430,24 @@ def validate_projection(payload, expected_profile, expected_control_sha=None):
             or any(type(item) is not str or item not in ("chromium", "firefox", "webkit") for item in browsers)):
         _fail("projection-playwright")
     tools = value.get("tools")
-    expected_tools = {"node", "npm"} if expected_profile == "core-node" else ({"cargo", "rustc"} if expected_profile == "core-rust" else set())
+    expected_tools = (
+        {"node", "npm"} if expected_profile == "core-node" else
+        {"cargo", "rustc"} if expected_profile == "core-rust" else
+        {"node", "npm", "cargo", "rustc"} if expected_profile == "desktop" else set()
+    )
     if type(tools) is not dict or set(tools) != expected_tools:
         _fail("projection-tools")
     if expected_profile == "core-node" and tools != {"node": "24.22.1", "npm": "11.19.1"}:
         _fail("projection-tool-version")
     if expected_profile == "core-rust" and tools != {"cargo": "1.99.1", "rustc": "1.99.1"}:
         _fail("projection-tool-version")
+    if expected_profile == "desktop" and tools != {
+            "node": "26.8.1", "npm": "11.19.0", "cargo": "1.99.1", "rustc": "1.99.1"}:
+        _fail("projection-tool-version")
     for version in tools.values():
         if type(version) is not str or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", version):
             _fail("projection-tool-version")
-    if expected_profile == "core-node":
+    if expected_profile in ("core-node", "desktop"):
         package, lock = value["npm_package"], value["npm_lock"]
         if type(package) is not dict or set(package) - {"name", "version", "private", "dependencies", "devDependencies", "optionalDependencies", "peerDependencies"}:
             _fail("projection-npm-package")
@@ -453,8 +460,9 @@ def validate_projection(payload, expected_profile, expected_control_sha=None):
             _fail("projection-playwright-package")
         if cargo_workspaces:
             _fail("projection-node-workspaces")
-    if expected_profile == "core-rust":
-        if [item["path"] for item in cargo_workspaces] != ["fuzz/Cargo.lock", "runtime/Cargo.lock"]:
+    if expected_profile in ("core-rust", "desktop"):
+        expected_workspaces = ["fuzz/Cargo.lock", "runtime/Cargo.lock"] if expected_profile == "core-rust" else []
+        if [item["path"] for item in cargo_workspaces] != expected_workspaces:
             _fail("projection-cargo-workspace-set")
         if type(value["cargo_manifest"]) is not str or len(value["cargo_manifest"]) > 2 * 1024 * 1024:
             _fail("projection-cargo-manifest")

@@ -133,7 +133,7 @@ def _valid_bindings(bindings):
         _refuse("binding-control")
     if bindings.get("workflow_path") != ".github/workflows/devlane-encrypted.yml":
         _refuse("binding-workflow")
-    if bindings.get("profile") not in ("core-node", "core-rust"):
+    if bindings.get("profile") not in ("core-node", "core-rust", "desktop"):
         _refuse("binding-profile")
     for name in ("wave_id", "bundle_id"):
         if type(bindings.get(name)) is not str or not OPAQUE_ID.fullmatch(bindings[name]):
@@ -659,7 +659,7 @@ def build_source_archive(repository, revision, profile, fetch_sha256, source_fil
     repository = Path(repository).resolve(strict=True)
     if type(revision) is not str or not GIT_SHA.fullmatch(revision):
         _refuse("source-revision-invalid")
-    if profile not in ("core-node", "core-rust", "synthetic") or not SHA256.fullmatch(fetch_sha256):
+    if profile not in ("core-node", "core-rust", "desktop", "synthetic") or not SHA256.fullmatch(fetch_sha256):
         _refuse("source-profile-invalid")
     verify = subprocess.run(
         ["git", "-C", str(repository), "rev-parse", "--verify", revision + "^{commit}"],

@@ -10,6 +10,7 @@ on:
         options:
           - core-node
           - core-rust
+          - desktop
       control_run_id:
         description: Successful exact-SHA source-free public control run
         required: true
@@ -345,6 +346,22 @@ jobs:
             --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json"
           printf 'KD-DEVLANE-DISPATCH schema=1 wave-id=%s bundle-id=%s control-sha=%s run-id=%s run-attempt=1\n' \
             "$DEVLANE_WAVE_ID" "$DEVLANE_BUNDLE_ID" "$CI_SHA" "$CI_RUN_ID"
+      - name: Install Tauri Linux build dependencies
+        if: inputs.profile == 'desktop'
+        run: |
+          set -euo pipefail
+          sudo apt-get update >/dev/null 2>&1
+          sudo apt-get install --no-install-recommends -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev >/dev/null 2>&1
+          printf 'tauri_linux_dependencies=installed\n'
       - name: Fetch ciphertext and sanitized dependency projection
         run: |
           set -euo pipefail
@@ -356,7 +373,7 @@ jobs:
           '
           mkdir -m 700 "$RUN_ROOT/workspace"
       - name: Install pinned Rust toolchain
-        if: ${{ inputs.profile == 'core-rust' }}
+        if: ${{ inputs.profile == 'core-rust' || inputs.profile == 'desktop' }}
         run: |
           set -euo pipefail
           rust_version="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
@@ -366,9 +383,13 @@ jobs:
             rustup toolchain install "$rust_version" --profile minimal --component rustfmt >/dev/null 2>&1
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             rustup default "$rust_version" >/dev/null 2>&1
-          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
-            python3 -B kit/devlane/rust_tooling.py fetch --output "$RUN_ROOT/rust-tooling" \
-              --deadline-file "$RUN_ROOT/deadline.json"
+          if [[ "$DEVLANE_PROFILE" == "core-rust" ]]; then
+            python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              python3 -B kit/devlane/rust_tooling.py fetch --output "$RUN_ROOT/rust-tooling" \
+                --deadline-file "$RUN_ROOT/deadline.json"
+          else
+            printf 'rust_toolchain=prepared\n'
+          fi
       - name: Prepare dependencies before the cut
         run: |
           set -euo pipefail
@@ -376,12 +397,16 @@ jobs:
           owner_uid="$EUID"
           owner_gid="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- id -g)"
           node_snapshot_id=""
+          node_source_id=""
           cargo_path=""
           rustc_path=""
           if [[ "$DEVLANE_PROFILE" == "core-node" ]]; then
-            node_snapshot_id="devlane-${CI_RUN_ID}-${CI_RUN_ATTEMPT}"
+            node_snapshot_id="$(printf 'devlane-%s-%s' "$CI_RUN_ID" "$CI_RUN_ATTEMPT")"
           fi
-          if [[ "$DEVLANE_PROFILE" == "core-rust" ]]; then
+          if [[ "$DEVLANE_PROFILE" == "desktop" ]]; then
+            node_source_id="$(printf 'devlane-%s-%s' "$CI_RUN_ID" "$CI_RUN_ATTEMPT")"
+          fi
+          if [[ "$DEVLANE_PROFILE" == "core-rust" || "$DEVLANE_PROFILE" == "desktop" ]]; then
             rust_version="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
               python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tools"]["cargo"])' "$RUN_ROOT/projection.json")"
             [[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
@@ -398,6 +423,7 @@ jobs:
               --owner-uid "$owner_uid" --owner-gid "$owner_gid" \
               --cargo-path "$cargo_path" --rustc-path "$rustc_path" \
               --node-snapshot-id "$node_snapshot_id" \
+              --node-source-id "$node_source_id" \
               --deadline-file "$RUN_ROOT/deadline.json"
           if [[ "$DEVLANE_PROFILE" == "core-rust" ]]; then
             python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
@@ -415,12 +441,16 @@ jobs:
           ulimit -S -c 0
           ulimit -H -c 0
           node_snapshot_id=""
+          node_vendor_id=""
           cargo_path=""
           rustc_path=""
           if [[ "$DEVLANE_PROFILE" == "core-node" ]]; then
-            node_snapshot_id="devlane-${CI_RUN_ID}-${CI_RUN_ATTEMPT}"
+            node_snapshot_id="$(printf 'devlane-%s-%s' "$CI_RUN_ID" "$CI_RUN_ATTEMPT")"
           fi
-          if [[ "$DEVLANE_PROFILE" == "core-rust" ]]; then
+          if [[ "$DEVLANE_PROFILE" == "desktop" ]]; then
+            node_vendor_id="$(printf 'devlane-%s-%s' "$CI_RUN_ID" "$CI_RUN_ATTEMPT")"
+          fi
+          if [[ "$DEVLANE_PROFILE" == "core-rust" || "$DEVLANE_PROFILE" == "desktop" ]]; then
             rust_version="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
               python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tools"]["cargo"])' "$RUN_ROOT/projection.json")"
             [[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
@@ -436,7 +466,8 @@ jobs:
               --bundle "$RUN_ROOT/bundle.enc" --projection "$RUN_ROOT/projection.json" \
               --deadline-file "$RUN_ROOT/deadline.json" \
               --positive-control "$RUN_ROOT/positive-control.json" \
-              --node-snapshot-id "$node_snapshot_id" --cargo-path "$cargo_path" --rustc-path "$rustc_path"
+              --node-snapshot-id "$node_snapshot_id" --node-vendor-id "$node_vendor_id" \
+              --cargo-path "$cargo_path" --rustc-path "$rustc_path"
       - name: Probe isolation before decryption
         run: |
           set -euo pipefail
@@ -469,12 +500,16 @@ jobs:
         run: |
           set -euo pipefail
           node_snapshot_id=""
+          node_vendor_id=""
           if [[ "$DEVLANE_PROFILE" == "core-node" ]]; then
-            node_snapshot_id="devlane-${CI_RUN_ID}-${CI_RUN_ATTEMPT}"
+            node_snapshot_id="$(printf 'devlane-%s-%s' "$CI_RUN_ID" "$CI_RUN_ATTEMPT")"
+          fi
+          if [[ "$DEVLANE_PROFILE" == "desktop" ]]; then
+            node_vendor_id="$(printf 'devlane-%s-%s' "$CI_RUN_ID" "$CI_RUN_ATTEMPT")"
           fi
           python3 -B kit/devlane/host_cleanup.py --root "$RUN_ROOT" --runner-temp "$RUNNER_TEMP" \
             --deadline-file "$RUN_ROOT/deadline.json" \
-            --node-snapshot-id "$node_snapshot_id"
+            --node-snapshot-id "$node_snapshot_id" --node-vendor-id "$node_vendor_id"
           printf 'devlane_job=completed public_output=filtered cleanup=confirmed\n'
   devlane-encrypted-audit:
     name: devlane-encrypted-audit

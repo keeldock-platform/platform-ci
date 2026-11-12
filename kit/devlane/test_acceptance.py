@@ -1126,7 +1126,7 @@ class SupervisorOrderAcceptanceTests(unittest.TestCase):
             "state_dir": tempfile.mkdtemp(), "context": "context", "workspace": "workspace",
             "prepared": "prepared", "bundle": "bundle", "projection": "projection",
             "deadline_file": "deadline",
-            "host_net_inode": 1, "owner_uid": os.getuid(), "node_snapshot_id": "",
+            "host_net_inode": 1, "owner_uid": os.getuid(), "node_snapshot_id": "", "node_vendor_id": "",
             "cargo_path": "", "rustc_path": "",
         })()
         service = type("Service", (), {
