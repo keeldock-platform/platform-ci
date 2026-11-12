@@ -1081,6 +1081,13 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/src/lib.rs',
             'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/src/main.rs',
             'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/tauri.conf.json',
+            'kit/confinement/macos_boundary_guard.py',
+            'kit/confinement/test_macos_boundary_guard.py',
+            'kit/confinement/test_macos_context_load.py',
+            'kit/confinement/test_macos_deny_default.py',
+            'kit/confinement/test_macos_public_audit.py',
+            'kit/devlane/sandbox_macos.py',
+            'kit/devlane/test_sandbox_macos.py',
         })
         self.assertEqual(set(PINNED_FILE_SHA256), expected)
         self.assertTrue({name for name in expected if type(name) is str}.issubset(PLATFORM_FILES))

@@ -141,11 +141,12 @@ function compile(ts, sourceRoot, manifest, libraryRoot) {
   return records;
 }
 
-export async function runTypeScriptReporter({ sourceRoot, manifestPath, outputPath, trustedTypeScriptPath }) {
+export async function runTypeScriptReporter({ sourceRoot, manifestPath, outputPath, trustedTypeScriptPath,
+  trustedTypeScriptRoot = '/prepared/node_modules' }) {
   const normalizedRoot = fs.realpathSync(sourceRoot);
   if (!fs.statSync(normalizedRoot).isDirectory()) fail('source-root-invalid');
   const manifest = parseStrictJson(readBounded(manifestPath, 4 * 1024 * 1024).toString('utf8'), 4 * 1024 * 1024);
-  const tsPath = requireTypeScriptPath(trustedTypeScriptPath);
+  const tsPath = requireTypeScriptPath(trustedTypeScriptPath, trustedTypeScriptRoot);
   const ts = await import(pathToFileURL(tsPath).href);
   const records = compile(ts.default ?? ts, normalizedRoot, manifest, path.dirname(tsPath));
   const payload = records.map((record) => `${JSON.stringify(record)}\n`).join('');
@@ -154,8 +155,8 @@ export async function runTypeScriptReporter({ sourceRoot, manifestPath, outputPa
   return records.length;
 }
 
-function requireTypeScriptPath(candidate) {
-  const preparedRoot = '/prepared/node_modules';
+function requireTypeScriptPath(candidate, trustedTypeScriptRoot = '/prepared/node_modules') {
+  const preparedRoot = path.resolve(trustedTypeScriptRoot || '');
   const resolved = path.resolve(candidate || '');
   if (!inside(preparedRoot, resolved) || !resolved.endsWith('/typescript/lib/typescript.js')) {
     fail('typescript-unavailable');
@@ -173,9 +174,10 @@ function requireTypeScriptPath(candidate) {
 export { compile as compileForTest };
 
 async function main(argv) {
-  if (argv.length !== 4) fail('usage');
+  if (argv.length !== 4 && argv.length !== 5) fail('usage');
   try {
-    const count = await runTypeScriptReporter({ sourceRoot: argv[0], manifestPath: argv[1], outputPath: argv[2], trustedTypeScriptPath: argv[3] });
+    const count = await runTypeScriptReporter({ sourceRoot: argv[0], manifestPath: argv[1], outputPath: argv[2],
+      trustedTypeScriptPath: argv[3], trustedTypeScriptRoot: argv[4] });
     process.stdout.write(`typescript_records=${count}\n`);
     return 0;
   } catch (error) {

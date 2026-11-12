@@ -16,6 +16,7 @@ from unittest import mock
 
 import bundle
 import coordinator
+import sandbox_macos
 
 
 CONTROL_SHA = "a" * 40
@@ -54,6 +55,27 @@ def _ledger_record(wave_id="wave-test-0001", bundle_id="bundle-test-0001", state
             "replay_guard": {"state": "not-created", "retain_until": int(time.time()) + 1800},
         },
     }
+
+
+class MacWorkerSourceFreeAcceptanceTests(unittest.TestCase):
+    def test_profile_keeps_network_and_external_system_interfaces_denied(self):
+        profile = sandbox_macos.profile_text(
+            workspace="/tmp/workspace", prepared="/tmp/prepared", scratch="/tmp/scratch",
+            home="/tmp/home", control="/tmp/control", node="/usr/bin/true",
+            developer="/Library/Developer/CommandLineTools", clang="/usr/bin/true",
+        )
+        self.assertTrue(profile.startswith("(version 1)\n(deny default)\n"))
+        self.assertIn("(deny network*)", profile)
+        self.assertIn("(deny lsopen)", profile)
+        self.assertIn("(deny mach-lookup)", profile)
+        self.assertIn('(allow file-write* (subpath "/tmp/workspace/source")', profile)
+        self.assertNotIn('(allow file-write* (subpath "/tmp")', profile)
+
+    def test_worker_cleanup_parser_rejects_malformed_directory_service_rows(self):
+        self.assertFalse(sandbox_macos._account_is_listed(b"daemon 1\n", "kddevlane123"))
+        self.assertTrue(sandbox_macos._account_is_listed(b"kddevlane123 502\n", "kddevlane123"))
+        with self.assertRaises(sandbox_macos.Refusal):
+            sandbox_macos._account_is_listed(b"malformed\n", "kddevlane123")
 
 
 def _write_record(root, record):
@@ -821,6 +843,16 @@ class SingleDispatchOwnerTests(unittest.TestCase):
                 coordinator.dispatch_wave(ledger, "wave-test-0001", key_path, timeout_seconds=10)
             self.assertFalse(key_path.exists())
 
+    def test_macos_runner_is_limited_to_core_node(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger, key_path = self._ready_wave(temporary)
+            record = coordinator._read(ledger / "wave-test-0001.json")
+            record["profile"] = "core-rust"
+            _write_record(ledger, record)
+            with self.assertRaisesRegex(coordinator.Refusal, "runner-profile-unsupported"):
+                coordinator.dispatch_wave(ledger, "wave-test-0001", key_path, runner="macos-15")
+            self.assertFalse(key_path.exists())
+
     def test_key_file_requires_exact_lowercase_hex_without_echoing_contents(self):
         with tempfile.TemporaryDirectory() as temporary:
             key_path = Path(temporary) / "key.hex"
@@ -1371,7 +1403,7 @@ class ControlDispatchReconciliationTests(unittest.TestCase):
                     status = coordinator.main([
                         "dispatch-wave", "--ledger", str(ledger), "--wave-id", "wave-test-0001",
                         "--key-file", str(key_path), "--poll-seconds", "2", "--timeout-seconds", "30",
-                        "--decrypt-timeout-seconds", "60",
+                        "--decrypt-timeout-seconds", "60", "--runner", "macos-15",
                     ])
                     live_process.assert_not_called()
             finally:
@@ -1380,6 +1412,7 @@ class ControlDispatchReconciliationTests(unittest.TestCase):
             self.assertEqual(len(calls), 2)
             self.assertIn("secret set", " ".join(calls[0]))
             self.assertIn("workflow run", " ".join(calls[1]))
+            self.assertIn("runner=macos-15", " ".join(calls[1]))
             self.assertIn("dispatch_wave=attached run-id=54321", output.getvalue())
             self.assertEqual(cleanup_calls, [(ledger, "wave-test-0001")])
             updated = coordinator._read(ledger / "wave-test-0001.json")

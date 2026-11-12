@@ -29,6 +29,7 @@ import public_audit
 import rust_tooling
 import rust_preparation_smoke
 import supervisor
+import sandbox_macos
 import test_e2e
 
 
@@ -432,7 +433,9 @@ class DeadlineTests(unittest.TestCase):
                 jobs = public_audit.parse_workflow(WORKFLOW_ROOT / ".github/workflows" / filename)
                 steps = jobs[job_name]["steps"]
                 names = [step["name"] for step in steps]
-                preflight_index = names.index("Prepare hosted Linux isolation state")
+                preflight_name = ("Prepare hosted runner isolation state" if filename == "devlane-encrypted.yml"
+                                  else "Prepare hosted Linux isolation state")
+                preflight_index = names.index(preflight_name)
                 preflight = steps[preflight_index]
                 source = "\n".join(preflight["run"])
                 self.assertEqual(preflight["timeout_minutes"], 2)
@@ -458,7 +461,7 @@ class DeadlineTests(unittest.TestCase):
             WORKFLOW_ROOT / ".github/workflows/devlane-encrypted.yml",
         )[public_audit.RUN_JOB]["steps"]
         preflight = next(step for step in encrypted_steps
-                         if step["name"] == "Prepare hosted Linux isolation state")
+                         if step["name"] == "Prepare hosted runner isolation state")
         source = "\n".join(preflight["run"])
         self.assertIn('if [[ "$DEVLANE_PROFILE" == "core-rust" || "$DEVLANE_PROFILE" == "local-sync-rust" ]]', source)
         self.assertIn("timeout --signal=TERM --kill-after=5s 30s sudo -n python3 -B -c", source)
@@ -591,7 +594,7 @@ class DeadlineTests(unittest.TestCase):
             ("devlane-synthetic.yml", "devlane-synthetic", "test_rust_lock_generation.py"): 1,
             ("devlane-synthetic.yml", "devlane-synthetic", "test_source_projection.py"): 1,
             ("devlane-synthetic.yml", "devlane-synthetic", "rust_preparation_smoke.py"): 1,
-            ("devlane-encrypted.yml", "devlane-encrypted-run", "deadline.py"): 25,
+            ("devlane-encrypted.yml", "devlane-encrypted-run", "deadline.py"): 30,
             ("devlane-encrypted.yml", "devlane-encrypted-audit", "deadline.py"): 1,
             ("devlane-encrypted.yml", "devlane-encrypted-run", "fetch.py"): 4,
             ("devlane-encrypted.yml", "devlane-encrypted-run", "host_cleanup.py"): 1,
@@ -600,6 +603,7 @@ class DeadlineTests(unittest.TestCase):
             ("devlane-encrypted.yml", "devlane-encrypted-run", "prepare.py"): 1,
             ("devlane-encrypted.yml", "devlane-encrypted-run", "rust_tooling.py"): 2,
             ("devlane-encrypted.yml", "devlane-encrypted-run", "supervisor.py"): 4,
+            ("devlane-encrypted.yml", "devlane-encrypted-run", "sandbox_macos.py"): 2,
             ("devlane-encrypted.yml", "devlane-encrypted-audit", "public_audit.py"): 1,
         })
         self.assertEqual(Counter((workflow, job, script) for workflow, job, _step, script, _args in calls),
@@ -766,6 +770,14 @@ class DeadlineTests(unittest.TestCase):
                         self._assert_required_argument(permit.main, arguments, option)
                 elif script == "network_probe.py":
                     self._assert_required_argument(network_probe.main, arguments, "--output")
+                elif script == "sandbox_macos.py":
+                    required = {
+                        "preflight": ("--state-dir", "--workspace", "--profile", "--run-id", "--control-sha"),
+                        "prepare": ("--state-dir", "--projection", "--output", "--profile",
+                                    "--control-sha", "--deadline-file"),
+                    }[arguments[0]]
+                    for option in required:
+                        self._assert_required_argument(sandbox_macos.main, arguments, option)
                 elif script == "public_audit.py":
                     self.assertEqual(arguments, [])
                     self.assertEqual(public_audit.main.__code__.co_argcount, 0)

@@ -12,6 +12,14 @@ on:
           - core-rust
           - desktop
           - local-sync-rust
+      runner:
+        description: One hosted operating system for this one-run permit
+        required: true
+        type: choice
+        default: ubuntu-24.04
+        options:
+          - ubuntu-24.04
+          - macos-15
       control_run_id:
         description: Successful exact-SHA source-free public control run
         required: true
@@ -63,7 +71,7 @@ concurrency:
 jobs:
   devlane-encrypted-run:
     name: devlane-encrypted-run
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 180
     environment: devlane-decrypt
     permissions: {}
@@ -82,6 +90,7 @@ jobs:
       CI_WORKSPACE: ${{ github.workspace }}
       CI_CONTROL_RUN_ID: ${{ inputs.control_run_id }}
       DEVLANE_PROFILE: ${{ inputs.profile }}
+      DEVLANE_RUNNER: ${{ inputs.runner }}
       DEVLANE_WAVE_ID: ${{ inputs.wave_id }}
       DEVLANE_BUNDLE_ID: ${{ inputs.bundle_id }}
       DEVLANE_BUNDLE_ASSET_ID: ${{ inputs.bundle_asset_id }}
@@ -219,10 +228,16 @@ jobs:
             python3 -B -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; import cryptography; assert AESGCM is not None and cryptography.__version__'
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             python3 -B kit/devlane/fetch.py context --output "$RUN_ROOT/context.json"
-      - name: Prepare hosted Linux isolation state
+      - name: Prepare hosted runner isolation state
         timeout-minutes: 2
         run: |
           set -euo pipefail
+          if [[ "$DEVLANE_RUNNER" == "macos-15" ]]; then
+            mkdir -m 700 -p "$RUN_ROOT/state"
+            python3 -B kit/devlane/sandbox_macos.py preflight \
+              --state-dir "$RUN_ROOT/state" --workspace "$GITHUB_WORKSPACE" \
+              --profile "$DEVLANE_PROFILE" --run-id "$CI_RUN_ID" --control-sha "$CI_SHA"
+          elif [[ "$DEVLANE_RUNNER" == "ubuntu-24.04" ]]; then
           refuse() {
             printf 'devlane_host_preflight=refused code=%s\n' "$1" >&2
             exit 1
@@ -275,6 +290,10 @@ jobs:
             printf 'devlane_cgroup_v2=ready\n'
           fi
           printf 'devlane_swap=disabled\n'
+          else
+            printf 'devlane_host_preflight=refused code=runner-unknown\n' >&2
+            exit 1
+          fi
       - name: Reserve work time for control evidence cache restore
         timeout-minutes: 1
         run: |
@@ -394,6 +413,13 @@ jobs:
       - name: Prepare dependencies before the cut
         run: |
           set -euo pipefail
+          if [[ "$DEVLANE_RUNNER" == "macos-15" ]]; then
+            python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              python3 -B kit/devlane/sandbox_macos.py prepare \
+                --state-dir "$RUN_ROOT/state" --projection "$RUN_ROOT/projection.json" \
+                --output "$RUN_ROOT/prepared" --profile "$DEVLANE_PROFILE" \
+                --control-sha "$CI_SHA" --deadline-file "$RUN_ROOT/deadline.json"
+          elif [[ "$DEVLANE_RUNNER" == "ubuntu-24.04" ]]; then
           for tool in unshare mount umount setpriv chroot ip nft shred; do command -v "$tool" >/dev/null 2>&1; done
           owner_uid="$EUID"
           owner_gid="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- id -g)"
@@ -431,6 +457,10 @@ jobs:
               python3 -B kit/devlane/rust_tooling.py install --source "$RUN_ROOT/rust-tooling" --prepared "$RUN_ROOT/prepared" \
                 --deadline-file "$RUN_ROOT/deadline.json"
           fi
+          else
+            printf 'dependency_preparation_refusal=runner-unknown\n' >&2
+            exit 1
+          fi
       - name: Prove public connectivity before the cut
         run: |
           set -euo pipefail
@@ -441,6 +471,16 @@ jobs:
           set -euo pipefail
           ulimit -S -c 0
           ulimit -H -c 0
+          if [[ "$DEVLANE_RUNNER" == "macos-15" ]]; then
+            python_bin="$(python3 -B -c 'import sys; print(sys.executable)')"
+            python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              sudo -n "$python_bin" -B kit/devlane/sandbox_macos.py start \
+                --state-dir "$RUN_ROOT/state" --context "$RUN_ROOT/context.json" \
+                --workspace "$GITHUB_WORKSPACE" --prepared "$RUN_ROOT/prepared" \
+                --bundle "$RUN_ROOT/bundle.enc" --projection "$RUN_ROOT/projection.json" \
+                --deadline-file "$RUN_ROOT/deadline.json" --positive-control "$RUN_ROOT/positive-control.json" \
+                --run-id "$CI_RUN_ID"
+          elif [[ "$DEVLANE_RUNNER" == "ubuntu-24.04" ]]; then
           node_snapshot_id=""
           node_vendor_id=""
           cargo_path=""
@@ -469,11 +509,24 @@ jobs:
               --positive-control "$RUN_ROOT/positive-control.json" \
               --node-snapshot-id "$node_snapshot_id" --node-vendor-id "$node_vendor_id" \
               --cargo-path "$cargo_path" --rustc-path "$rustc_path"
+          else
+            printf 'devlane_supervisor_refusal=runner-unknown\n' >&2
+            exit 1
+          fi
       - name: Probe isolation before decryption
         run: |
           set -euo pipefail
+          if [[ "$DEVLANE_RUNNER" == "macos-15" ]]; then
+            python_bin="$(python3 -B -c 'import sys; print(sys.executable)')"
+            python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              sudo -n "$python_bin" -B kit/devlane/sandbox_macos.py probe --state-dir "$RUN_ROOT/state"
+          elif [[ "$DEVLANE_RUNNER" == "ubuntu-24.04" ]]; then
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             python3 -B kit/devlane/supervisor.py probe --state-dir "$RUN_ROOT/state"
+          else
+            printf 'devlane_supervisor_refusal=runner-unknown\n' >&2
+            exit 1
+          fi
       - name: Decrypt authenticated bundle
         env:
           DEVLANE_DECRYPT_KEY: ${{ secrets.DEVLANE_DECRYPT_KEY }}
@@ -482,16 +535,39 @@ jobs:
           ulimit -S -c 0
           ulimit -H -c 0
           set +x
+          if [[ "$DEVLANE_RUNNER" == "macos-15" ]]; then
+            python_bin="$(python3 -B -c 'import sys; print(sys.executable)')"
+            python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              sudo -n --preserve-env=DEVLANE_DECRYPT_KEY "$python_bin" -B kit/devlane/sandbox_macos.py decrypt \
+                --state-dir "$RUN_ROOT/state" --context "$RUN_ROOT/context.json" \
+                --bundle "$RUN_ROOT/bundle.enc" --projection "$RUN_ROOT/projection.json" \
+                --deadline-file "$RUN_ROOT/deadline.json"
+          elif [[ "$DEVLANE_RUNNER" == "ubuntu-24.04" ]]; then
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             python3 -B kit/devlane/supervisor.py decrypt --state-dir "$RUN_ROOT/state"
+          else
+            printf 'devlane_supervisor_refusal=runner-unknown\n' >&2
+            exit 1
+          fi
       - name: Execute offline profile and filter public summary
         id: execute
         run: |
           set -euo pipefail
           ulimit -S -c 0
           ulimit -H -c 0
+          if [[ "$DEVLANE_RUNNER" == "macos-15" ]]; then
+            python_bin="$(python3 -B -c 'import sys; print(sys.executable)')"
+            python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              sudo -n "$python_bin" -B kit/devlane/sandbox_macos.py execute \
+                --state-dir "$RUN_ROOT/state" --context "$RUN_ROOT/context.json" \
+                --deadline-file "$RUN_ROOT/deadline.json"
+          elif [[ "$DEVLANE_RUNNER" == "ubuntu-24.04" ]]; then
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             python3 -B kit/devlane/supervisor.py execute --state-dir "$RUN_ROOT/state" --context "$RUN_ROOT/context.json"
+          else
+            printf 'devlane_supervisor_refusal=runner-unknown\n' >&2
+            exit 1
+          fi
       - name: Shred runner-local workspace
         id: cleanup
         if: ${{ always() }}
@@ -500,6 +576,12 @@ jobs:
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
           set -euo pipefail
+          if [[ "$DEVLANE_RUNNER" == "macos-15" ]]; then
+            python_bin="$(python3 -B -c 'import sys; print(sys.executable)')"
+            sudo -n "$python_bin" -B kit/devlane/sandbox_macos.py cleanup \
+              --state-dir "$RUN_ROOT/state" --root "$RUN_ROOT" --runner-temp "$RUNNER_TEMP" \
+              --workspace "$GITHUB_WORKSPACE" --run-id "$CI_RUN_ID"
+          elif [[ "$DEVLANE_RUNNER" == "ubuntu-24.04" ]]; then
           node_snapshot_id=""
           node_vendor_id=""
           if [[ "$DEVLANE_PROFILE" == "core-node" ]]; then
@@ -511,6 +593,10 @@ jobs:
           python3 -B kit/devlane/host_cleanup.py --root "$RUN_ROOT" --runner-temp "$RUNNER_TEMP" \
             --deadline-file "$RUN_ROOT/deadline.json" \
             --node-snapshot-id "$node_snapshot_id" --node-vendor-id "$node_vendor_id"
+          else
+            printf 'cleanup_refusal=runner-unknown\n' >&2
+            exit 1
+          fi
           printf 'devlane_job=completed public_output=filtered cleanup=confirmed\n'
   devlane-encrypted-audit:
     name: devlane-encrypted-audit
@@ -529,6 +615,7 @@ jobs:
       CI_SERVER_URL: ${{ github.server_url }}
       CI_EVENT_NAME: ${{ github.event_name }}
       DEVLANE_PROFILE: ${{ inputs.profile }}
+      DEVLANE_RUNNER: ${{ inputs.runner }}
       CI_CONTROL_RUN_ID: ${{ inputs.control_run_id }}
       DEVLANE_WAVE_ID: ${{ inputs.wave_id }}
       DEVLANE_BUNDLE_ID: ${{ inputs.bundle_id }}

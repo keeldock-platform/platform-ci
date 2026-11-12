@@ -1454,8 +1454,9 @@ def _watch_installed_key(ledger, wave_id, stop, done, outcome, *, poll_seconds, 
         done.set()
 
 
-def dispatch_wave(ledger, wave_id, key_file, *, poll_seconds=10, timeout_seconds=DISPATCH_RECONCILE_SECONDS,
-                  decrypt_timeout_seconds=7200, sleep=time.sleep, clock=None):
+def dispatch_wave(ledger, wave_id, key_file, *, runner="ubuntu-24.04", poll_seconds=10,
+                  timeout_seconds=DISPATCH_RECONCILE_SECONDS, decrypt_timeout_seconds=14400,
+                  sleep=time.sleep, clock=None):
     """Install once, dispatch once, reconcile, and revoke on handled in-process exit paths."""
     if clock is None:
         clock = time.time
@@ -1478,6 +1479,8 @@ def dispatch_wave(ledger, wave_id, key_file, *, poll_seconds=10, timeout_seconds
         record = _wave_record(root, wave_id)
         if record["state"] != "assets-attached":
             _fail("dispatch-wave-state")
+        if runner not in ("ubuntu-24.04", "macos-15") or runner == "macos-15" and record["profile"] != "core-node":
+            _fail("runner-profile-unsupported")
         _verify_remote_main(record["control_sha"])
         _verify_secret_absent()
         transition(ledger, wave_id, "mark-secret-installing")
@@ -1526,6 +1529,7 @@ def dispatch_wave(ledger, wave_id, key_file, *, poll_seconds=10, timeout_seconds
             result = subprocess.run(
                 ["gh", "workflow", "run", "devlane-encrypted.yml", "--repo", fetch.REPOSITORY,
                  "--ref", "main", "-f", "profile=" + record["profile"],
+                 "-f", "runner=" + runner,
                  "-f", "control_run_id=" + record["control_run_id"], "-f", "wave_id=" + record["wave_id"],
                  "-f", "bundle_id=" + record["bundle_id"], "-f", "bundle_asset_id=" + record["bundle_asset_id"],
                  "-f", "bundle_sha256=" + record["bundle_sha256"], "-f", "bundle_size=" + str(record["bundle_size"]),
@@ -1725,7 +1729,8 @@ def main(argv=None):
     dispatch_wave_cmd.add_argument("--key-file", required=True)
     dispatch_wave_cmd.add_argument("--poll-seconds", type=int, default=10)
     dispatch_wave_cmd.add_argument("--timeout-seconds", type=int, default=DISPATCH_RECONCILE_SECONDS)
-    dispatch_wave_cmd.add_argument("--decrypt-timeout-seconds", type=int, default=7200)
+    dispatch_wave_cmd.add_argument("--decrypt-timeout-seconds", type=int, default=14400)
+    dispatch_wave_cmd.add_argument("--runner", choices=("ubuntu-24.04", "macos-15"), default="ubuntu-24.04")
     cleanup = sub.add_parser("cleanup-terminal")
     cleanup.add_argument("--ledger", required=True)
     cleanup.add_argument("--wave-id", required=True)
@@ -1763,7 +1768,7 @@ def main(argv=None):
             return 0 if reconcile_dispatch(args.ledger, args.wave_id) else 3
         elif args.operation == "dispatch-wave":
             return 0 if dispatch_wave(
-                args.ledger, args.wave_id, args.key_file, poll_seconds=args.poll_seconds,
+                args.ledger, args.wave_id, args.key_file, runner=args.runner, poll_seconds=args.poll_seconds,
                 timeout_seconds=args.timeout_seconds,
                 decrypt_timeout_seconds=args.decrypt_timeout_seconds,
             ) else 3

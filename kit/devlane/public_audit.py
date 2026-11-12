@@ -35,7 +35,7 @@ DECRYPT_ENVIRONMENT = "devlane-decrypt"
 AUDIT_JOB = "devlane-encrypted-audit"
 STEP_NAMES = (
     "Fetch public control and validate dispatch",
-    "Prepare hosted Linux isolation state",
+    "Prepare hosted runner isolation state",
     "Reserve work time for control evidence cache restore",
     "Restore exact source-free control evidence",
     "Verify exact source-free control evidence",
@@ -85,6 +85,8 @@ PUBLIC_UNIT_FAILURE_SUBREASONS = frozenset((
 ))
 RUNNER_HOME = chr(47) + "home" + chr(47) + "runner"
 TEMP = RUNNER_HOME + "/work/_temp"
+MACOS_RUNNER_HOME = chr(47) + "Users" + chr(47) + "runner"
+MACOS_TEMP = MACOS_RUNNER_HOME + "/work/_temp"
 HOSTED_TOOL_CACHE = "/opt/hostedtoolcache/node/24.22.1/x64"
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 LOG_MARKER = chr(35) * 2
@@ -133,7 +135,7 @@ DECRYPT_CHILD_ERROR_CODES = frozenset((
 DECRYPT_FAILURE_CODES = frozenset((
     "decrypt-key-unavailable", "decrypt-manifest-unavailable", "decrypt-rejected", "decrypt-timeout",
 ))
-def cache_line_patterns(key):
+def cache_line_patterns(key, temp=TEMP):
     """Output lines of the pinned cache actions, bound to the one key the step may use."""
     escaped = re.escape(key)
     return (
@@ -145,7 +147,7 @@ def cache_line_patterns(key):
         re.compile(r"Cache not found for input keys: " + escaped + r"\Z"),
         re.compile(r"Cache Size: ~[0-9]+ MB \([0-9]+ B\)\Z"),
         re.compile(r"(?:Received|Sent) [0-9]+ of [0-9]+ \([0-9.]+%\), [0-9.]+ MBs/sec\Z"),
-        re.compile(r"(?:" + LOG_MARKER + r")?\[command\]/usr/bin/tar (?:--posix -cf cache\.tzst|-xf " + re.escape(TEMP) + "/" + UUID
+        re.compile(r"(?:" + LOG_MARKER + r")?\[command\]/usr/bin/tar (?:--posix -cf cache\.tzst|-xf " + re.escape(temp) + "/" + UUID
                    + r"/cache\.tzst)(?: [A-Za-z0-9_./=:+ -]{0,300})?\Z"),
     )
 
@@ -261,6 +263,12 @@ class _Grammar:
         self.names = [step["name"] for step in self.steps]
         self.identity = identity
         self.kind = kind
+        self.runner = identity.get("runner", "ubuntu-24.04")
+        if self.runner not in ("ubuntu-24.04", "macos-15"):
+            _refuse()
+        self.job_runner = ("ubuntu-24.04" if kind == "encrypted" and job_key == AUDIT_JOB else self.runner)
+        self.runner_home = MACOS_RUNNER_HOME if self.job_runner == "macos-15" else RUNNER_HOME
+        self.temp = MACOS_TEMP if self.job_runner == "macos-15" else TEMP
         self.script_lines = set()
         self.headers = {}
         for step in self.steps:
@@ -286,7 +294,8 @@ class _Grammar:
             "CI_REPOSITORY": REPOSITORY, "CI_REPOSITORY_ID": str(REPOSITORY_ID),
             "CI_SERVER_URL": "https://github.com", "CI_EVENT_NAME": "workflow_dispatch",
             "CI_SHA": identity.get("control_sha"), "PYTHONDONTWRITEBYTECODE": "1",
-            "CI_WORKSPACE": RUNNER_HOME + "/work/platform-ci/platform-ci",
+            "CI_WORKSPACE": self.runner_home + "/work/platform-ci/platform-ci",
+            "DEVLANE_RUNNER": self.runner,
             "CI_RUN_ID": run_id, "GITHUB_RUN_ID": run_id, "CI_RUN_ATTEMPT": "1", "GITHUB_RUN_ATTEMPT": "1",
         }
         if kind == "encrypted":
@@ -295,7 +304,7 @@ class _Grammar:
                 "DEVLANE_PROFILE": identity.get("profile"), "DEVLANE_WAVE_ID": identity.get("wave_id"),
                 "DEVLANE_BUNDLE_ID": identity.get("bundle_id"),
                 "DEVLANE_CACHE_BASELINE_SHA256": identity.get("cache_baseline_sha256"),
-                "RUN_ROOT": TEMP + "/devlane-" + str(run_id),
+                "RUN_ROOT": self.temp + "/devlane-" + str(run_id),
             })
         else:
             fixed["CI_REF"] = identity.get("ref")
@@ -329,7 +338,7 @@ class _Grammar:
             prefix = "${{ runner.temp }}"
             suffix = declared[len(prefix):] if declared.startswith(prefix) else None
             return suffix in ("/devlane-control-evidence/permit.json", "/devlane-bundle-permit/permit.json") \
-                and value == TEMP + suffix
+                and value == self.temp + suffix
         if key == "key":
             return value == self.expected_cache_key(step)
         if key == "token" and "github.token" in declared:
@@ -358,11 +367,12 @@ class _Grammar:
         uses = (step or {}).get("uses") or ""
         if uses.startswith("actions/cache/"):
             key = self.expected_cache_key(step)
-            return key is not None and any(pattern.fullmatch(line) for pattern in cache_line_patterns(key))
+            return key is not None and any(pattern.fullmatch(line) for pattern in cache_line_patterns(key, self.temp))
         if uses.startswith("actions/setup-node@") or step_name.startswith("Post Set up"):
             return any(pattern.fullmatch(line) for pattern in NODE_LINES)
         exact = {
             "Fetch public control and validate dispatch": {"dispatch_context=validated"},
+            "Prepare hosted runner isolation state": set(),
             "Prepare hosted Linux isolation state": {"devlane_swap=disabled"},
             "Verify exact source-free control evidence": {"devlane_permit=verify_control=pass"},
             "Claim this bundle for one run before decryption": {"devlane_permit=claim=pass"},
@@ -454,6 +464,12 @@ class _Grammar:
             ) + 1
             public_counts["network_probe_supervisor_refusal_code"] = NETWORK_PROBE_SUPERVISOR_CODES[line]
             return public_counts["network_probe_supervisor_refusal"] == 1
+        if (step_name == "Prepare hosted runner isolation state" and self.kind == "encrypted"
+                and self.identity.get("profile") == "core-rust"):
+            exact = exact | {"devlane_cgroup_v2=ready"}
+        if step_name == "Prepare hosted runner isolation state":
+            expected_preflight = "devlane_macos=preflight-ready" if self.runner == "macos-15" else "devlane_swap=disabled"
+            exact = exact | {expected_preflight}
         if line in exact:
             public_counts[line] = public_counts.get(line, 0) + 1
             return public_counts[line] == 1
@@ -567,6 +583,9 @@ def validate_summary_records(record_lines, profile):
 def _hosted_preamble(lines, grammar, job_name, identity, workflow_path):
     """Validate the setup text and runner metadata emitted by a real GitHub job log."""
     index = 0
+    job_runner = "ubuntu-24.04" if grammar.kind == "encrypted" and job_name == AUDIT_JOB else identity.get(
+        "runner", "ubuntu-24.04",
+    )
 
     def take():
         nonlocal index
@@ -592,6 +611,7 @@ def _hosted_preamble(lines, grammar, job_name, identity, workflow_path):
         return values
 
     provisioner = group("Runner Image Provisioner")
+    cloud_pattern = r"MacCloud" if job_runner == "macos-15" else r"(?:Azure|AWS|GCP)"
     provisioner_patterns = (
         r"Hosted Compute Agent",
         r"Version: [0-9]{8}\.[0-9]+",
@@ -599,7 +619,7 @@ def _hosted_preamble(lines, grammar, job_name, identity, workflow_path):
         r"Build Date: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
         r"Worker ID: \{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}",
         r"Region: [a-z0-9-]{2,32}",
-        r"Cloud: (?:Azure|AWS|GCP)",
+        r"Cloud: " + cloud_pattern,
     )
     if len(provisioner) != len(provisioner_patterns) or any(
             not re.fullmatch(pattern, value)
@@ -607,18 +627,31 @@ def _hosted_preamble(lines, grammar, job_name, identity, workflow_path):
         _refuse()
 
     operating_system = group("Operating System")
-    if (len(operating_system) != 3 or operating_system[0] != "Ubuntu"
+    if job_runner == "macos-15":
+        if (len(operating_system) != 3 or operating_system[0] != "macOS"
+                or not re.fullmatch(r"15\.[0-9]+\.[0-9]+", operating_system[1])
+                or not re.fullmatch(r"24[A-Z][A-Z0-9]+", operating_system[2])):
+            _refuse()
+    elif (len(operating_system) != 3 or operating_system[0] != "Ubuntu"
             or not re.fullmatch(r"24\.04\.[0-9]+", operating_system[1])
             or operating_system[2] != "LTS"):
         _refuse()
 
     runner_image = group("Runner Image")
-    image_patterns = (
-        r"Image: ubuntu-24\.04",
-        r"Version: [0-9]{8}\.[0-9]+\.[0-9]+",
-        r"Included Software: https://github\.com/actions/runner-images/blob/ubuntu24/[0-9]{8}\.[0-9]+/images/ubuntu/Ubuntu2404-Readme\.md",
-        r"Image Release: https://github\.com/actions/runner-images/releases/tag/ubuntu24%2F[0-9]{8}\.[0-9]+",
-    )
+    if job_runner == "macos-15":
+        image_patterns = (
+            r"Image: macos-15-arm64",
+            r"Version: [0-9]{8}\.[0-9]+\.[0-9]+",
+            r"Included Software: https://github\.com/actions/runner-images/blob/macos-15-arm64/[0-9]{8}\.[0-9]+/images/macos/macos-15-arm64-Readme\.md",
+            r"Image Release: https://github\.com/actions/runner-images/releases/tag/macos-15-arm64%2F[0-9]{8}\.[0-9]+",
+        )
+    else:
+        image_patterns = (
+            r"Image: ubuntu-24\.04",
+            r"Version: [0-9]{8}\.[0-9]+\.[0-9]+",
+            r"Included Software: https://github\.com/actions/runner-images/blob/ubuntu24/[0-9]{8}\.[0-9]+/images/ubuntu/Ubuntu2404-Readme\.md",
+            r"Image Release: https://github\.com/actions/runner-images/releases/tag/ubuntu24%2F[0-9]{8}\.[0-9]+",
+        )
     if len(runner_image) != len(image_patterns) or any(
             not re.fullmatch(pattern, value)
             for pattern, value in zip(image_patterns, runner_image)):
@@ -714,30 +747,53 @@ def _hosted_preamble(lines, grammar, job_name, identity, workflow_path):
     maybe_environment()
     if grammar.kind == "synthetic":
         expected_inputs = {"control_wave_id": identity.get("wave_id")}
-        if take() != LOG_MARKER + "[group] Inputs":
-            _refuse()
-        observed_inputs = {}
-        input_lines = []
-        while index < len(lines) and lines[index] != LOG_MARKER + "[endgroup]":
-            line = take()
-            if not line.startswith("  "):
-                _refuse()
-            key, separator, value = line[2:].partition(": ")
-            if not separator or key in observed_inputs or key not in expected_inputs:
-                _refuse()
-            if key != "control_wave_id" or value != str(expected_inputs[key]):
-                _refuse()
-            observed_inputs[key] = value
-            input_lines.append(line)
-        if take() != LOG_MARKER + "[endgroup]" or set(observed_inputs) != set(expected_inputs):
-            _refuse()
-        canonical.append(LOG_MARKER + "[group] Inputs")
-        canonical.extend(input_lines)
-        canonical.append(LOG_MARKER + "[endgroup]")
-    elif index < len(lines) and lines[index] == LOG_MARKER + "[group] Inputs":
-        _refuse()
-
+    else:
+        expected_inputs = {
+            "profile": identity.get("profile"),
+            "runner": identity.get("runner", "ubuntu-24.04"),
+            "control_run_id": identity.get("control_run_id"),
+            "wave_id": identity.get("wave_id"),
+            "bundle_id": identity.get("bundle_id"),
+            "bundle_asset_id": None,
+            "bundle_sha256": None,
+            "bundle_size": None,
+            "projection_asset_id": None,
+            "projection_sha256": None,
+            "projection_size": None,
+            "expires": None,
+            "cache_baseline_sha256": identity.get("cache_baseline_sha256"),
+        }
     maybe_environment()
+    if take() != LOG_MARKER + "[group] Inputs":
+        _refuse()
+    observed_inputs = {}
+    input_lines = []
+    while index < len(lines) and lines[index] != LOG_MARKER + "[endgroup]":
+        line = take()
+        if not line.startswith("  "):
+            _refuse()
+        key, separator, value = line[2:].partition(": ")
+        if not separator or key in observed_inputs or key not in expected_inputs:
+            _refuse()
+        expected = expected_inputs[key]
+        if expected is not None:
+            valid = value == str(expected)
+        elif key.endswith("_asset_id") or key.endswith("_size") or key == "expires":
+            valid = DECIMAL.fullmatch(value) is not None
+        elif key.endswith("_sha256"):
+            valid = SHA256.fullmatch(value) is not None
+        else:
+            valid = False
+        if not valid:
+            _refuse()
+        observed_inputs[key] = value
+        input_lines.append(line)
+    if take() != LOG_MARKER + "[endgroup]" or set(observed_inputs) != set(expected_inputs):
+        _refuse()
+    canonical.append(LOG_MARKER + "[group] Inputs")
+    canonical.extend(input_lines)
+    canonical.append(LOG_MARKER + "[endgroup]")
+
     expected_job_name = ("devlane-synthetic / devlane-synthetic"
                          if grammar.kind == "synthetic" else job_name)
     job_line = take()
@@ -757,6 +813,8 @@ def _parse_hosted_step_block(block, step, grammar):
     canonical = []
     if run:
         shell_options = (
+            "shell: /bin/bash --noprofile --norc -e -o pipefail {0}",
+            "shell: /bin/bash -e {0}",
             "shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}",
             "shell: /usr/bin/bash -e {0}",
         )
@@ -1060,7 +1118,9 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
             in_header, mode = True, None
             continue
         if in_header:
-            if normalized in ("shell: /usr/bin/bash -e {0}", "shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}"):
+            if normalized in (
+                    "shell: /bin/bash -e {0}", "shell: /bin/bash --noprofile --norc -e -o pipefail {0}",
+                    "shell: /usr/bin/bash -e {0}", "shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}"):
                 mode = None
                 continue
             if normalized == "env:":
@@ -1244,6 +1304,9 @@ def validate_job_contract(jobs, identity, profile):
         "success", "failure", "cancelled", "timed_out",
     }:
         _refuse()
+    expected_runner = identity.get("runner", "ubuntu-24.04")
+    if run_job.get("labels") != [expected_runner] or audit_job.get("labels") != ["ubuntu-24.04"]:
+        _refuse()
     if audit_job.get("status") != "in_progress" or audit_job.get("conclusion") is not None:
         _refuse()
     audit_steps = _steps(audit_job)
@@ -1404,7 +1467,7 @@ def audit_environment(env):
         "CI_REPOSITORY", "CI_REPOSITORY_ID", "CI_EVENT_NAME", "CI_REF", "CI_SHA", "CI_CONTROL_RUN_ID",
         "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "DEVLANE_PROFILE",
         "DEVLANE_WAVE_ID", "DEVLANE_BUNDLE_ID", "DEVLANE_CACHE_BASELINE_SHA256",
-        "GITHUB_TOKEN",
+        "GITHUB_TOKEN", "DEVLANE_RUNNER",
     )
     if any(type(env.get(key)) is not str or not env.get(key) for key in required):
         _refuse()
@@ -1415,6 +1478,7 @@ def audit_environment(env):
             or not DECIMAL.fullmatch(env["CI_CONTROL_RUN_ID"])
             or not DECIMAL.fullmatch(env["GITHUB_RUN_ID"]) or env["GITHUB_RUN_ATTEMPT"] != "1"
             or env["DEVLANE_PROFILE"] not in ENCRYPTED_PROFILES
+            or env["DEVLANE_RUNNER"] not in ("ubuntu-24.04", "macos-15")
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{7,63}", env["DEVLANE_WAVE_ID"])
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{7,63}", env["DEVLANE_BUNDLE_ID"])
             or not SHA256.fullmatch(env["DEVLANE_CACHE_BASELINE_SHA256"])):
@@ -1423,6 +1487,7 @@ def audit_environment(env):
         "repository": env["CI_REPOSITORY"], "repository_id": REPOSITORY_ID,
         "event": env["CI_EVENT_NAME"], "ref": env["CI_REF"], "control_sha": env["CI_SHA"],
         "run_id": env["GITHUB_RUN_ID"], "run_attempt": 1, "profile": env["DEVLANE_PROFILE"],
+        "runner": env["DEVLANE_RUNNER"],
         "control_run_id": env["CI_CONTROL_RUN_ID"],
         "wave_id": env["DEVLANE_WAVE_ID"], "bundle_id": env["DEVLANE_BUNDLE_ID"],
         "cache_baseline_sha256": env["DEVLANE_CACHE_BASELINE_SHA256"],

@@ -2837,7 +2837,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
         decrypt_index = next(i for i, step in enumerate(steps) if step["name"] == "Decrypt authenticated bundle")
         workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml").read_text()
         run_job_source = workflow.split("  devlane-encrypted-run:", 1)[1].split("  devlane-encrypted-audit:", 1)[0]
-        self.assertRegex(run_job_source, r"(?m)^    runs-on: ubuntu-24\.04$")
+        self.assertRegex(run_job_source, r"(?m)^    runs-on: \$\{\{ inputs\.runner \}\}$")
         self.assertLess(prepare_index, decrypt_index)
         self.assertFalse(any((step.get("uses") or "").startswith("actions/setup-node@") for step in steps))
         preparation = supervisor.node_tool_prepare

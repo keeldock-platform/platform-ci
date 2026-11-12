@@ -429,7 +429,8 @@ class ReceiptTests(unittest.TestCase):
                     audit.validate_receipt(encode_receipt(value), CONTROL_SHA, RUN_ID, RUN_ATTEMPT)["schema_version"],
                     2,
                 )
-        for product, image_version in (("15.8.2", "20260907.0337.1"), ("15.7.9", "20261028.0489.1")):
+        for product, image_version in (("15.8.2", "20260907.0337.1"), ("15.7.9", "20261028.0489.1"),
+                                       ("15.7.9", "20261104.0514.1")):
             value = receipt_value()
             value["macos_product_version"] = product
             value["runner_image_version"] = image_version

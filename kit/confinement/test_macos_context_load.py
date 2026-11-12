@@ -262,12 +262,16 @@ class ApprovedHostReleaseTableTests(unittest.TestCase):
         boundary = load_module("macos_boundary_guard")
         deny = load_module("macos_deny_default")
         audit = load_module("macos_public_audit")
-        expected = (("15.7.9", "20260907.0337.1"), ("15.8.2", "20261028.0489.1"))
+        expected = (("15.7.9", "20260907.0337.1"), ("15.8.2", "20261028.0489.1"),
+                    ("15.8.2", "20261104.0514.1"))
         self.assertEqual(boundary.APPROVED_HOST_RELEASES, expected)
         self.assertEqual(deny.APPROVED_HOST_RELEASES, expected)
         self.assertEqual(audit.APPROVED_HOST_RELEASES, expected)
-        self.assertLessEqual(len(expected), 2)
-        observed = {("15.8.2", "20261028.0489.1"): "40941660825"}
+        self.assertLessEqual(len(expected), 3)
+        observed = {
+            ("15.8.2", "20261028.0489.1"): "40941660825",
+            ("15.8.2", "20261104.0514.1"): "43275774178",
+        }
         self.assertEqual(boundary.APPROVED_HOST_RELEASE_FIRST_RUNS, observed)
         self.assertEqual(deny.APPROVED_HOST_RELEASE_FIRST_RUNS, observed)
         self.assertEqual(audit.APPROVED_HOST_RELEASE_FIRST_RUNS, observed)

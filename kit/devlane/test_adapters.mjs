@@ -365,12 +365,13 @@ async function main(argv) {
     process.stdout.write(result.output);
     return result.code;
   }
-  if (argv.length !== 3 || !['vitest', 'playwright'].includes(argv[0])) return 2;
+  if (![3, 4].includes(argv.length) || !['vitest', 'playwright'].includes(argv[0])) return 2;
   try {
     const report = parseReport(argv[1]);
     // The manifest remains inside the offline workspace; only opaque public IDs
     // survive this adapter. The first positional config is a trusted file path.
-    const config = parseStrictJson(fs.readFileSync('/trusted/adapter-config.json', 'utf8'), 4 * 1024 * 1024);
+    const configPath = argv[3] || '/trusted/adapter-config.json';
+    const config = parseStrictJson(fs.readFileSync(configPath, 'utf8'), 4 * 1024 * 1024);
     const result = argv[0] === 'vitest'
       ? normalizeVitest(report, config.tests)
       : normalizePlaywright(report, config.frames);
