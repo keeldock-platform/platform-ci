@@ -1526,7 +1526,22 @@ class PreparationDefectTests(unittest.TestCase):
         self.assertEqual(environment["TMPDIR"], "/scratch/tmp")
         self.assertEqual(environment["XDG_CACHE_HOME"], "/scratch/tmp")
         self.assertNotIn("NODE_OPTIONS", environment)
+        self.assertNotIn("DEBUG", environment)
         self.assertEqual(environment["PATH"].split(":")[0], "/tools/node/bin")
+        browser_environment = supervisor._worker_environment(
+            "browser", Path("/unused"), {"node_dir": "/tools/node/bin"}, browser_debug=True,
+        )
+        self.assertEqual(browser_environment["DEBUG"], "pw:browser*")
+        self.assertNotIn("DEBUG", supervisor._worker_environment(
+            "unit", Path("/unused"), {"node_dir": "/tools/node/bin"}, browser_debug=True,
+        ))
+        execute_source = inspect.getsource(supervisor.Service._execute)
+        self.assertIn('stage == "browser"', execute_source)
+        self.assertIn('self.context.get("wave_class") == fetch.SOURCE_FREE_WAVE_CLASS', execute_source)
+
+        host_mount_source = inspect.getsource(supervisor._host_toolchain_mounts)
+        self.assertIn('fonts = Path("/etc/fonts")', host_mount_source)
+        self.assertIn('mounts.append((fonts, root / "etc/fonts"))', host_mount_source)
 
         with tempfile.TemporaryDirectory() as temporary:
             with patch.object(supervisor.os, "chown"):
@@ -1554,8 +1569,9 @@ class PreparationDefectTests(unittest.TestCase):
             )
             self.assertEqual(supervisor._host_toolchain_mounts(root)[:3], expected_base_mounts)
             with patch.object(Path, "is_dir", return_value=True):
-                self.assertEqual(supervisor._host_toolchain_mounts(root)[-1],
-                                 (Path("/etc/alternatives"), root / "etc/alternatives"))
+                optional_mounts = supervisor._host_toolchain_mounts(root)[3:]
+            self.assertIn((Path("/etc/alternatives"), root / "etc/alternatives"), optional_mounts)
+            self.assertIn((Path("/etc/fonts"), root / "etc/fonts"), optional_mounts)
             mount_sources = expected_base_mounts + ((host_alternatives, root / "etc/alternatives"),)
             mounted = []
             with patch.object(supervisor, "_host_toolchain_mounts",

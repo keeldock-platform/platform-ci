@@ -586,6 +586,10 @@ def _capture_source_free_failure_diagnostics(root, destination, owner_uid, wave_
                     (path for pattern in patterns for path in raw_root.glob(pattern)),
                     key=lambda item: item.name,
                 )
+                browser_stderr = raw_root / "browser.stderr.log"
+                if browser_stderr in candidates:
+                    candidates.remove(browser_stderr)
+                    candidates.insert(0, browser_stderr)
         except OSError:
             pass
         scratch_raw = Path(root) / "scratch/raw"
@@ -752,6 +756,9 @@ def _host_toolchain_mounts(root):
     alternatives = Path("/etc/alternatives")
     if alternatives.is_dir():
         mounts.append((alternatives, root / "etc/alternatives"))
+    fonts = Path("/etc/fonts")
+    if fonts.is_dir():
+        mounts.append((fonts, root / "etc/fonts"))
     return tuple(mounts)
 
 
@@ -785,6 +792,7 @@ def _mount_minimal_root(root, workspace, prepared, control_root):
         "tmp", "home", "devlane-home", "control", "prepared", "workspace", "scratch", "var", "tools", "sys",
     ):
         _ensure_directory(root / name, 0o755)
+    _ensure_directory(root / "etc/fonts")
     for host, guest in _host_toolchain_mounts(root):
         if Path(host).exists():
             if guest == root / "etc/alternatives":
@@ -880,7 +888,7 @@ def _read_profiles(root):
     return value
 
 
-def _worker_environment(stage, root, tools):
+def _worker_environment(stage, root, tools, *, browser_debug=False):
     node_path = tools.get("node_dir")
     rust_path = tools.get("rust_dir")
     path = ["/usr/bin", "/bin"]
@@ -905,6 +913,8 @@ def _worker_environment(stage, root, tools):
         "PLAYWRIGHT_BROWSERS_PATH": "/prepared/ms-playwright",
         "DEVLANE_STAGE": stage,
     }
+    if stage == "browser" and browser_debug:
+        env["DEBUG"] = "pw:browser*"
     if rust_path:
         env["LD_LIBRARY_PATH"] = "/tools/rust/lib"
         env["CC"] = "/usr/bin/cc"
@@ -1020,8 +1030,9 @@ def _wait_child(process, timeout):
         time.sleep(min(0.1, remaining))
 
 
-def _run_profile_command(root, command, stage, log_path, tools, timeout=1200, deadline=None):
-    environment = _worker_environment(stage, root, tools)
+def _run_profile_command(root, command, stage, log_path, tools, timeout=1200, deadline=None,
+                         browser_debug=False):
+    environment = _worker_environment(stage, root, tools, browser_debug=browser_debug)
     if CANCEL_REQUESTED.is_set():
         return 130
     if deadline is None:
@@ -2307,8 +2318,13 @@ class Service:
             except deadline_budget.DeadlineRefusal:
                 result = 124
             else:
+                browser_debug = (
+                    stage == "browser"
+                    and self.context.get("wave_class") == fetch.SOURCE_FREE_WAVE_CLASS
+                )
                 result = _run_profile_command(self.root, command, stage, "/workspace/raw/" + stage + ".log",
-                                              self.tool_info, timeout=phase_timeout, deadline=self.deadline_file)
+                                              self.tool_info, timeout=phase_timeout, deadline=self.deadline_file,
+                                              browser_debug=browser_debug)
             if result == 130:
                 _refuse("execution-cancelled")
             outcomes.append((stage, result))

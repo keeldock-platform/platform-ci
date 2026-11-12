@@ -404,6 +404,7 @@ class ProductionExecuteFixtureTests(unittest.TestCase):
         self.assertIn("video: 'off'", browser_config)
         self.assertIn("trace: 'off'", browser_config)
         self.assertIn("chromiumSandbox: false", browser_config)
+        self.assertIn("args: ['--no-sandbox']", browser_config)
         self.assertIn("packages/kernel-ui-kit/browser/frame.spec.mjs", browser)
         self.assertNotIn("packages/kernel-ui-kit/browser/frame.spec.ts", browser)
 
@@ -601,6 +602,46 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
             self.assertTrue(service._capture_failure_diagnostics())
             document = bundle.strict_json(destination.read_bytes())
             self.assertEqual(len(document["logs"]), supervisor.MAX_SYNTHETIC_NODE_DIAGNOSTIC_LOGS)
+
+    def test_browser_failure_diagnostics_prioritize_bounded_canary_scanned_stderr(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "workspace/raw"
+            raw.mkdir(parents=True)
+            (root / "scratch/reports").mkdir(parents=True)
+            rows = ["browser diagnostic line %03d" % index for index in range(140)]
+            rows[-2] = "PRIVATE_SOURCE_CANARY must be skipped"
+            (raw / "browser.stderr.log").write_text("\n".join(rows) + "\n", encoding="ascii")
+            (raw / "browser.log").write_text("browser stdout detail\n", encoding="ascii")
+            destination = root / "devlane-vitest-local-synthetic-browser-accept.json"
+            service = object.__new__(supervisor.Service)
+            service.root = root
+            service.failure_diagnostics_file = destination
+            service.owner_uid = os.getuid()
+            service.context = {
+                "wave_class": supervisor.fetch.SOURCE_FREE_WAVE_CLASS,
+                "profile": "core-node",
+            }
+            service.summary = b""
+            self.assertTrue(service._capture_failure_diagnostics(execution_failed=True))
+            document = bundle.strict_json(destination.read_bytes())
+            self.assertEqual(document["subreason"], "execute-failed")
+            self.assertEqual(document["logs"][0]["name"], "browser.stderr.log")
+            raw_tail = [base64.b64decode(line) for line in document["logs"][0]["lines"]]
+            self.assertLessEqual(len(raw_tail), supervisor.MAX_SYNTHETIC_DIAGNOSTIC_TAIL_LINES)
+            self.assertTrue(all(len(line) <= supervisor.MAX_SYNTHETIC_DIAGNOSTIC_LINE_BYTES for line in raw_tail))
+            self.assertFalse(any(b"PRIVATE_SOURCE_CANARY" in line for line in raw_tail))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                test_e2e._emit_synthetic_failure_diagnostics(
+                    destination, b"", execution_failed=True,
+                )
+            rendered = output.getvalue()
+            self.assertIn("name=browser.stderr.log", rendered)
+            self.assertIn("browser diagnostic line 139", rendered)
+            self.assertNotIn("PRIVATE_SOURCE_CANARY", rendered)
+            self.assertTrue(all(test_e2e.diagnostic_contract.public_e2e_failure_diagnostic(line)
+                                for line in rendered.splitlines()))
 
     def test_supervisor_devices_keep_worker_writable_modes_under_private_umask(self):
         with tempfile.TemporaryDirectory() as temporary:
