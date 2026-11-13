@@ -5,6 +5,8 @@ import contextlib
 import io
 import json
 import re
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -13,6 +15,7 @@ import public_audit as audit
 import control_audit
 import acceptance_diagnostics
 import diagnostic_contract
+import refusal_codes
 
 
 SHA = "a" * 40
@@ -501,6 +504,89 @@ def _terminal_control_jobs(require_main=True):
 
 
 class EncryptedAuditorMutationTests(unittest.TestCase):
+    def test_windows_policy_imports_without_unix_only_stdlib_modules(self):
+        root = Path(__file__).resolve().parents[2]
+        direct_scripts = (
+            "kit/bootstrap/test_policy.py",
+            "kit/bootstrap/test_public_tree.py",
+            "kit/devlane/test_audit_contracts.py",
+            "kit/bootstrap/check_candidate.py",
+        )
+        discovery_targets = (
+            ("kit/promotion", "test_*.py"),
+            ("kit/selector", "test_*.py"),
+            ("kit/ci", "test_*.py"),
+            ("kit/confinement", "test_capsule_frame.py"),
+            ("kit/confinement", "test_native_loopback_profile.py"),
+            ("kit/cache", "test_*.py"),
+            ("kit/bootstrap", "test_api_controls.py"),
+            ("kit/confinement", "test_macos*.py"),
+            ("kit/confinement", "test_confinement*.py"),
+            ("kit/confinement", "test_source_bundle_preflight.py"),
+            ("kit/confinement", "test_log_canary.py"),
+            ("kit/confinement", "test_cargo_lock_parser.py"),
+            ("kit/confinement", "test_release_build_verify.py"),
+            ("kit/confinement", "test_release_evidence.py"),
+            ("kit/confinement", "test_release_tool_ledger.py"),
+            ("kit/baselines", "test_baselines_prepare.py"),
+            ("kit/confinement", "test_role_signer.py"),
+            ("kit/confinement", "test_confinement_gate_table.py"),
+            ("kit/confinement", "test_windows_source_run.py"),
+        )
+        smoke = (
+            "import runpy, sys, unittest\n"
+            "from pathlib import Path\n"
+            "root = Path(" + repr(str(root)) + ")\n"
+            "for name in ('resource', 'fcntl', 'pwd', 'grp'):\n"
+            "    sys.modules[name] = None\n"
+            "sys.path[:0] = [str(root / 'kit/bootstrap'), str(root / 'kit/devlane')]\n"
+        )
+        targets = [("script", relative) for relative in direct_scripts]
+        targets.extend(("discover", start + "|" + pattern) for start, pattern in discovery_targets)
+        for kind, target in targets:
+            if kind == "script":
+                target_path = root / target
+                code = smoke + (
+                    "sys.path.insert(0, str(root / " + repr(str(target_path.parent.relative_to(root))) + "))\n"
+                    "runpy.run_path(str(root / " + repr(target) + "), run_name='windows_policy_import_smoke')\n"
+                )
+            else:
+                start, pattern = target.split("|", 1)
+                code = smoke + (
+                    "unittest.TestLoader().discover(str(root / " + repr(start)
+                    + "), pattern=" + repr(pattern) + ")\n"
+                )
+            with self.subTest(kind=kind, target=target):
+                result = subprocess.run(
+                    [sys.executable, "-B", "-c", code],
+                    cwd=str(root),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_supervisor_refusal_exports_match_the_platform_neutral_module(self):
+        if sys.platform == "win32":
+            self.skipTest("the supervisor requires Unix resource limits")
+        import supervisor
+
+        for name in (
+            "CLEANUP_SUBREASONS",
+            "DECRYPT_CHILD_ERROR_CLASSES",
+            "DECRYPT_CHILD_ERROR_CODES",
+            "DECRYPT_CHILD_EXIT_CODES",
+            "DECRYPT_REFUSAL_CODES",
+            "NETWORK_PROBE_DIAGNOSTIC_CODES",
+            "NETWORK_PROBE_REFUSAL_CODES",
+            "REFUSAL_CODES",
+            "STARTUP_DIAGNOSTIC_CODES",
+            "STARTUP_DIAGNOSTIC_PHASES",
+            "STARTUP_REFUSAL_CODES",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(getattr(supervisor, name), getattr(refusal_codes, name))
+
     def test_decrypt_failed_four_job_graph_is_accepted_when_public_audit_succeeds(self):
         jobs = _encrypted_jobs()
         by_name = {job["name"]: job for job in jobs}

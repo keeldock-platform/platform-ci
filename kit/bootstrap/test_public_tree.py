@@ -1010,6 +1010,7 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/owned_tree_cleanup.py',
             'kit/devlane/isolated_cleanup.py',
             'kit/devlane/network_probe.py',
+            'kit/devlane/refusal_codes.py',
             'kit/devlane/permit.py',
             'kit/devlane/prepare.py',
             'kit/devlane/project.py',
