@@ -271,7 +271,7 @@ def _render_log(job_key, identity=None, *, records=(), kind="encrypted", skip=("
     return "".join(stamp + line + "\n" for line in lines).encode("utf-8")
 
 
-def _render_real_runner_encrypted_log(identity, job_key=None):
+def _render_real_runner_encrypted_log(identity, job_key=None, early_failure=None):
     if job_key is None:
         job_key = audit.PLATFORM_RUN_JOBS[identity.get("platform", "linux")]
     grammar = audit._Grammar(
@@ -354,8 +354,11 @@ def _render_real_runner_encrypted_log(identity, job_key=None):
     lines.extend("  %s: %s" % (key, value) for key, value in inputs.items())
     lines.extend((marker + "[endgroup]", "Complete job name: " + job_key))
 
-    for step in grammar.steps:
+    failure_seen = False
+    for step_index, step in enumerate(grammar.steps):
         if step["name"] == "Install pinned Rust toolchain":
+            continue
+        if failure_seen and step["name"] != "Shred runner-local workspace":
             continue
         uses = step["uses"] or ""
         run = step["run"]
@@ -385,6 +388,8 @@ def _render_real_runner_encrypted_log(identity, job_key=None):
                          for key in sorted(env_names))
         lines.append(marker + "[endgroup]")
         outputs = _step_outputs(step, identity, "encrypted", ())
+        if early_failure and step["name"] == early_failure["step"]:
+            outputs = [early_failure["marker"]]
         if "Environment details" in outputs:
             position = outputs.index("Environment details")
             lines.extend(outputs[:position])
@@ -393,6 +398,9 @@ def _render_real_runner_encrypted_log(identity, job_key=None):
             lines.append(marker + "[endgroup]")
         else:
             lines.extend(outputs)
+        if early_failure and step["name"] == early_failure["step"]:
+            lines.append(marker + "[error]Process completed with exit code %d." % early_failure["exit_code"])
+            failure_seen = True
     lines.append("Cleaning up orphan processes")
     stamp = "2026-11-10T12:00:00.1234567Z "
     return "".join(stamp + line + "\n" for line in lines).encode("utf-8")
@@ -588,7 +596,11 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 patch.object(audit, "cache_inventory_digest", return_value=IDENTITY["cache_baseline_sha256"]), \
                 patch.object(audit, "validate_check_output"), \
                 patch.object(audit, "_read_annotations", return_value=[]):
-            self.assertIsNone(audit.run_audit(API(), IDENTITY))
+            self.assertEqual(
+                audit.run_audit(API(), IDENTITY),
+                "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed "
+                "disposition=run-failed-at-decrypt",
+            )
 
     def test_public_audit_refusal_prints_only_a_fixed_code(self):
         output = io.StringIO()
@@ -612,6 +624,92 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         jobs = _encrypted_jobs()
         result = audit.validate_job_contract(jobs, IDENTITY, "core-node")
         self.assertEqual(set(result), set(audit.EXECUTION_JOBS) | {audit.AUDIT_JOB})
+
+    def test_macos_and_windows_early_failures_are_audited_with_fixed_dispositions(self):
+        scenarios = (
+            ("macos", "Prepare hosted runner isolation state",
+             "devlane_macos_preflight_refusal=macos-user-attribute-set", 2,
+             "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed "
+             "disposition=run-failed-at-macos-preflight"),
+            ("windows", "Fetch public control and validate dispatch",
+             "devlane_deadline_refusal=deadline-start-invalid", 1,
+             "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed "
+             "disposition=run-failed-at-bootstrap"),
+        )
+        for platform_name, failed_step, marker, exit_code, outcome in scenarios:
+            with self.subTest(platform=platform_name):
+                identity = dict(IDENTITY, platform=platform_name)
+                jobs = _encrypted_jobs(platform=platform_name)
+                by_name = {job["name"]: job for job in jobs}
+                run_job = by_name[audit.PLATFORM_RUN_JOBS[platform_name]]
+                run_job["conclusion"] = "failure"
+                names = [step["name"] for step in run_job["steps"]]
+                failed_index = names.index(failed_step)
+                for index, step in enumerate(run_job["steps"]):
+                    if step["name"] == "Shred runner-local workspace":
+                        step["conclusion"] = "success"
+                    elif step["name"] == "Install pinned Rust toolchain" and platform_name == "macos":
+                        step["conclusion"] = "skipped"
+                    elif index < failed_index:
+                        step["conclusion"] = "success"
+                    elif index == failed_index:
+                        step["conclusion"] = "failure"
+                    else:
+                        step["conclusion"] = "skipped"
+                audit_job = by_name[audit.AUDIT_JOB]
+
+                logs = _render_real_runner_encrypted_log(
+                    identity, early_failure={"step": failed_step, "marker": marker, "exit_code": exit_code},
+                )
+                surface = audit.validate_job_log_surface(logs, audit.PLATFORM_RUN_JOBS[platform_name], identity,
+                                                          completed=True)
+                self.assertEqual(surface["early_failure"], failed_step)
+                self.assertFalse(audit.validate_dispatch_marker(logs, identity, allow_missing=True))
+                with self.assertRaises(audit.AuditRefusal):
+                    audit.validate_job_log_surface(
+                        logs.replace(marker.encode("ascii"), b"devlane_bootstrap_refusal=private-path", 1),
+                        audit.PLATFORM_RUN_JOBS[platform_name], identity, completed=True,
+                    )
+
+                class API:
+                    def json(self, endpoint):
+                        if endpoint.endswith("/actions/runs/" + identity["run_id"]):
+                            repository = {"full_name": audit.REPOSITORY, "id": audit.REPOSITORY_ID}
+                            return ({
+                                "id": int(identity["run_id"]), "path": audit.WORKFLOW_PATH,
+                                "event": "workflow_dispatch", "head_branch": "main",
+                                "head_sha": identity["control_sha"], "run_attempt": 1,
+                                "status": "in_progress", "conclusion": None,
+                                "repository": repository, "head_repository": repository,
+                            }, {})
+                        if "/jobs?" in endpoint:
+                            return ({"total_count": 4, "jobs": jobs}, {})
+                        if "/artifacts?" in endpoint:
+                            return ({"total_count": 0, "artifacts": []}, {})
+                        return ({}, {})
+
+                    def log_text(self, identifier):
+                        self.assert_run_id = identifier
+                        return logs
+
+                permit_key = "devlane-permit-v1-" + identity["bundle_id"]
+                control_key = "devlane-control-v1-" + identity["control_run_id"]
+                with patch.object(audit, "_fetch_cache_entries", return_value=[
+                        {"key": permit_key, "size_in_bytes": 1}, {"key": control_key, "size_in_bytes": 1}]), \
+                        patch.object(audit, "cache_inventory_digest", return_value=identity["cache_baseline_sha256"]), \
+                        patch.object(audit, "validate_check_output"), \
+                        patch.object(audit, "_read_annotations", return_value=[]):
+                    self.assertEqual(audit.run_audit(API(), identity), outcome)
+                terminal_jobs = copy.deepcopy(jobs)
+                terminal_audit = next(job for job in terminal_jobs if job["name"] == audit.AUDIT_JOB)
+                terminal_audit["status"] = "completed"
+                terminal_audit["conclusion"] = "success"
+                for step in terminal_audit["steps"]:
+                    step.update({"status": "completed", "conclusion": "success"})
+                _terminal, audit_passed = audit.validate_terminal_job_contract(
+                    terminal_jobs, identity, "core-node",
+                )
+                self.assertTrue(audit_passed)
 
     def test_desktop_contract_runs_tauri_dependencies_and_pinned_rust_setup(self):
         identity = dict(IDENTITY, profile="desktop")
@@ -897,7 +995,11 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 patch.object(audit, "cache_inventory_digest", return_value=identity["cache_baseline_sha256"]), \
                 patch.object(audit, "validate_check_output"), \
                 patch.object(audit, "_read_annotations", return_value=[]):
-            self.assertIsNone(audit.run_audit(API(), identity))
+            self.assertEqual(
+                audit.run_audit(API(), identity),
+                "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed "
+                "disposition=run-failed-at-decrypt",
+            )
 
         reasoned_log = run_log.replace(
             b"devlane_supervisor_refusal=decrypt-rejected",

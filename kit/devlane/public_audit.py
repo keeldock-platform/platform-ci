@@ -112,6 +112,10 @@ DISPATCH_MARKER = re.compile(
     rb"bundle-id=([A-Za-z0-9][A-Za-z0-9_-]{7,63}) control-sha=([a-f0-9]{40,64}) "
     rb"run-id=([1-9][0-9]{0,18}) run-attempt=1$"
 )
+CLEANUP_RECEIPT_MARKER = re.compile(
+    rb"(?m)^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z )?"
+    rb"cleanup_receipt=confirmed$"
+)
 DECIMAL = re.compile(r"[1-9][0-9]{0,18}\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 TIME_PREFIX = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z ")
@@ -150,7 +154,8 @@ PUBLIC_CODES = frozenset({
     "DEVLANE_FAILURE",
 })
 REFUSAL_LINE = re.compile(
-    r"(?:(?:devlane_refusal|devlane_supervisor_refusal|dependency_preparation_refusal)"
+    r"(?:(?:devlane_refusal|devlane_supervisor_refusal|dependency_preparation_refusal|"
+    r"devlane_deadline_refusal|devlane_macos_preflight_refusal|devlane_bootstrap_refusal)"
     r"=(?:[a-z0-9-]{1,64}|node-snapshot-manifest-invalid:"
     r"(?:link-row-path|source-row-kind|manifest-open|manifest-metadata|manifest-race|"
     r"manifest-missing|manifest-shape|manifest-digest|unlisted-site)))\Z"
@@ -178,6 +183,37 @@ DECRYPT_CHILD_ERROR_CODES = frozenset((
     "MemoryError", "PanicException", "SystemError", "UnicodeDecodeError", "other",
 ))
 AUDIT_REFUSAL_CODES = frozenset(("audit-contract", "audit-internal"))
+WINDOWS_BOOTSTRAP_REFUSAL_CODES = frozenset((
+    "deadline-start-invalid", "deadline-file-invalid", "deadline-budget-invalid", "deadline-failed",
+))
+MACOS_PREFLIGHT_REFUSAL_CODES = frozenset((
+    "macos-preflight-internal", "macos-root-identity-internal", "macos-preflight-host-identity",
+    "macos-preflight-node-tools", "macos-preflight-command-line-tools", "macos-preflight-platform-policy",
+    "macos-preflight-temp-permissions", "macos-preflight-root-helper", "macos-preflight-state-record",
+    "macos-run-root-missing", "macos-state-directory-create", "macos-python3-unavailable",
+    "macos-user-list", "macos-user-name-conflict", "macos-user-id-exhausted", "macos-user-create",
+    "macos-user-attribute-set", "macos-worker-home-create", "macos-worker-home-permissions",
+    "macos-user-verify", "macos-cleanup-intent-write", "macos-identity-record-write",
+    "macos-runner-required", "profile-unknown", "dispatch-context-invalid", "state-directory-permissions",
+    "node-toolchain-missing", "node-toolchain-version", "npm-toolchain-version", "tool-path-invalid",
+    "tool-version-unavailable", "supervisor-operation-failed", "raw-record-size",
+))
+EARLY_FAILURE_STEP_IDS = {
+    "Fetch public control and validate dispatch": "bootstrap",
+    "Prepare hosted runner isolation state": "macos-preflight",
+    "Prepare hosted Windows isolation state": "windows-preflight",
+}
+AUDIT_OUTCOME_LINES = frozenset((
+    "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed",
+    "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-bootstrap",
+    "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-macos-preflight",
+    "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-windows-preflight",
+    "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-probe",
+    "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-decrypt",
+    "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-during-execution",
+    "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-cancelled",
+    "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-timed-out",
+))
 DECRYPT_FAILURE_CODES = frozenset((
     "decrypt-key-unavailable", "decrypt-manifest-unavailable", "decrypt-rejected", "decrypt-timeout",
 ))
@@ -544,6 +580,25 @@ class _Grammar:
             return any(pattern.fullmatch(line) for pattern in patterns)
         if step_name == "Install pinned macOS npm runtime":
             return line == "macos_node_runtime=ready"
+        if line.startswith("devlane_deadline_refusal="):
+            code = line[len("devlane_deadline_refusal="):]
+            if (self.job_runner != "windows-2025"
+                    or step_name != "Fetch public control and validate dispatch"
+                    or code not in WINDOWS_BOOTSTRAP_REFUSAL_CODES):
+                return False
+            public_counts["early_failure_marker"] = public_counts.get("early_failure_marker", 0) + 1
+            public_counts["early_failure_step"] = step_name
+            public_counts["early_failure_code"] = code
+            return public_counts["early_failure_marker"] == 1
+        if line.startswith("devlane_macos_preflight_refusal="):
+            code = line[len("devlane_macos_preflight_refusal="):]
+            if (self.job_runner != "macos-15" or step_name != "Prepare hosted runner isolation state"
+                    or code not in MACOS_PREFLIGHT_REFUSAL_CODES):
+                return False
+            public_counts["early_failure_marker"] = public_counts.get("early_failure_marker", 0) + 1
+            public_counts["early_failure_step"] = step_name
+            public_counts["early_failure_code"] = code
+            return public_counts["early_failure_marker"] == 1
         exact = {
             "Fetch public control and validate dispatch": {"dispatch_context=validated"},
             "Prepare hosted runner isolation state": set(),
@@ -578,6 +633,10 @@ class _Grammar:
                     "devlane_audit_refusal", 0,
                 ) + 1
                 return public_counts["devlane_audit_refusal"] == 1
+            if line in AUDIT_OUTCOME_LINES:
+                public_counts["devlane_audit_outcome"] = public_counts.get("devlane_audit_outcome", 0) + 1
+                public_counts["devlane_audit_outcome_line"] = line
+                return public_counts["devlane_audit_outcome"] == 1
         if step_name == "Install pinned Rust toolchain":
             exact = exact | {"rust_matrix_fixture=loaded committed_locks=3 matrix_coverage_ids=23"}
         if step_name == "Install fixed Rust acceptance toolchain":
@@ -1399,6 +1458,16 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
                 mode = None
                 continue
             _refuse()
+        error_exit = re.fullmatch(
+            re.escape(LOG_MARKER) + r"\[error\]Process completed with exit code ([12])\.", normalized,
+        )
+        if error_exit and counts.get("early_failure_marker") == 1:
+            if (counts.get("early_failure_step") != step_name
+                    or counts.get("early_failure_exit") is not None):
+                _refuse()
+            counts["early_failure_exit"] = int(error_exit.group(1))
+            counts["early_failed_step"] = step_name
+            continue
         if normalized == LOG_MARKER + "[error]Process completed with exit code 2.":
             if step_name == "Probe isolation before decryption":
                 if not (counts.get("network_probe_refusal")
@@ -1435,13 +1504,26 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         if profile not in ENCRYPTED_PROFILES:
             _refuse()
         validate_summary_records(records, profile)
+    early_failure = None
     if kind == "encrypted" and job_name in EXECUTION_JOBS:
         windows_job = grammar.job_runner == "windows-2025"
         if (counts.get("network_probe_refusal_code") is not None
                 and counts.get("network_probe_supervisor_refusal_code") is not None
                 and counts["network_probe_refusal_code"] != counts["network_probe_supervisor_refusal_code"]):
             _refuse()
-        if counts.get("dispatch") != 1 or counts.get("permit") != 1:
+        if counts.get("early_failure_marker"):
+            early_failure = counts.get("early_failure_step")
+            if (counts.get("early_failure_marker") != 1 or counts.get("early_failure_exit") not in (1, 2)
+                    or counts.get("early_failed_step") != early_failure
+                    or counts.get("dispatch") or counts.get("permit") or records
+                    or counts.get("network_probe_refusal") or counts.get("network_probe_supervisor_refusal")
+                    or counts.get("network_cut_probe=pass") or counts.get("authenticated_decryption=pass")
+                    or counts.get("windows_decrypt=accepted manifest=bound") or counts.get("decrypt_failure_marker")
+                    or counts.get("decrypt_refusal_detail") or "Probe isolation before decryption" in seen_steps
+                    or "Decrypt authenticated bundle" in seen_steps
+                    or "Execute offline profile and filter public summary" in seen_steps):
+                _refuse()
+        elif counts.get("dispatch") != 1 or counts.get("permit") != 1:
             _refuse()
         probe_refusal_count = counts.get("network_probe_refusal", 0) + (
             1 if counts.get("network_probe_supervisor_refusal")
@@ -1453,31 +1535,32 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
             "outside_write=blocked other_drive_read=blocked other_drive_write=blocked firewall=verified"
         )
         probe_success_count = counts.get(windows_probe_success, 0) if windows_job else counts.get("network_cut_probe=pass", 0)
-        if probe_success_count + probe_refusal_count != 1:
-            _refuse()
-        if probe_refusal_count != counts.get("network_probe_failed_exit", 0):
-            _refuse()
-        decrypt_failure_count = counts.get("decrypt_failure_marker", 0)
-        if probe_refusal_count:
-            if (counts.get("authenticated_decryption=pass") or counts.get("windows_decrypt=accepted manifest=bound")
-                    or decrypt_failure_count
-                    or counts.get("decrypt_failed_exit") or counts.get("decrypt_refusal_detail")
-                    or "Decrypt authenticated bundle" in seen_steps
-                    or "Execute offline profile and filter public summary" in seen_steps):
+        if early_failure is None:
+            if probe_success_count + probe_refusal_count != 1:
                 _refuse()
-        else:
-            decrypt_success_count = (counts.get("windows_decrypt=accepted manifest=bound", 0)
-                                     if windows_job else counts.get("authenticated_decryption=pass", 0))
-            if decrypt_success_count + decrypt_failure_count != 1:
+            if probe_refusal_count != counts.get("network_probe_failed_exit", 0):
                 _refuse()
-            if decrypt_failure_count:
-                if (counts.get("decrypt_failed_exit") != 1 or records
+            decrypt_failure_count = counts.get("decrypt_failure_marker", 0)
+            if probe_refusal_count:
+                if (counts.get("authenticated_decryption=pass") or counts.get("windows_decrypt=accepted manifest=bound")
+                        or decrypt_failure_count
+                        or counts.get("decrypt_failed_exit") or counts.get("decrypt_refusal_detail")
+                        or "Decrypt authenticated bundle" in seen_steps
                         or "Execute offline profile and filter public summary" in seen_steps):
                     _refuse()
-            elif counts.get("decrypt_failed_exit") or counts.get("decrypt_refusal_detail"):
+            else:
+                decrypt_success_count = (counts.get("windows_decrypt=accepted manifest=bound", 0)
+                                         if windows_job else counts.get("authenticated_decryption=pass", 0))
+                if decrypt_success_count + decrypt_failure_count != 1:
+                    _refuse()
+                if decrypt_failure_count:
+                    if (counts.get("decrypt_failed_exit") != 1 or records
+                            or "Execute offline profile and filter public summary" in seen_steps):
+                        _refuse()
+                elif counts.get("decrypt_failed_exit") or counts.get("decrypt_refusal_detail"):
+                    _refuse()
+            if counts.get("decrypt_refusal_detail", 0) > 1:
                 _refuse()
-        if counts.get("decrypt_refusal_detail", 0) > 1:
-            _refuse()
         cleanup_line = "cleanup_receipt=confirmed"
         if counts.get(cleanup_line) != 1 or (completed and counts.get(
                 "devlane_job=completed public_output=filtered cleanup=confirmed") != 1):
@@ -1485,8 +1568,7 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
     elif kind == "encrypted":
         if counts.get("dispatch") or counts.get("permit") or records:
             _refuse()
-        audit_line = "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed"
-        audit_outcome_count = counts.get(audit_line, 0) + counts.get("devlane_audit_refusal", 0)
+        audit_outcome_count = counts.get("devlane_audit_outcome", 0) + counts.get("devlane_audit_refusal", 0)
         if ((completed and audit_outcome_count != 1) or audit_outcome_count > 1):
             _refuse()
     else:
@@ -1501,7 +1583,8 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         elif (counts.get("devlane_acceptance=pass") != 1 or counts.get("acceptance_refused")
               or counts.get("devlane_linux_probe=pass") != 1):
             _refuse()
-    return {"records": [record.encode("ascii") for record in records]}
+    return {"records": [record.encode("ascii") for record in records], "early_failure": early_failure,
+            "counts": counts if job_name == AUDIT_JOB else None}
 
 
 def validate_check_output(check, job, identity, *, completed):
@@ -1634,8 +1717,42 @@ def validate_job_contract(jobs, identity, profile):
         and decrypt_step.get("status") == "completed" and decrypt_step.get("conclusion") == "failure"
         and execute_step.get("status") == "completed" and execute_step.get("conclusion") == "skipped"
     )
+    probe_index = expected_names.index("Probe isolation before decryption")
+    pre_probe_failures = [
+        name for name in expected_names[:probe_index]
+        if step_by_name[name].get("status") == "completed" and step_by_name[name].get("conclusion") == "failure"
+    ]
+    early_failure_step = None
+    if run_job.get("conclusion") == "failure" and len(pre_probe_failures) == 1:
+        candidate = pre_probe_failures[0]
+        platform_early_steps = {
+            "macos": {"Prepare hosted runner isolation state"},
+            "windows": {"Fetch public control and validate dispatch", "Prepare hosted Windows isolation state"},
+        }.get(platform, set())
+        if candidate in platform_early_steps:
+            early_failure_step = candidate
     cancelled = run_job["conclusion"] in ("cancelled", "timed_out")
     for name, step in step_by_name.items():
+        if ((skipped_tool_step is not None and name == skipped_tool_step)
+                or (skipped_desktop_dependency_step is not None and name == skipped_desktop_dependency_step)):
+            if step.get("status") != "completed" or step.get("conclusion") != "skipped":
+                _refuse()
+            continue
+        if early_failure_step is not None:
+            index = expected_names.index(name)
+            failed_index = expected_names.index(early_failure_step)
+            if name == "Shred runner-local workspace":
+                if step.get("status") != "completed" or step.get("conclusion") != "success":
+                    _refuse()
+            elif index < failed_index:
+                if step.get("status") != "completed" or step.get("conclusion") != "success":
+                    _refuse()
+            elif index == failed_index:
+                if step.get("status") != "completed" or step.get("conclusion") != "failure":
+                    _refuse()
+            elif step.get("status") != "completed" or step.get("conclusion") != "skipped":
+                _refuse()
+            continue
         if failed_before_decrypt and name == "Probe isolation before decryption":
             if step.get("status") != "completed" or step.get("conclusion") != "failure":
                 _refuse()
@@ -1651,22 +1768,17 @@ def validate_job_contract(jobs, identity, profile):
             if step.get("status") != "completed" or step.get("conclusion") != expected:
                 _refuse()
             continue
-        if ((skipped_tool_step is not None and name == skipped_tool_step)
-                or (skipped_desktop_dependency_step is not None and name == skipped_desktop_dependency_step)):
-            if step.get("status") != "completed" or step.get("conclusion") != "skipped":
-                _refuse()
-            continue
         if name == "Execute offline profile and filter public summary":
             if step.get("status") != "completed" or step.get("conclusion") not in ("success", "failure", "cancelled"):
                 _refuse()
         elif step.get("status") != "completed" or step.get("conclusion") != "success":
             if not cancelled or name == "Shred runner-local workspace" or step.get("conclusion") not in ("cancelled", "skipped"):
                 _refuse()
-    if step_by_name[expected_tool_step].get("conclusion") != "success":
+    if early_failure_step is None and step_by_name[expected_tool_step].get("conclusion") != "success":
         _refuse()
     if run_job["conclusion"] in ("success", "failure"):
         expected_run_conclusion = (
-            "failure" if failed_before_decrypt or failed_at_decrypt
+            "failure" if early_failure_step or failed_before_decrypt or failed_at_decrypt
             or execute_step.get("conclusion") == "failure"
             else "success"
         )
@@ -1744,10 +1856,14 @@ def validate_run_record(run, identity):
         _refuse()
 
 
-def validate_dispatch_marker(log, identity):
+def validate_dispatch_marker(log, identity, *, allow_missing=False):
     if type(log) is not bytes or len(log) > MAX_LOG_BYTES or b"::warning::" in log or b"::error::" in log:
         _refuse()
     matches = list(DISPATCH_MARKER.finditer(log))
+    if not matches and allow_missing:
+        if PERMIT_MARKER.search(log) or len(CLEANUP_RECEIPT_MARKER.findall(log)) != 1:
+            _refuse()
+        return False
     if len(matches) != 1:
         _refuse()
     wave_id, bundle_id, control_sha, run_id = matches[0].groups()
@@ -1755,11 +1871,39 @@ def validate_dispatch_marker(log, identity):
             or control_sha.decode("ascii") != identity["control_sha"]
             or run_id.decode("ascii") != identity["run_id"]):
         _refuse()
-    if log.count(b"cleanup_receipt=confirmed") != 1:
+    if len(CLEANUP_RECEIPT_MARKER.findall(log)) != 1:
         _refuse()
     permit_matches = list(PERMIT_MARKER.finditer(log))
     if len(permit_matches) != 1 or permit_matches[0].group(1).decode("ascii") != identity["run_id"]:
         _refuse()
+    return True
+
+
+def _audit_outcome_line(jobs, identity):
+    active_name = (RUN_JOB if _legacy_encrypted_workflow_path(identity)
+                   else PLATFORM_RUN_JOBS[identity.get("platform", "linux")])
+    run_job = next((job for job in jobs if type(job) is dict and job.get("name") == active_name), None)
+    if run_job is None or run_job.get("conclusion") == "success":
+        return "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed"
+    if run_job.get("conclusion") in ("cancelled", "timed_out"):
+        disposition = "run-cancelled" if run_job["conclusion"] == "cancelled" else "run-timed-out"
+        return "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=" + disposition
+    steps = {step.get("name"): step for step in _steps(run_job)}
+    failed = next((name for name, step in steps.items()
+                   if step.get("status") == "completed" and step.get("conclusion") == "failure"), None)
+    disposition = EARLY_FAILURE_STEP_IDS.get(failed)
+    if disposition is not None:
+        suffix = "at-" + disposition
+    elif failed == "Probe isolation before decryption":
+        suffix = "at-probe"
+    elif failed == "Decrypt authenticated bundle":
+        suffix = "at-decrypt"
+    elif failed == "Execute offline profile and filter public summary":
+        suffix = "during-execution"
+    else:
+        _refuse()
+    return ("devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed "
+            "disposition=run-failed-" + suffix)
 
 
 def audit_environment(env):
@@ -1810,8 +1954,8 @@ def run_audit(api, identity):
                    else PLATFORM_RUN_JOBS[identity.get("platform", "linux")])
     run_job = jobs[active_name]
     log = api.log_text(run_job["id"])
-    validate_dispatch_marker(log, identity)
-    validate_job_log_surface(log, active_name, identity, completed=True)
+    surface = validate_job_log_surface(log, active_name, identity, completed=True)
+    validate_dispatch_marker(log, identity, allow_missing=surface["early_failure"] is not None)
     artifacts, _ = api.json(prefix + "/artifacts?per_page=100&page=1")
     if (type(artifacts) is not dict or artifacts.get("total_count") != 0
             or artifacts.get("artifacts") != []):
@@ -1834,6 +1978,7 @@ def run_audit(api, identity):
         annotations = _read_annotations(api, "/repos/%s/check-runs/%d/annotations" % (REPOSITORY, check_id))
         if annotations:
             _refuse()
+    return _audit_outcome_line(list(jobs.values()), identity)
 
 
 def validate_final_public_surfaces(api, jobs, identity, profile):
@@ -1841,7 +1986,8 @@ def validate_final_public_surfaces(api, jobs, identity, profile):
     if type(jobs) is not list or len(jobs) > 100:
         _refuse()
     collected, collection_failed = {}, False
-    active_name = PLATFORM_RUN_JOBS.get(identity.get("platform", "linux"))
+    active_name = (RUN_JOB if _legacy_encrypted_workflow_path(identity)
+                   else PLATFORM_RUN_JOBS.get(identity.get("platform", "linux")))
     for job in jobs:
         if type(job) is not dict or job.get("status") != "completed":
             continue
@@ -1890,9 +2036,12 @@ def validate_final_public_surfaces(api, jobs, identity, profile):
         surface = collected[job["id"]]
         log = surface.get("log")
         surface_result = validate_job_log_surface(log, job_name, identity, completed=True)
-        if job_name == RUN_JOB:
+        if job_name == active_name:
             public_records = surface_result["records"]
-            validate_dispatch_marker(log, identity)
+            validate_dispatch_marker(log, identity, allow_missing=surface_result["early_failure"] is not None)
+        elif surface_result.get("counts", {}).get("devlane_audit_outcome_line") != _audit_outcome_line(
+                list(validated.values()), identity):
+            _refuse()
         check_id = int(job["check_run_url"].rsplit("/", 1)[1])
         validate_check_output(surface.get("check"), job, identity, completed=True)
         if surface.get("annotations"):
@@ -1904,8 +2053,8 @@ def main():
     try:
         identity = audit_environment(os.environ)
         api = GitHubAPI(os.environ["GITHUB_TOKEN"])
-        run_audit(api, identity)
-        print("devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed")
+        outcome = run_audit(api, identity)
+        print(outcome)
         return 0
     except AuditRefusal:
         print("devlane_audit=refused code=audit-contract")
