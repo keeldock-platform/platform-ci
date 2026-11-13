@@ -2969,7 +2969,8 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
         bash_callable = "crypto_print_reason() {\n" + bash_function.group(1) + "}\ncrypto_print_reason \"$1\"\n"
         canonical = "devlane_crypto_refusal=crypto-acl-invalid"
         bash_allowed = sorted(refusal_codes.CRYPTO_CONTROL_REFUSAL_CODES)
-        for code in bash_allowed:
+        run_bash = sys.platform != "win32"
+        for code in bash_allowed if run_bash else ():
             candidate = "devlane_crypto_refusal=" + code
             result = subprocess.run(
                 ["bash", "-c", bash_callable, "crypto-reason-test", candidate],
@@ -2982,7 +2983,7 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
             canonical + " ", canonical + "\r", "prefix-" + canonical, canonical + "-suffix",
             "prefix\n" + canonical + "\nsuffix",
         )
-        for candidate in malformed:
+        for candidate in malformed if run_bash else ():
             result = subprocess.run(
                 ["bash", "-c", bash_callable, "crypto-reason-test", candidate],
                 capture_output=True, text=True, check=False,
