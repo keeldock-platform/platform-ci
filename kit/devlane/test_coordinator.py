@@ -28,7 +28,7 @@ CACHE_SHA = "d" * 64
 def _request(wave_id="wave-test-0001", bundle_id="bundle-test-0001"):
     return {
         "schema": 2, "wave_id": wave_id, "bundle_id": bundle_id,
-        "control_run_id": "12345", "control_sha": CONTROL_SHA, "profile": "core-node",
+        "control_run_id": "12345", "control_sha": CONTROL_SHA, "platform": "linux", "profile": "core-node",
         "expires": int(time.time()) + 1800, "release_id": "77",
     }
 
@@ -36,7 +36,7 @@ def _request(wave_id="wave-test-0001", bundle_id="bundle-test-0001"):
 def _ledger_record(wave_id="wave-test-0001", bundle_id="bundle-test-0001", state="assets-staged"):
     return {
         "schema": 2, "wave_id": wave_id, "bundle_id": bundle_id, "control_run_id": "12345",
-        "control_sha": CONTROL_SHA, "profile": "core-node", "runner": None, "release_id": "77",
+        "control_sha": CONTROL_SHA, "profile": "core-node", "platform": "linux", "release_id": "77",
         "bundle_asset_name": "devlane-" + wave_id + "-" + bundle_id + ".enc",
         "projection_asset_name": "devlane-" + wave_id + "-" + bundle_id + ".projection.json",
         "bundle_asset_id": "111", "bundle_sha256": BUNDLE_SHA, "bundle_size": 1024,
@@ -340,11 +340,11 @@ class RunLifecycleTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(coordinator, "_terminal_audit_disposition", return_value=disposition))
         return stack
 
-    def test_terminal_audit_receives_the_runner_persisted_on_the_wave(self):
+    def test_terminal_audit_receives_the_platform_persisted_on_the_wave(self):
         with tempfile.TemporaryDirectory() as temporary:
             ledger = self._ledger(temporary)
             record = _ledger_record(state="run-attached")
-            record.update({"runner": "macos-15", "run_id": "54321", "authorized_run_id": "54321",
+            record.update({"platform": "macos", "run_id": "54321", "authorized_run_id": "54321",
                            "run_attempt": 1})
             _write_record(ledger, record)
             run = {"id": 54321, "path": coordinator.fetch.WORKFLOW_PATH, "head_branch": "main",
@@ -362,7 +362,11 @@ class RunLifecycleTests(unittest.TestCase):
                     mock.patch.object(coordinator, "_preserve_diagnostics"), \
                     mock.patch.object(coordinator, "_cli_token", return_value="opaque"):
                 self.assertEqual(coordinator._terminal_audit_disposition("54321", record, run, ledger), "accepted")
-            self.assertEqual(observed["runner"], "macos-15")
+            self.assertEqual(observed["platform"], "macos")
+
+    def test_decrypt_watch_uses_one_two_hour_deadline_for_every_platform(self):
+        self.assertEqual(coordinator.DECRYPT_WATCH_TIMEOUT_SECONDS, 7200)
+        self.assertEqual(set(coordinator.PLATFORM_RUN_JOBS), {"linux", "macos", "windows"})
 
     def test_run_deleted_but_ledger_stale_is_reconciled_from_absence(self):
         """Fails on the old code: the 404 run made identity validation fail and logs, artifacts and run stayed delete-pending forever (reproduced as cleanup-incomplete)."""
@@ -869,14 +873,16 @@ class SingleDispatchOwnerTests(unittest.TestCase):
                 coordinator.dispatch_wave(ledger, "wave-test-0001", key_path, timeout_seconds=10)
             self.assertFalse(key_path.exists())
 
-    def test_macos_runner_is_limited_to_core_node(self):
+    def test_macos_platform_is_limited_to_core_node(self):
         with tempfile.TemporaryDirectory() as temporary:
             ledger, key_path = self._ready_wave(temporary)
             record = coordinator._read(ledger / "wave-test-0001.json")
             record["profile"] = "core-rust"
             _write_record(ledger, record)
-            with self.assertRaisesRegex(coordinator.Refusal, "runner-profile-unsupported"):
-                coordinator.dispatch_wave(ledger, "wave-test-0001", key_path, runner="macos-15")
+            record["platform"] = "macos"
+            _write_record(ledger, record)
+            with self.assertRaisesRegex(coordinator.Refusal, "platform-profile-unsupported"):
+                coordinator.dispatch_wave(ledger, "wave-test-0001", key_path, platform="macos")
             self.assertFalse(key_path.exists())
 
     def test_key_file_requires_exact_lowercase_hex_without_echoing_contents(self):
@@ -914,7 +920,7 @@ class SingleDispatchOwnerTests(unittest.TestCase):
             self.assertEqual(sum("workflow" in command for command in calls), 1)
             self.assertGreaterEqual(len(revoked), 1)
             self.assertFalse(key_path.exists())
-            self.assertEqual(coordinator._read(ledger / "wave-test-0001.json")["runner"], "ubuntu-24.04")
+            self.assertEqual(coordinator._read(ledger / "wave-test-0001.json")["platform"], "linux")
             self.assertEqual(coordinator._read(ledger / "wave-test-0001.json")["dispatch_result"], "ambiguous")
 
     def test_pending_forever_hits_absolute_deadline_and_revokes_without_run_guess(self):
@@ -1370,6 +1376,7 @@ class ControlDispatchReconciliationTests(unittest.TestCase):
             record["bundle_asset_id"] = "111"
             record["projection_asset_id"] = "222"
             record["cache_baseline_sha256"] = CACHE_SHA
+            record["platform"] = "macos"
             _write_record(ledger, record)
             key_path = Path(temporary) / "key.hex"
             key_path.write_bytes(b"a" * 64)
@@ -1430,7 +1437,7 @@ class ControlDispatchReconciliationTests(unittest.TestCase):
                     status = coordinator.main([
                         "dispatch-wave", "--ledger", str(ledger), "--wave-id", "wave-test-0001",
                         "--key-file", str(key_path), "--poll-seconds", "2", "--timeout-seconds", "30",
-                        "--decrypt-timeout-seconds", "60", "--runner", "macos-15",
+                        "--decrypt-timeout-seconds", "60", "--platform", "macos",
                     ])
                     live_process.assert_not_called()
             finally:
@@ -1439,7 +1446,7 @@ class ControlDispatchReconciliationTests(unittest.TestCase):
             self.assertEqual(len(calls), 2)
             self.assertIn("secret set", " ".join(calls[0]))
             self.assertIn("workflow run", " ".join(calls[1]))
-            self.assertIn("runner=macos-15", " ".join(calls[1]))
+            self.assertIn("platform=macos", " ".join(calls[1]))
             self.assertIn("dispatch_wave=attached run-id=54321", output.getvalue())
             self.assertEqual(cleanup_calls, [(ledger, "wave-test-0001")])
             updated = coordinator._read(ledger / "wave-test-0001.json")

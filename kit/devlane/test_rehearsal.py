@@ -464,7 +464,7 @@ class RehearsalBuilderTests(unittest.TestCase):
             reserve = json.loads((owner / "reserve.json").read_text(encoding="utf-8"))
             self.assertEqual(reserve["expires"], expires)
             self.assertEqual(
-                set(reserve), {"schema", "wave_id", "bundle_id", "control_run_id", "control_sha", "profile",
+                set(reserve), {"schema", "wave_id", "bundle_id", "control_run_id", "control_sha", "profile", "platform",
                                "expires", "release_id"})
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(bundle.main(["create", "--request", str(owner / "bundle-request.json"),
@@ -677,7 +677,7 @@ class ProcedureDocumentTests(unittest.TestCase):
         )["devlane-synthetic"]["steps"]
         encrypted_names = [step["name"] for step in encrypted_steps]
         synthetic_names = [step["name"] for step in synthetic_steps]
-        self.assertLess(encrypted_names.index("Prepare hosted runner isolation state"),
+        self.assertLess(encrypted_names.index("Prepare hosted Linux isolation state"),
                         encrypted_names.index(coordinator.DECRYPT_STEP))
         self.assertLess(synthetic_names.index("Prepare hosted Linux isolation state"),
                         synthetic_names.index("Run full source-free production-path acceptance"))

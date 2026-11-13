@@ -596,7 +596,10 @@ class NodeVendorIntegrationAcceptanceTests(unittest.TestCase):
         prepare_step = workflow.split("- name: Prepare dependencies before the cut", 1)[1].split(
             "- name:", 1,
         )[0]
-        self.assertNotIn("actions/setup-node@", workflow)
+        self.assertNotIn("actions/setup-node@", workflow.split("devlane-encrypted-run-windows", 1)[0])
+        windows_job = workflow.split("devlane-encrypted-run-windows", 1)[1]
+        self.assertIn("actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1", windows_job)
+        self.assertIn('node-version: "24.22.1"', windows_job)
         self.assertNotIn("/opt/hostedtoolcache", workflow + prepare_source)
         self.assertNotIn("command -v node", prepare_step)
         self.assertNotIn("command -v npm", prepare_step)
@@ -799,7 +802,7 @@ class PostCutBaselineStagingAcceptanceTests(unittest.TestCase):
 class OneRunPermitAcceptanceTests(unittest.TestCase):
     def _environment(self, **changes):
         environment = {
-            "CI_SHA": CONTROL_SHA, "CI_CONTROL_RUN_ID": "12345", "DEVLANE_PROFILE": "core-node",
+            "CI_SHA": CONTROL_SHA, "CI_CONTROL_RUN_ID": "12345", "DEVLANE_PLATFORM": "linux", "DEVLANE_PROFILE": "core-node",
             "DEVLANE_WAVE_ID": "wave-test-0001", "DEVLANE_BUNDLE_ID": "bundle-test-0001",
             "CI_RUN_ID": "54321", "CI_RUN_ATTEMPT": "1",
             "DEVLANE_EXPIRES": str(int(time.time()) + 1800),
@@ -855,6 +858,7 @@ class FetchProjectionAcceptanceTests(unittest.TestCase):
             "projection_sha256": "c" * 64,
             "projection_size": 200,
             "expires": 2_000_000_000,
+            "platform": "linux",
         }
         self.assertEqual(fetch.validate_dispatch(identity, now=1_999_999_000), identity)
         local_sync_identity = {**identity, "profile": "local-sync-rust"}

@@ -134,15 +134,19 @@ def _opaque(value, code):
     return value
 
 
-def build_requests(directory, control_sha, control_run_id, wave_id, bundle_id, release_id, lifetime_seconds):
+def build_requests(directory, control_sha, control_run_id, wave_id, bundle_id, release_id, lifetime_seconds,
+                   platform="linux"):
     root = _directory(directory)
     _opaque(wave_id, "wave-id")
     _opaque(bundle_id, "bundle-id")
-    if (type(control_sha) is not str or not re.fullmatch(r"[a-f0-9]{40}", control_sha)
+    if (platform not in ("linux", "macos", "windows")
+            or type(control_sha) is not str or not re.fullmatch(r"[a-f0-9]{40}", control_sha)
             or not DECIMAL.fullmatch(str(control_run_id)) or not DECIMAL.fullmatch(str(release_id))
             or type(lifetime_seconds) is not int or not 60 <= lifetime_seconds <= 3300):
         _refuse("request-input")
     request = bundle.strict_json((root / "projection-request.json").read_bytes(), 1024 * 1024)
+    if platform != "linux" and request.get("profile") != "core-node":
+        _refuse("request-input")
     projection = root / "projection.json"
     if not projection.is_file() or projection.is_symlink():
         _refuse("projection-missing")
@@ -156,7 +160,8 @@ def build_requests(directory, control_sha, control_run_id, wave_id, bundle_id, r
     expires = int(time.time()) + lifetime_seconds
     reserve = {
         "schema": 2, "wave_id": wave_id, "bundle_id": bundle_id, "control_run_id": str(control_run_id),
-        "control_sha": control_sha, "profile": profile, "expires": expires, "release_id": str(release_id),
+        "control_sha": control_sha, "profile": profile, "platform": platform,
+        "expires": expires, "release_id": str(release_id),
     }
     tracked = _git(request["repository"], "ls-files", "-z")
     source_files = sorted(item for item in tracked.split("\x00") if item)
@@ -210,6 +215,7 @@ def main(argv=None):
     requests.add_argument("--wave-id", required=True)
     requests.add_argument("--bundle-id", required=True)
     requests.add_argument("--release-id", required=True)
+    requests.add_argument("--platform", choices=("linux", "macos", "windows"), default="linux")
     requests.add_argument("--lifetime-seconds", type=int, default=3000)
     staged = sub.add_parser("staged")
     staged.add_argument("--directory", required=True)
@@ -226,7 +232,7 @@ def main(argv=None):
                 args.profile, build_source(args.directory, args.profile)))
         elif args.operation == "requests":
             expires = build_requests(args.directory, args.control_sha, args.control_run_id, args.wave_id,
-                                     args.bundle_id, args.release_id, args.lifetime_seconds)
+                                     args.bundle_id, args.release_id, args.lifetime_seconds, args.platform)
             print("rehearsal_requests=ready expires=%d" % expires)
         elif args.operation == "staged":
             build_staged(args.directory)

@@ -27,7 +27,7 @@ import public_audit
 
 
 LEDGER_FIELDS = {
-    "schema", "wave_id", "bundle_id", "control_run_id", "control_sha", "profile", "runner",
+    "schema", "wave_id", "bundle_id", "control_run_id", "control_sha", "platform", "profile",
     "release_id", "bundle_asset_name", "projection_asset_name", "bundle_asset_id",
     "bundle_sha256", "bundle_size", "projection_asset_id", "projection_sha256",
     "projection_size", "expires", "cache_baseline_sha256", "state", "created_at", "updated_at",
@@ -37,6 +37,13 @@ LEDGER_FIELDS = {
 SECRET_NAME = "DEVLANE_DECRYPT_KEY"
 DECRYPT_STEP = "Decrypt authenticated bundle"
 RUN_JOB_NAME = "devlane-encrypted-run"
+PLATFORM_RUNNERS = {"linux": "ubuntu-24.04", "macos": "macos-15", "windows": "windows-2025"}
+PLATFORM_RUN_JOBS = {
+    "linux": RUN_JOB_NAME,
+    "macos": "devlane-encrypted-run-macos",
+    "windows": "devlane-encrypted-run-windows",
+}
+DECRYPT_WATCH_TIMEOUT_SECONDS = 7200
 MAX_REVOKE_LATENCY_SECONDS = 120
 GH_STATUS_TIMEOUT_SECONDS = 15
 DISPATCH_RECONCILE_SECONDS = 300
@@ -99,7 +106,7 @@ def _read(path):
             os.close(descriptor)
     if type(record) is not dict or set(record) != LEDGER_FIELDS or record.get("schema") != 2:
         _fail("ledger-record-invalid")
-    if record.get("runner") not in (None, "ubuntu-24.04", "macos-15"):
+    if record.get("platform") not in PLATFORM_RUNNERS:
         _fail("ledger-record-invalid")
     return record
 
@@ -288,12 +295,14 @@ def _validate_wave_id(value, code):
 
 def reserve_wave(ledger, request):
     root = _ledger_root(ledger)
-    required = {"schema", "wave_id", "bundle_id", "control_run_id", "control_sha", "profile", "expires", "release_id"}
+    required = {"schema", "wave_id", "bundle_id", "control_run_id", "control_sha", "platform", "profile", "expires", "release_id"}
     if type(request) is not dict or set(request) != required or request["schema"] != 2:
         _fail("reservation-shape")
     for name in ("wave_id", "bundle_id"):
         _validate_wave_id(request[name], "reservation-id")
-    if (request["profile"] not in bundle.ENCRYPTED_PROFILES
+    if (request["platform"] not in PLATFORM_RUNNERS
+            or request["profile"] not in bundle.ENCRYPTED_PROFILES
+            or (request["platform"] != "linux" and request["profile"] != "core-node")
             or not re.fullmatch(r"[1-9][0-9]{0,18}", str(request["control_run_id"]))
             or type(request["control_sha"]) is not str or not bundle.GIT_SHA.fullmatch(request["control_sha"])
             or type(request["expires"]) is not int or not int(time.time()) < request["expires"] <= int(time.time()) + 3600):
@@ -330,7 +339,7 @@ def reserve_wave(ledger, request):
         record = {
             "schema": 2, "wave_id": request["wave_id"], "bundle_id": request["bundle_id"],
             "control_run_id": control_run_id, "control_sha": request["control_sha"],
-            "profile": request["profile"], "runner": None, "release_id": request["release_id"],
+            "profile": request["profile"], "platform": request["platform"], "release_id": request["release_id"],
             "bundle_asset_name": "devlane-" + request["wave_id"] + "-" + request["bundle_id"] + ".enc",
             "projection_asset_name": "devlane-" + request["wave_id"] + "-" + request["bundle_id"] + ".projection.json",
             "bundle_asset_id": None, "bundle_sha256": None, "bundle_size": None,
@@ -1060,7 +1069,7 @@ def _terminal_audit_disposition(run_id, record, run, root=None):
             return "refused"
         identity = {"run_id": run_id, "control_sha": record["control_sha"],
                     "control_run_id": record["control_run_id"],
-                    "profile": record["profile"], "runner": record.get("runner") or "ubuntu-24.04",
+                    "profile": record["profile"], "platform": record["platform"],
                     "wave_id": record["wave_id"],
                     "bundle_id": record["bundle_id"], "cache_baseline_sha256": record["cache_baseline_sha256"]}
         public = public_audit.validate_final_public_surfaces(
@@ -1459,8 +1468,9 @@ def _watch_installed_key(ledger, wave_id, stop, done, outcome, *, poll_seconds, 
         done.set()
 
 
-def dispatch_wave(ledger, wave_id, key_file, *, runner="ubuntu-24.04", poll_seconds=10,
-                  timeout_seconds=DISPATCH_RECONCILE_SECONDS, decrypt_timeout_seconds=14400,
+def dispatch_wave(ledger, wave_id, key_file, *, platform=None, poll_seconds=10,
+                  timeout_seconds=DISPATCH_RECONCILE_SECONDS,
+                  decrypt_timeout_seconds=DECRYPT_WATCH_TIMEOUT_SECONDS,
                   sleep=time.sleep, clock=None):
     """Install once, dispatch once, reconcile, and revoke on handled in-process exit paths."""
     if clock is None:
@@ -1479,17 +1489,16 @@ def dispatch_wave(ledger, wave_id, key_file, *, runner="ubuntu-24.04", poll_seco
     try:
         _validate_wave_id(wave_id, "wave-id")
         if (not 1 <= poll_seconds <= 30 or not 30 <= timeout_seconds <= 600
-                or not 60 <= decrypt_timeout_seconds <= 14400):
+                or not 60 <= decrypt_timeout_seconds <= DECRYPT_WATCH_TIMEOUT_SECONDS):
             _fail("dispatch-wave-bounds")
         record = _wave_record(root, wave_id)
         if record["state"] != "assets-attached":
             _fail("dispatch-wave-state")
-        if runner not in ("ubuntu-24.04", "macos-15") or runner == "macos-15" and record["profile"] != "core-node":
-            _fail("runner-profile-unsupported")
-        if record.get("runner") not in (None, runner):
-            _fail("runner-binding-mismatch")
-        record["runner"] = runner
-        _write_atomic(root / (wave_id + ".json"), record)
+        selected_platform = record["platform"] if platform is None else platform
+        if selected_platform not in PLATFORM_RUNNERS or selected_platform != record["platform"]:
+            _fail("platform-binding-mismatch")
+        if selected_platform != "linux" and record["profile"] != "core-node":
+            _fail("platform-profile-unsupported")
         _verify_remote_main(record["control_sha"])
         _verify_secret_absent()
         transition(ledger, wave_id, "mark-secret-installing")
@@ -1538,7 +1547,7 @@ def dispatch_wave(ledger, wave_id, key_file, *, runner="ubuntu-24.04", poll_seco
             result = subprocess.run(
                 ["gh", "workflow", "run", "devlane-encrypted.yml", "--repo", fetch.REPOSITORY,
                  "--ref", "main", "-f", "profile=" + record["profile"],
-                 "-f", "runner=" + runner,
+                 "-f", "platform=" + selected_platform,
                  "-f", "control_run_id=" + record["control_run_id"], "-f", "wave_id=" + record["wave_id"],
                  "-f", "bundle_id=" + record["bundle_id"], "-f", "bundle_asset_id=" + record["bundle_asset_id"],
                  "-f", "bundle_sha256=" + record["bundle_sha256"], "-f", "bundle_size=" + str(record["bundle_size"]),
@@ -1619,7 +1628,7 @@ def _epoch(value):
         return None
 
 
-def _decrypt_conclusion(run_id):
+def _decrypt_conclusion(run_id, platform="linux"):
     """(concluded, concluded_at_epoch): the decrypt step finished, or nothing can still decrypt.
 
     Nothing can still decrypt once the run job or the whole run has completed, so a run that failed
@@ -1629,7 +1638,10 @@ def _decrypt_conclusion(run_id):
     entries = jobs.get("jobs") if type(jobs) is dict else None
     if type(entries) is not list:
         _fail("decrypt-progress-unavailable")
-    job = next((item for item in entries if type(item) is dict and item.get("name") == RUN_JOB_NAME), None)
+    job_name = PLATFORM_RUN_JOBS.get(platform)
+    if job_name is None:
+        _fail("decrypt-platform")
+    job = next((item for item in entries if type(item) is dict and item.get("name") == job_name), None)
     if job is None:
         return False, None
     step = next((item for item in (job.get("steps") or []) if type(item) is dict and item.get("name") == DECRYPT_STEP), None)
@@ -1663,7 +1675,7 @@ def await_decrypt_and_revoke(ledger, wave_id, poll_seconds=2, timeout_seconds=72
     try:
         while True:
             try:
-                concluded, concluded_at = _decrypt_conclusion(run_id)
+                concluded, concluded_at = _decrypt_conclusion(run_id, record["platform"])
                 poll_failed = False
             except Exception:
                 """A transient API or parse error is retried until the timeout; it never skips the revocation."""
@@ -1728,7 +1740,7 @@ def main(argv=None):
     awaiting.add_argument("--ledger", required=True)
     awaiting.add_argument("--wave-id", required=True)
     awaiting.add_argument("--poll-seconds", type=int, default=2)
-    awaiting.add_argument("--timeout-seconds", type=int, default=7200)
+    awaiting.add_argument("--timeout-seconds", type=int, default=DECRYPT_WATCH_TIMEOUT_SECONDS)
     reconcile = sub.add_parser("reconcile-dispatch")
     reconcile.add_argument("--ledger", required=True)
     reconcile.add_argument("--wave-id", required=True)
@@ -1738,8 +1750,8 @@ def main(argv=None):
     dispatch_wave_cmd.add_argument("--key-file", required=True)
     dispatch_wave_cmd.add_argument("--poll-seconds", type=int, default=10)
     dispatch_wave_cmd.add_argument("--timeout-seconds", type=int, default=DISPATCH_RECONCILE_SECONDS)
-    dispatch_wave_cmd.add_argument("--decrypt-timeout-seconds", type=int, default=14400)
-    dispatch_wave_cmd.add_argument("--runner", choices=("ubuntu-24.04", "macos-15"), default="ubuntu-24.04")
+    dispatch_wave_cmd.add_argument("--decrypt-timeout-seconds", type=int, default=DECRYPT_WATCH_TIMEOUT_SECONDS)
+    dispatch_wave_cmd.add_argument("--platform", choices=tuple(PLATFORM_RUNNERS))
     cleanup = sub.add_parser("cleanup-terminal")
     cleanup.add_argument("--ledger", required=True)
     cleanup.add_argument("--wave-id", required=True)
@@ -1777,7 +1789,7 @@ def main(argv=None):
             return 0 if reconcile_dispatch(args.ledger, args.wave_id) else 3
         elif args.operation == "dispatch-wave":
             return 0 if dispatch_wave(
-                args.ledger, args.wave_id, args.key_file, runner=args.runner, poll_seconds=args.poll_seconds,
+                args.ledger, args.wave_id, args.key_file, platform=args.platform, poll_seconds=args.poll_seconds,
                 timeout_seconds=args.timeout_seconds,
                 decrypt_timeout_seconds=args.decrypt_timeout_seconds,
             ) else 3

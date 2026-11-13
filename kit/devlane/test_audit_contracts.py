@@ -24,7 +24,7 @@ IDENTITY = {
     "run_attempt": 1,
     "control_run_id": "9876",
     "profile": "core-node",
-    "runner": "ubuntu-24.04",
+    "platform": "linux",
     "wave_id": "wave-test-0001",
     "bundle_id": "bundle-test-0001",
     "cache_baseline_sha256": "b" * 64,
@@ -39,25 +39,31 @@ MACOS_TMP = MACOS_RUNNER_HOME + "/work/_temp"
 
 
 def _env_value(name, identity=IDENTITY, kind="encrypted", job_runner=None):
-    runner = identity.get("runner", "ubuntu-24.04")
-    execution_runner = job_runner or runner
-    runner_home = MACOS_RUNNER_HOME if execution_runner == "macos-15" else RUNNER_HOME
-    runner_temp = MACOS_TMP if execution_runner == "macos-15" else TMP
+    platform = identity.get("platform", "linux")
+    execution_runner = job_runner or audit.PLATFORM_RUNNERS.get(platform, "ubuntu-24.04")
+    runner_home = (audit.WINDOWS_RUNNER_HOME if execution_runner == "windows-2025" else
+                   MACOS_RUNNER_HOME if execution_runner == "macos-15" else RUNNER_HOME)
+    runner_temp = (audit.WINDOWS_TEMP if execution_runner == "windows-2025" else
+                   MACOS_TMP if execution_runner == "macos-15" else TMP)
+    run_root = (runner_temp + "\\devlane-" + identity["run_id"] if execution_runner == "windows-2025"
+                else runner_temp + "/devlane-" + identity["run_id"])
+    workspace = (r"D:\a\platform-ci\platform-ci" if execution_runner == "windows-2025" else
+                 runner_home + "/work/platform-ci/platform-ci")
     values = {
         "CI_REPOSITORY": audit.REPOSITORY, "CI_REPOSITORY_ID": str(audit.REPOSITORY_ID),
         "CI_REF": "refs/heads/main", "CI_SHA": identity["control_sha"], "CI_SERVER_URL": "https://github.com",
         "CI_EVENT_NAME": "workflow_dispatch", "CI_RUN_ID": identity["run_id"], "CI_RUN_ATTEMPT": "1",
         "GITHUB_RUN_ID": identity["run_id"], "GITHUB_RUN_ATTEMPT": "1",
         "CI_CONTROL_RUN_ID": identity.get("control_run_id", ""), "DEVLANE_PROFILE": identity["profile"],
-        "DEVLANE_RUNNER": runner,
+        "DEVLANE_PLATFORM": platform,
         "DEVLANE_WAVE_ID": identity["wave_id"], "DEVLANE_BUNDLE_ID": identity["bundle_id"],
         "DEVLANE_BUNDLE_ASSET_ID": "111", "DEVLANE_BUNDLE_SHA256": "c" * 64, "DEVLANE_BUNDLE_SIZE": "4096",
         "DEVLANE_PROJECTION_ASSET_ID": "222", "DEVLANE_PROJECTION_SHA256": "d" * 64,
         "DEVLANE_PROJECTION_SIZE": "512", "DEVLANE_EXPIRES": "2000000000",
         "DEVLANE_CACHE_BASELINE_SHA256": identity["cache_baseline_sha256"],
-        "RUN_ROOT": runner_temp + "/devlane-" + identity["run_id"], "PYTHONDONTWRITEBYTECODE": "1",
+        "RUN_ROOT": run_root, "PYTHONDONTWRITEBYTECODE": "1",
         "DEVLANE_DECRYPT_KEY": "***", "GITHUB_TOKEN": "***",
-        "CI_WORKSPACE": runner_home + "/work/platform-ci/platform-ci",
+        "CI_WORKSPACE": workspace,
     }
     if kind == "synthetic":
         values["CI_REF"] = identity.get("ref", "refs/heads/develop")
@@ -69,9 +75,13 @@ def _with_value(step, key, identity, kind):
     if "${{" not in declared:
         return declared
     if key == "path":
-        runner_temp = MACOS_TMP if identity.get("runner") == "macos-15" else TMP
-        return {"Restore exact source-free control evidence": runner_temp + "/devlane-control-evidence/permit.json"}.get(
-            step["name"], runner_temp + "/devlane-bundle-permit/permit.json")
+        platform = identity.get("platform", "linux")
+        if step["name"] == "Restore exact source-free control evidence":
+            return "devlane-control-evidence/permit.json"
+        runner_temp = (audit.WINDOWS_TEMP if platform == "windows" else
+                       MACOS_TMP if platform == "macos" else TMP)
+        separator = "\\" if platform == "windows" else "/"
+        return runner_temp + separator + "devlane-bundle-permit" + separator + "permit.json"
     if kind == "synthetic":
         return "devlane-permit-v1-synthetic-bundle-" + identity["run_id"]
     return ("devlane-control-v1-" + identity["control_run_id"]
@@ -91,13 +101,30 @@ def _step_outputs(step, identity, kind, records):
     key = None
     if uses.startswith("actions/cache/restore"):
         key = _with_value(step, "key", identity, kind)
-        return ["Cache hit for: " + key, "Cache Size: ~0 MB (160 B)", "Cache restored successfully",
+        cache_outputs = ["Cache hit for: " + key, "Cache Size: ~0 MB (160 B)", "Cache restored successfully",
                 "Cache restored from key: " + key] if "fail-on-cache-miss" in step["with"] else [
                 "Cache not found for input keys: " + _with_value(step, "key", identity, kind)]
+        if identity.get("platform") == "windows" and "fail-on-cache-miss" in step["with"]:
+            cache_outputs.append(
+                MARK + '[command]"C:\\Program Files\\Git\\usr\\bin\\tar.exe" -xf '
+                + 'D:/a/_temp/01234567-89ab-cdef-0123-456789abcdef/cache.tzst -P -C D:/a/platform-ci/platform-ci '
+                + '--force-local --use-compress-program "zstd -d --long=30"'
+            )
+        return cache_outputs
     if uses.startswith("actions/cache/save"):
         key = _with_value(step, "key", identity, kind)
-        return ["Cache saved with key: " + key, "Cache saved successfully"]
+        cache_outputs = ["Cache saved with key: " + key, "Cache saved successfully"]
+        if identity.get("platform") == "windows":
+            cache_outputs.append(
+                MARK + '[command]"C:\\Program Files\\Git\\usr\\bin\\tar.exe" --posix -cf cache.tzst '
+                + '--exclude cache.tzst -P -C D:/a/platform-ci/platform-ci --files-from manifest.txt '
+                + '--force-local --use-compress-program "zstd -T0 --long=30"'
+            )
+        return cache_outputs
     if uses.startswith("actions/setup-node"):
+        if identity.get("platform") == "windows":
+            return ["Found in cache @ " + audit.WINDOWS_HOSTED_TOOL_CACHE, "Environment details", "node: v24.22.1",
+                    "npm: 11.19.1", "yarn: 1.22.22"]
         return ["Found in cache @ " + audit.HOSTED_TOOL_CACHE, "Environment details", "node: v24.22.1", "npm: 11.19.1",
                 "yarn: 1.22.22"]
     outputs = {
@@ -106,8 +133,9 @@ def _step_outputs(step, identity, kind, records):
             ["devlane_cgroup_v2=ready"] if kind == "encrypted" and identity["profile"] in audit.RUST_PROFILES else []
         ),
         "Prepare hosted runner isolation state": [
-            "devlane_macos=preflight-ready" if identity.get("runner") == "macos-15" else "devlane_swap=disabled",
+            "devlane_macos=preflight-ready" if identity.get("platform") == "macos" else "devlane_swap=disabled",
         ],
+        "Prepare hosted Windows isolation state": ["windows_runner=hosted-admin verified=windows-2025"],
         "Verify exact source-free control evidence": ["devlane_permit=verify_control=pass"],
         "Claim this bundle for one run before decryption": ["devlane_permit=claim=pass"],
         "Verify permit and emit bound dispatch marker": [
@@ -125,13 +153,35 @@ def _step_outputs(step, identity, kind, records):
         "Execute offline profile and filter public summary": list(records),
         "Shred runner-local workspace": ["cleanup_receipt=confirmed",
                                          "devlane_job=completed public_output=filtered cleanup=confirmed"],
-        "Audit exact two-job graph and public surfaces": [
-            "devlane_audit=accepted jobs=2 artifacts=0 cache=unchanged cleanup=confirmed"],
+        "Audit exact four-job graph and public surfaces": [
+            "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed"],
         "Claim a synthetic bundle permit": ["devlane_cache_permit=claimed"],
         "Verify the restored permit and refuse a second claim": ["devlane_cache_permit=restored-and-single-use"],
         "Run full source-free production-path acceptance": ["devlane_acceptance=pass"],
         "Probe the loopback-only Linux network boundary": ["devlane_linux_probe=pass"],
     }
+    if identity.get("platform") == "windows":
+        outputs.update({
+            "Prepare dependencies before the cut": [
+                "windows_prepare=complete lifecycle_scripts=disabled identity=lpac network=outbound-only",
+            ],
+            "Prove public connectivity before the cut": ["windows_public_connectivity=proved"],
+            "Cut network and start the isolated supervisor": [
+                "windows_sandbox_profile=created appcontainer=lpac capabilities=empty",
+                "windows_firewall=installed direction=outbound action=block package=verified remote=any",
+                "windows_network_cut=installed",
+            ],
+            "Probe isolation before decryption": [
+                "windows_network_probe=pass ipv4=blocked ipv6=blocked dns=blocked loopback=blocked "
+                "local_listener=blocked named_pipe=blocked smb=blocked outside_read=blocked "
+                "outside_write=blocked other_drive_read=blocked other_drive_write=blocked firewall=verified"],
+            "Decrypt authenticated bundle": ["windows_decrypt=accepted manifest=bound"],
+            "Shred runner-local workspace": [
+                "windows_runner_shred=confirmed files=1 bytes=1 reparse=0",
+                "windows_sandbox_cleanup=confirmed firewall=removed profile=deleted",
+                "cleanup_receipt=confirmed", "devlane_job=completed public_output=filtered cleanup=confirmed",
+            ],
+        })
     return outputs.get(name, [])
 
 
@@ -187,7 +237,9 @@ def _render_log(job_key, identity=None, *, records=(), kind="encrypted", skip=("
     return "".join(stamp + line + "\n" for line in lines).encode("utf-8")
 
 
-def _render_real_runner_encrypted_log(identity, job_key=audit.RUN_JOB):
+def _render_real_runner_encrypted_log(identity, job_key=None):
+    if job_key is None:
+        job_key = audit.PLATFORM_RUN_JOBS[identity.get("platform", "linux")]
     grammar = audit._Grammar(
         ".github/workflows/devlane-encrypted.yml", job_key, identity, "encrypted",
     )
@@ -198,9 +250,8 @@ def _render_real_runner_encrypted_log(identity, job_key=audit.RUN_JOB):
         lines.extend([marker + "[group]" + name, *values, marker + "[endgroup]"])
 
     runner_images = "https://" + "github.com" + "/actions/runner-images"
-    platform_runner = "ubuntu-24.04" if job_key == audit.AUDIT_JOB else identity.get(
-        "runner", "ubuntu-24.04",
-    )
+    platform_runner = ("ubuntu-24.04" if job_key == audit.AUDIT_JOB else
+                       audit.PLATFORM_RUNNERS[identity.get("platform", "linux")])
     if platform_runner == "macos-15":
         group("Runner Image Provisioner", [
             "Hosted Compute Agent", "Version: 20261103.629", "Commit: " + "0" * 40,
@@ -212,6 +263,18 @@ def _render_real_runner_encrypted_log(identity, job_key=audit.RUN_JOB):
             "Image: macos-15-arm64", "Version: 20261104.0514.1",
             "Included Software: %s/blob/macos-15-arm64/20261104.0514/images/macos/macos-15-arm64-Readme.md" % runner_images,
             "Image Release: %s/releases/tag/macos-15-arm64%%2F20261104.0514" % runner_images,
+        ])
+    elif platform_runner == "windows-2025":
+        group("Runner Image Provisioner", [
+            "Hosted Compute Agent", "Version: 20261103.629", "Commit: " + "0" * 40,
+            "Build Date: 2026-11-03T17:26:59Z", "Worker ID: {4f704859-5d76-44d1-9bfa-adab3eedd3ef}",
+            "Region: westus", "Cloud: Azure",
+        ])
+        group("Operating System", ["Microsoft Windows Server 2025", "10.0.26100", "Datacenter"])
+        group("Runner Image", [
+            "Image: windows-2025-vs2026", "Version: 20261103.629",
+            "Included Software: %s/blob/win25-vs2026/20261103.629/images/windows/Windows2025-VS2026-Readme.md" % runner_images,
+            "Image Release: %s/releases/tag/win25-vs2026%%2F20261103.629" % runner_images,
         ])
     else:
         group("Runner Image Provisioner", [
@@ -230,7 +293,7 @@ def _render_real_runner_encrypted_log(identity, job_key=audit.RUN_JOB):
         permissions = ["Actions: read", "Checks: read", "Metadata: read"]
     group("GITHUB_TOKEN Permissions", permissions)
     lines.append("Secret source: Actions")
-    if job_key == audit.RUN_JOB:
+    if job_key in audit.EXECUTION_JOBS:
         lines.append("Deployment environment: devlane-decrypt")
     lines.extend(("Cache mode: write", "Prepare workflow directory", "Prepare all required actions"))
     if any((step["uses"] or "") and not (step["uses"] or "").startswith("./")
@@ -246,7 +309,7 @@ def _render_real_runner_encrypted_log(identity, job_key=audit.RUN_JOB):
                 seen.add(repository)
                 lines.append("Download action repository '%s' (SHA:%s)" % (repository, revision))
     inputs = {
-        "profile": identity["profile"], "runner": identity.get("runner", "ubuntu-24.04"),
+        "profile": identity["profile"], "platform": identity.get("platform", "linux"),
         "control_run_id": identity["control_run_id"],
         "wave_id": identity["wave_id"], "bundle_id": identity["bundle_id"],
         "bundle_asset_id": "111", "bundle_sha256": "c" * 64, "bundle_size": "4096",
@@ -265,8 +328,11 @@ def _render_real_runner_encrypted_log(identity, job_key=audit.RUN_JOB):
         lines.append(marker + "[group]Run " + (run[0].strip() if run else uses))
         if run:
             lines.extend("\x1b[36;1m" + line + "\x1b[0m" for line in run)
-            shell = "/bin/bash" if platform_runner == "macos-15" else "/usr/bin/bash"
-            lines.append("shell: " + shell + " --noprofile --norc -e -o pipefail {0}")
+            if platform_runner == "windows-2025":
+                lines.append(audit.WINDOWS_PWSH)
+            else:
+                shell = "/bin/bash" if platform_runner == "macos-15" else "/usr/bin/bash"
+                lines.append("shell: " + shell + " --noprofile --norc -e -o pipefail {0}")
         else:
             lines.append("with:")
             for key in step["with"]:
@@ -274,7 +340,8 @@ def _render_real_runner_encrypted_log(identity, job_key=audit.RUN_JOB):
                 if value != "":
                     lines.append("  %s: %s" % (key, value))
             if uses.startswith("actions/cache/"):
-                lines.append("  enableCrossOsArchive: false")
+                if "enableCrossOsArchive" not in step["with"]:
+                    lines.append("  enableCrossOsArchive: false")
                 if "/restore@" in uses:
                     lines.append("  lookup-only: false")
         env_names = grammar.expected_env_names(step)
@@ -283,7 +350,15 @@ def _render_real_runner_encrypted_log(identity, job_key=audit.RUN_JOB):
             lines.extend("  %s: %s" % (key, _env_value(key, identity, "encrypted", platform_runner))
                          for key in sorted(env_names))
         lines.append(marker + "[endgroup]")
-        lines.extend(_step_outputs(step, identity, "encrypted", ()))
+        outputs = _step_outputs(step, identity, "encrypted", ())
+        if "Environment details" in outputs:
+            position = outputs.index("Environment details")
+            lines.extend(outputs[:position])
+            lines.append(marker + "[group]Environment details")
+            lines.extend(outputs[position + 1:])
+            lines.append(marker + "[endgroup]")
+        else:
+            lines.extend(outputs)
     lines.append("Cleaning up orphan processes")
     stamp = "2026-11-10T12:00:00.1234567Z "
     return "".join(stamp + line + "\n" for line in lines).encode("utf-8")
@@ -293,8 +368,9 @@ def _record(**fields):
     return json.dumps(fields, sort_keys=True, separators=(",", ":"))
 
 
-def _encrypted_jobs(profile="core-node"):
-    names = audit._expected_step_names("core-node")
+def _encrypted_jobs(profile="core-node", platform="linux"):
+    identity = dict(IDENTITY, profile=profile, platform=platform)
+    names = audit._expected_step_names(profile, identity)
     steps = []
     for name in names:
         conclusion = "success"
@@ -302,27 +378,35 @@ def _encrypted_jobs(profile="core-node"):
                 or (name == "Install Tauri Linux build dependencies" and profile != "desktop")):
             conclusion = "skipped"
         steps.append({"name": name, "status": "completed", "conclusion": conclusion})
-    return [
-        {
-            "id": 100, "name": audit.RUN_JOB, "run_id": 12345, "run_attempt": 1,
-            "labels": [IDENTITY.get("runner", "ubuntu-24.04")],
-            "head_sha": SHA, "status": "completed", "conclusion": "success",
-            "check_run_url": "https://api.github.com/repos/keeldock-platform/platform-ci/check-runs/500",
-            "steps": steps,
-        },
-        {
-            "id": 101, "name": audit.AUDIT_JOB, "run_id": 12345, "run_attempt": 1,
-            "labels": ["ubuntu-24.04"],
-            "head_sha": SHA, "status": "in_progress", "conclusion": None,
-            "check_run_url": "https://api.github.com/repos/keeldock-platform/platform-ci/check-runs/501",
-            "steps": [
-                {"name": "Set up job", "status": "completed", "conclusion": "success"},
-                {"name": audit.AUDIT_STEP_NAMES[0], "status": "completed", "conclusion": "success"},
-                {"name": audit.AUDIT_STEP_NAMES[1], "status": "in_progress", "conclusion": None},
-                {"name": "Complete job", "status": "in_progress", "conclusion": None},
-            ],
-        },
-    ]
+    active_name = audit.PLATFORM_RUN_JOBS[platform]
+    output = [{
+        "id": 100, "name": active_name, "run_id": 12345, "run_attempt": 1,
+        "labels": [audit.PLATFORM_RUNNERS[platform]],
+        "head_sha": SHA, "status": "completed", "conclusion": "success",
+        "check_run_url": "https://api.github.com/repos/keeldock-platform/platform-ci/check-runs/500",
+        "steps": steps,
+    }, {
+        "id": 101, "name": audit.AUDIT_JOB, "run_id": 12345, "run_attempt": 1,
+        "labels": [audit.PLATFORM_RUNNERS["linux"]],
+        "head_sha": SHA, "status": "in_progress", "conclusion": None,
+        "check_run_url": "https://api.github.com/repos/keeldock-platform/platform-ci/check-runs/501",
+        "steps": [
+            {"name": "Set up job", "status": "completed", "conclusion": "success"},
+            {"name": audit.AUDIT_STEP_NAMES[0], "status": "completed", "conclusion": "success"},
+            {"name": audit.AUDIT_STEP_NAMES[1], "status": "in_progress", "conclusion": None},
+            {"name": "Complete job", "status": "in_progress", "conclusion": None},
+        ],
+    }]
+    for index, inactive_name in enumerate(set(audit.EXECUTION_JOBS) - {active_name}, 1):
+        inactive_platform = next(p for p, name in audit.PLATFORM_RUN_JOBS.items() if name == inactive_name)
+        output.append({
+            "id": 101 + index, "name": inactive_name, "run_id": 12345, "run_attempt": 1,
+            "labels": [audit.PLATFORM_RUNNERS[inactive_platform]],
+            "head_sha": SHA, "status": "completed", "conclusion": "skipped",
+            "check_run_url": "https://api.github.com/repos/keeldock-platform/platform-ci/check-runs/%d" % (501 + index),
+            "steps": [],
+        })
+    return output
 
 
 def _control_jobs():
@@ -378,13 +462,13 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
     def test_two_job_contract_accepts_exact_names_steps_attempt_and_cleanup(self):
         jobs = _encrypted_jobs()
         result = audit.validate_job_contract(jobs, IDENTITY, "core-node")
-        self.assertEqual(set(result), {audit.RUN_JOB, audit.AUDIT_JOB})
+        self.assertEqual(set(result), set(audit.EXECUTION_JOBS) | {audit.AUDIT_JOB})
 
     def test_desktop_contract_runs_tauri_dependencies_and_pinned_rust_setup(self):
         identity = dict(IDENTITY, profile="desktop")
         jobs = _encrypted_jobs("desktop")
         result = audit.validate_job_contract(jobs, identity, "desktop")
-        self.assertEqual(set(result), {audit.RUN_JOB, audit.AUDIT_JOB})
+        self.assertEqual(set(result), set(audit.EXECUTION_JOBS) | {audit.AUDIT_JOB})
         grammar = audit._Grammar(
             ".github/workflows/devlane-encrypted.yml", audit.RUN_JOB, identity, "encrypted",
         )
@@ -633,12 +717,11 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         success_log = _render_real_runner_encrypted_log(IDENTITY)
         audit.validate_job_log_surface(success_log, audit.RUN_JOB, IDENTITY, completed=True)
     def test_macos_runner_shaped_log_from_public_control_preamble_is_accepted_and_closed(self):
-        identity = dict(IDENTITY, runner="macos-15")
-        jobs = _encrypted_jobs()
-        jobs[0]["labels"] = ["macos-15"]
+        identity = dict(IDENTITY, platform="macos")
+        jobs = _encrypted_jobs(platform="macos")
         audit.validate_job_contract(jobs, identity, "core-node")
         log = _render_real_runner_encrypted_log(identity)
-        audit.validate_job_log_surface(log, audit.RUN_JOB, identity)
+        audit.validate_job_log_surface(log, audit.MACOS_RUN_JOB, identity)
         audit_log = _render_real_runner_encrypted_log(identity, job_key=audit.AUDIT_JOB)
         audit.validate_job_log_surface(audit_log, audit.AUDIT_JOB, identity)
         self.assertIn(b"Ubuntu2404-Readme.md", audit_log)
@@ -649,7 +732,39 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             audit.validate_job_log_surface(wrong_audit_image, audit.AUDIT_JOB, identity)
         changed = log.replace(b"Cloud: MacCloud", b"Cloud: Azure", 1)
         with self.assertRaises(audit.AuditRefusal):
-            audit.validate_job_log_surface(changed, audit.RUN_JOB, identity)
+            audit.validate_job_log_surface(changed, audit.MACOS_RUN_JOB, identity)
+
+    def test_windows_four_job_graph_and_pinned_cache_command_grammar(self):
+        identity = dict(IDENTITY, platform="windows")
+        jobs = _encrypted_jobs(platform="windows")
+        by_name = audit.validate_job_contract(jobs, identity, "core-node")
+        self.assertEqual(set(by_name), set(audit.EXECUTION_JOBS) | {audit.AUDIT_JOB})
+        skipped = [job for job in jobs if job["name"] in audit.EXECUTION_JOBS
+                   and job["name"] != audit.WINDOWS_RUN_JOB]
+        self.assertEqual(len(skipped), 2)
+        self.assertTrue(all(job["conclusion"] == "skipped" for job in skipped))
+        log = _render_real_runner_encrypted_log(identity)
+        result = audit.validate_job_log_surface(log, audit.WINDOWS_RUN_JOB, identity, completed=True)
+        self.assertEqual(result["records"], [])
+        self.assertIn(b"tar.exe", log)
+        audit_log = _render_real_runner_encrypted_log(identity, job_key=audit.AUDIT_JOB)
+        audit.validate_job_log_surface(audit_log, audit.AUDIT_JOB, identity, completed=True)
+        for changed in (
+            log.replace(b"D:/a/platform-ci/platform-ci", b"D:/a/foreign/platform-ci", 1),
+            log.replace(b"C:\\Program Files\\Git\\usr\\bin\\tar.exe", b"C:\\Windows\\System32\\tar.exe", 1),
+            log.replace(b"--force-local --use-compress-program", b"--checkpoint-action=exec=bad --force-local --use-compress-program", 1),
+        ):
+            with self.subTest(mutation=changed[:100]), self.assertRaises(audit.AuditRefusal):
+                audit.validate_job_log_surface(changed, audit.WINDOWS_RUN_JOB, identity, completed=True)
+
+    def test_dispatch_identity_maps_platform_to_the_reviewed_job_and_runner(self):
+        for platform in ("linux", "macos", "windows"):
+            identity = dict(IDENTITY, platform=platform)
+            jobs = _encrypted_jobs(platform=platform)
+            by_name = audit.validate_job_contract(jobs, identity, "core-node")
+            active = by_name[audit.PLATFORM_RUN_JOBS[platform]]
+            self.assertEqual(active["labels"], [audit.PLATFORM_RUNNERS[platform]])
+            self.assertEqual(sum(job["conclusion"] == "skipped" for job in jobs), 2)
         with self.assertRaises(audit.AuditRefusal):
             audit.validate_job_contract(_encrypted_jobs(), identity, "core-node")
 
@@ -703,14 +818,15 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             ".github/workflows/devlane-encrypted.yml", audit.RUN_JOB, rust, "encrypted",
         )
         counts = {}
-        step = "Prepare hosted runner isolation state"
+        step = "Prepare hosted Linux isolation state"
         self.assertTrue(grammar.step_output_ok(step, "devlane_swap=disabled", counts))
         mac = audit._Grammar(
-            ".github/workflows/devlane-encrypted.yml", audit.RUN_JOB,
-            dict(IDENTITY, runner="macos-15"), "encrypted",
+            ".github/workflows/devlane-encrypted.yml", audit.MACOS_RUN_JOB,
+            dict(IDENTITY, platform="macos"), "encrypted",
         )
-        self.assertTrue(mac.step_output_ok(step, "devlane_macos=preflight-ready", {}))
-        self.assertFalse(mac.step_output_ok(step, "devlane_swap=disabled", {}))
+        mac_step = "Prepare hosted runner isolation state"
+        self.assertTrue(mac.step_output_ok(mac_step, "devlane_macos=preflight-ready", {}))
+        self.assertFalse(mac.step_output_ok(mac_step, "devlane_swap=disabled", {}))
         self.assertTrue(grammar.step_output_ok(step, "devlane_cgroup_v2=ready", counts))
         self.assertFalse(grammar.step_output_ok(step, "devlane_cgroup_v2=ready", counts))
         self.assertFalse(grammar.step_output_ok("Probe isolation before decryption", "devlane_swap=disabled", {}))
@@ -1355,11 +1471,11 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         jobs[1]["steps"][3]["conclusion"] = "success"
         result, accepted = audit.validate_terminal_job_contract(jobs, IDENTITY, "core-node")
         self.assertTrue(accepted)
-        self.assertEqual(set(result), {audit.RUN_JOB, audit.AUDIT_JOB})
+        self.assertEqual(set(result), set(audit.EXECUTION_JOBS) | {audit.AUDIT_JOB})
         jobs[1]["conclusion"] = "failure"
         result, accepted = audit.validate_terminal_job_contract(jobs, IDENTITY, "core-node")
         self.assertFalse(accepted)
-        self.assertEqual(set(result), {audit.RUN_JOB, audit.AUDIT_JOB})
+        self.assertEqual(set(result), set(audit.EXECUTION_JOBS) | {audit.AUDIT_JOB})
         jobs[1]["steps"][1]["name"] = "Audit an unexpected graph"
         with self.assertRaises(audit.AuditRefusal):
             audit.validate_terminal_job_contract(jobs, IDENTITY, "core-node")
@@ -1648,7 +1764,7 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
         concurrency = trigger.split("concurrency:", 1)[1]
         self.assertNotIn("inputs.wave_id", concurrency)
         self.assertIn("run-name: devlane wave=${{ inputs.wave_id }} bundle=${{ inputs.bundle_id }}", trigger)
-        self.assertEqual(encrypted.count("secrets.DEVLANE_DECRYPT_KEY"), 1)
+        self.assertEqual(encrypted.count("secrets.DEVLANE_DECRYPT_KEY"), 3)
         self.assertLess(encrypted.index("Probe isolation before decryption"), encrypted.index("secrets.DEVLANE_DECRYPT_KEY"))
         self.assertLess(encrypted.index("secrets.DEVLANE_DECRYPT_KEY"), encrypted.index("Execute offline profile"))
         pinned = re.findall(r"(?m)^\s*uses:\s*(\S+)", encrypted)
@@ -1658,6 +1774,16 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
         self.assertIn("actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca", encrypted)
         self.assertIn("actions/cache/save@3edfce9056124e459a23f683a21433670d47daca", encrypted)
         self.assertIn("control_run_id", encrypted)
+        graph = audit.validate_workflow_job_graph("linux")
+        self.assertEqual(set(graph), set(audit.EXECUTION_JOBS) | {audit.AUDIT_JOB})
+        self.assertEqual(graph[audit.AUDIT_JOB]["needs"], list(audit.EXECUTION_JOBS))
+        self.assertTrue(all(graph[name]["needs"] == [] for name in audit.EXECUTION_JOBS))
+        self.assertNotRegex(encrypted, r"(?m)^ {4}strategy:\s*$|^ {6}matrix:\s*$")
+        self.assertEqual(
+            {graph[name]["condition"] for name in audit.EXECUTION_JOBS},
+            {"${{ inputs.platform == 'linux' }}", "${{ inputs.platform == 'macos' }}",
+             "${{ inputs.platform == 'windows' }}"},
+        )
         self.assertNotIn("upload-artifact", encrypted)
         control = self._workflow("public-policy.yml").split("jobs:", 1)[0]
         self.assertIn("on:\n  workflow_dispatch:", control)
@@ -1667,6 +1793,33 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
         self.assertIn("run-name: public control=${{ inputs.control_wave_id }}", control)
         self.assertIn("inputs.control_wave_id", control)
         self.assertNotIn("pull_request", control)
+
+    def test_windows_deadline_starts_before_manual_checkout_and_wer_dumps_are_disabled(self):
+        encrypted = self._workflow("devlane-encrypted.yml")
+        windows = encrypted.split("  devlane-encrypted-run-windows:", 1)[1]
+        bootstrap = windows.split("      - name: Prepare hosted Windows isolation state", 1)[0]
+        positions = [bootstrap.index(token) for token in (
+            "started = Join-Path $runRoot 'deadline-start'",
+            "time.monotonic()",
+            "git -C $env:CI_WORKSPACE fetch",
+            "git -C $env:CI_WORKSPACE checkout",
+            "deadline.py create --file",
+            "--started-at-file $started",
+        )]
+        self.assertEqual(positions, sorted(positions))
+        isolation = windows.split("      - name: Prepare hosted Windows isolation state", 1)[1]
+        self.assertIn("Windows Error Reporting", isolation)
+        self.assertIn("-Name Disabled -Value 1", isolation)
+
+    def test_source_free_control_evidence_cache_is_cross_os_and_workspace_relative(self):
+        control = self._workflow("public-policy.yml")
+        save = control.split("- name: Save exact source-free control evidence", 1)[1].split(
+            "- name:", 1,
+        )[0]
+        self.assertIn("path: devlane-control-evidence/permit.json", save)
+        self.assertIn("enableCrossOsArchive: true", save)
+        self.assertIn("DEVLANE_CONTROL_EVIDENCE_PATH: ${{ github.workspace }}/devlane-control-evidence/permit.json",
+                      control)
         self.assertNotIn("  push:", control)
 
     def test_cache_authorization_paths_and_keys_are_run_independent_and_identical(self):
@@ -1682,7 +1835,7 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
         control_restore = steps["Restore exact source-free control evidence"]["with"]
         saved = audit.parse_workflow(self.root / ".github/workflows/public-policy.yml")["control-audit"]["steps"][-1]["with"]
         self.assertEqual(control_restore["path"], saved["path"])
-        self.assertEqual(control_restore["path"], "${{ runner.temp }}/devlane-control-evidence/permit.json")
+        self.assertEqual(control_restore["path"], "devlane-control-evidence/permit.json")
         self.assertEqual(control_restore["fail-on-cache-miss"], "true")
         self.assertEqual(steps["Restore and verify persisted one-run permit"]["with"]["fail-on-cache-miss"], "true")
         self.assertNotIn("fail-on-cache-miss", steps["Restore one-run bundle permit"]["with"])
@@ -1777,13 +1930,14 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
         jobs = audit.parse_workflow(self.root / ".github/workflows/devlane-encrypted.yml")
         self.assertEqual(jobs[audit.RUN_JOB]["environment"], "devlane-decrypt")
         self.assertEqual(jobs[audit.AUDIT_JOB].get("environment"), None)
-        self.assertEqual(encrypted.count("environment: devlane-decrypt"), 1)
-        self.assertEqual(encrypted.count("environment:"), 1)
+        self.assertEqual(encrypted.count("environment: devlane-decrypt"), 3)
+        self.assertEqual(encrypted.count("environment:"), 3)
         run_block = encrypted.split("  devlane-encrypted-audit:", 1)[0]
         self.assertIn("    environment: devlane-decrypt\n", run_block)
-        self.assertEqual(encrypted.count("secrets."), 1)
-        holders = [step["name"] for step in jobs[audit.RUN_JOB]["steps"] if "DEVLANE_DECRYPT_KEY" in step["env"]]
-        self.assertEqual(holders, ["Decrypt authenticated bundle"])
+        self.assertEqual(encrypted.count("secrets."), 3)
+        for run_job in audit.EXECUTION_JOBS:
+            holders = [step["name"] for step in jobs[run_job]["steps"] if "DEVLANE_DECRYPT_KEY" in step["env"]]
+            self.assertEqual(holders, ["Decrypt authenticated bundle"])
         for relative in ("public-policy.yml", "devlane-synthetic.yml", "node-lock-smoke.yml", "linux-confinement.yml"):
             self.assertNotIn("environment:", self._workflow(relative))
 

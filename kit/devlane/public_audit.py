@@ -1,4 +1,4 @@
-"""Exact two-job, read-only audit for one encrypted development wave."""
+"""Exact four-job, read-only audit for one encrypted development wave."""
 
 import os
 import re
@@ -40,11 +40,18 @@ LEGACY_ENCRYPTED_WORKFLOWS = {
 def _legacy_encrypted_workflow_path(identity):
     return LEGACY_ENCRYPTED_WORKFLOWS.get(identity.get("control_sha"))
 RUN_JOB = "devlane-encrypted-run"
+MACOS_RUN_JOB = "devlane-encrypted-run-macos"
+WINDOWS_RUN_JOB = "devlane-encrypted-run-windows"
+PLATFORM_RUN_JOBS = {
+    "linux": RUN_JOB, "macos": MACOS_RUN_JOB, "windows": WINDOWS_RUN_JOB,
+}
+PLATFORM_RUNNERS = {"linux": "ubuntu-24.04", "macos": "macos-15", "windows": "windows-2025"}
+EXECUTION_JOBS = tuple(PLATFORM_RUN_JOBS.values())
 DECRYPT_ENVIRONMENT = "devlane-decrypt"
 AUDIT_JOB = "devlane-encrypted-audit"
 STEP_NAMES = (
     "Fetch public control and validate dispatch",
-    "Prepare hosted runner isolation state",
+    "Prepare hosted Linux isolation state",
     "Reserve work time for control evidence cache restore",
     "Restore exact source-free control evidence",
     "Verify exact source-free control evidence",
@@ -70,8 +77,17 @@ STEP_NAMES = (
 )
 AUDIT_STEP_NAMES = (
     "Fetch public control and validate dispatch",
-    "Audit exact two-job graph and public surfaces",
+    "Audit exact four-job graph and public surfaces",
 )
+MACOS_STEP_NAMES = tuple(
+    "Prepare hosted runner isolation state" if name == "Prepare hosted Linux isolation state" else name
+    for name in STEP_NAMES
+)
+WINDOWS_STEP_NAMES = tuple(
+    "Prepare hosted Windows isolation state" if name == "Prepare hosted Linux isolation state" else name
+    for name in STEP_NAMES if name != "Install Tauri Linux build dependencies"
+)
+WINDOWS_STEP_NAMES = WINDOWS_STEP_NAMES[:2] + ("Set up pinned Windows Node runtime",) + WINDOWS_STEP_NAMES[2:]
 PERMIT_MARKER = re.compile(
     rb"(?m)^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z )?"
     rb"devlane_permit=consumed run-id=([1-9][0-9]{0,18}) run-attempt=1$"
@@ -96,7 +112,11 @@ RUNNER_HOME = chr(47) + "home" + chr(47) + "runner"
 TEMP = RUNNER_HOME + "/work/_temp"
 MACOS_RUNNER_HOME = chr(47) + "Users" + chr(47) + "runner"
 MACOS_TEMP = MACOS_RUNNER_HOME + "/work/_temp"
+WINDOWS_RUNNER_HOME = r"D:\a\_work"
+WINDOWS_TEMP = r"D:\a\_temp"
+WINDOWS_PWSH = 'shell: C:\\Program Files\\PowerShell\\7\\pwsh.EXE -command ". \'{0}\'"'
 HOSTED_TOOL_CACHE = "/opt/hostedtoolcache/node/24.22.1/x64"
+WINDOWS_HOSTED_TOOL_CACHE = r"C:\hostedtoolcache\windows\node\24.22.1\x64"
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 LOG_MARKER = chr(35) * 2
 ANSI_SGR = (b"\x1b[0m", b"\x1b[36;1m")
@@ -144,10 +164,10 @@ DECRYPT_CHILD_ERROR_CODES = frozenset((
 DECRYPT_FAILURE_CODES = frozenset((
     "decrypt-key-unavailable", "decrypt-manifest-unavailable", "decrypt-rejected", "decrypt-timeout",
 ))
-def cache_line_patterns(key, temp=TEMP):
+def cache_line_patterns(key, temp=TEMP, platform="linux"):
     """Output lines of the pinned cache actions, bound to the one key the step may use."""
     escaped = re.escape(key)
-    return (
+    common = (
         re.compile(r"Cache hit for: " + escaped + r"\Z"),
         re.compile(r"Cache restored from key: " + escaped + r"\Z"),
         re.compile(r"Cache restored successfully\Z"),
@@ -156,9 +176,26 @@ def cache_line_patterns(key, temp=TEMP):
         re.compile(r"Cache not found for input keys: " + escaped + r"\Z"),
         re.compile(r"Cache Size: ~[0-9]+ MB \([0-9]+ B\)\Z"),
         re.compile(r"(?:Received|Sent) [0-9]+ of [0-9]+ \([0-9.]+%\), [0-9.]+ MBs/sec\Z"),
-        re.compile(r"(?:" + LOG_MARKER + r")?\[command\]/usr/bin/tar (?:--posix -cf cache\.tzst|-xf " + re.escape(temp) + "/" + UUID
-                   + r"/cache\.tzst)(?: [A-Za-z0-9_./=:+ -]{0,300})?\Z"),
     )
+    if platform == "windows":
+        tar = r'"C:\\Program Files\\Git\\usr\\bin\\tar.exe"'
+        workspace = r"D:/a/platform-ci/platform-ci"
+        create = re.compile(
+            r"(?:" + LOG_MARKER + r")?\[command\]" + tar
+            + r" --posix -cf cache\.tzst --exclude cache\.tzst -P -C " + re.escape(workspace)
+            + r" --files-from manifest\.txt --force-local --use-compress-program \"zstd -T0 --long=30\"\Z"
+        )
+        restore = re.compile(
+            r"(?:" + LOG_MARKER + r")?\[command\]" + tar + r" -xf D:/a/_temp/" + UUID
+            + r"/cache\.tzst -P -C " + re.escape(workspace)
+            + r" --force-local --use-compress-program \"zstd -d --long=30\"\Z"
+        )
+        return common + (create, restore)
+    tar_command = re.compile(
+        r"(?:" + LOG_MARKER + r")?\[command\]/usr/bin/tar (?:--posix -cf cache\.tzst|-xf "
+        + re.escape(temp) + "/" + UUID + r"/cache\.tzst)(?: [A-Za-z0-9_./=:+ -]{0,300})?\Z"
+    )
+    return common + (tar_command,)
 
 
 NODE_LINES = (
@@ -172,6 +209,20 @@ NODE_LINES = (
     re.compile(r"Added node to the tool cache\Z"),
     re.compile(r"(?:" + LOG_MARKER + r")?\[command\]/usr/bin/tar xz --strip 1 --warning=no-unknown-keyword --overwrite -C "
                + re.escape(TEMP) + "/" + UUID + " -f " + re.escape(TEMP) + "/" + UUID + r"\Z"),
+    re.compile(r"Environment details\Z"),
+    re.compile(r"(?:node: v24\.22\.1|npm: 11\.19\.1|yarn: [0-9]+\.[0-9]+\.[0-9]+)\Z"),
+    re.compile(r"Finished\Z"),
+    re.compile(r"Post job cleanup\.\Z"),
+)
+WINDOWS_NODE_LINES = (
+    re.compile(r"Found in cache @ " + re.escape(WINDOWS_HOSTED_TOOL_CACHE) + r"\Z"),
+    re.compile(r"Attempting to download 24\.22\.1\.\.\.\Z"),
+    re.compile(r"Acquiring 24\.22\.1 - x64 from https:" + re.escape(chr(47) * 2)
+               + r"github\.com/actions/node-versions/releases/download/24\.22\.1-[0-9]+/node-24\.22\.1-win32-x64\.7z\Z"),
+    re.compile(r"Extracting \.\.\.\Z"),
+    re.compile(r"Adding to the cache \.\.\.\Z"),
+    re.compile(r"Successfully cached node to " + re.escape(WINDOWS_HOSTED_TOOL_CACHE) + r"\Z"),
+    re.compile(r"Added node to the tool cache\Z"),
     re.compile(r"Environment details\Z"),
     re.compile(r"(?:node: v24\.22\.1|npm: 11\.19\.1|yarn: [0-9]+\.[0-9]+\.[0-9]+)\Z"),
     re.compile(r"Finished\Z"),
@@ -213,7 +264,8 @@ def parse_workflow(path):
             block_indent = None
         if indent == 2 and text.endswith(":"):
             job = text[:-1]
-            jobs[job] = {"env": {}, "steps": [], "timeout_minutes": None}
+            jobs[job] = {"env": {}, "steps": [], "timeout_minutes": None,
+                         "needs": [], "runner": None, "condition": None}
             step = section = sub = None
         elif job is None:
             continue
@@ -226,6 +278,12 @@ def parse_workflow(path):
                 jobs[job]["timeout_minutes"] = int(value) if value.isdecimal() else None
             if text.startswith("environment: "):
                 jobs[job]["environment"] = text[len("environment: "):].strip()
+            if text.startswith("runs-on: "):
+                jobs[job]["runner"] = text[len("runs-on: "):].strip()
+            if text.startswith("if: "):
+                jobs[job]["condition"] = text[len("if: "):].strip()
+            if text.startswith("needs: [") and text.endswith("]"):
+                jobs[job]["needs"] = [value.strip() for value in text[8:-1].split(",")]
         elif section == "env" and indent == 6 and ": " in text:
             key, value = text.split(": ", 1)
             jobs[job]["env"][key] = value
@@ -253,6 +311,33 @@ def parse_workflow(path):
     return jobs
 
 
+def validate_workflow_job_graph(platform):
+    """Keep the dispatch YAML, audited job names, conditions and reviewed runner labels exact."""
+    if platform not in PLATFORM_RUN_JOBS:
+        _refuse()
+    try:
+        workflow_text = (REPOSITORY_ROOT / WORKFLOW_PATH).read_text(encoding="utf-8")
+    except OSError:
+        _refuse()
+    if re.search(r"(?m)^ {4}strategy:\s*$|^ {6}matrix:\s*$", workflow_text):
+        _refuse()
+    jobs = parse_workflow(WORKFLOW_PATH)
+    if set(jobs) != set(EXECUTION_JOBS) | {AUDIT_JOB}:
+        _refuse()
+    for selected, name in PLATFORM_RUN_JOBS.items():
+        job = jobs[name]
+        if (job["runner"] != PLATFORM_RUNNERS[selected]
+                or job["condition"] != "${{ inputs.platform == '" + selected + "' }}"
+                or job.get("environment") != DECRYPT_ENVIRONMENT or job["needs"]):
+            _refuse()
+    audit = jobs[AUDIT_JOB]
+    if (audit["runner"] != PLATFORM_RUNNERS["linux"]
+            or audit["condition"] != "${{ always() }}"
+            or audit["needs"] != list(EXECUTION_JOBS)):
+        _refuse()
+    return jobs
+
+
 class _Grammar:
     """The closed set of lines one reviewed workflow job may legitimately write to its log."""
 
@@ -262,22 +347,33 @@ class _Grammar:
             _refuse()
         self.job = jobs[job_key]
         self.environment = self.job.get("environment")
-        if self.environment != (DECRYPT_ENVIRONMENT if kind == "encrypted" and job_key == RUN_JOB else None):
+        if self.environment != (DECRYPT_ENVIRONMENT if kind == "encrypted" and job_key in EXECUTION_JOBS else None):
             _refuse()
         self.steps = self.job["steps"]
         self.job_key = job_key
-        if kind == "encrypted" and any(
-                step["uses"] and step["uses"].startswith("actions/setup-node@") for step in self.steps):
-            _refuse()
+        self.platform = identity.get("platform", "linux")
+        if kind == "encrypted" and job_key in EXECUTION_JOBS:
+            if job_key != PLATFORM_RUN_JOBS.get(self.platform):
+                _refuse()
+            node_steps = [step for step in self.steps if step["uses"] and step["uses"].startswith("actions/setup-node@")]
+            if self.platform == "windows":
+                if (len(node_steps) != 1
+                        or node_steps[0]["uses"] != "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1"
+                        or node_steps[0]["with"] != {
+                            "node-version": "24.22.1", "check-latest": "false", "package-manager-cache": "false",
+                        }):
+                    _refuse()
+            elif node_steps:
+                _refuse()
         self.names = [step["name"] for step in self.steps]
         self.identity = identity
         self.kind = kind
-        self.runner = identity.get("runner", "ubuntu-24.04")
-        if self.runner not in ("ubuntu-24.04", "macos-15"):
-            _refuse()
-        self.job_runner = ("ubuntu-24.04" if kind == "encrypted" and job_key == AUDIT_JOB else self.runner)
-        self.runner_home = MACOS_RUNNER_HOME if self.job_runner == "macos-15" else RUNNER_HOME
-        self.temp = MACOS_TEMP if self.job_runner == "macos-15" else TEMP
+        self.job_runner = (PLATFORM_RUNNERS["linux"] if kind == "encrypted" and job_key == AUDIT_JOB
+                           else PLATFORM_RUNNERS.get(self.platform, PLATFORM_RUNNERS["linux"]))
+        self.runner_home = (WINDOWS_RUNNER_HOME if self.job_runner == "windows-2025" else
+                            MACOS_RUNNER_HOME if self.job_runner == "macos-15" else RUNNER_HOME)
+        self.temp = (WINDOWS_TEMP if self.job_runner == "windows-2025" else
+                     MACOS_TEMP if self.job_runner == "macos-15" else TEMP)
         self.script_lines = set()
         self.headers = {}
         for step in self.steps:
@@ -291,7 +387,7 @@ class _Grammar:
 
     def expected_env_names(self, step):
         names = set(self.job["env"]) | set(step["env"])
-        if (self.kind == "encrypted" and self.job_key == RUN_JOB
+        if (self.kind == "encrypted" and self.job_key in EXECUTION_JOBS
                 and step["name"] != self.names[0]):
             names = names | {"RUN_ROOT"}
         return names
@@ -299,12 +395,15 @@ class _Grammar:
     def env_value_ok(self, name, value):
         identity, kind = self.identity, self.kind
         run_id = identity.get("run_id", "")
+        workspace = (r"D:\a\platform-ci\platform-ci" if self.job_runner == "windows-2025" else
+                     self.runner_home + "/work/platform-ci/platform-ci")
+        run_root = (self.temp + r"\devlane-" + str(run_id) if self.job_runner == "windows-2025" else
+                    self.temp + "/devlane-" + str(run_id))
         fixed = {
             "CI_REPOSITORY": REPOSITORY, "CI_REPOSITORY_ID": str(REPOSITORY_ID),
             "CI_SERVER_URL": "https://github.com", "CI_EVENT_NAME": "workflow_dispatch",
             "CI_SHA": identity.get("control_sha"), "PYTHONDONTWRITEBYTECODE": "1",
-            "CI_WORKSPACE": self.runner_home + "/work/platform-ci/platform-ci",
-            "DEVLANE_RUNNER": self.runner,
+            "CI_WORKSPACE": workspace,
             "CI_RUN_ID": run_id, "GITHUB_RUN_ID": run_id, "CI_RUN_ATTEMPT": "1", "GITHUB_RUN_ATTEMPT": "1",
         }
         if kind == "encrypted":
@@ -312,8 +411,9 @@ class _Grammar:
                 "CI_REF": "refs/heads/main", "CI_CONTROL_RUN_ID": identity.get("control_run_id"),
                 "DEVLANE_PROFILE": identity.get("profile"), "DEVLANE_WAVE_ID": identity.get("wave_id"),
                 "DEVLANE_BUNDLE_ID": identity.get("bundle_id"),
+                "DEVLANE_PLATFORM": self.platform,
                 "DEVLANE_CACHE_BASELINE_SHA256": identity.get("cache_baseline_sha256"),
-                "RUN_ROOT": self.temp + "/devlane-" + str(run_id),
+                "RUN_ROOT": run_root,
             })
         else:
             fixed["CI_REF"] = identity.get("ref")
@@ -346,8 +446,11 @@ class _Grammar:
         if key == "path":
             prefix = "${{ runner.temp }}"
             suffix = declared[len(prefix):] if declared.startswith(prefix) else None
-            return suffix in ("/devlane-control-evidence/permit.json", "/devlane-bundle-permit/permit.json") \
-                and value == self.temp + suffix
+            expected_suffix = ("/devlane-control-evidence/permit.json"
+                               if step["name"] == "Restore exact source-free control evidence"
+                               else "/devlane-bundle-permit/permit.json")
+            runner_suffix = expected_suffix.replace("/", "\\") if self.job_runner == "windows-2025" else expected_suffix
+            return suffix == expected_suffix and value == self.temp + runner_suffix
         if key == "key":
             return value == self.expected_cache_key(step)
         if key == "token" and "github.token" in declared:
@@ -376,9 +479,12 @@ class _Grammar:
         uses = (step or {}).get("uses") or ""
         if uses.startswith("actions/cache/"):
             key = self.expected_cache_key(step)
-            return key is not None and any(pattern.fullmatch(line) for pattern in cache_line_patterns(key, self.temp))
+            return key is not None and any(
+                pattern.fullmatch(line) for pattern in cache_line_patterns(key, self.temp, self.platform)
+            )
         if uses.startswith("actions/setup-node@") or step_name.startswith("Post Set up"):
-            return any(pattern.fullmatch(line) for pattern in NODE_LINES)
+            patterns = WINDOWS_NODE_LINES if self.job_runner == "windows-2025" else NODE_LINES
+            return any(pattern.fullmatch(line) for pattern in patterns)
         exact = {
             "Fetch public control and validate dispatch": {"dispatch_context=validated"},
             "Prepare hosted runner isolation state": set(),
@@ -395,8 +501,8 @@ class _Grammar:
             "Shred runner-local workspace": {
                 "cleanup_receipt=confirmed", "devlane_job=completed public_output=filtered cleanup=confirmed",
             },
-            "Audit exact two-job graph and public surfaces": {
-                "devlane_audit=accepted jobs=2 artifacts=0 cache=unchanged cleanup=confirmed",
+            "Audit exact four-job graph and public surfaces": {
+                "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed",
             },
             "Claim a synthetic bundle permit": {"devlane_cache_permit=claimed"},
             "Verify the restored permit and refuse a second claim": {"devlane_cache_permit=restored-and-single-use"},
@@ -473,12 +579,42 @@ class _Grammar:
             ) + 1
             public_counts["network_probe_supervisor_refusal_code"] = NETWORK_PROBE_SUPERVISOR_CODES[line]
             return public_counts["network_probe_supervisor_refusal"] == 1
-        if (step_name == "Prepare hosted runner isolation state" and self.kind == "encrypted"
-                and self.identity.get("profile") == "core-rust"):
+        if (step_name in ("Prepare hosted runner isolation state", "Prepare hosted Windows isolation state")
+                and self.kind == "encrypted" and self.identity.get("profile") in RUST_PROFILES
+                and self.job_runner != "windows-2025"):
             exact = exact | {"devlane_cgroup_v2=ready"}
         if step_name == "Prepare hosted runner isolation state":
-            expected_preflight = "devlane_macos=preflight-ready" if self.runner == "macos-15" else "devlane_swap=disabled"
+            expected_preflight = "devlane_macos=preflight-ready" if self.job_runner == "macos-15" else "devlane_swap=disabled"
             exact = exact | {expected_preflight}
+        if step_name == "Prepare hosted Windows isolation state" and self.job_runner == "windows-2025":
+            exact = exact | {"windows_runner=hosted-admin verified=windows-2025"}
+        if self.job_runner == "windows-2025":
+            windows_exact = {
+                "Prepare dependencies before the cut": {
+                    "windows_prepare=complete lifecycle_scripts=disabled identity=lpac network=outbound-only",
+                },
+                "Prove public connectivity before the cut": {"windows_public_connectivity=proved"},
+                "Cut network and start the isolated supervisor": {
+                    "windows_sandbox_profile=created appcontainer=lpac capabilities=empty",
+                    "windows_firewall=installed direction=outbound action=block package=verified remote=any",
+                    "windows_network_cut=installed",
+                },
+                "Probe isolation before decryption": {
+                    "windows_network_probe=pass ipv4=blocked ipv6=blocked dns=blocked loopback=blocked "
+                    "local_listener=blocked named_pipe=blocked smb=blocked outside_read=blocked "
+                    "outside_write=blocked other_drive_read=blocked other_drive_write=blocked firewall=verified",
+                },
+                "Decrypt authenticated bundle": {"windows_decrypt=accepted manifest=bound"},
+                "Shred runner-local workspace": {
+                    "windows_sandbox_cleanup=confirmed firewall=removed profile=deleted",
+                    "cleanup_receipt=confirmed", "devlane_job=completed public_output=filtered cleanup=confirmed",
+                },
+            }
+            exact = windows_exact.get(step_name, exact)
+            if step_name == "Shred runner-local workspace" and re.fullmatch(
+                    r"windows_runner_shred=confirmed files=[0-9]+ bytes=[0-9]+ reparse=[0-9]+", line):
+                public_counts[line] = public_counts.get(line, 0) + 1
+                return public_counts[line] == 1
         if line in exact:
             public_counts[line] = public_counts.get(line, 0) + 1
             return public_counts[line] == 1
@@ -592,9 +728,7 @@ def validate_summary_records(record_lines, profile):
 def _hosted_preamble(lines, grammar, job_name, identity, workflow_path):
     """Validate the setup text and runner metadata emitted by a real GitHub job log."""
     index = 0
-    job_runner = "ubuntu-24.04" if grammar.kind == "encrypted" and job_name == AUDIT_JOB else identity.get(
-        "runner", "ubuntu-24.04",
-    )
+    job_runner = grammar.job_runner
 
     def take():
         nonlocal index
@@ -641,6 +775,11 @@ def _hosted_preamble(lines, grammar, job_name, identity, workflow_path):
                 or not re.fullmatch(r"15\.[0-9]+\.[0-9]+", operating_system[1])
                 or not re.fullmatch(r"24[A-Z][A-Z0-9]+", operating_system[2])):
             _refuse()
+    elif job_runner == "windows-2025":
+        if (len(operating_system) != 3 or operating_system[0] != "Microsoft Windows Server 2025"
+                or not re.fullmatch(r"10\.0\.26100", operating_system[1])
+                or operating_system[2] != "Datacenter"):
+            _refuse()
     elif (len(operating_system) != 3 or operating_system[0] != "Ubuntu"
             or not re.fullmatch(r"24\.04\.[0-9]+", operating_system[1])
             or operating_system[2] != "LTS"):
@@ -653,6 +792,13 @@ def _hosted_preamble(lines, grammar, job_name, identity, workflow_path):
             r"Version: [0-9]{8}\.[0-9]+\.[0-9]+",
             r"Included Software: https://github\.com/actions/runner-images/blob/macos-15-arm64/[0-9]{8}\.[0-9]+/images/macos/macos-15-arm64-Readme\.md",
             r"Image Release: https://github\.com/actions/runner-images/releases/tag/macos-15-arm64%2F[0-9]{8}\.[0-9]+",
+        )
+    elif job_runner == "windows-2025":
+        image_patterns = (
+            r"Image: windows-2025-vs2026",
+            r"Version: [0-9]{8}\.[0-9]{3}",
+            r"Included Software: https://github\.com/actions/runner-images/blob/win25-vs2026/[0-9]{8}\.[0-9]{3}/images/windows/Windows2025-VS2026-Readme\.md",
+            r"Image Release: https://github\.com/actions/runner-images/releases/tag/win25-vs2026%2F[0-9]{8}\.[0-9]{3}",
         )
     else:
         image_patterns = (
@@ -759,7 +905,7 @@ def _hosted_preamble(lines, grammar, job_name, identity, workflow_path):
     else:
         expected_inputs = {
             "profile": identity.get("profile"),
-            "runner": identity.get("runner", "ubuntu-24.04"),
+            "platform": identity.get("platform", "linux"),
             "control_run_id": identity.get("control_run_id"),
             "wave_id": identity.get("wave_id"),
             "bundle_id": identity.get("bundle_id"),
@@ -775,7 +921,8 @@ def _hosted_preamble(lines, grammar, job_name, identity, workflow_path):
     maybe_environment()
     input_group_present = index < len(lines) and lines[index] == LOG_MARKER + "[group] Inputs"
     if not input_group_present:
-        if grammar.kind != "encrypted" or job_runner != "ubuntu-24.04":
+        if (grammar.kind != "encrypted" or job_runner != "ubuntu-24.04"
+                or identity.get("platform", "linux") != "linux"):
             _refuse()
         expected_inputs = {}
     else:
@@ -835,7 +982,10 @@ def _parse_hosted_step_block(block, step, grammar):
             "shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}",
             "shell: /usr/bin/bash -e {0}",
         )
-        shell_index = next((index for index, line in enumerate(block) if line in shell_options), None)
+        if grammar.job_runner == "windows-2025":
+            shell_index = next((index for index, line in enumerate(block) if line == WINDOWS_PWSH), None)
+        else:
+            shell_index = next((index for index, line in enumerate(block) if line in shell_options), None)
         if shell_index is None:
             _refuse()
         script = [line for line in block[:shell_index] if line]
@@ -974,6 +1124,12 @@ def _canonicalize_github_hosted_log(text, grammar, job_name, identity, workflow_
                 if index >= len(lines) or env_details != expected_details:
                     _refuse()
                 output.extend(env_details)
+                index += 1
+                continue
+            if (line.startswith(LOG_MARKER + "[command]")
+                    and (step["uses"] or "").startswith("actions/cache/")
+                    and grammar.step_output_ok(step["name"], line, {})):
+                output.append(line)
                 index += 1
                 continue
             if line.startswith(LOG_MARKER + "["):
@@ -1135,6 +1291,9 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
             in_header, mode = True, None
             continue
         if in_header:
+            if (grammar.job_runner == "windows-2025" and normalized == WINDOWS_PWSH):
+                mode = None
+                continue
             if normalized in (
                     "shell: /bin/bash -e {0}", "shell: /bin/bash --noprofile --norc -e -o pipefail {0}",
                     "shell: /usr/bin/bash -e {0}", "shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}"):
@@ -1196,7 +1355,8 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         if profile not in ENCRYPTED_PROFILES:
             _refuse()
         validate_summary_records(records, profile)
-    if kind == "encrypted" and job_name == RUN_JOB:
+    if kind == "encrypted" and job_name in EXECUTION_JOBS:
+        windows_job = grammar.job_runner == "windows-2025"
         if (counts.get("network_probe_refusal_code") is not None
                 and counts.get("network_probe_supervisor_refusal_code") is not None
                 and counts["network_probe_refusal_code"] != counts["network_probe_supervisor_refusal_code"]):
@@ -1207,19 +1367,28 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
             1 if counts.get("network_probe_supervisor_refusal")
             and not counts.get("network_probe_refusal") else 0
         )
-        if counts.get("network_cut_probe=pass", 0) + probe_refusal_count != 1:
+        windows_probe_success = (
+            "windows_network_probe=pass ipv4=blocked ipv6=blocked dns=blocked loopback=blocked "
+            "local_listener=blocked named_pipe=blocked smb=blocked outside_read=blocked "
+            "outside_write=blocked other_drive_read=blocked other_drive_write=blocked firewall=verified"
+        )
+        probe_success_count = counts.get(windows_probe_success, 0) if windows_job else counts.get("network_cut_probe=pass", 0)
+        if probe_success_count + probe_refusal_count != 1:
             _refuse()
         if probe_refusal_count != counts.get("network_probe_failed_exit", 0):
             _refuse()
         decrypt_failure_count = counts.get("decrypt_failure_marker", 0)
         if probe_refusal_count:
-            if (counts.get("authenticated_decryption=pass") or decrypt_failure_count
+            if (counts.get("authenticated_decryption=pass") or counts.get("windows_decrypt=accepted manifest=bound")
+                    or decrypt_failure_count
                     or counts.get("decrypt_failed_exit") or counts.get("decrypt_refusal_detail")
                     or "Decrypt authenticated bundle" in seen_steps
                     or "Execute offline profile and filter public summary" in seen_steps):
                 _refuse()
         else:
-            if counts.get("authenticated_decryption=pass", 0) + decrypt_failure_count != 1:
+            decrypt_success_count = (counts.get("windows_decrypt=accepted manifest=bound", 0)
+                                     if windows_job else counts.get("authenticated_decryption=pass", 0))
+            if decrypt_success_count + decrypt_failure_count != 1:
                 _refuse()
             if decrypt_failure_count:
                 if (counts.get("decrypt_failed_exit") != 1 or records
@@ -1236,7 +1405,7 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
     elif kind == "encrypted":
         if counts.get("dispatch") or counts.get("permit") or records:
             _refuse()
-        audit_line = "devlane_audit=accepted jobs=2 artifacts=0 cache=unchanged cleanup=confirmed"
+        audit_line = "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed"
         if completed and counts.get(audit_line) != 1 or counts.get(audit_line, 0) > 1:
             _refuse()
     else:
@@ -1293,40 +1462,63 @@ def _steps(job):
 
 
 def _expected_step_names(profile, identity=None):
+    platform = identity.get("platform", "linux") if type(identity) is dict else "linux"
     legacy_workflow = _legacy_encrypted_workflow_path(identity) if type(identity) is dict else None
-    if legacy_workflow and profile in ("core-node", "core-rust"):
+    if legacy_workflow and platform == "linux" and profile in ("core-node", "core-rust"):
         legacy = parse_workflow(REPOSITORY_ROOT / legacy_workflow)
         return [step["name"] for step in legacy[RUN_JOB]["steps"]]
-    return list(STEP_NAMES)
+    jobs = validate_workflow_job_graph(platform)
+    return [step["name"] for step in jobs[PLATFORM_RUN_JOBS[platform]]["steps"]]
 
 
 def validate_job_contract(jobs, identity, profile):
-    if type(jobs) is not list or len(jobs) != 2:
+    platform = identity.get("platform", "linux")
+    legacy = _legacy_encrypted_workflow_path(identity) is not None
+    if platform not in PLATFORM_RUN_JOBS or (platform == "windows" and profile != "core-node"):
+        _refuse()
+    if not legacy:
+        validate_workflow_job_graph(platform)
+    expected_names = ({RUN_JOB, AUDIT_JOB} if legacy else set(EXECUTION_JOBS) | {AUDIT_JOB})
+    expected_count = 2 if legacy else 4
+    if type(jobs) is not list or len(jobs) != expected_count:
         _refuse()
     by_name = {}
     for job in jobs:
         if type(job) is not dict or type(job.get("name")) is not str or job["name"] in by_name:
             _refuse()
         by_name[job["name"]] = job
-    if set(by_name) != {RUN_JOB, AUDIT_JOB}:
+    if set(by_name) != expected_names:
         _refuse()
-    run_job, audit_job = by_name[RUN_JOB], by_name[AUDIT_JOB]
-    for job in (run_job, audit_job):
+    active_name = RUN_JOB if legacy else PLATFORM_RUN_JOBS[platform]
+    run_job, audit_job = by_name[active_name], by_name[AUDIT_JOB]
+    for job in by_name.values():
         if (job.get("run_id") != int(identity["run_id"])
                 or job.get("run_attempt") != 1 or job.get("head_sha") != identity["control_sha"]
                 or type(job.get("id")) is not int or job["id"] < 1):
+            _refuse()
+    for inactive_name in (() if legacy else set(EXECUTION_JOBS) - {active_name}):
+        inactive_job = by_name[inactive_name]
+        inactive_platform = next(key for key, name in PLATFORM_RUN_JOBS.items() if name == inactive_name)
+        if (inactive_job.get("labels") != [PLATFORM_RUNNERS[inactive_platform]]
+                or inactive_job.get("status") != "completed" or inactive_job.get("conclusion") != "skipped"
+                or _steps(inactive_job)):
             _refuse()
     if run_job.get("status") != "completed" or run_job.get("conclusion") not in {
         "success", "failure", "cancelled", "timed_out",
     }:
         _refuse()
-    expected_runner = identity.get("runner", "ubuntu-24.04")
-    if run_job.get("labels") != [expected_runner] or audit_job.get("labels") != ["ubuntu-24.04"]:
+    expected_runner = identity.get("runner", PLATFORM_RUNNERS[platform])
+    if (run_job.get("labels") != [expected_runner]
+            or audit_job.get("labels") != [PLATFORM_RUNNERS["linux"]]):
         _refuse()
     if audit_job.get("status") != "in_progress" or audit_job.get("conclusion") is not None:
         _refuse()
     audit_steps = _steps(audit_job)
-    if [step.get("name") for step in audit_steps] != list(AUDIT_STEP_NAMES):
+    legacy_audit_names = None
+    if legacy:
+        legacy_audit_names = [step["name"] for step in parse_workflow(
+            REPOSITORY_ROOT / _legacy_encrypted_workflow_path(identity))[AUDIT_JOB]["steps"]]
+    if [step.get("name") for step in audit_steps] != (legacy_audit_names or list(AUDIT_STEP_NAMES)):
         _refuse()
     if (audit_steps[0].get("status") != "completed" or audit_steps[0].get("conclusion") != "success"
             or audit_steps[1].get("status") != "in_progress" or audit_steps[1].get("conclusion") is not None):
@@ -1338,7 +1530,11 @@ def validate_job_contract(jobs, identity, profile):
     step_by_name = {step["name"]: step for step in steps}
     expected_tool_step = "Prepare dependencies before the cut" if profile == "core-node" else "Install pinned Rust toolchain"
     skipped_tool_step = "Install pinned Rust toolchain" if profile == "core-node" else None
-    skipped_desktop_dependency_step = "Install Tauri Linux build dependencies" if profile != "desktop" else None
+    skipped_desktop_dependency_step = (
+        "Install Tauri Linux build dependencies"
+        if "Install Tauri Linux build dependencies" in step_by_name
+        and (profile != "desktop" or platform != "linux") else None
+    )
     cleanup_step = step_by_name["Shred runner-local workspace"]
     if cleanup_step.get("status") != "completed" or cleanup_step.get("conclusion") != "success":
         _refuse()
@@ -1395,7 +1591,7 @@ def validate_job_contract(jobs, identity, profile):
         )
         if run_job.get("conclusion") != expected_run_conclusion:
             _refuse()
-    for job in (run_job, audit_job):
+    for job in by_name.values():
         url = job.get("check_run_url")
         parsed = urlsplit(url) if type(url) is str else None
         if (parsed is None or parsed.scheme != "https" or parsed.netloc != "api.github.com"
@@ -1407,14 +1603,21 @@ def validate_job_contract(jobs, identity, profile):
 
 def validate_terminal_job_contract(jobs, identity, profile):
     """Validate final job identities and return whether the in-run audit passed."""
-    if type(jobs) is not list or len(jobs) != 2:
+    legacy = _legacy_encrypted_workflow_path(identity) is not None
+    expected = ({RUN_JOB, AUDIT_JOB} if legacy else set(EXECUTION_JOBS) | {AUDIT_JOB})
+    expected_count = 2 if legacy else 4
+    if type(jobs) is not list or len(jobs) != expected_count:
         _refuse()
     by_name = {job.get("name"): job for job in jobs if type(job) is dict}
-    if len(by_name) != 2 or set(by_name) != {RUN_JOB, AUDIT_JOB}:
+    if len(by_name) != expected_count or set(by_name) != expected:
         _refuse()
     audit_job = by_name[AUDIT_JOB]
     audit_steps = _steps(audit_job)
-    if [step.get("name") for step in audit_steps] != list(AUDIT_STEP_NAMES):
+    legacy_audit_names = None
+    if legacy:
+        legacy_audit_names = [step["name"] for step in parse_workflow(
+            REPOSITORY_ROOT / _legacy_encrypted_workflow_path(identity))[AUDIT_JOB]["steps"]]
+    if [step.get("name") for step in audit_steps] != (legacy_audit_names or list(AUDIT_STEP_NAMES)):
         _refuse()
     if audit_steps[0].get("status") != "completed" or audit_steps[0].get("conclusion") != "success":
         _refuse()
@@ -1483,7 +1686,7 @@ def audit_environment(env):
         "CI_REPOSITORY", "CI_REPOSITORY_ID", "CI_EVENT_NAME", "CI_REF", "CI_SHA", "CI_CONTROL_RUN_ID",
         "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "DEVLANE_PROFILE",
         "DEVLANE_WAVE_ID", "DEVLANE_BUNDLE_ID", "DEVLANE_CACHE_BASELINE_SHA256",
-        "GITHUB_TOKEN", "DEVLANE_RUNNER",
+        "GITHUB_TOKEN", "DEVLANE_PLATFORM",
     )
     if any(type(env.get(key)) is not str or not env.get(key) for key in required):
         _refuse()
@@ -1494,7 +1697,8 @@ def audit_environment(env):
             or not DECIMAL.fullmatch(env["CI_CONTROL_RUN_ID"])
             or not DECIMAL.fullmatch(env["GITHUB_RUN_ID"]) or env["GITHUB_RUN_ATTEMPT"] != "1"
             or env["DEVLANE_PROFILE"] not in ENCRYPTED_PROFILES
-            or env["DEVLANE_RUNNER"] not in ("ubuntu-24.04", "macos-15")
+            or env["DEVLANE_PLATFORM"] not in PLATFORM_RUNNERS
+            or env["DEVLANE_PLATFORM"] == "windows" and env["DEVLANE_PROFILE"] != "core-node"
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{7,63}", env["DEVLANE_WAVE_ID"])
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{7,63}", env["DEVLANE_BUNDLE_ID"])
             or not SHA256.fullmatch(env["DEVLANE_CACHE_BASELINE_SHA256"])):
@@ -1503,7 +1707,7 @@ def audit_environment(env):
         "repository": env["CI_REPOSITORY"], "repository_id": REPOSITORY_ID,
         "event": env["CI_EVENT_NAME"], "ref": env["CI_REF"], "control_sha": env["CI_SHA"],
         "run_id": env["GITHUB_RUN_ID"], "run_attempt": 1, "profile": env["DEVLANE_PROFILE"],
-        "runner": env["DEVLANE_RUNNER"],
+        "platform": env["DEVLANE_PLATFORM"],
         "control_run_id": env["CI_CONTROL_RUN_ID"],
         "wave_id": env["DEVLANE_WAVE_ID"], "bundle_id": env["DEVLANE_BUNDLE_ID"],
         "cache_baseline_sha256": env["DEVLANE_CACHE_BASELINE_SHA256"],
@@ -1515,15 +1719,18 @@ def run_audit(api, identity):
     run, _ = api.json(prefix)
     validate_run_record(run, identity)
     response, headers = api.json(prefix + "/jobs?filter=all&per_page=100&page=1")
+    expected_count = 2 if _legacy_encrypted_workflow_path(identity) else 4
     if (type(response) is not dict or type(response.get("jobs")) is not list
-            or response.get("total_count") != 2 or len(response["jobs"]) != 2
+            or response.get("total_count") != expected_count or len(response["jobs"]) != expected_count
             or headers.get("Link")):
         _refuse()
     jobs = validate_job_contract(response["jobs"], identity, identity["profile"])
-    run_job = jobs[RUN_JOB]
+    active_name = (RUN_JOB if expected_count == 2
+                   else PLATFORM_RUN_JOBS[identity.get("platform", "linux")])
+    run_job = jobs[active_name]
     log = api.log_text(run_job["id"])
     validate_dispatch_marker(log, identity)
-    validate_job_log_surface(log, RUN_JOB, identity, completed=True)
+    validate_job_log_surface(log, active_name, identity, completed=True)
     artifacts, _ = api.json(prefix + "/artifacts?per_page=100&page=1")
     if (type(artifacts) is not dict or artifacts.get("total_count") != 0
             or artifacts.get("artifacts") != []):
@@ -1549,12 +1756,15 @@ def run_audit(api, identity):
 
 
 def validate_final_public_surfaces(api, jobs, identity, profile):
-    """Recheck both final job logs and check outputs immediately before cleanup."""
+    """Recheck the active execution and audit logs plus all four check outputs."""
     if type(jobs) is not list or len(jobs) > 100:
         _refuse()
     collected, collection_failed = {}, False
+    active_name = PLATFORM_RUN_JOBS.get(identity.get("platform", "linux"))
     for job in jobs:
         if type(job) is not dict or job.get("status") != "completed":
+            continue
+        if job.get("name") not in (active_name, AUDIT_JOB):
             continue
         identifier = job.get("id")
         if type(identifier) is not int or identifier < 1:
@@ -1591,7 +1801,8 @@ def validate_final_public_surfaces(api, jobs, identity, profile):
     validated, audit_passed = validate_terminal_job_contract(jobs, identity, profile)
     if not audit_passed:
         _refuse()
-    for job_name in (RUN_JOB, AUDIT_JOB):
+    active_name = PLATFORM_RUN_JOBS[identity.get("platform", "linux")]
+    for job_name in (active_name, AUDIT_JOB):
         job = validated[job_name]
         if job.get("status") != "completed" or job["id"] not in collected:
             _refuse()
@@ -1613,7 +1824,7 @@ def main():
         identity = audit_environment(os.environ)
         api = GitHubAPI(os.environ["GITHUB_TOKEN"])
         run_audit(api, identity)
-        print("devlane_audit=accepted jobs=2 artifacts=0 cache=unchanged cleanup=confirmed")
+        print("devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed")
         return 0
     except Exception:
         print("devlane_audit=refused")

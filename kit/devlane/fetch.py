@@ -64,8 +64,10 @@ def validate_dispatch(identity, expected_profile=None, now=None):
         _fail("dispatch-shape")
     identity = dict(identity)
     identity.setdefault("platform", "linux")
-    if identity["platform"] not in ("linux", "windows"):
+    if identity["platform"] not in ("linux", "macos", "windows"):
         _fail("dispatch-platform")
+    if identity["platform"] != "linux" and identity["profile"] != "core-node":
+        _fail("dispatch-platform-profile")
     if "wave_class" in identity and identity["wave_class"] != SOURCE_FREE_WAVE_CLASS:
         _fail("dispatch-wave-class")
     if identity["repository"] != REPOSITORY or identity["repository_id"] != REPOSITORY_ID:

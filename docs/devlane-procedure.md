@@ -8,6 +8,7 @@ This is the committed procedure for running the encrypted public dev lane. It is
 - Never put key material on a command line, in a checkout, in an environment variable of a long-lived shell, or in a log. The key reaches GitHub over standard input. A shell trap removes the local key file on handled shell exits; process kill, interpreter failure and host loss can bypass it.
 - One open wave at a time. A bundle is never reused. Never retry a dispatch; reconcile instead.
 - Revoking the key as soon as the decrypt step concludes is mandatory and timed (step 8). A wave whose revocation missed the limit is recorded as late and reviewed before the next wave.
+- The decrypt watcher uses one 7,200-second deadline on Linux, macOS and Windows. That covers the Windows job's 90-minute maximum dependency-preparation window plus runner startup and dispatch margin; the key is revoked as soon as the decrypt step concludes, so it is not held for the later offline test execution.
 - A coordinator `finally` block and its watcher run only while that process and host remain alive. Process kill, interpreter failure or host loss can leave a secret installed. Before any later wave, run `recover-pending-secrets`, verify it completes, and resolve every open wave. This recovery is durable and resumable; it cannot guarantee revocation within 120 seconds during process, host or API loss.
 - Keep `record-control-evidence` mandatory (step 1). Any job running on `main` can write an Actions cache entry named like control evidence, so the cache entry alone is never trusted; the coordinator re-reads the real control run, its 18 jobs and the single matching cache entry.
 - GitHub does not count check runs created by `workflow_dispatch` toward required status checks. After it accepts the full 18-job graph, `control-audit` posts one `keeldock/control-verified` success status on the exact control SHA, with the run URL as its target. The promotion tool checks that newest status and independently checks every latest 18-job control attempt. The status API record exposes `creator.login` as `github-actions[bot]` and its context; the endpoint is scoped to the SHA in its request path and has no app field. Branch rules pin the context to GitHub Actions app ID `15368`.
@@ -37,6 +38,7 @@ This is the committed procedure for running the encrypted public dev lane. It is
 set -euo pipefail
 umask 077
 REPO=keeldock-platform/platform-ci
+PLATFORM=linux
 CONTROL_SHA="$(git rev-parse HEAD)"
 CONTROL_WAVE_ID="control-$(date -u +%Y%m%d%H%M%S)-$(openssl rand -hex 4)"
 CONTROL_RUN_ID=""
@@ -99,8 +101,8 @@ test "$CONTROL_SHA" = "$REMOTE_MAIN_SHA"
    ```
 
 4. Reserve the wave. The request lifetime is at most one hour, so build it only when you are ready to run the whole sequence.
-   - Rehearsal: `python3 -B kit/devlane/rehearsal.py requests --directory "$DEVLANE_PRIVATE" --control-sha "$CONTROL_SHA" --control-run-id "$CONTROL_RUN_ID" --wave-id "$WAVE_ID" --bundle-id "$BUNDLE_ID" --release-id "$RELEASE_ID" --lifetime-seconds 3300` writes `reserve.json` and `bundle-request.json`.
-   - Private wave: write `reserve.json` (exactly `schema` 2, `wave_id`, `bundle_id`, `control_run_id`, `control_sha`, `profile`, `expires` in Unix seconds, `release_id`) and `bundle-request.json` (exactly `repository`, `source_revision`, `profile`, `fetch_sha256` equal to the SHA-256 of `projection.json`, `wave_id`, `bundle_id`, `control_sha`, `expires`, `source_files`, `allowed_files`, `allowed_tests`, `frames`) with the same `expires`.
+   - Rehearsal: `python3 -B kit/devlane/rehearsal.py requests --directory "$DEVLANE_PRIVATE" --control-sha "$CONTROL_SHA" --control-run-id "$CONTROL_RUN_ID" --wave-id "$WAVE_ID" --bundle-id "$BUNDLE_ID" --release-id "$RELEASE_ID" --platform linux --lifetime-seconds 3300` writes `reserve.json` and `bundle-request.json`.
+   - Private wave: write `reserve.json` (exactly `schema` 2, `wave_id`, `bundle_id`, `control_run_id`, `control_sha`, `profile`, `platform` (`linux`, `macos`, or `windows`), `expires` in Unix seconds, `release_id`) and `bundle-request.json` (exactly `repository`, `source_revision`, `profile`, `fetch_sha256` equal to the SHA-256 of `projection.json`, `wave_id`, `bundle_id`, `control_sha`, `expires`, `source_files`, `allowed_files`, `allowed_tests`, `frames`) with the same `expires`. macOS and Windows reservations support `core-node`; Linux also retains `core-rust`, `desktop`, and `local-sync-rust`.
 
    ```sh
    python3 -B kit/devlane/coordinator.py reserve-wave --ledger "$DEVLANE_PRIVATE/ledger" --request "$DEVLANE_PRIVATE/reserve.json"
@@ -158,7 +160,7 @@ test "$CONTROL_SHA" = "$REMOTE_MAIN_SHA"
      [[ "$REMOTE_MAIN_SHA" == "$CONTROL_SHA" ]] || { echo "remote main moved" >&2; exit 2; }
      python3 -B kit/devlane/coordinator.py dispatch-wave \
        --ledger "$DEVLANE_PRIVATE/ledger" --wave-id "$WAVE_ID" \
-       --key-file "$DEVLANE_PRIVATE/key.hex" > "$DEVLANE_PRIVATE/dispatch-wave.out"
+       --key-file "$DEVLANE_PRIVATE/key.hex" --platform "$PLATFORM" > "$DEVLANE_PRIVATE/dispatch-wave.out"
      RUN_ID="$(sed -n 's/^dispatch_wave=attached run-id=\([0-9]*\)$/\1/p' \
        "$DEVLANE_PRIVATE/dispatch-wave.out" | tail -n 1)"
      [[ "$RUN_ID" =~ ^[1-9][0-9]*$ ]] || { echo "run id missing" >&2; exit 2; }

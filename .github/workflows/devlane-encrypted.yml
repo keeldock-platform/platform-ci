@@ -12,14 +12,15 @@ on:
           - core-rust
           - desktop
           - local-sync-rust
-      runner:
-        description: One hosted operating system for this one-run permit
+      platform:
+        description: Hosted execution platform for this one-run wave
         required: true
         type: choice
-        default: ubuntu-24.04
+        default: linux
         options:
-          - ubuntu-24.04
-          - macos-15
+          - linux
+          - macos
+          - windows
       control_run_id:
         description: Successful exact-SHA source-free public control run
         required: true
@@ -71,7 +72,8 @@ concurrency:
 jobs:
   devlane-encrypted-run:
     name: devlane-encrypted-run
-    runs-on: ${{ inputs.runner }}
+    if: ${{ inputs.platform == 'linux' }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     environment: devlane-decrypt
     permissions: {}
@@ -90,7 +92,463 @@ jobs:
       CI_WORKSPACE: ${{ github.workspace }}
       CI_CONTROL_RUN_ID: ${{ inputs.control_run_id }}
       DEVLANE_PROFILE: ${{ inputs.profile }}
-      DEVLANE_RUNNER: ${{ inputs.runner }}
+      DEVLANE_PLATFORM: linux
+      DEVLANE_WAVE_ID: ${{ inputs.wave_id }}
+      DEVLANE_BUNDLE_ID: ${{ inputs.bundle_id }}
+      DEVLANE_BUNDLE_ASSET_ID: ${{ inputs.bundle_asset_id }}
+      DEVLANE_BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
+      DEVLANE_BUNDLE_SIZE: ${{ inputs.bundle_size }}
+      DEVLANE_PROJECTION_ASSET_ID: ${{ inputs.projection_asset_id }}
+      DEVLANE_PROJECTION_SHA256: ${{ inputs.projection_sha256 }}
+      DEVLANE_PROJECTION_SIZE: ${{ inputs.projection_size }}
+      DEVLANE_EXPIRES: ${{ inputs.expires }}
+      DEVLANE_CACHE_BASELINE_SHA256: ${{ inputs.cache_baseline_sha256 }}
+    steps:
+      - name: Fetch public control and validate dispatch
+        timeout-minutes: 180
+        run: |
+          set -euo pipefail
+          umask 077
+          RUN_ROOT="$RUNNER_TEMP/devlane-$CI_RUN_ID"
+          export RUN_ROOT
+          printf 'RUN_ROOT=%s\n' "$RUN_ROOT" >> "$GITHUB_ENV"
+          python3 -B - <<'PY'
+          import os
+          import re
+          import signal
+          import subprocess
+          import sys
+          import time
+
+          def refuse(code):
+              print("devlane_bootstrap_refusal=" + code, file=sys.stderr)
+              raise SystemExit(1)
+
+          started_at = time.monotonic()
+          run_root = os.environ["RUN_ROOT"]
+          try:
+              os.mkdir(run_root, 0o700)
+          except OSError:
+              refuse("bootstrap-run-root")
+          start_file = os.path.join(run_root, "deadline-start")
+          try:
+              descriptor = os.open(start_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+              with os.fdopen(descriptor, "w", encoding="ascii") as output:
+                  output.write("%.17g\n" % started_at)
+                  output.flush()
+                  os.fsync(output.fileno())
+          except OSError:
+              refuse("bootstrap-start-marker")
+
+          work_deadline = started_at + 8700
+          reap_seconds = 5
+          child_environment = {
+              "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+              "LC_ALL": "C",
+              "GIT_CONFIG_GLOBAL": "/dev/null",
+              "GIT_CONFIG_NOSYSTEM": "1",
+              "GIT_TERMINAL_PROMPT": "0",
+              "PYTHONDONTWRITEBYTECODE": "1",
+          }
+
+          def terminate_and_reap(process):
+              try:
+                  os.killpg(process.pid, signal.SIGTERM)
+              except ProcessLookupError:
+                  pass
+              try:
+                  process.communicate(timeout=2)
+              except subprocess.TimeoutExpired:
+                  pass
+              try:
+                  os.killpg(process.pid, signal.SIGKILL)
+              except ProcessLookupError:
+                  pass
+              try:
+                  process.communicate(timeout=3)
+              except subprocess.TimeoutExpired:
+                  refuse("bootstrap-reap-unconfirmed")
+
+          def run(argv, *, capture=False):
+              remaining = work_deadline - time.monotonic()
+              if remaining <= reap_seconds:
+                  refuse("bootstrap-work-deadline")
+              timeout = min(540, remaining - reap_seconds)
+              try:
+                  process = subprocess.Popen(
+                      argv, cwd=os.environ["CI_WORKSPACE"], env=child_environment,
+                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL,
+                      close_fds=True, start_new_session=True,
+                  )
+                  remaining = work_deadline - time.monotonic()
+                  if remaining <= reap_seconds:
+                      terminate_and_reap(process)
+                      refuse("bootstrap-work-deadline")
+                  timeout = min(timeout, 540, remaining - reap_seconds)
+                  try:
+                      output, _errors = process.communicate(timeout=timeout)
+                  except subprocess.TimeoutExpired:
+                      terminate_and_reap(process)
+                      refuse("bootstrap-command-timeout")
+              except OSError:
+                  refuse("bootstrap-command-failed")
+              if process.returncode != 0:
+                  refuse("bootstrap-command-failed")
+              return output if capture else b""
+
+          if (os.environ.get("CI_REPOSITORY") != "keeldock-platform/platform-ci"
+                  or os.environ.get("CI_REPOSITORY_ID") != "1430960557"
+                  or os.environ.get("CI_SERVER_URL") != "https://github.com"
+                  or os.environ.get("CI_EVENT_NAME") != "workflow_dispatch"
+                  or os.environ.get("CI_REF") != "refs/heads/main"
+                  or not re.fullmatch(r"[1-9][0-9]{0,18}", os.environ.get("CI_RUN_ID", ""))
+                  or not re.fullmatch(r"[a-f0-9]{40}", os.environ.get("CI_SHA", ""))):
+              refuse("dispatch-identity")
+
+          workspace = os.environ["CI_WORKSPACE"]
+          origin = os.environ["CI_SERVER_URL"].rstrip("/") + "/" + os.environ["CI_REPOSITORY"] + ".git"
+          run(["git", "-C", workspace, "init", "-q"])
+          run(["git", "-C", workspace, "config", "core.autocrlf", "false"])
+          run(["git", "-C", workspace, "remote", "add", "origin", origin])
+          if run(["git", "-C", workspace, "remote", "get-url", "origin"], capture=True).decode("utf-8").strip() != origin:
+              refuse("bootstrap-origin-mismatch")
+          run(["git", "-C", workspace, "fetch", "--quiet", "--no-tags", "--depth=1", "origin", os.environ["CI_SHA"]])
+          run(["git", "-C", workspace, "checkout", "--quiet", "--detach", "FETCH_HEAD"])
+          actual_sha = run(["git", "-C", workspace, "rev-parse", "--verify", "HEAD"], capture=True).decode("ascii").strip()
+          if actual_sha != os.environ["CI_SHA"]:
+              refuse("bootstrap-sha-mismatch")
+          deadline_script = os.path.join(workspace, "kit/devlane/deadline.py")
+          deadline_file = os.path.join(run_root, "deadline.json")
+          run([
+              sys.executable, "-B", deadline_script, "create", "--file", deadline_file,
+              "--budget-seconds", "8700", "--cleanup-reserve-seconds", "2100", "--job-seconds", "10800",
+              "--started-at-file", start_file,
+          ])
+          PY
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            python3 -B -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; import cryptography; assert AESGCM is not None and cryptography.__version__'
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            python3 -B kit/devlane/fetch.py context --output "$RUN_ROOT/context.json"
+      - name: Prepare hosted Linux isolation state
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          refuse() {
+            printf 'devlane_host_preflight=refused code=%s\n' "$1" >&2
+            exit 1
+          }
+          command -v timeout >/dev/null 2>&1 || refuse timeout-unavailable
+          sudo -n true >/dev/null 2>&1 || refuse sudo-unavailable
+          if ! timeout --signal=TERM --kill-after=5s 90s sudo -n swapoff -a >/dev/null 2>&1; then
+            refuse swapoff-failed
+          fi
+          if ! python3 -B -c 'from pathlib import Path; lines=Path("/proc/swaps").read_text(encoding="ascii").splitlines(); expected=["Filename", "Type", "Size", "Used", "Priority"]; raise SystemExit(0 if len(lines) == 1 and lines[0].split() == expected else 1)'; then
+            refuse swap-remains
+          fi
+          if [[ "$DEVLANE_PROFILE" == "core-rust" || "$DEVLANE_PROFILE" == "local-sync-rust" ]]; then
+            if ! timeout --signal=TERM --kill-after=5s 30s sudo -n python3 -B -c '
+          import os, stat
+          from pathlib import Path
+          root = Path("/sys/fs/cgroup")
+          if root.is_symlink() or not root.is_dir() or not os.path.ismount(root):
+              raise SystemExit(1)
+          mountinfo = Path("/proc/self/mountinfo").read_text(encoding="ascii")
+          mounted = False
+          for line in mountinfo.splitlines():
+              fields = line.split()
+              if "-" in fields:
+                  separator = fields.index("-")
+                  if separator + 1 < len(fields) and fields[separator + 1] == "cgroup2" and fields[4] == str(root):
+                      mounted = True
+                      break
+          if not mounted:
+              raise SystemExit(1)
+          path = root / ("devlane-preflight-" + str(os.getpid()) + "-" + os.urandom(8).hex())
+          descriptor = None
+          try:
+              path.mkdir(mode=0o700)
+              for name in ("cgroup.procs", "cgroup.events", "cgroup.kill"):
+                  item = path / name
+                  if not stat.S_ISREG(item.lstat().st_mode) or item.is_symlink():
+                      raise SystemExit(1)
+              descriptor = os.open(path / "cgroup.procs", os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+              if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                  raise SystemExit(1)
+          finally:
+              if descriptor is not None:
+                  os.close(descriptor)
+              if path.exists():
+                  path.rmdir()
+          ' >/dev/null 2>&1; then
+              refuse cgroup-v2-unavailable
+            fi
+            printf 'devlane_cgroup_v2=ready\n'
+          fi
+          printf 'devlane_swap=disabled\n'
+      - name: Reserve work time for control evidence cache restore
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/deadline.py guard-action --file "$RUN_ROOT/deadline.json" \
+            --step-timeout-seconds 60 --margin-seconds 60
+      - name: Restore exact source-free control evidence
+        timeout-minutes: 1
+        uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: devlane-control-evidence/permit.json
+          key: devlane-control-v1-${{ inputs.control_run_id }}
+          enableCrossOsArchive: true
+          fail-on-cache-miss: true
+      - name: Verify exact source-free control evidence
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/permit.py verify-control \
+            --file "$GITHUB_WORKSPACE/devlane-control-evidence/permit.json" --control-sha "$CI_SHA" --run-id "$CI_CONTROL_RUN_ID"
+      - name: Reserve work time for initial permit cache restore
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/deadline.py guard-action --file "$RUN_ROOT/deadline.json" \
+            --step-timeout-seconds 60 --margin-seconds 60
+      - name: Restore one-run bundle permit
+        timeout-minutes: 1
+        uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          key: devlane-permit-v1-${{ inputs.bundle_id }}
+      - name: Claim this bundle for one run before decryption
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/devlane-bundle-permit"
+          chmod 700 "$RUNNER_TEMP/devlane-bundle-permit"
+          python3 -B kit/devlane/permit.py claim --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json"
+      - name: Reserve work time for permit cache save
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/deadline.py guard-action --file "$RUN_ROOT/deadline.json" \
+            --step-timeout-seconds 60 --margin-seconds 60
+      - name: Save one-run bundle permit
+        timeout-minutes: 1
+        uses: actions/cache/save@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          key: devlane-permit-v1-${{ inputs.bundle_id }}
+      - name: Discard local permit copy before persisted verification
+        run: |
+          set -euo pipefail
+          rm -rf -- "$RUNNER_TEMP/devlane-bundle-permit"
+          [[ ! -e "$RUNNER_TEMP/devlane-bundle-permit" ]]
+      - name: Reserve work time for persisted permit cache restore
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/deadline.py guard-action --file "$RUN_ROOT/deadline.json" \
+            --step-timeout-seconds 60 --margin-seconds 60
+      - name: Restore and verify persisted one-run permit
+        timeout-minutes: 1
+        uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          key: devlane-permit-v1-${{ inputs.bundle_id }}
+          fail-on-cache-miss: true
+      - name: Verify permit and emit bound dispatch marker
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/permit.py verify-claim \
+            --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json"
+          printf 'KD-DEVLANE-DISPATCH schema=1 wave-id=%s bundle-id=%s control-sha=%s run-id=%s run-attempt=1\n' \
+            "$DEVLANE_WAVE_ID" "$DEVLANE_BUNDLE_ID" "$CI_SHA" "$CI_RUN_ID"
+      - name: Install Tauri Linux build dependencies
+        if: inputs.profile == 'desktop'
+        run: |
+          set -euo pipefail
+          sudo apt-get update >/dev/null 2>&1
+          sudo apt-get install --no-install-recommends -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev >/dev/null 2>&1
+          printf 'tauri_linux_dependencies=installed\n'
+      - name: Fetch ciphertext and sanitized dependency projection
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- bash -euo pipefail -c '
+            python3 -B kit/devlane/fetch.py download --asset-id "$DEVLANE_BUNDLE_ASSET_ID" --size "$DEVLANE_BUNDLE_SIZE" --sha256 "$DEVLANE_BUNDLE_SHA256" --output "$RUN_ROOT/bundle.enc"
+            python3 -B kit/devlane/fetch.py download --maximum 16777216 --asset-id "$DEVLANE_PROJECTION_ASSET_ID" --size "$DEVLANE_PROJECTION_SIZE" --sha256 "$DEVLANE_PROJECTION_SHA256" --output "$RUN_ROOT/projection.json"
+            python3 -B kit/devlane/fetch.py check-projection --file "$RUN_ROOT/projection.json" \
+              --profile "$DEVLANE_PROFILE" --control-sha "$CI_SHA"
+          '
+          mkdir -m 700 "$RUN_ROOT/workspace"
+      - name: Install pinned Rust toolchain
+        if: ${{ inputs.profile == 'core-rust' || inputs.profile == 'desktop' || inputs.profile == 'local-sync-rust' }}
+        run: |
+          set -euo pipefail
+          rust_version="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tools"]["cargo"])' "$RUN_ROOT/projection.json")"
+          [[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            rustup toolchain install "$rust_version" --profile minimal --component rustfmt >/dev/null 2>&1
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            rustup default "$rust_version" >/dev/null 2>&1
+          if [[ "$DEVLANE_PROFILE" == "core-rust" || "$DEVLANE_PROFILE" == "local-sync-rust" ]]; then
+            python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              python3 -B kit/devlane/rust_tooling.py fetch --output "$RUN_ROOT/rust-tooling" \
+                --deadline-file "$RUN_ROOT/deadline.json"
+          else
+            printf 'rust_toolchain=prepared\n'
+          fi
+      - name: Prepare dependencies before the cut
+        run: |
+          set -euo pipefail
+          for tool in unshare mount umount setpriv chroot ip nft shred; do command -v "$tool" >/dev/null 2>&1; done
+          owner_uid="$EUID"
+          owner_gid="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- id -g)"
+          node_snapshot_id=""
+          node_source_id=""
+          cargo_path=""
+          rustc_path=""
+          if [[ "$DEVLANE_PROFILE" == "core-node" ]]; then
+            node_snapshot_id="$(printf 'devlane-%s-%s' "$CI_RUN_ID" "$CI_RUN_ATTEMPT")"
+          fi
+          if [[ "$DEVLANE_PROFILE" == "desktop" ]]; then
+            node_source_id="$(printf 'devlane-%s-%s' "$CI_RUN_ID" "$CI_RUN_ATTEMPT")"
+          fi
+          if [[ "$DEVLANE_PROFILE" == "core-rust" || "$DEVLANE_PROFILE" == "desktop" || "$DEVLANE_PROFILE" == "local-sync-rust" ]]; then
+            rust_version="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tools"]["cargo"])' "$RUN_ROOT/projection.json")"
+            [[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            cargo_path="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              rustup which --toolchain "$rust_version" cargo)"
+            rustc_path="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              rustup which --toolchain "$rust_version" rustc)"
+          fi
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            sudo -n unshare --mount --pid --ipc --fork --mount-proc --kill-child -- \
+            python3 -B kit/devlane/prepare.py \
+              --projection "$RUN_ROOT/projection.json" --output "$RUN_ROOT/prepared" \
+              --profile "$DEVLANE_PROFILE" --control-sha "$CI_SHA" \
+              --owner-uid "$owner_uid" --owner-gid "$owner_gid" \
+              --cargo-path "$cargo_path" --rustc-path "$rustc_path" \
+              --node-snapshot-id "$node_snapshot_id" \
+              --node-source-id "$node_source_id" \
+              --deadline-file "$RUN_ROOT/deadline.json"
+          if [[ "$DEVLANE_PROFILE" == "core-rust" || "$DEVLANE_PROFILE" == "local-sync-rust" ]]; then
+            python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              python3 -B kit/devlane/rust_tooling.py install --source "$RUN_ROOT/rust-tooling" --prepared "$RUN_ROOT/prepared" \
+                --deadline-file "$RUN_ROOT/deadline.json"
+          fi
+      - name: Prove public connectivity before the cut
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            python3 -B kit/devlane/network_probe.py positive-control --output "$RUN_ROOT/positive-control.json"
+      - name: Cut network and start the isolated supervisor
+        run: |
+          set -euo pipefail
+          ulimit -S -c 0
+          ulimit -H -c 0
+          node_snapshot_id=""
+          node_vendor_id=""
+          cargo_path=""
+          rustc_path=""
+          if [[ "$DEVLANE_PROFILE" == "core-node" ]]; then
+            node_snapshot_id="$(printf 'devlane-%s-%s' "$CI_RUN_ID" "$CI_RUN_ATTEMPT")"
+          fi
+          if [[ "$DEVLANE_PROFILE" == "desktop" ]]; then
+            node_vendor_id="$(printf 'devlane-%s-%s' "$CI_RUN_ID" "$CI_RUN_ATTEMPT")"
+          fi
+          if [[ "$DEVLANE_PROFILE" == "core-rust" || "$DEVLANE_PROFILE" == "desktop" || "$DEVLANE_PROFILE" == "local-sync-rust" ]]; then
+            rust_version="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tools"]["cargo"])' "$RUN_ROOT/projection.json")"
+            [[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            cargo_path="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              rustup which --toolchain "$rust_version" cargo)"
+            rustc_path="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+              rustup which --toolchain "$rust_version" rustc)"
+          fi
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            python3 -B kit/devlane/supervisor.py start \
+              --state-dir "$RUN_ROOT/state" --context "$RUN_ROOT/context.json" \
+              --workspace "$GITHUB_WORKSPACE" --prepared "$RUN_ROOT/prepared" \
+              --bundle "$RUN_ROOT/bundle.enc" --projection "$RUN_ROOT/projection.json" \
+              --deadline-file "$RUN_ROOT/deadline.json" \
+              --positive-control "$RUN_ROOT/positive-control.json" \
+              --node-snapshot-id "$node_snapshot_id" --node-vendor-id "$node_vendor_id" \
+              --cargo-path "$cargo_path" --rustc-path "$rustc_path"
+      - name: Probe isolation before decryption
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            python3 -B kit/devlane/supervisor.py probe --state-dir "$RUN_ROOT/state"
+      - name: Decrypt authenticated bundle
+        env:
+          DEVLANE_DECRYPT_KEY: ${{ secrets.DEVLANE_DECRYPT_KEY }}
+        run: |
+          set -euo pipefail
+          ulimit -S -c 0
+          ulimit -H -c 0
+          set +x
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            python3 -B kit/devlane/supervisor.py decrypt --state-dir "$RUN_ROOT/state"
+      - name: Execute offline profile and filter public summary
+        id: execute
+        run: |
+          set -euo pipefail
+          ulimit -S -c 0
+          ulimit -H -c 0
+          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            python3 -B kit/devlane/supervisor.py execute --state-dir "$RUN_ROOT/state" --context "$RUN_ROOT/context.json"
+      - name: Shred runner-local workspace
+        id: cleanup
+        if: ${{ always() }}
+        timeout-minutes: 15
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -euo pipefail
+          node_snapshot_id=""
+          node_vendor_id=""
+          if [[ "$DEVLANE_PROFILE" == "core-node" ]]; then
+            node_snapshot_id="$(printf 'devlane-%s-%s' "$CI_RUN_ID" "$CI_RUN_ATTEMPT")"
+          fi
+          if [[ "$DEVLANE_PROFILE" == "desktop" ]]; then
+            node_vendor_id="$(printf 'devlane-%s-%s' "$CI_RUN_ID" "$CI_RUN_ATTEMPT")"
+          fi
+          python3 -B kit/devlane/host_cleanup.py --root "$RUN_ROOT" --runner-temp "$RUNNER_TEMP" \
+            --deadline-file "$RUN_ROOT/deadline.json" \
+            --node-snapshot-id "$node_snapshot_id" --node-vendor-id "$node_vendor_id"
+          printf 'devlane_job=completed public_output=filtered cleanup=confirmed\n'
+  devlane-encrypted-run-macos:
+    name: devlane-encrypted-run-macos
+    if: ${{ inputs.platform == 'macos' }}
+    runs-on: macos-15
+    timeout-minutes: 180
+    environment: devlane-decrypt
+    permissions: {}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REPOSITORY_ID: ${{ github.repository_id }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      CI_RUN_ID: ${{ github.run_id }}
+      CI_RUN_ATTEMPT: ${{ github.run_attempt }}
+      CI_WORKSPACE: ${{ github.workspace }}
+      CI_CONTROL_RUN_ID: ${{ inputs.control_run_id }}
+      DEVLANE_PROFILE: ${{ inputs.profile }}
+      DEVLANE_PLATFORM: macos
       DEVLANE_WAVE_ID: ${{ inputs.wave_id }}
       DEVLANE_BUNDLE_ID: ${{ inputs.bundle_id }}
       DEVLANE_BUNDLE_ASSET_ID: ${{ inputs.bundle_asset_id }}
@@ -232,12 +690,12 @@ jobs:
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          if [[ "$DEVLANE_RUNNER" == "macos-15" ]]; then
-            mkdir -m 700 -p "$RUN_ROOT/state"
+          if [[ "$DEVLANE_PLATFORM" == "macos" ]]; then
+            mkdir -m 700 "$RUN_ROOT/state"
             python3 -B kit/devlane/sandbox_macos.py preflight \
               --state-dir "$RUN_ROOT/state" --workspace "$GITHUB_WORKSPACE" \
               --profile "$DEVLANE_PROFILE" --run-id "$CI_RUN_ID" --control-sha "$CI_SHA"
-          elif [[ "$DEVLANE_RUNNER" == "ubuntu-24.04" ]]; then
+          elif [[ "$DEVLANE_PLATFORM" == "linux" ]]; then
           refuse() {
             printf 'devlane_host_preflight=refused code=%s\n' "$1" >&2
             exit 1
@@ -304,14 +762,15 @@ jobs:
         timeout-minutes: 1
         uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
         with:
-          path: ${{ runner.temp }}/devlane-control-evidence/permit.json
+          path: devlane-control-evidence/permit.json
           key: devlane-control-v1-${{ inputs.control_run_id }}
+          enableCrossOsArchive: true
           fail-on-cache-miss: true
       - name: Verify exact source-free control evidence
         run: |
           set -euo pipefail
           python3 -B kit/devlane/permit.py verify-control \
-            --file "$RUNNER_TEMP/devlane-control-evidence/permit.json" --control-sha "$CI_SHA" --run-id "$CI_CONTROL_RUN_ID"
+            --file "$GITHUB_WORKSPACE/devlane-control-evidence/permit.json" --control-sha "$CI_SHA" --run-id "$CI_CONTROL_RUN_ID"
       - name: Reserve work time for initial permit cache restore
         timeout-minutes: 1
         run: |
@@ -327,7 +786,9 @@ jobs:
       - name: Claim this bundle for one run before decryption
         run: |
           set -euo pipefail
-          mkdir -m 700 -p "$RUNNER_TEMP/devlane-bundle-permit"
+          umask 077
+          mkdir -p "$RUNNER_TEMP/devlane-bundle-permit"
+          chmod 700 "$RUNNER_TEMP/devlane-bundle-permit"
           python3 -B kit/devlane/permit.py claim --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json"
       - name: Reserve work time for permit cache save
         timeout-minutes: 1
@@ -367,7 +828,7 @@ jobs:
           printf 'KD-DEVLANE-DISPATCH schema=1 wave-id=%s bundle-id=%s control-sha=%s run-id=%s run-attempt=1\n' \
             "$DEVLANE_WAVE_ID" "$DEVLANE_BUNDLE_ID" "$CI_SHA" "$CI_RUN_ID"
       - name: Install Tauri Linux build dependencies
-        if: inputs.profile == 'desktop'
+        if: ${{ inputs.profile == 'desktop' && inputs.platform == 'linux' }}
         run: |
           set -euo pipefail
           sudo apt-get update >/dev/null 2>&1
@@ -412,14 +873,14 @@ jobs:
       - name: Prepare dependencies before the cut
         run: |
           set -euo pipefail
-          if [[ "$DEVLANE_RUNNER" == "macos-15" ]]; then
+          if [[ "$DEVLANE_PLATFORM" == "macos" ]]; then
             python_bin="$(python3 -B -c 'import sys; print(sys.executable)')"
             python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
               sudo -n "$python_bin" -B kit/devlane/sandbox_macos.py prepare \
                 --state-dir "$RUN_ROOT/state" --projection "$RUN_ROOT/projection.json" \
                 --output "$RUN_ROOT/prepared" --profile "$DEVLANE_PROFILE" \
                 --control-sha "$CI_SHA" --deadline-file "$RUN_ROOT/deadline.json"
-          elif [[ "$DEVLANE_RUNNER" == "ubuntu-24.04" ]]; then
+          elif [[ "$DEVLANE_PLATFORM" == "linux" ]]; then
           for tool in unshare mount umount setpriv chroot ip nft shred; do command -v "$tool" >/dev/null 2>&1; done
           owner_uid="$EUID"
           owner_gid="$(python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- id -g)"
@@ -471,7 +932,7 @@ jobs:
           set -euo pipefail
           ulimit -S -c 0
           ulimit -H -c 0
-          if [[ "$DEVLANE_RUNNER" == "macos-15" ]]; then
+          if [[ "$DEVLANE_PLATFORM" == "macos" ]]; then
             python_bin="$(python3 -B -c 'import sys; print(sys.executable)')"
             python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
               sudo -n "$python_bin" -B kit/devlane/sandbox_macos.py start \
@@ -480,7 +941,7 @@ jobs:
                 --bundle "$RUN_ROOT/bundle.enc" --projection "$RUN_ROOT/projection.json" \
                 --deadline-file "$RUN_ROOT/deadline.json" --positive-control "$RUN_ROOT/positive-control.json" \
                 --run-id "$CI_RUN_ID"
-          elif [[ "$DEVLANE_RUNNER" == "ubuntu-24.04" ]]; then
+          elif [[ "$DEVLANE_PLATFORM" == "linux" ]]; then
           node_snapshot_id=""
           node_vendor_id=""
           cargo_path=""
@@ -516,11 +977,11 @@ jobs:
       - name: Probe isolation before decryption
         run: |
           set -euo pipefail
-          if [[ "$DEVLANE_RUNNER" == "macos-15" ]]; then
+          if [[ "$DEVLANE_PLATFORM" == "macos" ]]; then
             python_bin="$(python3 -B -c 'import sys; print(sys.executable)')"
             python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
               sudo -n "$python_bin" -B kit/devlane/sandbox_macos.py probe --state-dir "$RUN_ROOT/state"
-          elif [[ "$DEVLANE_RUNNER" == "ubuntu-24.04" ]]; then
+          elif [[ "$DEVLANE_PLATFORM" == "linux" ]]; then
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             python3 -B kit/devlane/supervisor.py probe --state-dir "$RUN_ROOT/state"
           else
@@ -535,14 +996,14 @@ jobs:
           ulimit -S -c 0
           ulimit -H -c 0
           set +x
-          if [[ "$DEVLANE_RUNNER" == "macos-15" ]]; then
+          if [[ "$DEVLANE_PLATFORM" == "macos" ]]; then
             python_bin="$(python3 -B -c 'import sys; print(sys.executable)')"
             python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
               sudo -n --preserve-env=DEVLANE_DECRYPT_KEY "$python_bin" -B kit/devlane/sandbox_macos.py decrypt \
                 --state-dir "$RUN_ROOT/state" --context "$RUN_ROOT/context.json" \
                 --bundle "$RUN_ROOT/bundle.enc" --projection "$RUN_ROOT/projection.json" \
                 --deadline-file "$RUN_ROOT/deadline.json"
-          elif [[ "$DEVLANE_RUNNER" == "ubuntu-24.04" ]]; then
+          elif [[ "$DEVLANE_PLATFORM" == "linux" ]]; then
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             python3 -B kit/devlane/supervisor.py decrypt --state-dir "$RUN_ROOT/state"
           else
@@ -555,13 +1016,13 @@ jobs:
           set -euo pipefail
           ulimit -S -c 0
           ulimit -H -c 0
-          if [[ "$DEVLANE_RUNNER" == "macos-15" ]]; then
+          if [[ "$DEVLANE_PLATFORM" == "macos" ]]; then
             python_bin="$(python3 -B -c 'import sys; print(sys.executable)')"
             python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
               sudo -n "$python_bin" -B kit/devlane/sandbox_macos.py execute \
                 --state-dir "$RUN_ROOT/state" --context "$RUN_ROOT/context.json" \
                 --deadline-file "$RUN_ROOT/deadline.json"
-          elif [[ "$DEVLANE_RUNNER" == "ubuntu-24.04" ]]; then
+          elif [[ "$DEVLANE_PLATFORM" == "linux" ]]; then
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             python3 -B kit/devlane/supervisor.py execute --state-dir "$RUN_ROOT/state" --context "$RUN_ROOT/context.json"
           else
@@ -576,12 +1037,12 @@ jobs:
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
           set -euo pipefail
-          if [[ "$DEVLANE_RUNNER" == "macos-15" ]]; then
+          if [[ "$DEVLANE_PLATFORM" == "macos" ]]; then
             python_bin="$(python3 -B -c 'import sys; print(sys.executable)')"
             sudo -n "$python_bin" -B kit/devlane/sandbox_macos.py cleanup \
               --state-dir "$RUN_ROOT/state" --root "$RUN_ROOT" --runner-temp "$RUNNER_TEMP" \
               --workspace "$GITHUB_WORKSPACE" --run-id "$CI_RUN_ID"
-          elif [[ "$DEVLANE_RUNNER" == "ubuntu-24.04" ]]; then
+          elif [[ "$DEVLANE_PLATFORM" == "linux" ]]; then
           node_snapshot_id=""
           node_vendor_id=""
           if [[ "$DEVLANE_PROFILE" == "core-node" ]]; then
@@ -598,10 +1059,235 @@ jobs:
             exit 1
           fi
           printf 'devlane_job=completed public_output=filtered cleanup=confirmed\n'
+  devlane-encrypted-run-windows:
+    name: devlane-encrypted-run-windows
+    if: ${{ inputs.platform == 'windows' }}
+    runs-on: windows-2025
+    timeout-minutes: 180
+    environment: devlane-decrypt
+    permissions: {}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REPOSITORY_ID: ${{ github.repository_id }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      CI_RUN_ID: ${{ github.run_id }}
+      CI_RUN_ATTEMPT: ${{ github.run_attempt }}
+      CI_WORKSPACE: ${{ github.workspace }}
+      CI_CONTROL_RUN_ID: ${{ inputs.control_run_id }}
+      DEVLANE_PROFILE: ${{ inputs.profile }}
+      DEVLANE_PLATFORM: windows
+      DEVLANE_WAVE_ID: ${{ inputs.wave_id }}
+      DEVLANE_BUNDLE_ID: ${{ inputs.bundle_id }}
+      DEVLANE_BUNDLE_ASSET_ID: ${{ inputs.bundle_asset_id }}
+      DEVLANE_BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
+      DEVLANE_BUNDLE_SIZE: ${{ inputs.bundle_size }}
+      DEVLANE_PROJECTION_ASSET_ID: ${{ inputs.projection_asset_id }}
+      DEVLANE_PROJECTION_SHA256: ${{ inputs.projection_sha256 }}
+      DEVLANE_PROJECTION_SIZE: ${{ inputs.projection_size }}
+      DEVLANE_EXPIRES: ${{ inputs.expires }}
+      DEVLANE_CACHE_BASELINE_SHA256: ${{ inputs.cache_baseline_sha256 }}
+    steps:
+      - name: Fetch public control and validate dispatch
+        timeout-minutes: 180
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runRoot = Join-Path $env:RUNNER_TEMP ('devlane-' + $env:CI_RUN_ID)
+          if (Test-Path -LiteralPath $runRoot) { exit 1 }
+          New-Item -ItemType Directory -Path $runRoot | Out-Null
+          $env:RUN_ROOT = $runRoot
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value ('RUN_ROOT=' + $runRoot) -Encoding utf8
+          $started = Join-Path $runRoot 'deadline-start'
+          if ($env:CI_REPOSITORY -ne 'keeldock-platform/platform-ci' -or $env:CI_REPOSITORY_ID -ne '1430960557'
+              -or $env:CI_SERVER_URL -ne 'https://github.com' -or $env:CI_EVENT_NAME -ne 'workflow_dispatch'
+              -or $env:CI_REF -ne 'refs/heads/main' -or $env:DEVLANE_PLATFORM -ne 'windows'
+              -or $env:DEVLANE_PROFILE -ne 'core-node' -or $env:CI_RUN_ATTEMPT -ne '1'
+              -or $env:CI_SHA -notmatch '^[a-f0-9]{40}$') { exit 1 }
+          python -B -c 'import os,sys,time; fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600); f=os.fdopen(fd,"w",encoding="ascii"); f.write("%.17g\n" % time.monotonic()); f.flush(); os.fsync(f.fileno()); f.close()' $started
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          git -C $env:CI_WORKSPACE init -q 2>$null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          git -C $env:CI_WORKSPACE config core.autocrlf false 2>$null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          git -C $env:CI_WORKSPACE remote add origin "$($env:CI_SERVER_URL)/$($env:CI_REPOSITORY).git" 2>$null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          git -C $env:CI_WORKSPACE fetch --quiet --no-tags --depth=1 origin $env:CI_SHA 2>$null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          git -C $env:CI_WORKSPACE checkout --quiet --detach FETCH_HEAD 2>$null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $actualSha = git -C $env:CI_WORKSPACE rev-parse --verify HEAD 2>$null
+          if ($LASTEXITCODE -ne 0 -or $actualSha.Trim() -ne $env:CI_SHA) { exit 1 }
+          python -B kit/devlane/deadline.py create --file (Join-Path $runRoot 'deadline.json') --budget-seconds 8700 --cleanup-reserve-seconds 2100 --job-seconds 10800 --started-at-file $started
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python -B -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; import cryptography; assert AESGCM is not None and cryptography.__version__'
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python -B kit/devlane/fetch.py context --output (Join-Path $runRoot 'context.json')
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Prepare hosted Windows isolation state
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 1 }
+          New-Item -Path 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting' -Force | Out-Null; New-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting' -Name Disabled -Value 1 -PropertyType DWord -Force | Out-Null
+          if (-not (Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))) { exit 1 }
+          $sandboxRoot = Join-Path $env:CI_WORKSPACE 'kit\devlane'
+          $tokens = $null
+          $parseErrors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $sandboxRoot 'sandbox_windows.ps1'), [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count -ne 0) { exit 1 }
+          $null = Add-Type -Path (Join-Path $sandboxRoot 'sandbox_windows_native.cs')
+          Write-Output 'windows_runner=hosted-admin verified=windows-2025'
+      - name: Set up pinned Windows Node runtime
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: "24.22.1"
+          check-latest: false
+          package-manager-cache: false
+      - name: Reserve work time for control evidence cache restore
+        timeout-minutes: 1
+        run: |
+          python -B kit/devlane/deadline.py guard-action --file (Join-Path $env:RUN_ROOT 'deadline.json') --step-timeout-seconds 60 --margin-seconds 60
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Restore exact source-free control evidence
+        timeout-minutes: 1
+        uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: devlane-control-evidence/permit.json
+          key: devlane-control-v1-${{ inputs.control_run_id }}
+          enableCrossOsArchive: true
+          fail-on-cache-miss: true
+      - name: Verify exact source-free control evidence
+        run: |
+          python -B kit/devlane/permit.py verify-control --file (Join-Path $env:CI_WORKSPACE 'devlane-control-evidence\permit.json') --control-sha $env:CI_SHA --run-id $env:CI_CONTROL_RUN_ID
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Reserve work time for initial permit cache restore
+        timeout-minutes: 1
+        run: |
+          python -B kit/devlane/deadline.py guard-action --file (Join-Path $env:RUN_ROOT 'deadline.json') --step-timeout-seconds 60 --margin-seconds 60
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Restore one-run bundle permit
+        timeout-minutes: 1
+        uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          key: devlane-permit-v1-${{ inputs.bundle_id }}
+      - name: Claim this bundle for one run before decryption
+        run: |
+          $permitRoot = Join-Path $env:RUNNER_TEMP 'devlane-bundle-permit'
+          New-Item -ItemType Directory -Force -Path $permitRoot | Out-Null
+          python -B kit/devlane/permit.py claim --file (Join-Path $permitRoot 'permit.json')
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Reserve work time for permit cache save
+        timeout-minutes: 1
+        run: |
+          python -B kit/devlane/deadline.py guard-action --file (Join-Path $env:RUN_ROOT 'deadline.json') --step-timeout-seconds 60 --margin-seconds 60
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Save one-run bundle permit
+        timeout-minutes: 1
+        uses: actions/cache/save@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          key: devlane-permit-v1-${{ inputs.bundle_id }}
+      - name: Discard local permit copy before persisted verification
+        run: |
+          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'devlane-bundle-permit') -Recurse -Force -ErrorAction SilentlyContinue
+          if (Test-Path -LiteralPath (Join-Path $env:RUNNER_TEMP 'devlane-bundle-permit')) { exit 1 }
+      - name: Reserve work time for persisted permit cache restore
+        timeout-minutes: 1
+        run: |
+          python -B kit/devlane/deadline.py guard-action --file (Join-Path $env:RUN_ROOT 'deadline.json') --step-timeout-seconds 60 --margin-seconds 60
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Restore and verify persisted one-run permit
+        timeout-minutes: 1
+        uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          key: devlane-permit-v1-${{ inputs.bundle_id }}
+          fail-on-cache-miss: true
+      - name: Verify permit and emit bound dispatch marker
+        run: |
+          python -B kit/devlane/permit.py verify-claim --file (Join-Path $env:RUNNER_TEMP 'devlane-bundle-permit\permit.json')
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Write-Output ('KD-DEVLANE-DISPATCH schema=1 wave-id=' + $env:DEVLANE_WAVE_ID + ' bundle-id=' + $env:DEVLANE_BUNDLE_ID + ' control-sha=' + $env:CI_SHA + ' run-id=' + $env:CI_RUN_ID + ' run-attempt=1')
+      - name: Fetch ciphertext and sanitized dependency projection
+        run: |
+          python -B kit/devlane/fetch.py download --asset-id $env:DEVLANE_BUNDLE_ASSET_ID --size $env:DEVLANE_BUNDLE_SIZE --sha256 $env:DEVLANE_BUNDLE_SHA256 --output (Join-Path $env:RUN_ROOT 'bundle.enc')
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python -B kit/devlane/fetch.py download --maximum 16777216 --asset-id $env:DEVLANE_PROJECTION_ASSET_ID --size $env:DEVLANE_PROJECTION_SIZE --sha256 $env:DEVLANE_PROJECTION_SHA256 --output (Join-Path $env:RUN_ROOT 'projection.json')
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python -B kit/devlane/fetch.py check-projection --file (Join-Path $env:RUN_ROOT 'projection.json') --profile $env:DEVLANE_PROFILE --control-sha $env:CI_SHA
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          New-Item -ItemType Directory -Path (Join-Path $env:RUN_ROOT 'workspace\source') -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $env:RUN_ROOT 'state') -Force | Out-Null
+      - name: Install pinned Rust toolchain
+        if: ${{ inputs.profile == 'core-rust' && inputs.platform == 'linux' }}
+        run: |
+          exit 1
+      - name: Prepare dependencies before the cut
+        timeout-minutes: 90
+        run: |
+          python -B kit/devlane/sandbox_windows.py prepare --projection (Join-Path $env:RUN_ROOT 'projection.json') --output (Join-Path $env:RUN_ROOT 'prepared-root') --deadline (Join-Path $env:RUN_ROOT 'deadline.json') --state (Join-Path $env:RUN_ROOT 'state\preparation.json')
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Prove public connectivity before the cut
+        timeout-minutes: 1
+        run: |
+          python -B kit/devlane/sandbox_windows.py positive-control
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Cut network and start the isolated supervisor
+        timeout-minutes: 3
+        run: |
+          $state = Join-Path $env:RUN_ROOT 'state\sandbox.json'
+          python -B kit/devlane/sandbox_windows.py create-profile --state $state
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python -B kit/devlane/sandbox_windows.py firewall-install --state $state
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Write-Output 'windows_network_cut=installed'
+      - name: Probe isolation before decryption
+        timeout-minutes: 1
+        run: |
+          $toolchain = Get-Content -LiteralPath (Join-Path $env:RUN_ROOT 'prepared-root\prepared\toolchain.json') -Raw | ConvertFrom-Json
+          python -B kit/devlane/sandbox_windows.py probe --state (Join-Path $env:RUN_ROOT 'state\sandbox.json') --run-root $env:RUN_ROOT --node $toolchain.node --scratch (Join-Path $env:RUN_ROOT 'scratch')
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Decrypt authenticated bundle
+        env:
+          DEVLANE_DECRYPT_KEY: ${{ secrets.DEVLANE_DECRYPT_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -B kit/devlane/sandbox_windows.py decrypt --context (Join-Path $env:RUN_ROOT 'context.json') --bundle (Join-Path $env:RUN_ROOT 'bundle.enc') --source (Join-Path $env:RUN_ROOT 'workspace\source') --manifest (Join-Path $env:RUN_ROOT 'state\manifest.json')
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Execute offline profile and filter public summary
+        id: execute
+        timeout-minutes: 120
+        run: |
+          $toolchain = Get-Content -LiteralPath (Join-Path $env:RUN_ROOT 'prepared-root\prepared\toolchain.json') -Raw | ConvertFrom-Json
+          python -B kit/devlane/sandbox_windows.py execute --context (Join-Path $env:RUN_ROOT 'context.json') --manifest (Join-Path $env:RUN_ROOT 'state\manifest.json') --source (Join-Path $env:RUN_ROOT 'workspace\source') --prepared (Join-Path $env:RUN_ROOT 'prepared-root\prepared') --scratch (Join-Path $env:RUN_ROOT 'scratch') --run-root $env:RUN_ROOT --state (Join-Path $env:RUN_ROOT 'state\sandbox.json') --deadline (Join-Path $env:RUN_ROOT 'deadline.json')
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Shred runner-local workspace
+        id: cleanup
+        if: ${{ always() }}
+        timeout-minutes: 15
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $runRoot = $env:RUN_ROOT
+          if ([string]::IsNullOrWhiteSpace($runRoot) -or -not (Test-Path -LiteralPath $runRoot)) {
+            Write-Output 'cleanup_receipt=confirmed'
+            Write-Output 'devlane_job=completed public_output=filtered cleanup=confirmed'
+            exit 0
+          }
+          python -B kit/devlane/sandbox_windows.py shred --state (Join-Path $runRoot 'state\sandbox.json') --root $runRoot --workspace (Join-Path $runRoot 'workspace\source')
+          if ($LASTEXITCODE -ne 0) { exit 1 }
   devlane-encrypted-audit:
     name: devlane-encrypted-audit
     if: ${{ always() }}
-    needs: devlane-encrypted-run
+    needs: [devlane-encrypted-run, devlane-encrypted-run-macos, devlane-encrypted-run-windows]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -615,7 +1301,7 @@ jobs:
       CI_SERVER_URL: ${{ github.server_url }}
       CI_EVENT_NAME: ${{ github.event_name }}
       DEVLANE_PROFILE: ${{ inputs.profile }}
-      DEVLANE_RUNNER: ${{ inputs.runner }}
+      DEVLANE_PLATFORM: ${{ inputs.platform }}
       CI_CONTROL_RUN_ID: ${{ inputs.control_run_id }}
       DEVLANE_WAVE_ID: ${{ inputs.wave_id }}
       DEVLANE_BUNDLE_ID: ${{ inputs.bundle_id }}
@@ -741,7 +1427,7 @@ jobs:
               "--started-at-file", start_file,
           ])
           PY
-      - name: Audit exact two-job graph and public surfaces
+      - name: Audit exact four-job graph and public surfaces
         id: audit
         timeout-minutes: 8
         env:

@@ -13,7 +13,7 @@ import bundle
 
 CONTROL_FIELDS = {"schema", "kind", "control_ref", "control_sha", "control_run_id", "run_attempt", "status"}
 CLAIM_FIELDS = {
-    "schema", "kind", "control_sha", "control_run_id", "profile", "wave_id", "bundle_id",
+    "schema", "kind", "control_sha", "control_run_id", "platform", "profile", "wave_id", "bundle_id",
     "run_id", "run_attempt", "expires", "status",
 }
 DECIMAL = re.compile(r"[1-9][0-9]{0,18}\Z")
@@ -81,13 +81,15 @@ def _valid_control(record):
 
 
 def _identity(env):
-    required = ("CI_SHA", "CI_CONTROL_RUN_ID", "DEVLANE_PROFILE", "DEVLANE_WAVE_ID",
+    required = ("CI_SHA", "CI_CONTROL_RUN_ID", "DEVLANE_PLATFORM", "DEVLANE_PROFILE", "DEVLANE_WAVE_ID",
                 "DEVLANE_BUNDLE_ID", "CI_RUN_ID", "CI_RUN_ATTEMPT", "DEVLANE_EXPIRES")
     if any(type(env.get(name)) is not str or not env[name] for name in required):
         _refuse("permit-identity-invalid")
     if (not re.fullmatch(r"[a-f0-9]{40}", env["CI_SHA"])
             or not DECIMAL.fullmatch(env["CI_CONTROL_RUN_ID"])
+            or env["DEVLANE_PLATFORM"] not in ("linux", "macos", "windows")
             or env["DEVLANE_PROFILE"] not in bundle.ENCRYPTED_PROFILES
+            or (env["DEVLANE_PLATFORM"] != "linux" and env["DEVLANE_PROFILE"] != "core-node")
             or not bundle.OPAQUE_ID.fullmatch(env["DEVLANE_WAVE_ID"])
             or not bundle.OPAQUE_ID.fullmatch(env["DEVLANE_BUNDLE_ID"])
             or not DECIMAL.fullmatch(env["CI_RUN_ID"]) or env["CI_RUN_ATTEMPT"] != "1"
@@ -99,6 +101,7 @@ def _identity(env):
         _refuse("permit-expiry-invalid")
     return {
         "control_sha": env["CI_SHA"], "control_run_id": env["CI_CONTROL_RUN_ID"],
+        "platform": env["DEVLANE_PLATFORM"],
         "profile": env["DEVLANE_PROFILE"], "wave_id": env["DEVLANE_WAVE_ID"],
         "bundle_id": env["DEVLANE_BUNDLE_ID"], "run_id": env["CI_RUN_ID"],
         "run_attempt": 1, "expires": expires,

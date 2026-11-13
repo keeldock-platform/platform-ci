@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 import sandbox_macos as sandbox
+import public_audit
 
 NODE = shutil.which("node")
 if NODE:
@@ -227,11 +228,11 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         self.assertEqual(sandbox._filter_summary([], allowlists), b"")
 
     def test_encrypted_workflow_leaves_workspace_creation_to_root_supervisor(self):
-        workflow = (sandbox.CONTROL_ROOT / ".github/workflows/devlane-encrypted.yml").read_text(encoding="utf-8")
-        download = workflow.split("- name: Fetch ciphertext and sanitized dependency projection", 1)[1].split(
-            "- name: Install pinned Rust toolchain", 1,
-        )[0]
-        self.assertNotIn('mkdir -m 700 "$RUN_ROOT/workspace"', download)
+        jobs = public_audit.parse_workflow(sandbox.CONTROL_ROOT / ".github/workflows/devlane-encrypted.yml")
+        macos_job = jobs[public_audit.MACOS_RUN_JOB]
+        download = next(step for step in macos_job["steps"]
+                        if step["name"] == "Fetch ciphertext and sanitized dependency projection")
+        self.assertNotIn('mkdir -m 700 "$RUN_ROOT/workspace"', "\n".join(download["run"]))
         self.assertIn('(root / "workspace").mkdir(mode=0o700)',
                       (sandbox.CONTROL_ROOT / "kit/devlane/sandbox_macos.py").read_text(encoding="utf-8"))
 
