@@ -29,7 +29,7 @@ try {
     }
     $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
         if ($state.schema -ne 1 -or $state.profile_name -notmatch '^KDDevLane[a-f0-9]{32}$'
-        -or $state.package_sid -notmatch '^S-1-15-2-(?:[0-9]+-){7}[0-9]+$'
+        -or $state.package_sid -notmatch '^S-1-15-2-(?:[0-9]+-){6}[0-9]+$'
             -or $state.firewall_rule -ne ('KD-DevLane-' + $env:CI_RUN_ID)
             -or $null -eq $state.acl_grants) { throw }
     if ($Mode -eq 'firewall-install') {
@@ -60,6 +60,11 @@ try {
             -or $request.executable -notmatch '^[A-Za-z]:\\[^\r\n]{1,240}\.exe$'
             -or $request.working_directory -notmatch '^[A-Za-z]:\\[^\r\n]{1,240}$'
             -or @($request.arguments).Count -gt 128 -or @($request.environment).Count -gt 128) { throw }
+        $internetClient = $false
+        if ($request.PSObject.Properties.Name -contains 'internet_client') {
+            if ($request.internet_client -isnot [bool]) { throw }
+            $internetClient = [bool]$request.internet_client
+        }
         $sid = [Security.Principal.SecurityIdentifier]::new([string]$state.package_sid)
         $grants = [Collections.Generic.List[object]]::new()
         foreach ($grant in @($state.acl_grants)) { $grants.Add($grant) }
@@ -121,7 +126,7 @@ try {
         $arguments = [string[]]@($request.arguments)
         $result = [KeelDock.Platform.DevLaneWindows.Boundary]::Run(
             [string]$state.profile_name, [string]$state.package_sid, [string]$request.executable,
-            $arguments, [string]$request.working_directory, $environment, [int]$request.timeout_milliseconds)
+            $arguments, [string]$request.working_directory, $environment, [int]$request.timeout_milliseconds, $internetClient)
         if (-not $result.Created -or -not $result.Exited -or $result.AppContainer -notlike 'lpac=verified*'
             -or $result.Job -notlike 'assigned kill_on_close=enabled breakaway=disabled*') { throw }
         $status = if ($result.TimedOut) { 'timeout' } elseif ($result.ExitCode -eq 0) { 'pass' } else { 'fail' }

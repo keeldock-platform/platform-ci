@@ -9,6 +9,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path, PureWindowsPath
 
@@ -19,7 +20,7 @@ import filter as output_filter
 
 WINDOWS_IMAGE = "windows-2025"
 PROFILE_PATTERN = re.compile(r"^KDDevLane[a-f0-9]{32}$")
-PACKAGE_SID_PATTERN = re.compile(r"^S-1-15-2-(?:[0-9]+-){7}[0-9]+$")
+PACKAGE_SID_PATTERN = re.compile(r"^S-1-15-2-(?:[0-9]+-){6}[0-9]+$")
 MAX_COMMANDS = 32
 MAX_COMMAND_ARGUMENTS = 128
 MAX_COMMAND_LINE = 30000
@@ -28,7 +29,8 @@ SAFE_ENVIRONMENT = frozenset((
     "PATH", "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOME", "CI",
     "SystemRoot", "WINDIR", "ComSpec",
     "NPM_CONFIG_CACHE", "NPM_CONFIG_IGNORE_SCRIPTS", "NPM_CONFIG_AUDIT", "NPM_CONFIG_FUND",
-    "NPM_CONFIG_OFFLINE", "PLAYWRIGHT_BROWSERS_PATH", "PLAYWRIGHT_JSON_OUTPUT_FILE",
+    "NPM_CONFIG_OFFLINE", "NPM_CONFIG_UPDATE_NOTIFIER", "NPM_CONFIG_USERCONFIG",
+    "PLAYWRIGHT_BROWSERS_PATH", "PLAYWRIGHT_JSON_OUTPUT_FILE",
     "NO_COLOR", "TERM", "PYTHONDONTWRITEBYTECODE",
 ))
 PROHIBITED_ENVIRONMENT = frozenset((
@@ -69,7 +71,7 @@ def validate_package_sid(value):
     return value
 
 
-def validate_environment(entries):
+def validate_environment(entries, *, allow_internet=False):
     if type(entries) is not list or len(entries) > 128:
         _refuse("child-environment")
     result = {}
@@ -82,7 +84,7 @@ def validate_environment(entries):
         result[name] = value
     if result.get("NPM_CONFIG_IGNORE_SCRIPTS") != "true":
         _refuse("lifecycle-scripts-enabled")
-    if result.get("NPM_CONFIG_OFFLINE") != "true":
+    if result.get("NPM_CONFIG_OFFLINE") != ("false" if allow_internet else "true"):
         _refuse("offline-mode-disabled")
     return tuple(name + "=" + result[name] for name in sorted(result, key=str.lower))
 
@@ -154,7 +156,8 @@ def _translate_embedded_path(value, source, scratch):
         if suffix and any(part in ("", ".", "..") for part in suffix.split("/")):
             _refuse("profile-command")
         mapped = str(PureWindowsPath(str(root)).joinpath(*suffix.split("/"))) if suffix else str(root)
-        translated = translated[:index] + mapped + translated[end + (1 if suffix else 0):]
+        consumed_end = end + (1 + len(suffix) if suffix else 0)
+        translated = translated[:index] + mapped + translated[consumed_end:]
     if "/workspace/" in translated or translated.startswith("/scratch/"):
         _refuse("profile-path-unmapped")
     return translated
@@ -285,19 +288,36 @@ def positive_connectivity(timeout=4):
     return "windows_public_connectivity=proved\n"
 
 
-def probe_script(result_path):
+def probe_script(result_path, *, listener_port, outside_canary, outside_write,
+                 other_drive_canary, other_drive_write, pipe_path):
     target = json.dumps(str(result_path))
+    outside_canary = json.dumps(str(outside_canary))
+    outside_write = json.dumps(str(outside_write))
+    other_drive_canary = json.dumps(str(other_drive_canary))
+    other_drive_write = json.dumps(str(other_drive_write))
+    pipe_path = json.dumps(str(pipe_path))
     return (
         "const net=require('net'),dns=require('dns'),fs=require('fs');"
-        "const attempt=(host,family)=>new Promise(resolve=>{const s=net.createConnection({host,port:443,family});"
+        "const attempt=(host,port,family)=>new Promise(resolve=>{const s=net.createConnection({host,port,family});"
         "const timer=setTimeout(()=>{s.destroy();resolve('blocked')},3000);"
         "s.once('connect',()=>{clearTimeout(timer);s.destroy();resolve('open')});"
         "s.once('error',()=>{clearTimeout(timer);resolve('blocked')})});"
-        "(async()=>{const outcomes=[];outcomes.push(await attempt('1.1.1.1',4));"
-        "outcomes.push(await attempt('2606:4700:4700::1111',6));"
-        "await new Promise(resolve=>dns.resolve4('example.com',error=>{outcomes.push(error?'dns-blocked':'dns-open');resolve()}));"
+        "const readProbe=path=>{try{fs.readFileSync(path);return 'open'}catch(_){return 'blocked'}};"
+        "const writeProbe=path=>{try{fs.writeFileSync(path,'unexpected');return 'open'}catch(_){return 'blocked'}};"
+        "const pipeProbe=path=>new Promise(resolve=>{const s=net.createConnection({path});"
+        "const timer=setTimeout(()=>{s.destroy();resolve('blocked')},3000);"
+        "s.once('connect',()=>{clearTimeout(timer);s.destroy();resolve('open')});"
+        "s.once('error',()=>{clearTimeout(timer);resolve('blocked')})});"
+        "(async()=>{const outcomes=[];outcomes.push(await attempt('1.1.1.1',443,4));"
+        "outcomes.push(await attempt('2606:4700:4700::1111',443,6));"
+        "outcomes.push(await attempt('127.0.0.1'," + str(listener_port) + ",4));"
+        "outcomes.push(await attempt('127.0.0.1',445,4));"
+        "outcomes.push(await pipeProbe(" + pipe_path + "));"
+        "await new Promise(resolve=>dns.resolve4('example.com',error=>{outcomes.push(error?'blocked':'open');resolve()}));"
+        "outcomes.push(readProbe(" + outside_canary + "));outcomes.push(writeProbe(" + outside_write + "));"
+        "outcomes.push(readProbe(" + other_drive_canary + "));outcomes.push(writeProbe(" + other_drive_write + "));"
         "fs.writeFileSync(" + target + ",outcomes.join(' '),'ascii');"
-        "process.exitCode=outcomes.join(' ')==='blocked blocked dns-blocked'?0:19})().catch(()=>{process.exitCode=20});"
+        "process.exitCode=outcomes.every(value=>value==='blocked')?0:19})().catch(()=>{process.exitCode=20});"
     )
 
 
@@ -428,7 +448,10 @@ def _native_run(state_path, request, run_root):
             or type(request.get("timeout_milliseconds")) is not int
             or not 1000 <= request["timeout_milliseconds"] <= MAX_CHILD_SECONDS * 1000):
         _refuse("native-request")
-    request["environment"] = list(validate_environment(request.get("environment")))
+    internet_client = request.get("internet_client", False)
+    if type(internet_client) is not bool:
+        _refuse("native-request")
+    request["environment"] = list(validate_environment(request.get("environment"), allow_internet=internet_client))
     request_path = Path(run_root) / "state" / ("windows-request-" + str(os.getpid()) + ".json")
     payload = bundle.canonical_json(request)
     if len(payload) > 64 * 1024:
@@ -462,23 +485,70 @@ def run_network_probe(state_path, run_root, *, node_path, scratch, environment):
     result_path = Path(scratch) / "network-probe.txt"
     if result_path.exists():
         _refuse("probe-output-exists")
-    source = probe_script(result_path)
-    request = {
-        "executable": str(node_path), "arguments": ["-e", source],
-        "working_directory": str(scratch), "environment": environment,
-        "access_root": str(Path(run_root)), "read_paths": [str(Path(node_path).parent),
-                                                           str(Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32")],
-        "write_paths": [str(scratch)], "timeout_milliseconds": 15000,
-    }
-    result = _native_run(state_path, request, run_root)
+    run_root = Path(run_root)
+    outside_root = run_root.parent
+    outside_canary = outside_root / ("outside-canary-" + os.urandom(8).hex())
+    outside_write = outside_root / ("outside-write-" + os.urandom(8).hex())
+    system_root = Path(os.environ.get("SystemRoot", "C:\\Windows"))
+    other_drive = system_root.drive if system_root.drive.lower() != run_root.drive.lower() else "D:"
+    if other_drive.lower() == run_root.drive.lower() or not Path(other_drive + "\\").is_dir():
+        _refuse("other-drive-unavailable")
+    other_temp = Path(other_drive + "\\Windows\\Temp")
+    other_drive_canary = other_temp / ("outside-canary-" + os.urandom(8).hex())
+    other_drive_write = other_temp / ("outside-write-" + os.urandom(8).hex())
+    created = []
     try:
+        outside_canary.write_text("host-canary", encoding="ascii")
+        created.append(outside_canary)
+        other_drive_canary.write_text("host-canary", encoding="ascii")
+        created.append(other_drive_canary)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            listener.settimeout(8)
+            listener_port = listener.getsockname()[1]
+
+            def accept_local():
+                try:
+                    connection, _address = listener.accept()
+                    connection.close()
+                except OSError:
+                    pass
+
+            accepted = threading.Thread(target=accept_local, name="devlane-loopback-probe", daemon=True)
+            accepted.start()
+            source = probe_script(
+                result_path, listener_port=listener_port, outside_canary=outside_canary,
+                outside_write=outside_write, other_drive_canary=other_drive_canary,
+                other_drive_write=other_drive_write, pipe_path=r"\\.\pipe\spoolss",
+            )
+            request = {
+                "executable": str(node_path), "arguments": ["-e", source],
+                "working_directory": str(scratch), "environment": environment,
+                "access_root": str(run_root), "read_paths": [str(Path(node_path).parent), str(system_root / "System32")],
+                "write_paths": [str(scratch)], "timeout_milliseconds": 15000,
+            }
+            result = _native_run(state_path, request, run_root)
+            accepted.join(timeout=1)
         report = result_path.read_text(encoding="ascii")
+        canaries_intact = (outside_canary.read_text(encoding="ascii") == "host-canary"
+                           and other_drive_canary.read_text(encoding="ascii") == "host-canary")
+        writes_blocked = not outside_write.exists() and not other_drive_write.exists()
+        passed = (result["status"] == "pass" and report == " ".join(["blocked"] * 10)
+                  and canaries_intact and writes_blocked)
     except (OSError, UnicodeError):
-        _refuse("probe-report")
-    if result["status"] != "pass" or report != "blocked blocked dns-blocked":
+        passed = False
+    finally:
+        for path in (outside_canary, outside_write, other_drive_canary, other_drive_write, result_path):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                _refuse("probe-cleanup")
+    if not passed:
         _refuse("network-cut-unproven")
-    result_path.unlink()
-    return "windows_network_probe=pass ipv4=blocked ipv6=blocked dns=blocked firewall=verified\n"
+    return ("windows_network_probe=pass ipv4=blocked ipv6=blocked dns=blocked loopback=blocked "
+            "local_listener=blocked named_pipe=blocked smb=blocked outside_read=blocked outside_write=blocked "
+            "other_drive_read=blocked other_drive_write=blocked firewall=verified\n")
 
 
 def _npm_tools():
@@ -501,7 +571,7 @@ def _npm_tools():
     return node, npm_cli
 
 
-def prepare_dependencies(projection_path, output_root, deadline_file):
+def prepare_dependencies(projection_path, output_root, deadline_file, state_path):
     if sys.platform != "win32":
         _refuse("windows-host-required")
     try:
@@ -517,6 +587,8 @@ def prepare_dependencies(projection_path, output_root, deadline_file):
     prepared = root / "prepared"
     project.mkdir(mode=0o700, parents=True)
     prepared.mkdir(mode=0o700)
+    browser_root = prepared / "ms-playwright"
+    browser_root.mkdir(mode=0o700)
     (project / "package.json").write_bytes(bundle.canonical_json(projection["npm_package"]) + b"\n")
     (project / "package-lock.json").write_bytes(bundle.canonical_json(projection["npm_lock"]) + b"\n")
     (project / ".npmrc").write_text(
@@ -525,48 +597,64 @@ def prepare_dependencies(projection_path, output_root, deadline_file):
     )
     cache = root / "npm-cache"
     cache.mkdir(mode=0o700)
-    environment = os.environ.copy()
-    for name in PROHIBITED_ENVIRONMENT:
-        environment.pop(name, None)
-    environment.update({
-        "NPM_CONFIG_CACHE": str(cache), "NPM_CONFIG_IGNORE_SCRIPTS": "true", "NPM_CONFIG_AUDIT": "false",
-        "NPM_CONFIG_FUND": "false", "NPM_CONFIG_UPDATE_NOTIFIER": "false", "PYTHONDONTWRITEBYTECODE": "1",
-        "PLAYWRIGHT_BROWSERS_PATH": str(prepared / "ms-playwright"),
-    })
+    system_root = Path(os.environ.get("SystemRoot", "C:\\Windows"))
+    environment = [
+        "PATH=" + str(node.parent) + os.pathsep + str(system_root / "System32"),
+        "TEMP=" + str(cache), "TMP=" + str(cache), "USERPROFILE=" + str(project),
+        "APPDATA=" + str(project), "LOCALAPPDATA=" + str(project), "HOME=" + str(project), "CI=1",
+        "SystemRoot=" + str(system_root), "WINDIR=" + str(system_root),
+        "ComSpec=" + str(system_root / "System32" / "cmd.exe"),
+        "NPM_CONFIG_CACHE=" + str(cache), "NPM_CONFIG_IGNORE_SCRIPTS=true",
+        "NPM_CONFIG_AUDIT=false", "NPM_CONFIG_FUND=false", "NPM_CONFIG_OFFLINE=false",
+        "NPM_CONFIG_UPDATE_NOTIFIER=false", "NPM_CONFIG_USERCONFIG=" + str(project / ".npmrc"),
+        "PLAYWRIGHT_BROWSERS_PATH=" + str(browser_root), "PYTHONDONTWRITEBYTECODE=1",
+        "NO_COLOR=1", "TERM=dumb",
+    ]
+    runner_root = Path(state_path).resolve().parents[1]
+    created_profile = False
     try:
+        create_profile(state_path)
+        created_profile = True
         remaining = max(1, int(_deadline_remaining(deadline_file)))
-        result = subprocess.run([str(node), str(npm_cli), *NPM_INSTALL_ARGUMENTS], cwd=str(project),
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                env=environment, timeout=min(3600, remaining), check=False)
+        request = {
+            "executable": str(node), "arguments": [str(npm_cli), *NPM_INSTALL_ARGUMENTS],
+            "working_directory": str(project), "environment": environment, "access_root": str(runner_root),
+            "read_paths": [str(system_root / "System32"), str(node.parent), str(project), str(npm_cli)],
+            "write_paths": [str(project), str(cache), str(browser_root)],
+            "timeout_milliseconds": min(3_600_000, max(1000, int(remaining * 1000))), "internet_client": True,
+        }
+        result = _native_run(state_path, request, runner_root)
+        if result["status"] != "pass":
+            _refuse("dependency-preparation-failed")
+        if projection["playwright"]:
+            candidates = (
+                project / "node_modules" / "playwright" / "cli.js",
+                project / "node_modules" / "@playwright" / "test" / "cli.js",
+            )
+            cli = next((item for item in candidates if item.is_file() and not item.is_symlink()), None)
+            if cli is None:
+                _refuse("playwright-cli-missing")
+            remaining = max(1, int(_deadline_remaining(deadline_file)))
+            request.update({
+                "arguments": [str(cli), "install", *projection["playwright"]],
+                "working_directory": str(project),
+                "timeout_milliseconds": min(1_800_000, max(1000, int(remaining * 1000))),
+            })
+            result = _native_run(state_path, request, runner_root)
+            if result["status"] != "pass":
+                _refuse("browser-preparation-failed")
     except (OSError, subprocess.SubprocessError):
         _refuse("dependency-preparation-failed")
-    if result.returncode != 0:
-        _refuse("dependency-preparation-failed")
-    if projection["playwright"]:
-        candidates = (
-            project / "node_modules" / "playwright" / "cli.js",
-            project / "node_modules" / "@playwright" / "test" / "cli.js",
-        )
-        cli = next((item for item in candidates if item.is_file() and not item.is_symlink()), None)
-        if cli is None:
-            _refuse("playwright-cli-missing")
-        try:
-            remaining = max(1, int(_deadline_remaining(deadline_file)))
-            result = subprocess.run([str(node), str(cli), "install", *projection["playwright"]], cwd=str(project),
-                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL, env=environment,
-                                    timeout=min(1800, remaining), check=False)
-        except (OSError, subprocess.SubprocessError):
-            _refuse("browser-preparation-failed")
-        if result.returncode != 0:
-            _refuse("browser-preparation-failed")
+    finally:
+        if created_profile:
+            delete_profile(state_path)
     node_modules = project / "node_modules"
     _reject_reparse_tree(node_modules)
     shutil.copytree(node_modules, prepared / "node_modules", symlinks=False)
-    (prepared / "projection.json").write_bytes(bundle.canonical_json(projection) + b"\n")
-    (prepared / "toolchain.json").write_bytes(bundle.canonical_json({
+    _write_private_json(prepared / "projection.json", projection)
+    _write_private_json(prepared / "toolchain.json", {
         "node": str(node), "npm_cli": str(npm_cli),
-    }) + b"\n")
+    })
     return prepared, node, npm_cli
 
 
@@ -722,10 +810,44 @@ def _summary_failed(summary):
     return False
 
 
+def _public_decrypt_refusal(error):
+    if isinstance(error, bundle.Refusal):
+        code = str(error)
+        if code.startswith("projection-"):
+            return "binding-mismatch"
+        if code == "authentication-failed":
+            return "auth-tag"
+        if code == "key-invalid":
+            return "key-format"
+        if code == "request-expired":
+            return "expired"
+        if code in ("envelope-truncated", "decrypt-input"):
+            return "truncated"
+        if code == "crypto-unavailable":
+            return "crypto-unavailable"
+        if code in ("binding-mismatch", "inner-binding-mismatch") or code.startswith("binding-"):
+            return "binding-mismatch"
+        if code == "ciphertext-size":
+            return "invalid-envelope"
+        if code == "decrypt-request" or code.startswith("json-"):
+            return "request-invalid"
+        return "archive-invalid"
+    if isinstance(error, WindowsBoundaryRefusal):
+        if error.code == "key-invalid":
+            return "key-format"
+        if error.code in ("bundle-binding", "lockfile-binding", "projection-source-mismatch"):
+            return "binding-mismatch"
+        if error.code == "manifest-profile":
+            return "archive-invalid"
+    if isinstance(error, fetch.Refusal):
+        return "binding-mismatch"
+    return "archive-invalid"
+
+
 def decrypt_bundle(context_path, bundle_path, source_path, manifest_path):
     context = _read_json(context_path, 65536)
     identity = fetch.validate_dispatch(context, expected_profile="core-node")
-    key_hex = os.environ.get("DEVLANE_DECRYPT_KEY", "")
+    key_hex = os.environ.pop("DEVLANE_DECRYPT_KEY", "")
     if len(key_hex) != 64 or any(character not in "0123456789abcdef" for character in key_hex):
         _refuse("key-invalid")
     key = bytearray.fromhex(key_hex)
@@ -762,8 +884,8 @@ def decrypt_bundle(context_path, bundle_path, source_path, manifest_path):
             output.flush()
             os.fsync(output.fileno())
         return "windows_decrypt=accepted manifest=bound\n"
-    except (OSError, fetch.Refusal, bundle.Refusal):
-        _refuse("decrypt-rejected")
+    except (OSError, fetch.Refusal, bundle.Refusal) as error:
+        _refuse("decrypt-rejected:" + _public_decrypt_refusal(error))
     finally:
         for index in range(len(key)):
             key[index] = 0
@@ -913,51 +1035,114 @@ def run_profile(context_path, manifest_path, source_root, prepared_root, scratch
     return 0 if all(result == "pass" for _stage, result in outcomes) and not _summary_failed(summary) else 1
 
 
-def shred_tree(root):
+def shred_tree(root, plaintext_root=None, overwrite_limit=1024 * 1024 * 1024):
     root = Path(root)
     if root.is_symlink() or not root.is_dir():
         _refuse("cleanup-root")
+    plaintext_root = Path(plaintext_root) if plaintext_root else None
     total = 0
     files = []
-    for current, directories, names in os.walk(root, topdown=True, followlinks=False):
-        for name in list(directories):
+    directory_paths = []
+    reparse_entries = []
+    failures = []
+    for current, child_directories, names in os.walk(root, topdown=True, followlinks=False):
+        for name in list(child_directories):
             path = Path(current) / name
-            if path.is_symlink() or getattr(path.stat(follow_symlinks=False), "st_file_attributes", 0) & 0x400:
-                _refuse("cleanup-reparse")
+            try:
+                metadata = path.stat(follow_symlinks=False)
+                is_symlink = path.is_symlink()
+                reparse = is_symlink or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
+            except OSError:
+                child_directories.remove(name)
+                failures.append(path)
+                continue
+            if reparse:
+                child_directories.remove(name)
+                reparse_entries.append((path, True, is_symlink))
+            else:
+                directory_paths.append(path)
         for name in names:
             path = Path(current) / name
-            if path.is_symlink() or getattr(path.stat(follow_symlinks=False), "st_file_attributes", 0) & 0x400:
-                _refuse("cleanup-reparse")
-            if not path.is_file():
-                _refuse("cleanup-file-type")
-            total += path.stat().st_size
-            if total > 8 * 1024 * 1024 * 1024:
-                _refuse("cleanup-size")
-            files.append(path)
-    for path in files:
-        try:
-            remaining = path.stat().st_size
-            with path.open("r+b", buffering=0) as output:
-                while remaining:
-                    chunk = os.urandom(min(1024 * 1024, remaining))
-                    output.write(chunk)
-                    remaining -= len(chunk)
-                output.flush()
-                os.fsync(output.fileno())
-            path.unlink()
-        except OSError:
-            _refuse("cleanup-overwrite")
-    for current, directories, _names in os.walk(root, topdown=False, followlinks=False):
-        for name in directories:
             try:
-                (Path(current) / name).rmdir()
+                metadata = path.stat(follow_symlinks=False)
+                is_symlink = path.is_symlink()
+                reparse = is_symlink or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
             except OSError:
-                _refuse("cleanup-directory")
+                failures.append(path)
+                continue
+            if reparse:
+                reparse_entries.append((path, False, is_symlink))
+            elif not path.is_file():
+                failures.append(path)
+            else:
+                size = metadata.st_size
+                total += size
+                files.append((path, size))
+    files.sort(key=lambda item: (0 if plaintext_root and item[0].is_relative_to(plaintext_root) else 1,
+                                 len(item[0].parts), str(item[0])))
+    cleaned = 0
+    for path, is_directory, is_symlink in reparse_entries:
+        try:
+            if is_directory and not is_symlink:
+                path.rmdir()
+            else:
+                path.unlink()
+            cleaned += 1
+        except OSError:
+            failures.append(path)
+    for path, size in files:
+        try:
+            if size <= overwrite_limit:
+                remaining = size
+                with path.open("r+b", buffering=0) as output:
+                    while remaining:
+                        chunk = os.urandom(min(1024 * 1024, remaining))
+                        output.write(chunk)
+                        remaining -= len(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+            path.unlink()
+            cleaned += 1
+        except OSError:
+            failures.append(path)
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    for path in reversed(directory_paths):
+        try:
+            path.rmdir()
+        except OSError:
+            failures.append(path)
     try:
         root.rmdir()
     except OSError:
-        _refuse("cleanup-root")
-    return "windows_runner_shred=confirmed files=%d bytes=%d\n" % (len(files), total)
+        failures.append(root)
+    if failures:
+        _refuse("cleanup-incomplete")
+    return "windows_runner_shred=confirmed files=%d bytes=%d reparse=%d\n" % (cleaned, total, len(reparse_entries))
+
+
+def cleanup_runner(state_path, root, plaintext_root=None):
+    errors = []
+    state = Path(state_path)
+    if state.is_file():
+        try:
+            remove_firewall(state)
+        except Exception:
+            errors.append("firewall")
+        try:
+            delete_profile(state)
+        except Exception:
+            errors.append("profile")
+    shred_receipt = None
+    try:
+        shred_receipt = shred_tree(root, plaintext_root=plaintext_root)
+    except Exception:
+        errors.append("plaintext-tree")
+    if errors:
+        _refuse("cleanup-incomplete")
+    return "windows_sandbox_cleanup=confirmed firewall=removed profile=deleted\n" + shred_receipt
 
 
 def projection_has_browsers(path):
@@ -1014,6 +1199,7 @@ def main(argv=None):
     prepare.add_argument("--projection", required=True)
     prepare.add_argument("--output", required=True)
     prepare.add_argument("--deadline", required=True)
+    prepare.add_argument("--state", required=True)
     decrypt = sub.add_parser("decrypt")
     decrypt.add_argument("--context", required=True)
     decrypt.add_argument("--bundle", required=True)
@@ -1066,8 +1252,8 @@ def main(argv=None):
         elif args.operation == "delete-profile":
             sys.stdout.write(delete_profile(args.state))
         elif args.operation == "prepare":
-            prepare_dependencies(args.projection, args.output, args.deadline)
-            sys.stdout.write("windows_prepare=complete lifecycle_scripts=disabled\n")
+            prepare_dependencies(args.projection, args.output, args.deadline, args.state)
+            sys.stdout.write("windows_prepare=complete lifecycle_scripts=disabled identity=lpac network=outbound-only\n")
         elif args.operation == "decrypt":
             sys.stdout.write(decrypt_bundle(args.context, args.bundle, args.source, args.manifest))
         elif args.operation == "execute":
@@ -1077,18 +1263,26 @@ def main(argv=None):
             return run_profile(args.context, args.manifest, args.source, args.prepared, args.scratch,
                                args.run_root, args.state, args.deadline, toolchain["node"], toolchain["npm_cli"])
         elif args.operation == "shred":
-            state_path = Path(args.state)
-            if state_path.is_file():
-                sys.stdout.write(delete_profile(state_path))
-            sys.stdout.write(shred_tree(args.root))
+            sys.stdout.write(cleanup_runner(args.state, args.root, args.workspace))
             sys.stdout.write("cleanup_receipt=confirmed\n")
             sys.stdout.write("devlane_job=completed public_output=filtered cleanup=confirmed\n")
         return 0
     except WindowsBoundaryRefusal as error:
-        print("devlane_windows_refusal=windows-runner-failed", file=sys.stderr)
+        if args.operation == "decrypt":
+            reason = (error.code.split(":", 1)[1]
+                      if error.code.startswith("decrypt-rejected:")
+                      else _public_decrypt_refusal(error))
+            print("devlane_supervisor_refusal=decrypt-rejected", file=sys.stderr)
+            print("decrypt_refusal=" + reason, file=sys.stderr)
+        else:
+            print("devlane_refusal=windows-runner-failed", file=sys.stderr)
         return 1
     except Exception:
-        print("devlane_windows_refusal=boundary", file=sys.stderr)
+        if args.operation == "decrypt":
+            print("devlane_supervisor_refusal=decrypt-rejected", file=sys.stderr)
+            print("decrypt_refusal=archive-invalid", file=sys.stderr)
+        else:
+            print("devlane_refusal=boundary", file=sys.stderr)
         return 1
 
 

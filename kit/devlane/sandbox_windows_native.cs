@@ -53,6 +53,7 @@ namespace KeelDock.Platform.DevLaneWindows
         private const uint GenericWrite = 0x40000000;
         private const uint FileShareRead = 1;
         private const uint FileShareWrite = 2;
+        private const uint SecurityEnabled = 0x00000004;
 
         [StructLayout(LayoutKind.Sequential)]
         private struct SecurityAttributes
@@ -177,6 +178,10 @@ namespace KeelDock.Platform.DevLaneWindows
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool ConvertSidToStringSidW(IntPtr sid, out IntPtr stringSid);
 
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool ConvertStringSidToSidW(string stringSid, out IntPtr sid);
+
         [DllImport("advapi32.dll", SetLastError = true)]
         private static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
 
@@ -223,6 +228,10 @@ namespace KeelDock.Platform.DevLaneWindows
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool TerminateProcess(IntPtr process, uint exitCode);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -281,7 +290,7 @@ namespace KeelDock.Platform.DevLaneWindows
         }
 
         public static RunResult Run(string profileName, string appContainerSid, string executable, string[] arguments,
-            string workingDirectory, string[] environment, int timeoutMilliseconds)
+            string workingDirectory, string[] environment, int timeoutMilliseconds, bool internetClient)
         {
             if (String.IsNullOrEmpty(profileName) || String.IsNullOrEmpty(appContainerSid) || String.IsNullOrEmpty(executable)
                 || String.IsNullOrEmpty(workingDirectory) || arguments == null || environment == null
@@ -294,6 +303,8 @@ namespace KeelDock.Platform.DevLaneWindows
             IntPtr policy = IntPtr.Zero;
             IntPtr handleList = IntPtr.Zero;
             IntPtr environmentBlock = IntPtr.Zero;
+            IntPtr internetClientSid = IntPtr.Zero;
+            IntPtr capabilityArray = IntPtr.Zero;
             IntPtr process = IntPtr.Zero;
             IntPtr thread = IntPtr.Zero;
             bool attributesReady = false;
@@ -326,8 +337,23 @@ namespace KeelDock.Platform.DevLaneWindows
                         new UIntPtr((uint)IntPtr.Size), IntPtr.Zero, IntPtr.Zero)) throw new InvalidOperationException("attribute_handles");
                 SecurityCapabilities securityCapabilities = new SecurityCapabilities();
                 securityCapabilities.AppContainerSid = sid;
-                securityCapabilities.Capabilities = IntPtr.Zero;
-                securityCapabilities.CapabilityCount = 0;
+                if (internetClient)
+                {
+                    if (!ConvertStringSidToSidW("S-1-15-3-1", out internetClientSid) || internetClientSid == IntPtr.Zero)
+                        throw new InvalidOperationException("internet_capability_sid");
+                    SidAndAttributes capability = new SidAndAttributes();
+                    capability.Sid = internetClientSid;
+                    capability.Attributes = SecurityEnabled;
+                    capabilityArray = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(SidAndAttributes)));
+                    Marshal.StructureToPtr(capability, capabilityArray, false);
+                    securityCapabilities.Capabilities = capabilityArray;
+                    securityCapabilities.CapabilityCount = 1;
+                }
+                else
+                {
+                    securityCapabilities.Capabilities = IntPtr.Zero;
+                    securityCapabilities.CapabilityCount = 0;
+                }
                 capabilities = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(SecurityCapabilities)));
                 Marshal.StructureToPtr(securityCapabilities, capabilities, false);
                 if (!UpdateProcThreadAttribute(attributes, 0, ProcThreadAttributeSecurityCapabilities, capabilities,
@@ -360,7 +386,7 @@ namespace KeelDock.Platform.DevLaneWindows
                 result.Created = true;
                 if (!AssignProcessToJobObject(job, process)) throw new InvalidOperationException("job_assign");
                 result.Job = VerifyJob(job, process);
-                result.AppContainer = VerifyToken(process, sid);
+                result.AppContainer = VerifyToken(process, sid, internetClient);
                 if (ResumeThread(thread) == UInt32.MaxValue) throw new InvalidOperationException("thread_resume");
                 uint wait = WaitForSingleObject(process, (uint)timeoutMilliseconds);
                 if (wait == WaitTimeout)
@@ -379,7 +405,15 @@ namespace KeelDock.Platform.DevLaneWindows
             }
             finally
             {
+                string reapFailure = null;
                 if (job != IntPtr.Zero) TerminateJobObject(job, JobExitCode);
+                if (process != IntPtr.Zero && !result.Exited)
+                {
+                    if (!TerminateProcess(process, JobExitCode) && WaitForSingleObject(process, 0) != WaitObject0)
+                        reapFailure = "process_terminate";
+                    if (WaitForSingleObject(process, 10000) != WaitObject0) reapFailure = "process_reap";
+                }
+                if (job != IntPtr.Zero && !WaitForEmptyJob(job, 10000)) reapFailure = "job_reap";
                 Close(thread);
                 Close(process);
                 Close(job);
@@ -390,7 +424,10 @@ namespace KeelDock.Platform.DevLaneWindows
                 Free(policy);
                 Free(handleList);
                 Free(environmentBlock);
+                Free(capabilityArray);
+                if (internetClientSid != IntPtr.Zero) LocalFree(internetClientSid);
                 Free(sid);
+                if (reapFailure != null) throw new InvalidOperationException(reapFailure);
             }
         }
 
@@ -457,7 +494,7 @@ namespace KeelDock.Platform.DevLaneWindows
             finally { Marshal.FreeHGlobal(buffer); }
         }
 
-        private static string VerifyToken(IntPtr process, IntPtr expectedSid)
+        private static string VerifyToken(IntPtr process, IntPtr expectedSid, bool internetClient)
         {
             IntPtr token;
             if (!OpenProcessToken(process, TokenQuery, out token) || token == IntPtr.Zero) throw new InvalidOperationException("token_open");
@@ -468,7 +505,20 @@ namespace KeelDock.Platform.DevLaneWindows
                 IntPtr capabilities = QueryToken(token, TokenCapabilities, out int capabilitiesLength);
                 try
                 {
-                    if (capabilitiesLength < 4 || Marshal.ReadInt32(capabilities) != 0) throw new InvalidOperationException("token_capabilities");
+                    int expectedCount = internetClient ? 1 : 0;
+                    if (capabilitiesLength < 4 || Marshal.ReadInt32(capabilities) != expectedCount)
+                        throw new InvalidOperationException("token_capabilities");
+                    if (internetClient)
+                    {
+                        int entryOffset = IntPtr.Size == 8 ? 8 : 4;
+                        if (capabilitiesLength < entryOffset + Marshal.SizeOf(typeof(SidAndAttributes)))
+                            throw new InvalidOperationException("token_capability_size");
+                        SidAndAttributes entry = (SidAndAttributes)Marshal.PtrToStructure(
+                            IntPtr.Add(capabilities, entryOffset), typeof(SidAndAttributes));
+                        if (entry.Sid == IntPtr.Zero || SidText(entry.Sid) != "S-1-15-3-1"
+                            || (entry.Attributes & SecurityEnabled) == 0)
+                            throw new InvalidOperationException("token_capability_mismatch");
+                    }
                 }
                 finally { Marshal.FreeHGlobal(capabilities); }
                 IntPtr app = QueryToken(token, TokenAppContainerSid, out int appLength);
@@ -492,7 +542,9 @@ namespace KeelDock.Platform.DevLaneWindows
                     if (ridAddress == IntPtr.Zero || Marshal.ReadInt32(ridAddress) != 0x1000) throw new InvalidOperationException("token_integrity");
                 }
                 finally { Marshal.FreeHGlobal(integrity); }
-                return "lpac=verified capabilities=empty integrity=low sid=verified";
+                return internetClient
+                    ? "lpac=verified capabilities=internetClient integrity=low sid=verified"
+                    : "lpac=verified capabilities=empty integrity=low sid=verified";
             }
             finally { Close(token); }
         }
