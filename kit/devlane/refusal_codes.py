@@ -31,8 +31,10 @@ REFUSAL_CODES = frozenset((
     "matrix-semver-tool-binding",
     "matrix-semver-worker-channel",
     "matrix-semver-worker-peer",
-    "crypto-dependency-install-failed",
-    "crypto-dependency-verification-failed",
+    "crypto-dependency-install-failed", "crypto-dependency-verification-failed",
+    "crypto-python-version-invalid",
+    "crypto-dependency-seal-failed", "crypto-dependency-check-failed",
+    "crypto-dependency-privileged-check-failed",
     "crypto-unavailable",
     "windows-node-runtime-invalid",
     "windows-npm-runtime-install-failed",
@@ -110,6 +112,21 @@ REFUSAL_CODES = frozenset((
     "developer-clang-mismatch", "developer-dir-trust-invalid", "developer-dir-unexpected", "tool-version-mismatch",
     "tool-version-unavailable", "total-deadline-exhausted", "total-deadline-unavailable",
     "typescript-report-incomplete",
+))
+CRYPTO_CONTROL_REFUSAL_CODES = frozenset((
+    "crypto-target-invalid", "crypto-acl-invalid", "crypto-platform-invalid",
+    "crypto-metadata-invalid", "crypto-file-invalid", "crypto-tree-invalid",
+    "crypto-manifest-invalid", "crypto-seal-write-failed", "crypto-tree-mismatch",
+    "crypto-import-invalid", "crypto-key-present", "crypto-script-invalid",
+    "crypto-control-invalid",
+))
+MACOS_SUPERVISOR_START_REFUSAL_CODES = frozenset((
+    "macos-root-required", "dispatch-context-invalid", "input-unavailable", "input-size",
+    "projection-invalid", "positive-control-failed", "tool-version-mismatch",
+    "tool-version-unavailable", "profile-config-invalid", "prepared-input-invalid",
+    "state-directory-permissions", "firewall-unavailable", "macos-supervisor-start-internal",
+    "macos-supervisor-start-boundary", "macos-supervisor-start-os-error",
+    "macos-supervisor-start-value-error", "macos-supervisor-start-type-error",
 ))
 MACOS_PREFLIGHT_REFUSAL_CODES = frozenset((
     "macos-preflight-internal", "macos-root-identity-internal", "macos-preflight-host-identity",

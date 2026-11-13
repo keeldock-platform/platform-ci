@@ -73,13 +73,13 @@ MACOS_ROOT_IDENTITY_REFUSAL_CODES = frozenset(
 
 
 class Refusal(ValueError):
-    def __init__(self, code="supervisor-failed", decrypt_refusal=None):
+    def __init__(self, code="macos-supervisor-start-internal", decrypt_refusal=None):
         super().__init__(code)
         self.code = code
         self.decrypt_refusal = decrypt_refusal
 
 
-def _refuse(code="supervisor-failed", *, decrypt_refusal=None):
+def _refuse(code="macos-supervisor-start-internal", *, decrypt_refusal=None):
     raise Refusal(code, decrypt_refusal=decrypt_refusal)
 
 
@@ -2023,6 +2023,11 @@ def main(argv=None):
             return _root_pf_cleanup(args)
         _refuse("control-operation-invalid")
     except Refusal as error:
+        if args.operation == "start":
+            code = (error.code if error.code in refusal_codes.MACOS_SUPERVISOR_START_REFUSAL_CODES
+                    else "macos-supervisor-start-internal")
+            print("devlane_supervisor_refusal=" + code, file=sys.stderr)
+            return 2
         if args.operation == "root-identity":
             code = error.code if error.code in MACOS_ROOT_IDENTITY_REFUSAL_CODES else "macos-root-identity-internal"
             print("devlane_macos_root_refusal=" + code, file=sys.stderr)
@@ -2047,14 +2052,28 @@ def main(argv=None):
         if args.operation == "root-identity":
             print("devlane_macos_root_refusal=macos-root-identity-internal", file=sys.stderr)
             return 2
+        if args.operation == "start":
+            print("devlane_supervisor_refusal=macos-supervisor-start-boundary", file=sys.stderr)
+            return 2
         print("devlane_supervisor_refusal=supervisor-failed", file=sys.stderr)
         return 2
-    except Exception:
+    except Exception as error:
         if args.operation == "root-identity":
             print("devlane_macos_root_refusal=macos-root-identity-internal", file=sys.stderr)
             return 2
         if args.operation == "preflight":
             print("devlane_macos_preflight_refusal=macos-preflight-internal", file=sys.stderr)
+            return 2
+        if args.operation == "start":
+            if isinstance(error, OSError):
+                code = "macos-supervisor-start-os-error"
+            elif isinstance(error, ValueError):
+                code = "macos-supervisor-start-value-error"
+            elif isinstance(error, TypeError):
+                code = "macos-supervisor-start-type-error"
+            else:
+                code = "macos-supervisor-start-internal"
+            print("devlane_supervisor_refusal=" + code, file=sys.stderr)
             return 2
         print("devlane_supervisor_refusal=supervisor-failed", file=sys.stderr)
         return 2

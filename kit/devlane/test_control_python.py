@@ -1,6 +1,7 @@
 """Integrity checks for the isolated control-only Python dependency tree."""
 
 import os
+import io
 from pathlib import Path
 import sys
 import tempfile
@@ -75,6 +76,57 @@ class ControlPythonTreeTests(unittest.TestCase):
             with mock.patch.object(control_python, "_powershell_acl_owner", return_value="S-1-5-21-200"):
                 with self.assertRaisesRegex(control_python.CryptoRefusal, "crypto-unavailable"):
                     control_python.validate(root, "windows")
+
+    def test_windows_tree_seals_native_extension_record_and_bytecode_files(self):
+        with tempfile.TemporaryDirectory(prefix="control-python-windows-") as temporary:
+            parent = Path(temporary).resolve(strict=True)
+            root = parent / "control-python-deps"
+            files = {
+                "cryptography/__init__.py": b'__version__ = "50.0.2"\n',
+                "cryptography/_rust.abi3.pyd": b"native-extension-fixture",
+                "cryptography-50.0.2.dist-info/RECORD": b"cryptography/_rust.abi3.pyd,,\n",
+                "cryptography/__pycache__/fixture.pyc": b"bytecode-fixture",
+            }
+            for relative, payload in files.items():
+                destination = root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(payload)
+            with mock.patch.object(control_python, "_powershell_acl_owner", return_value="S-1-5-21-100"):
+                control_python.seal(root, "windows")
+                control_python.validate(root, "windows")
+            manifest = control_python._read_manifest(root, "windows", "S-1-5-21-100")
+            self.assertEqual(
+                [row["path"] for row in manifest["files"]],
+                sorted(files),
+            )
+            self.assertIn("cryptography/_rust.abi3.pyd", [row["path"] for row in manifest["files"]])
+            self.assertIn("cryptography-50.0.2.dist-info/RECORD", [row["path"] for row in manifest["files"]])
+            self.assertIn("cryptography/__pycache__/fixture.pyc", [row["path"] for row in manifest["files"]])
+
+            extension = root / "cryptography" / "_rust.abi3.pyd"
+            extension.chmod(0o644)
+            extension.write_bytes(b"changed extension")
+            with mock.patch.object(control_python, "_powershell_acl_owner", return_value="S-1-5-21-100"), \
+                    self.assertRaisesRegex(control_python.CryptoRefusal, "crypto-unavailable") as caught:
+                control_python.validate(root, "windows")
+            self.assertEqual(caught.exception.reason, "crypto-tree-mismatch")
+
+    def test_seal_and_check_print_only_fixed_subreason_codes(self):
+        output = io.StringIO()
+        with mock.patch.object(control_python, "seal", side_effect=control_python.CryptoRefusal("crypto-acl-invalid")), \
+                mock.patch("sys.stderr", output):
+            self.assertEqual(control_python.main([
+                "--target", "/tmp/control-python-deps", "--platform", "windows", "seal",
+            ]), 2)
+        self.assertEqual(output.getvalue(), "devlane_crypto_refusal=crypto-acl-invalid\n")
+
+        output = io.StringIO()
+        with mock.patch.object(control_python, "validate", side_effect=control_python.CryptoRefusal("private-path")), \
+                mock.patch("sys.stderr", output):
+            self.assertEqual(control_python.main([
+                "--target", "/tmp/control-python-deps", "--platform", "windows", "check",
+            ]), 2)
+        self.assertEqual(output.getvalue(), "devlane_crypto_refusal=crypto-control-invalid\n")
 
     def test_predecrypt_check_imports_pinned_crypto_before_key_is_available(self):
         with tempfile.TemporaryDirectory(prefix="control-python-") as temporary:

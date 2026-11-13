@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import signal
 import shutil
 import subprocess
 import tempfile
@@ -95,7 +96,11 @@ class MacProfileTests(unittest.TestCase):
                      "TMPDIR": str(root / "scratch"), "LC_ALL": "C"},
                 timeout=10, check=False, close_fds=True,
             )
-            self.assertNotEqual(result.returncode, 64, result.stderr.decode("utf-8", "replace"))
+            local_major = platform.mac_ver()[0].split(".", 1)[0]
+            if (result.returncode == -signal.SIGABRT and local_major.isdecimal()
+                    and int(local_major) >= 27):
+                self.skipTest("sandbox-exec aborts before returning on macOS 27")
+            self.assertEqual(result.returncode, 0, "sandbox-exec did not run the generated profile")
             self.assertNotIn(b"syntax error", result.stderr.lower())
 
     def test_only_fixed_virtual_paths_are_mapped_to_private_run_paths(self):
@@ -619,6 +624,31 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         self.assertNotIn('mkdir -m 700 "$RUN_ROOT/workspace"', "\n".join(download["run"]))
         self.assertIn('(root / "workspace").mkdir(mode=0o700)',
                       (sandbox.CONTROL_ROOT / "kit/devlane/sandbox_macos.py").read_text(encoding="utf-8"))
+
+    def test_start_refusal_prints_only_fixed_codes(self):
+        state = Path(PRIVATE_RUN + "/state")
+        arguments = [
+            "start", "--state-dir", str(state), "--context", PRIVATE_RUN + "/context",
+            "--workspace", PRIVATE_RUN + "/workspace", "--prepared", PRIVATE_RUN + "/prepared",
+            "--bundle", PRIVATE_RUN + "/bundle", "--projection", PRIVATE_RUN + "/projection",
+            "--positive-control", PRIVATE_RUN + "/positive", "--deadline-file", PRIVATE_RUN + "/deadline",
+            "--run-id", "12345",
+        ]
+        cases = (
+            (sandbox.Refusal("firewall-unavailable"), "firewall-unavailable"),
+            (sandbox.Refusal("sensitive-host-detail"), "macos-supervisor-start-internal"),
+            (PermissionError("sensitive-host-detail"), "macos-supervisor-start-os-error"),
+        )
+        for error, code in cases:
+            stderr = io.StringIO()
+            with self.subTest(code=code), \
+                    mock.patch.object(sandbox, "_state_paths", return_value=(state, state.parent)), \
+                    mock.patch.object(sandbox.boundary_guard, "_check_trusted_system_file"), \
+                    mock.patch.object(sandbox, "_start", side_effect=error), \
+                    mock.patch("sys.stderr", stderr):
+                self.assertEqual(sandbox.main(arguments), 2)
+            self.assertEqual(stderr.getvalue(), "devlane_supervisor_refusal=" + code + "\n")
+            self.assertNotIn("sensitive-host-detail", stderr.getvalue())
 
     def test_decrypt_refusal_prints_the_safe_reason_grammar(self):
         stderr = io.StringIO()

@@ -178,6 +178,7 @@ AUDIT_REFUSAL_CODES = frozenset(("audit-contract", "audit-internal"))
 WINDOWS_BOOTSTRAP_REFUSAL_CODES = frozenset((
     "deadline-start-invalid", "deadline-file-invalid", "deadline-budget-invalid", "deadline-failed",
     "crypto-dependency-install-failed", "crypto-dependency-verification-failed",
+    "crypto-python-version-invalid", "crypto-dependency-seal-failed", "crypto-dependency-check-failed",
 ))
 BOOTSTRAP_REFUSAL_CODES = frozenset((
     "bootstrap-run-root", "bootstrap-start-marker", "bootstrap-reap-unconfirmed",
@@ -186,7 +187,47 @@ BOOTSTRAP_REFUSAL_CODES = frozenset((
 ))
 MACOS_BOOTSTRAP_REFUSAL_CODES = frozenset((
     "crypto-dependency-install-failed", "crypto-dependency-verification-failed", "crypto-unavailable",
+    "crypto-python-version-invalid", "crypto-dependency-seal-failed", "crypto-dependency-check-failed",
+    "crypto-dependency-privileged-check-failed",
 ))
+CRYPTO_CONTROL_REFUSAL_CODES = refusal_codes.CRYPTO_CONTROL_REFUSAL_CODES
+CRYPTO_SEAL_REFUSAL_CODES = CRYPTO_CONTROL_REFUSAL_CODES - frozenset((
+    "crypto-tree-mismatch", "crypto-import-invalid", "crypto-key-present", "crypto-script-invalid",
+))
+CRYPTO_CHECK_REFUSAL_CODES = CRYPTO_CONTROL_REFUSAL_CODES - frozenset((
+    "crypto-seal-write-failed", "crypto-script-invalid",
+))
+AUDIT_SUBREASONS = frozenset((
+    "workflow-parse", "workflow-graph", "summary-records", "hosted-log-preamble",
+    "hosted-step-block", "hosted-log-canonicalization", "job-log-surface", "check-run-output",
+    "job-step-shape", "job-grammar", "job-contract", "terminal-job-contract", "run-record", "dispatch-marker",
+    "audit-outcome", "step-metadata-binding", "audit-environment", "github-audit-surface",
+    "public-surface", "audit-internal-check",
+))
+AUDIT_REASON_BY_CHECK = {
+    "parse_workflow": "workflow-parse",
+    "validate_workflow_job_graph": "workflow-graph",
+    "validate_summary_records": "summary-records",
+    "_hosted_preamble": "hosted-log-preamble",
+    "_parse_hosted_step_block": "hosted-step-block",
+    "_canonicalize_github_hosted_log": "hosted-log-canonicalization",
+    "validate_job_log_surface": "job-log-surface",
+    "validate_check_output": "check-run-output",
+    "_steps": "job-step-shape",
+    "validate_job_contract": "job-contract",
+    "validate_terminal_job_contract": "terminal-job-contract",
+    "validate_run_record": "run-record",
+    "validate_dispatch_marker": "dispatch-marker",
+    "_audit_outcome_line": "audit-outcome",
+    "validate_job_log_metadata_binding": "step-metadata-binding",
+    "audit_environment": "audit-environment",
+    "run_audit": "github-audit-surface",
+    "validate_final_public_surfaces": "public-surface",
+    "__init__": "job-grammar",
+    "take": "hosted-log-preamble",
+    "group": "hosted-log-preamble",
+    "maybe_environment": "hosted-log-preamble",
+}
 WINDOWS_PREFLIGHT_REFUSAL_CODES = frozenset((
     "windows-admin-check-failed", "windows-admin-required", "windows-error-reporting-policy",
     "windows-powershell-unavailable", "windows-sandbox-parse", "windows-sandbox-native-load",
@@ -221,6 +262,7 @@ SUPERVISOR_START_REFUSAL_CODES = (
     refusal_codes.STARTUP_REFUSAL_CODES | refusal_codes.STARTUP_DIAGNOSTIC_CODES
     | frozenset(("supervisor-failed", "supervisor-start-failed", "supervisor-start-timeout", "runner-unknown"))
 )
+MACOS_SUPERVISOR_START_REFUSAL_CODES = refusal_codes.MACOS_SUPERVISOR_START_REFUSAL_CODES
 SUPERVISOR_EXECUTION_REFUSAL_CODES = (
     refusal_codes.REFUSAL_CODES - refusal_codes.NETWORK_PROBE_DIAGNOSTIC_CODES
     - refusal_codes.DECRYPT_REFUSAL_CODES - refusal_codes.STARTUP_DIAGNOSTIC_CODES
@@ -242,11 +284,14 @@ REFUSAL_LINE = re.compile(
     r"(?:devlane_refusal=" + _code_alternative(FETCH_REFUSAL_CODES | WINDOWS_RUNNER_REFUSAL_CODES)
     + r"|devlane_supervisor_refusal=" + _code_alternative(
         refusal_codes.REFUSAL_CODES | SUPERVISOR_START_REFUSAL_CODES | SUPERVISOR_CLEANUP_REFUSAL_CODES
-        | MACOS_DECRYPT_SUPERVISOR_REFUSAL_CODES
+        | MACOS_DECRYPT_SUPERVISOR_REFUSAL_CODES | MACOS_SUPERVISOR_START_REFUSAL_CODES
     )
     + r"|dependency_preparation_refusal=runner-unknown"
+    + r"|devlane_crypto_refusal=" + _code_alternative(CRYPTO_CONTROL_REFUSAL_CODES)
     + r"|devlane_deadline_refusal=" + _code_alternative(WINDOWS_BOOTSTRAP_REFUSAL_CODES)
-    + r"|devlane_bootstrap_refusal=" + _code_alternative(BOOTSTRAP_REFUSAL_CODES)
+    + r"|devlane_bootstrap_refusal=" + _code_alternative(
+        BOOTSTRAP_REFUSAL_CODES | MACOS_BOOTSTRAP_REFUSAL_CODES
+    )
     + r"|devlane_macos_preflight_refusal=" + _code_alternative(MACOS_PREFLIGHT_REFUSAL_CODES)
     + r"|devlane_windows_preflight_refusal=" + _code_alternative(WINDOWS_PREFLIGHT_REFUSAL_CODES)
     + r")\Z"
@@ -619,11 +664,14 @@ class _Grammar:
                     and code in WINDOWS_RUNNER_REFUSAL_CODES)
         if prefix == "dependency_preparation_refusal":
             return step_name == "Prepare dependencies before the cut" and code == "runner-unknown"
+        if prefix == "devlane_crypto_refusal":
+            return (step_name == "Fetch public control and validate dispatch"
+                    and code in CRYPTO_CONTROL_REFUSAL_CODES)
         if prefix != "devlane_supervisor_refusal":
             return False
         if step_name == "Cut network and start the isolated supervisor":
             if self.job_runner == "macos-15":
-                return code == "supervisor-failed"
+                return code in MACOS_SUPERVISOR_START_REFUSAL_CODES
             return self.job_runner != "windows-2025" and code in SUPERVISOR_START_REFUSAL_CODES
         if step_name == "Probe isolation before decryption":
             return self.job_runner != "windows-2025" and code == "supervisor-failed"
@@ -664,6 +712,14 @@ class _Grammar:
             public_counts["early_failure_step"] = step_name
             public_counts["early_failure_code"] = code
             return public_counts["early_failure_marker"] == 1
+        if line.startswith("devlane_crypto_refusal="):
+            code = line[len("devlane_crypto_refusal="):]
+            if (step_name != "Fetch public control and validate dispatch"
+                    or code not in CRYPTO_CONTROL_REFUSAL_CODES):
+                return False
+            public_counts["crypto_refusal_reason"] = public_counts.get("crypto_refusal_reason", 0) + 1
+            public_counts["crypto_refusal_reason_code"] = code
+            return public_counts["crypto_refusal_reason"] == 1
         if line.startswith("devlane_bootstrap_refusal="):
             code = line[len("devlane_bootstrap_refusal="):]
             allowed_codes = BOOTSTRAP_REFUSAL_CODES
@@ -722,8 +778,16 @@ class _Grammar:
         if step_name == "Audit exact four-job graph and public surfaces":
             refusal_prefix = "devlane_audit=refused code="
             if line.startswith(refusal_prefix):
-                code = line[len(refusal_prefix):]
-                if code not in AUDIT_REFUSAL_CODES:
+                match = re.fullmatch(
+                    r"devlane_audit=refused code=(audit-contract|audit-internal)"
+                    r"(?: reason=([a-z0-9-]+))?", line,
+                )
+                if match is None:
+                    return False
+                code, reason = match.groups()
+                if (code not in AUDIT_REFUSAL_CODES
+                        or (code == "audit-contract" and reason not in AUDIT_SUBREASONS)
+                        or (code == "audit-internal" and reason is not None)):
                     return False
                 public_counts["devlane_audit_refusal"] = public_counts.get(
                     "devlane_audit_refusal", 0,
@@ -1691,6 +1755,21 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         elif (counts.get("devlane_acceptance=pass") != 1 or counts.get("acceptance_refused")
               or counts.get("devlane_linux_probe=pass") != 1):
             _refuse()
+    if counts.get("crypto_refusal_reason"):
+        bootstrap_code = counts.get("early_failure_code")
+        reason = counts.get("crypto_refusal_reason_code")
+        allowed_crypto_reasons = (
+            CRYPTO_SEAL_REFUSAL_CODES if bootstrap_code == "crypto-dependency-seal-failed"
+            else CRYPTO_CHECK_REFUSAL_CODES
+            if bootstrap_code in ("crypto-dependency-check-failed", "crypto-dependency-privileged-check-failed")
+            else frozenset()
+        )
+        if counts.get("crypto_refusal_reason") != 1 or reason not in allowed_crypto_reasons:
+            _refuse()
+    elif counts.get("early_failure_code") in (
+            "crypto-dependency-seal-failed", "crypto-dependency-check-failed",
+            "crypto-dependency-privileged-check-failed"):
+        _refuse()
     failure_stage = None
     if early_failure is not None:
         failure_stage = early_failure
@@ -1701,6 +1780,7 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
     return {"records": [record.encode("ascii") for record in records], "early_failure": early_failure,
             "early_failure_code": counts.get("early_failure_code"),
             "early_failure_exit": counts.get("early_failure_exit"), "failure_stage": failure_stage,
+            "crypto_refusal_reason": counts.get("crypto_refusal_reason_code"),
             "counts": counts if job_name == AUDIT_JOB else None}
 
 
@@ -1728,11 +1808,15 @@ def validate_check_output(check, job, identity, *, completed):
 
 
 class AuditRefusal(ValueError):
-    pass
+    def __init__(self, code="audit-contract", reason="audit-internal-check"):
+        super().__init__(code)
+        self.code = code if code in AUDIT_REFUSAL_CODES else "audit-contract"
+        self.reason = reason if reason in AUDIT_SUBREASONS else "audit-internal-check"
 
 
 def _refuse():
-    raise AuditRefusal("audit-contract")
+    caller = sys._getframe(1).f_code.co_name
+    raise AuditRefusal("audit-contract", AUDIT_REASON_BY_CHECK.get(caller, "audit-internal-check"))
 
 
 def _steps(job):
@@ -2273,8 +2357,12 @@ def main():
         outcome = run_audit(api, identity)
         print(outcome)
         return 0
-    except AuditRefusal:
-        print("devlane_audit=refused code=audit-contract")
+    except AuditRefusal as error:
+        if error.code == "audit-contract":
+            reason = (error.reason if error.reason in AUDIT_SUBREASONS else "audit-internal-check")
+            print("devlane_audit=refused code=audit-contract reason=" + reason)
+        else:
+            print("devlane_audit=refused code=audit-internal")
         return 1
     except Exception:
         print("devlane_audit=refused code=audit-internal")

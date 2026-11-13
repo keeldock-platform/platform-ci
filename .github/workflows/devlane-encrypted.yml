@@ -690,7 +690,8 @@ jobs:
             printf 'devlane_bootstrap_refusal=%s\n' "$1" >&2
             exit 1
           }
-          [[ "$(python3 -B -c 'import sys; print("%d.%d" % sys.version_info[:2])')" == "3.15" ]] || crypto_refuse crypto-dependency-verification-failed
+          crypto_python_version="$(python3 -B -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)" || crypto_refuse crypto-python-version-invalid
+          [[ "$crypto_python_version" == "3.15" ]] || crypto_refuse crypto-python-version-invalid
           if ! python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             python3 -B -m pip install --quiet --disable-pip-version-check --no-input --no-cache-dir \
               --index-url https://pypi.org/simple --target "$crypto_target" --require-hashes \
@@ -699,18 +700,56 @@ jobs:
             crypto_refuse crypto-dependency-install-failed
           fi
           runner_uid="$(id -u)"
+          umask 077
+          crypto_reason_file="$RUN_ROOT/control-crypto-refusal.txt"
+          crypto_print_reason() {
+            case "$1" in
+              devlane_crypto_refusal=crypto-target-invalid|devlane_crypto_refusal=crypto-acl-invalid|\
+              devlane_crypto_refusal=crypto-platform-invalid|devlane_crypto_refusal=crypto-metadata-invalid|\
+              devlane_crypto_refusal=crypto-file-invalid|devlane_crypto_refusal=crypto-tree-invalid|\
+              devlane_crypto_refusal=crypto-manifest-invalid|devlane_crypto_refusal=crypto-seal-write-failed|\
+              devlane_crypto_refusal=crypto-tree-mismatch|devlane_crypto_refusal=crypto-import-invalid|\
+              devlane_crypto_refusal=crypto-key-present|devlane_crypto_refusal=crypto-script-invalid|\
+              devlane_crypto_refusal=crypto-control-invalid)
+                printf '%s\n' "$1" >&2
+                ;;
+              *)
+                printf 'devlane_crypto_refusal=crypto-control-invalid\n' >&2
+                ;;
+            esac
+          }
           if ! python3 -B kit/devlane/control_python.py --target "$crypto_target" \
-            --platform macos --owner-uid "$runner_uid" seal >/dev/null 2>&1 || \
-             ! python3 -B kit/devlane/control_python.py --target "$crypto_target" \
-               --platform macos --owner-uid "$runner_uid" check --require-key-absent >/dev/null 2>&1; then
-            crypto_refuse crypto-dependency-verification-failed
+            --platform macos --owner-uid "$runner_uid" seal \
+            >/dev/null 2>"$crypto_reason_file"
+          then
+            crypto_output="$(<"$crypto_reason_file")"
+            crypto_print_reason "$crypto_output"
+            rm -f -- "$crypto_reason_file" >/dev/null 2>&1
+            crypto_refuse crypto-dependency-seal-failed
           fi
+          rm -f -- "$crypto_reason_file" >/dev/null 2>&1
+          if ! python3 -B kit/devlane/control_python.py --target "$crypto_target" \
+            --platform macos --owner-uid "$runner_uid" check --require-key-absent \
+            >/dev/null 2>"$crypto_reason_file"
+          then
+            crypto_output="$(<"$crypto_reason_file")"
+            crypto_print_reason "$crypto_output"
+            rm -f -- "$crypto_reason_file" >/dev/null 2>&1
+            crypto_refuse crypto-dependency-check-failed
+          fi
+          rm -f -- "$crypto_reason_file" >/dev/null 2>&1
           python_bin="$(python3 -B -c 'import sys; print(sys.executable)')"
           if ! python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             sudo -n "$python_bin" -B kit/devlane/control_python.py --target "$crypto_target" \
-              --platform macos --owner-uid "$runner_uid" check --require-key-absent >/dev/null 2>&1; then
-            crypto_refuse crypto-unavailable
+              --platform macos --owner-uid "$runner_uid" check --require-key-absent \
+              >/dev/null 2>"$crypto_reason_file"
+          then
+            crypto_output="$(<"$crypto_reason_file")"
+            crypto_print_reason "$crypto_output"
+            rm -f -- "$crypto_reason_file" >/dev/null 2>&1
+            crypto_refuse crypto-dependency-privileged-check-failed
           fi
+          rm -f -- "$crypto_reason_file" >/dev/null 2>&1
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             python3 -B kit/devlane/fetch.py context --output "$RUN_ROOT/context.json"
       - name: Set up pinned macOS Node runtime
@@ -1185,9 +1224,25 @@ jobs:
             Write-Output ('devlane_deadline_refusal=' + $Code)
             exit 1
           }
-          $pythonVersion = python -B -c 'import sys; print("%d.%d" % sys.version_info[:2])'
+          function Write-Crypto-Reason([object[]]$Output) {
+            $allowed = @(
+              'devlane_crypto_refusal=crypto-target-invalid', 'devlane_crypto_refusal=crypto-acl-invalid',
+              'devlane_crypto_refusal=crypto-platform-invalid', 'devlane_crypto_refusal=crypto-metadata-invalid',
+              'devlane_crypto_refusal=crypto-file-invalid', 'devlane_crypto_refusal=crypto-tree-invalid',
+              'devlane_crypto_refusal=crypto-manifest-invalid', 'devlane_crypto_refusal=crypto-seal-write-failed',
+              'devlane_crypto_refusal=crypto-tree-mismatch', 'devlane_crypto_refusal=crypto-import-invalid',
+              'devlane_crypto_refusal=crypto-key-present', 'devlane_crypto_refusal=crypto-script-invalid',
+              'devlane_crypto_refusal=crypto-control-invalid'
+            )
+            foreach ($item in $Output) {
+              $line = [string]$item
+              if ($allowed -contains $line) { Write-Output $line; return }
+            }
+            Write-Output 'devlane_crypto_refusal=crypto-control-invalid'
+          }
+          $pythonVersion = python -B -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>$null
           if ($LASTEXITCODE -ne 0 -or $pythonVersion.Trim() -ne '3.12') {
-            Refuse-Bootstrap 'crypto-dependency-verification-failed'
+            Refuse-Bootstrap 'crypto-python-version-invalid'
           }
           $cryptoTarget = Join-Path $runRoot 'control-python-deps'
           python -B kit/devlane/deadline.py run --file (Join-Path $runRoot 'deadline.json') -- `
@@ -1195,10 +1250,18 @@ jobs:
               --index-url https://pypi.org/simple --target $cryptoTarget --require-hashes `
               --only-binary=:all: --no-deps -r (Join-Path $env:CI_WORKSPACE 'kit\devlane\control-crypto-requirements.txt') *> $null
           if ($LASTEXITCODE -ne 0) { Refuse-Bootstrap 'crypto-dependency-install-failed' }
-          python -B kit/devlane/control_python.py --target $cryptoTarget --platform windows seal *> $null
-          if ($LASTEXITCODE -ne 0) { Refuse-Bootstrap 'crypto-dependency-verification-failed' }
-          python -B kit/devlane/control_python.py --target $cryptoTarget --platform windows check --require-key-absent *> $null
-          if ($LASTEXITCODE -ne 0) { Refuse-Bootstrap 'crypto-dependency-verification-failed' }
+          $sealOutput = python -B kit/devlane/control_python.py --target $cryptoTarget --platform windows seal 2>&1
+          $sealExit = $LASTEXITCODE
+          if ($sealExit -ne 0) {
+            Write-Crypto-Reason $sealOutput
+            Refuse-Bootstrap 'crypto-dependency-seal-failed'
+          }
+          $checkOutput = python -B kit/devlane/control_python.py --target $cryptoTarget --platform windows check --require-key-absent 2>&1
+          $checkExit = $LASTEXITCODE
+          if ($checkExit -ne 0) {
+            Write-Crypto-Reason $checkOutput
+            Refuse-Bootstrap 'crypto-dependency-check-failed'
+          }
           python -B kit/devlane/fetch.py context --output (Join-Path $runRoot 'context.json')
           if ($LASTEXITCODE -ne 0) { exit 1 }
       - name: Set up pinned Windows Node runtime

@@ -13,6 +13,8 @@ import stat
 import subprocess
 import sys
 
+import refusal_codes
+
 
 MANIFEST_NAME = ".control-crypto-manifest.json"
 MAX_FILES = 10000
@@ -27,31 +29,35 @@ SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 
 
 class CryptoRefusal(ValueError):
-    pass
+    def __init__(self, reason):
+        super().__init__("crypto-unavailable")
+        self.reason = reason
 
 
-def _refuse():
-    raise CryptoRefusal("crypto-unavailable")
+def _refuse(reason="crypto-control-invalid"):
+    if reason not in refusal_codes.CRYPTO_CONTROL_REFUSAL_CODES:
+        reason = "crypto-control-invalid"
+    raise CryptoRefusal(reason)
 
 
 def _canonical_root(value):
     try:
         root = Path(value)
         if not root.is_absolute() or root.name != "control-python-deps":
-            _refuse()
+            _refuse("crypto-target-invalid")
         if root.resolve(strict=True) != root:
-            _refuse()
+            _refuse("crypto-target-invalid")
         metadata = root.lstat()
         if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-            _refuse()
+            _refuse("crypto-target-invalid")
         parent = root.parent.lstat()
         if not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode):
-            _refuse()
+            _refuse("crypto-target-invalid")
         return root
     except CryptoRefusal:
         raise
     except (OSError, RuntimeError, TypeError, ValueError):
-        _refuse()
+        _refuse("crypto-target-invalid")
 
 
 def _powershell_acl_owner(root):
@@ -61,7 +67,7 @@ def _powershell_acl_owner(root):
     )
     try:
         if not powershell.is_file():
-            _refuse()
+            _refuse("crypto-acl-invalid")
         encoded_root = base64.b64encode(str(root).encode("utf-8")).decode("ascii")
         script = r'''
 $ErrorActionPreference = 'Stop'
@@ -99,34 +105,34 @@ foreach ($item in $items) {
         )
         owner = result.stdout.decode("ascii", "strict").strip()
         if result.returncode != 0 or result.stderr or not re.fullmatch(r"S-1-(?:[0-9]+-)*[0-9]+", owner):
-            _refuse()
+            _refuse("crypto-acl-invalid")
         return owner
     except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
-        _refuse()
+        _refuse("crypto-acl-invalid")
 
 
 def _expected_owner(platform_name, owner_uid=None):
     if platform_name == "macos":
         if type(owner_uid) is not int or owner_uid <= 0 or owner_uid > 2**31 - 1:
-            _refuse()
+            _refuse("crypto-platform-invalid")
         return owner_uid
     if platform_name == "windows":
         if owner_uid is not None:
-            _refuse()
+            _refuse("crypto-platform-invalid")
         return None
-    _refuse()
+    _refuse("crypto-platform-invalid")
 
 
 def _check_posix_metadata(path, *, expected_uid, directory):
     try:
         metadata = path.lstat()
     except OSError:
-        _refuse()
+        _refuse("crypto-metadata-invalid")
     if (metadata.st_uid != expected_uid or metadata.st_mode & 0o022
             or directory != stat.S_ISDIR(metadata.st_mode)
             or (not directory and not stat.S_ISREG(metadata.st_mode))
             or stat.S_ISLNK(metadata.st_mode)):
-        _refuse()
+        _refuse("crypto-metadata-invalid")
     return metadata
 
 
@@ -137,10 +143,10 @@ def _hash_regular_file(path, *, expected_uid, platform_name):
         try:
             before = path.lstat()
         except OSError:
-            _refuse()
+            _refuse("crypto-file-invalid")
         if (stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode)
                 or getattr(before, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
-            _refuse()
+            _refuse("crypto-file-invalid")
     digest = hashlib.sha256()
     count = 0
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
@@ -150,19 +156,19 @@ def _hash_regular_file(path, *, expected_uid, platform_name):
             opened = os.fstat(stream.fileno())
             if (not stat.S_ISREG(opened.st_mode) or opened.st_ino != before.st_ino
                     or opened.st_size != before.st_size):
-                _refuse()
+                _refuse("crypto-file-invalid")
             while True:
                 chunk = stream.read(65536)
                 if not chunk:
                     break
                 count += len(chunk)
                 if count > MAX_TREE_BYTES:
-                    _refuse()
+                    _refuse("crypto-file-invalid")
                 digest.update(chunk)
     except (OSError, CryptoRefusal):
-        _refuse()
+        _refuse("crypto-file-invalid")
     if count != before.st_size:
-        _refuse()
+        _refuse("crypto-file-invalid")
     return count, digest.hexdigest()
 
 
@@ -178,16 +184,16 @@ def _tree_rows(root, *, platform_name, expected_uid=None):
             try:
                 metadata = directory.lstat()
             except OSError:
-                _refuse()
+                _refuse("crypto-tree-invalid")
             if (not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
                     or getattr(metadata, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
-                _refuse()
+                _refuse("crypto-tree-invalid")
         del metadata
         try:
             with os.scandir(directory) as scanner:
                 entries = sorted(scanner, key=lambda entry: entry.name, reverse=True)
         except OSError:
-            _refuse()
+            _refuse("crypto-tree-invalid")
         for entry in entries:
             path = Path(entry.path)
             if path == root / MANIFEST_NAME:
@@ -195,22 +201,22 @@ def _tree_rows(root, *, platform_name, expected_uid=None):
             try:
                 info = entry.stat(follow_symlinks=False)
             except OSError:
-                _refuse()
+                _refuse("crypto-tree-invalid")
             if stat.S_ISLNK(info.st_mode):
-                _refuse()
+                _refuse("crypto-tree-invalid")
             if stat.S_ISDIR(info.st_mode):
                 pending.append(path)
                 continue
             if not stat.S_ISREG(info.st_mode):
-                _refuse()
+                _refuse("crypto-tree-invalid")
             size, digest = _hash_regular_file(path, expected_uid=expected_uid, platform_name=platform_name)
             total += size
             if total > MAX_TREE_BYTES or len(rows) >= MAX_FILES:
-                _refuse()
+                _refuse("crypto-tree-invalid")
             rows.append({"path": path.relative_to(root).as_posix(), "size": size, "sha256": digest})
     rows.sort(key=lambda row: row["path"])
     if not rows:
-        _refuse()
+        _refuse("crypto-tree-invalid")
     return rows
 
 
@@ -226,7 +232,7 @@ def _unique_pairs(pairs):
     result = {}
     for key, value in pairs:
         if key in result:
-            _refuse()
+            _refuse("crypto-manifest-invalid")
         result[key] = value
     return result
 
@@ -240,10 +246,10 @@ def seal(target, platform_name, owner_uid=None):
         _check_posix_metadata(root, expected_uid=owner, directory=True)
     elif platform_name == "windows":
         if owner_uid is not None:
-            _refuse()
+            _refuse("crypto-platform-invalid")
         owner = _powershell_acl_owner(root)
     else:
-        _refuse()
+        _refuse("crypto-platform-invalid")
     rows = _tree_rows(root, platform_name=platform_name, expected_uid=owner)
     tree_digest = hashlib.sha256(_canonical_rows(rows)).hexdigest()
     manifest = json.dumps({
@@ -254,7 +260,7 @@ def seal(target, platform_name, owner_uid=None):
         "tree_sha256": tree_digest,
     }, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii") + b"\n"
     if len(manifest) > MAX_MANIFEST_BYTES:
-        _refuse()
+        _refuse("crypto-manifest-invalid")
     path = _manifest_path(root)
     try:
         descriptor = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
@@ -265,7 +271,7 @@ def seal(target, platform_name, owner_uid=None):
         if platform_name == "windows":
             path.chmod(0o444)
     except OSError:
-        _refuse()
+        _refuse("crypto-seal-write-failed")
     return owner
 
 
@@ -277,19 +283,19 @@ def _read_manifest(root, platform_name, expected_owner):
         info = path.lstat()
         if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
                 or info.st_size > MAX_MANIFEST_BYTES):
-            _refuse()
+            _refuse("crypto-manifest-invalid")
         payload = path.read_bytes()
         manifest = json.loads(payload.decode("ascii", "strict"), object_pairs_hook=_unique_pairs)
     except CryptoRefusal:
         raise
     except (OSError, UnicodeError, ValueError, TypeError):
-        _refuse()
+        _refuse("crypto-manifest-invalid")
     if (type(manifest) is not dict or set(manifest) != {"schema", "platform", "owner", "files", "tree_sha256"}
             or type(manifest["schema"]) is not int or manifest["schema"] != 1
             or manifest["platform"] != platform_name
             or manifest["owner"] != expected_owner or type(manifest["files"]) is not list
             or type(manifest["tree_sha256"]) is not str or not SHA256.fullmatch(manifest["tree_sha256"])):
-        _refuse()
+        _refuse("crypto-manifest-invalid")
     return manifest
 
 
@@ -301,15 +307,15 @@ def validate(target, platform_name, owner_uid=None):
         _check_posix_metadata(root, expected_uid=owner, directory=True)
     elif platform_name == "windows":
         if owner_uid is not None:
-            _refuse()
+            _refuse("crypto-platform-invalid")
         owner = _powershell_acl_owner(root)
     else:
-        _refuse()
+        _refuse("crypto-platform-invalid")
     manifest = _read_manifest(root, platform_name, owner)
     rows = _tree_rows(root, platform_name=platform_name, expected_uid=owner)
     if (rows != manifest["files"]
             or hashlib.sha256(_canonical_rows(rows)).hexdigest() != manifest["tree_sha256"]):
-        _refuse()
+        _refuse("crypto-tree-mismatch")
     return root
 
 
@@ -325,26 +331,26 @@ def _import_pinned_crypto(root):
         if (tuple(module.__version__ for module in modules)
                 != (PINNED_VERSIONS["cffi"], PINNED_VERSIONS["cryptography"], PINNED_VERSIONS["pycparser"])
                 or AESGCM is None):
-            _refuse()
+            _refuse("crypto-import-invalid")
         for module in modules:
             module_path = Path(module.__file__).resolve(strict=True)
             if not module_path.is_relative_to(root):
-                _refuse()
+                _refuse("crypto-import-invalid")
     except Exception:
-        _refuse()
+        _refuse("crypto-import-invalid")
 
 
 def _run_script(root, script, arguments, *, platform_name, owner_uid, key_absent):
     try:
         validated_root = validate(root, platform_name, owner_uid)
         if key_absent and "DEVLANE_DECRYPT_KEY" in os.environ:
-            _refuse()
+            _refuse("crypto-key-present")
         _import_pinned_crypto(validated_root)
         script_path = Path(script)
         if not script_path.is_absolute():
             script_path = Path.cwd() / script_path
         if not script_path.is_file() or script_path.is_symlink():
-            _refuse()
+            _refuse("crypto-script-invalid")
     except CryptoRefusal:
         if Path(script).name in ("sandbox_macos.py", "sandbox_windows.py") and arguments[:1] == ["decrypt"]:
             print("devlane_supervisor_refusal=decrypt-rejected", file=sys.stderr)
@@ -376,14 +382,22 @@ def main(argv=None):
         if args.command == "check":
             root = validate(args.target, args.platform, args.owner_uid)
             if args.require_key_absent and "DEVLANE_DECRYPT_KEY" in os.environ:
-                _refuse()
+                _refuse("crypto-key-present")
             _import_pinned_crypto(root)
             return 0
         return _run_script(
             args.target, args.script, args.arguments, platform_name=args.platform,
             owner_uid=args.owner_uid, key_absent=False,
         )
-    except CryptoRefusal:
+    except CryptoRefusal as error:
+        if args.command in ("seal", "check"):
+            reason = (error.reason if error.reason in refusal_codes.CRYPTO_CONTROL_REFUSAL_CODES
+                      else "crypto-control-invalid")
+            print("devlane_crypto_refusal=" + reason, file=sys.stderr)
+        return 2
+    except Exception:
+        if args.command in ("seal", "check"):
+            print("devlane_crypto_refusal=crypto-control-invalid", file=sys.stderr)
         return 2
 
 

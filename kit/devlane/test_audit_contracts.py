@@ -711,23 +711,25 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             with self.subTest(mutation=mutation), self.assertRaises(audit.AuditRefusal):
                 audit.validate_job_log_metadata_binding(failure_surface, changed_job, IDENTITY)
 
-    def test_public_audit_refusal_prints_only_a_fixed_code(self):
+    def test_public_audit_refusal_prints_a_fixed_check_reason(self):
         output = io.StringIO()
-        with patch.object(audit, "audit_environment", side_effect=audit.AuditRefusal("audit-contract")), \
+        with patch.object(audit, "audit_environment", side_effect=audit.AuditRefusal(
+                "audit-contract", "audit-environment")), \
                 contextlib.redirect_stdout(output):
             self.assertEqual(audit.main(), 1)
-        self.assertEqual(output.getvalue(), "devlane_audit=refused code=audit-contract\n")
+        refusal_line = "devlane_audit=refused code=audit-contract reason=audit-environment"
+        self.assertEqual(output.getvalue(), refusal_line + "\n")
         refusal_log = _render_real_runner_encrypted_log(IDENTITY, job_key=audit.AUDIT_JOB).replace(
             b"devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed",
-            b"devlane_audit=refused code=audit-contract",
+            refusal_line.encode("ascii"),
             1,
         )
         audit.validate_job_log_surface(refusal_log, audit.AUDIT_JOB, IDENTITY, completed=True)
-        with self.assertRaises(audit.AuditRefusal):
-            audit.validate_job_log_surface(
-                refusal_log.replace(b"audit-contract", b"private-path"),
-                audit.AUDIT_JOB, IDENTITY, completed=True,
-            )
+        for mutation in (b"audit-contract", b"reason=audit-environment"):
+            changed = (refusal_log.replace(b"audit-contract", b"private-path") if mutation == b"audit-contract"
+                       else refusal_log.replace(mutation, b"reason=private-path"))
+            with self.subTest(mutation=mutation), self.assertRaises(audit.AuditRefusal):
+                audit.validate_job_log_surface(changed, audit.AUDIT_JOB, IDENTITY, completed=True)
 
     def test_two_job_contract_accepts_exact_names_steps_attempt_and_cleanup(self):
         jobs = _encrypted_jobs()
@@ -880,10 +882,14 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 (platform_name, "Fetch public control and validate dispatch", prefix + code, 1)
                 for code in (
                     "crypto-dependency-install-failed", "crypto-dependency-verification-failed",
+                    "crypto-python-version-invalid", "crypto-dependency-seal-failed",
+                    "crypto-dependency-check-failed",
                 )
             )
         cases.append(("macos", "Fetch public control and validate dispatch",
                       "devlane_bootstrap_refusal=crypto-unavailable", 1))
+        cases.append(("macos", "Fetch public control and validate dispatch",
+                      "devlane_bootstrap_refusal=crypto-dependency-privileged-check-failed", 1))
 
         for platform_name, failed_step, marker, exit_code in cases:
             with self.subTest(platform=platform_name, marker=marker):
@@ -908,6 +914,17 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 log = _render_real_runner_encrypted_log(
                     identity, early_failure={"step": failed_step, "marker": marker, "exit_code": exit_code},
                 )
+                marker_code = marker.split("=", 1)[1]
+                crypto_reason = {
+                    "crypto-dependency-seal-failed": "crypto-seal-write-failed",
+                    "crypto-dependency-check-failed": "crypto-import-invalid",
+                    "crypto-dependency-privileged-check-failed": "crypto-key-present",
+                }.get(marker_code)
+                if crypto_reason:
+                    log = log.replace(
+                        marker.encode("ascii"),
+                        ("devlane_crypto_refusal=" + crypto_reason + "\n" + marker).encode("ascii"), 1,
+                    )
                 surface = audit.validate_job_log_surface(
                     log, audit.PLATFORM_RUN_JOBS[platform_name], identity, completed=True,
                 )
@@ -2182,6 +2199,56 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 route_line.replace("network-route-unexpected", "network-address-unexpected")):
             self.assertFalse(diagnostic_contract.public_preparation_diagnostic(malformed))
 
+    def test_macos_start_and_crypto_refusals_are_step_bound_and_unknown_codes_fail(self):
+        root = Path(__file__).resolve().parents[2]
+        grammar = audit._Grammar(
+            root / ".github/workflows/devlane-encrypted.yml", audit.MACOS_RUN_JOB,
+            dict(IDENTITY, platform="macos"), "encrypted",
+        )
+        for code in sorted(audit.MACOS_SUPERVISOR_START_REFUSAL_CODES):
+            self.assertTrue(grammar.refusal_line_ok(
+                "Cut network and start the isolated supervisor", "devlane_supervisor_refusal=" + code,
+            ))
+        for code in ("supervisor-failed", "private-path", "macos-supervisor-start-secret"):
+            self.assertFalse(grammar.refusal_line_ok(
+                "Cut network and start the isolated supervisor", "devlane_supervisor_refusal=" + code,
+            ))
+        self.assertTrue(grammar.step_output_ok(
+            "Fetch public control and validate dispatch", "devlane_crypto_refusal=crypto-acl-invalid", {},
+        ))
+        self.assertFalse(grammar.step_output_ok(
+            "Prepare hosted runner isolation state", "devlane_crypto_refusal=crypto-acl-invalid", {},
+        ))
+        self.assertFalse(grammar.step_output_ok(
+            "Fetch public control and validate dispatch", "devlane_crypto_refusal=private-path", {},
+        ))
+
+    def test_bootstrap_crypto_subreason_is_bound_to_a_fixed_reason_and_failure(self):
+        identity = dict(IDENTITY, platform="macos")
+        marker = b"devlane_bootstrap_refusal=crypto-dependency-check-failed"
+        log = _render_real_runner_encrypted_log(
+            identity,
+            early_failure={
+                "step": "Fetch public control and validate dispatch",
+                "marker": marker.decode("ascii"), "exit_code": 1,
+            },
+        ).replace(marker, b"devlane_crypto_refusal=crypto-import-invalid\n" + marker, 1)
+        result = audit.validate_job_log_surface(log, audit.MACOS_RUN_JOB, identity, completed=True)
+        self.assertEqual(result["crypto_refusal_reason"], "crypto-import-invalid")
+        for invalid in (
+            log.replace(b"crypto-import-invalid", b"private-path", 1),
+            log.replace(b"crypto-dependency-check-failed", b"crypto-dependency-seal-failed", 1),
+            log.replace(b"devlane_crypto_refusal=crypto-import-invalid\n", b"", 1),
+        ):
+            with self.subTest(invalid=invalid[-180:]), self.assertRaises(audit.AuditRefusal):
+                audit.validate_job_log_surface(invalid, audit.MACOS_RUN_JOB, identity, completed=True)
+
+    def test_audit_refusal_reason_identifies_the_contract_check(self):
+        job = {"name": "audit", "status": "completed", "conclusion": "success"}
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.validate_check_output(None, job, IDENTITY, completed=True)
+        self.assertEqual(caught.exception.reason, "check-run-output")
+
     def test_decrypt_child_diagnostics_are_fixed_and_appear_at_most_once(self):
         root = Path(__file__).resolve().parents[2]
         grammar = audit._Grammar(
@@ -2616,6 +2683,8 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
         self.assertEqual(requirements.count("--hash=sha256:"), 5)
         for code in (
             "crypto-dependency-install-failed", "crypto-dependency-verification-failed",
+            "crypto-python-version-invalid", "crypto-dependency-seal-failed",
+            "crypto-dependency-check-failed", "crypto-dependency-privileged-check-failed",
             "tool-file-type-invalid", "tool-owner-invalid", "tool-mode-invalid", "tool-symlink", "tool-path-resolve-mismatch",
             "tool-file-unavailable",
             "developer-dir-unexpected", "developer-dir-trust-invalid", "clang-path-invalid", "tool-digest-mismatch",
@@ -2644,7 +2713,7 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
             if platform_name == "macos":
                 self.assertIn("--require-key-absent", script)
                 self.assertIn("sudo -n", script)
-                self.assertIn("crypto_refuse crypto-unavailable", script)
+                self.assertIn("crypto_refuse crypto-dependency-privileged-check-failed", script)
                 root_check = script.index('sudo -n "$python_bin" -B kit/devlane/control_python.py')
                 self.assertIn(
                     '--platform macos --owner-uid "$runner_uid" check --require-key-absent',
@@ -2658,6 +2727,8 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
             expected_python = "3.15" if platform_name == "macos" else "3.12"
             self.assertIn(("== \"" + expected_python + "\"") if platform_name == "macos"
                           else ("-ne '" + expected_python + "'"), script)
+            self.assertIn("crypto-dependency-seal-failed", script)
+            self.assertIn("crypto-dependency-check-failed", script)
             steps = workflow[job_key]["steps"]
             runtime_label = "macOS" if platform_name == "macos" else "Windows"
             node_setup_index = next(index for index, step in enumerate(steps)
