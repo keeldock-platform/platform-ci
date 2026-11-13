@@ -20,7 +20,7 @@ from macos_public_audit import (
 )
 import diagnostic_contract
 import network_probe
-import supervisor
+import refusal_codes
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -223,19 +223,17 @@ DECRYPT_FAILURE_CODES = frozenset((
 WINDOWS_RUNNER_REFUSAL_CODES = frozenset(("windows-runner-failed", "boundary"))
 FETCH_REFUSAL_CODES = diagnostic_contract.PREPARATION_REFUSAL_CODES | frozenset(("fetch-failed",))
 SUPERVISOR_START_REFUSAL_CODES = (
-    supervisor.STARTUP_REFUSAL_CODES | supervisor.STARTUP_DIAGNOSTIC_CODES
+    refusal_codes.STARTUP_REFUSAL_CODES | refusal_codes.STARTUP_DIAGNOSTIC_CODES
     | frozenset(("supervisor-failed", "supervisor-start-failed", "supervisor-start-timeout", "runner-unknown"))
 )
 SUPERVISOR_EXECUTION_REFUSAL_CODES = (
-    supervisor.REFUSAL_CODES - supervisor.NETWORK_PROBE_DIAGNOSTIC_CODES
-    - supervisor.DECRYPT_REFUSAL_CODES - supervisor.STARTUP_DIAGNOSTIC_CODES
+    refusal_codes.REFUSAL_CODES - refusal_codes.NETWORK_PROBE_DIAGNOSTIC_CODES
+    - refusal_codes.DECRYPT_REFUSAL_CODES - refusal_codes.STARTUP_DIAGNOSTIC_CODES
 )
 SUPERVISOR_CLEANUP_REFUSAL_CODES = frozenset((
     "cleanup-incomplete", "cleanup-process-remains", "cleanup-receipt-invalid", "cleanup-root-invalid",
     "supervisor-failed", "supervisor-operation-failed",
-)) | frozenset("cleanup-incomplete:" + code for code in (
-    "umount-busy", "umount-missing", "tree-remove", "process-alive", "cgroup-nonempty",
-))
+)) | frozenset("cleanup-incomplete:" + code for code in refusal_codes.CLEANUP_SUBREASONS)
 MACOS_DECRYPT_SUPERVISOR_REFUSAL_CODES = DECRYPT_FAILURE_CODES | frozenset((
     "decrypt-order", "bundle-binding-mismatch", "supervisor-failed", "supervisor-operation-failed",
 ))
@@ -248,7 +246,7 @@ def _code_alternative(codes):
 REFUSAL_LINE = re.compile(
     r"(?:devlane_refusal=" + _code_alternative(FETCH_REFUSAL_CODES | WINDOWS_RUNNER_REFUSAL_CODES)
     + r"|devlane_supervisor_refusal=" + _code_alternative(
-        supervisor.REFUSAL_CODES | SUPERVISOR_START_REFUSAL_CODES | SUPERVISOR_CLEANUP_REFUSAL_CODES
+        refusal_codes.REFUSAL_CODES | SUPERVISOR_START_REFUSAL_CODES | SUPERVISOR_CLEANUP_REFUSAL_CODES
         | MACOS_DECRYPT_SUPERVISOR_REFUSAL_CODES
     )
     + r"|dependency_preparation_refusal=runner-unknown"
