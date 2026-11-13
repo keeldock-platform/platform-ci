@@ -1,13 +1,15 @@
 """Source-free unit and local Seatbelt acceptance for the macOS devlane worker."""
 
-import json
+import hashlib
 import io
+import json
 import os
 from pathlib import Path
 import platform
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -161,6 +163,96 @@ class MacProfileTests(unittest.TestCase):
                 "inside": True, "outside_read": True, "outside_write": True, "network": True,
             })
             self.assertEqual(outside.read_bytes(), b"outside-canary")
+
+    def test_start_initializes_a_valid_macos_dispatch_end_to_end_in_memory(self):
+        run_id = "12345"
+        control_sha = "a" * 40
+        with tempfile.TemporaryDirectory(prefix="devlane-macos-start-") as temporary:
+            root = Path(temporary).resolve()
+            state = root / "state"
+            prepared = root / "prepared"
+            state.mkdir(mode=0o700)
+            (prepared / "node_modules").mkdir(parents=True)
+            node = root / "node"
+            npm_cli = root / "npm-cli.js"
+            node.write_bytes(b"node executable fixture")
+            npm_cli.write_bytes(b"npm cli fixture")
+            bundle_path = root / "bundle.enc"
+            bundle_payload = b"opaque encrypted bundle fixture"
+            bundle_path.write_bytes(bundle_payload)
+            context = {
+                "repository": sandbox.fetch.REPOSITORY,
+                "repository_id": sandbox.fetch.REPOSITORY_ID,
+                "server_url": "https://github.com",
+                "event": "workflow_dispatch",
+                "ref": "refs/heads/main",
+                "control_sha": control_sha,
+                "workflow_path": sandbox.fetch.WORKFLOW_PATH,
+                "run_attempt": 1,
+                "control_run_id": "9876",
+                "profile": "core-node",
+                "wave_id": "wave-test-0001",
+                "bundle_id": "bundle-test-0001",
+                "bundle_asset_id": "111",
+                "bundle_sha256": hashlib.sha256(bundle_payload).hexdigest(),
+                "bundle_size": len(bundle_payload),
+                "projection_asset_id": "222",
+                "projection_sha256": "d" * 64,
+                "projection_size": 10,
+                "expires": int(time.time()) + 1800,
+                "platform": "macos",
+            }
+            context_path = root / "context.json"
+            sandbox._write_json(context_path, context)
+            projection_path = root / "projection.json"
+            projection_path.write_bytes(b"validated by the fixture")
+            positive_path = root / "positive.json"
+            sandbox._write_json(positive_path, {
+                "connected": True, "target": "public-tls-control",
+            })
+            ident = {
+                "schema": 1, "run_id": run_id, "runner_uid": 501, "uid": 544,
+                "gid": sandbox.WORKER_GROUP, "account": "kddevlane" + run_id,
+                "home": str(root / "worker-home"), "node": str(node), "npm_cli": str(npm_cli),
+                "node_sha256": hashlib.sha256(node.read_bytes()).hexdigest(),
+                "npm_sha256": hashlib.sha256(npm_cli.read_bytes()).hexdigest(),
+                "developer_directory": "/Library/Developer/CommandLineTools",
+                "clang": "/usr/bin/clang", "host_identity": {},
+            }
+            sandbox._write_json(state / sandbox.IDENTITY_FILE, ident, mode=0o644)
+
+            def install_pf(state_dir, identity):
+                sandbox._write_json(state_dir / sandbox.PF_STATE_FILE, {
+                    "schema": 1, "uid": identity["uid"], "token": "1234",
+                    "rules_file": str(root / "pf.rules"), "host_identity": identity["host_identity"],
+                    "loaded": True,
+                })
+
+            stdout = io.StringIO()
+            arguments = [
+                "start", "--state-dir", str(state), "--context", str(context_path),
+                "--workspace", str(root / "runner-workspace"), "--prepared", str(prepared),
+                "--bundle", str(bundle_path), "--projection", str(projection_path),
+                "--positive-control", str(positive_path), "--deadline-file", str(root / "deadline.json"),
+                "--run-id", run_id,
+            ]
+            with mock.patch.object(sandbox.os, "geteuid", return_value=0), \
+                    mock.patch.object(sandbox.boundary_guard, "_check_trusted_system_file"), \
+                    mock.patch.object(sandbox, "_validate_projection_file", return_value={
+                        "tools": {"node": "24.22.1", "npm": "11.19.1"},
+                    }), \
+                    mock.patch.object(sandbox, "_chown_tree"), \
+                    mock.patch.object(sandbox.os, "chown"), \
+                    mock.patch.object(sandbox, "_install_pf", side_effect=install_pf), \
+                    mock.patch("sys.stdout", stdout):
+                self.assertEqual(sandbox.main(arguments), 0)
+
+            worker = sandbox._worker_state(state)
+            self.assertEqual(worker["run_id"], run_id)
+            self.assertEqual(worker["profile"], "core-node")
+            self.assertFalse(worker["probe_complete"])
+            self.assertFalse(worker["decrypted"])
+            self.assertEqual(stdout.getvalue(), "offline_supervisor=ready\n")
 
 
 class MacRoundOneRegressionTests(unittest.TestCase):

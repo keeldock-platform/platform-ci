@@ -188,12 +188,12 @@ def cache_line_patterns(key, temp=TEMP, platform="linux"):
         create = re.compile(
             r"(?:" + LOG_MARKER + r")?\[command\]" + tar
             + r" --posix -cf cache\.tzst --exclude cache\.tzst -P -C " + re.escape(workspace)
-            + r" --files-from manifest\.txt --force-local --use-compress-program \"zstd -T0(?: --long=30)?\"\Z"
+            + r" --files-from manifest\.txt --force-local --use-compress-program \"zstd -T0\"\Z"
         )
         restore = re.compile(
             r"(?:" + LOG_MARKER + r")?\[command\]" + tar + r" -xf D:/a/_temp/" + UUID
             + r"/cache\.tzst -P -C " + re.escape(workspace)
-            + r" --force-local --use-compress-program \"zstd -d(?: --long=30)?\"\Z"
+            + r" --force-local --use-compress-program \"zstd -d\"\Z"
         )
         return common + (create, restore)
     if platform == "macos":
@@ -203,12 +203,12 @@ def cache_line_patterns(key, temp=TEMP, platform="linux"):
             r"(?:" + LOG_MARKER + r")?\[command\]" + tar
             + r" --posix -cf cache\.tzst --exclude cache\.tzst -P -C " + workspace
             + r" --files-from manifest\.txt --delay-directory-restore --use-compress-program "
-            + r"(?:zstdmt(?: --long=30)?)\Z"
+            + r"zstdmt\Z"
         )
         restore = re.compile(
             r"(?:" + LOG_MARKER + r")?\[command\]" + tar + r" -xf " + re.escape(MACOS_TEMP) + "/" + UUID
             + r"/cache\.tzst -P -C " + workspace
-            + r" --delay-directory-restore --use-compress-program (?:unzstd(?: --long=30)?)\Z"
+            + r" --delay-directory-restore --use-compress-program unzstd\Z"
         )
         return common + (create, restore)
     tar_command = re.compile(
@@ -238,16 +238,15 @@ MACOS_NODE_LINES = (
     re.compile(r"Found in cache @ " + re.escape(MACOS_HOSTED_TOOL_CACHE) + r"\Z"),
     re.compile(r"Attempting to download 24\.22\.1\.\.\.\Z"),
     re.compile(r"Acquiring 24\.22\.1 - arm64 from https://github\.com/actions/node-versions/releases/download/"
-               r"24\.22\.1-[0-9]+/node-24\.22\.1-darwin-arm64\.tar\.gz\Z"),
+               r"24\.22\.1-39619001896/node-24\.22\.1-darwin-arm64\.tar\.gz\Z"),
     re.compile(r"Extracting \.\.\.\Z"),
     re.compile(r"Adding to the cache \.\.\.\Z"),
     re.compile(r"Successfully cached node to " + re.escape(MACOS_HOSTED_TOOL_CACHE) + r"\Z"),
     re.compile(r"Added node to the tool cache\Z"),
-    re.compile(r"(?:" + LOG_MARKER + r")?\[command\]/usr/bin/tar xz --strip 1 --warning=no-unknown-keyword --overwrite -C "
+    re.compile(r"(?:" + LOG_MARKER + r")?\[command\]/usr/bin/tar xz --strip 1 -C "
                + re.escape(MACOS_TEMP) + "/" + UUID + " -f " + re.escape(MACOS_TEMP) + "/" + UUID + r"\Z"),
     re.compile(r"Environment details\Z"),
     re.compile(r"(?:node: v24\.22\.1|npm: [0-9]+\.[0-9]+\.[0-9]+|yarn: [0-9]+\.[0-9]+\.[0-9]+)\Z"),
-    re.compile(r"Finished\Z"),
     re.compile(r"Post job cleanup\.\Z"),
 )
 WINDOWS_NODE_LINES = (
@@ -1170,10 +1169,9 @@ def _canonicalize_github_hosted_log(text, grammar, job_name, identity, workflow_
                     index += 1
                 if grammar.job_runner == "macos-15":
                     details_valid = (
-                        len(env_details) == 4 and env_details[0] == "node: v24.22.1"
+                        len(env_details) == 3 and env_details[0] == "node: v24.22.1"
                         and re.fullmatch(r"npm: [0-9]+\.[0-9]+\.[0-9]+", env_details[1]) is not None
                         and re.fullmatch(r"yarn: [0-9]+\.[0-9]+\.[0-9]+", env_details[2]) is not None
-                        and env_details[3] == "Finished"
                     )
                 else:
                     details_valid = env_details == ["node: v24.22.1", "npm: 11.19.1", "yarn: 1.22.22"]
@@ -1182,8 +1180,9 @@ def _canonicalize_github_hosted_log(text, grammar, job_name, identity, workflow_
                 output.extend(env_details)
                 index += 1
                 continue
+            uses = step["uses"] or ""
             if (line.startswith(LOG_MARKER + "[command]")
-                    and (step["uses"] or "").startswith("actions/cache/")
+                    and (uses.startswith("actions/cache/") or uses.startswith("actions/setup-node@"))
                     and grammar.step_output_ok(step["name"], line, {})):
                 output.append(line)
                 index += 1

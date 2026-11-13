@@ -144,11 +144,15 @@ def _step_outputs(step, identity, kind, records):
             return ["Attempting to download 24.22.1...",
                     "Acquiring 24.22.1 - arm64 from https:" + chr(47) * 2
                     + "github.com/actions/node-versions/releases/download/"
-                    "24.22.1-123456/node-24.22.1-darwin-arm64.tar.gz",
-                    "Extracting ...", "Adding to the cache ...",
+                    "24.22.1-39619001896/node-24.22.1-darwin-arm64.tar.gz",
+                    "Extracting ...",
+                    MARK + "[command]/usr/bin/tar xz --strip 1 -C " + MACOS_TMP
+                    + "/01234567-89ab-cdef-0123-456789abcdef -f " + MACOS_TMP
+                    + "/fedcba98-7654-3210-fedc-ba9876543210",
+                    "Adding to the cache ...",
                     "Successfully cached node to " + audit.MACOS_HOSTED_TOOL_CACHE,
                     "Added node to the tool cache", "Environment details", "node: v24.22.1",
-                    "npm: 11.6.2", "yarn: 1.22.22", "Finished"]
+                    "npm: 11.6.2", "yarn: 1.22.22"]
         if identity.get("platform") == "windows":
             return ["Found in cache @ " + audit.WINDOWS_HOSTED_TOOL_CACHE, "Environment details", "node: v24.22.1",
                     "npm: 11.19.1", "yarn: 1.22.22"]
@@ -796,6 +800,13 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         jobs = _encrypted_jobs(platform="macos")
         audit.validate_job_contract(jobs, identity, "core-node")
         log = _render_real_runner_encrypted_log(identity)
+        self.assertIn(
+            (MARK + "[command]/usr/bin/tar xz --strip 1 -C " + MACOS_TMP
+             + "/01234567-89ab-cdef-0123-456789abcdef -f " + MACOS_TMP
+             + "/fedcba98-7654-3210-fedc-ba9876543210").encode(),
+            log,
+        )
+        self.assertNotIn(b"\nFinished\n", log)
         audit.validate_job_log_surface(log, audit.MACOS_RUN_JOB, identity)
         audit_log = _render_real_runner_encrypted_log(identity, job_key=audit.AUDIT_JOB)
         audit.validate_job_log_surface(audit_log, audit.AUDIT_JOB, identity)
@@ -808,6 +819,18 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         changed = log.replace(b"Cloud: MacCloud", b"Cloud: Azure", 1)
         with self.assertRaises(audit.AuditRefusal):
             audit.validate_job_log_surface(changed, audit.MACOS_RUN_JOB, identity)
+        for changed in (
+            log.replace(b"tar xz --strip 1 -C", b"tar xz --strip 2 -C", 1),
+            log.replace(b"tar xz --strip 1 -C", b"tar xz --strip 1 --overwrite -C", 1),
+            log.replace(b"/usr/bin/tar xz --strip 1", b"/opt/homebrew/bin/gtar xz --strip 1", 1),
+            log.replace(b"/work/_temp/01234567-89ab-cdef-0123-456789abcdef -f",
+                        b"/tmp/01234567-89ab-cdef-0123-456789abcdef -f", 1),
+        ):
+            with self.subTest(mutation=changed[:200]), self.assertRaises(audit.AuditRefusal):
+                audit.validate_job_log_surface(changed, audit.MACOS_RUN_JOB, identity)
+        long_mode = log.replace(b"--use-compress-program zstdmt", b"--use-compress-program zstdmt --long=30", 1)
+        with self.assertRaises(audit.AuditRefusal):
+            audit.validate_job_log_surface(long_mode, audit.MACOS_RUN_JOB, identity)
 
     def test_windows_four_job_graph_and_pinned_cache_command_grammar(self):
         identity = dict(IDENTITY, platform="windows")
@@ -828,6 +851,8 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             log.replace(b"D:/a/platform-ci/platform-ci", b"D:/a/foreign/platform-ci", 1),
             log.replace(b"C:\\Program Files\\Git\\usr\\bin\\tar.exe", b"C:\\Windows\\System32\\tar.exe", 1),
             log.replace(b"--force-local --use-compress-program", b"--checkpoint-action=exec=bad --force-local --use-compress-program", 1),
+            log.replace(b'--use-compress-program "zstd -T0"',
+                        b'--use-compress-program "zstd -T0 --long=30"', 1),
         ):
             with self.subTest(mutation=changed[:100]), self.assertRaises(audit.AuditRefusal):
                 audit.validate_job_log_surface(changed, audit.WINDOWS_RUN_JOB, identity, completed=True)

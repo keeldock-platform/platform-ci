@@ -620,7 +620,7 @@ def _check_public_control(state, context, profile, control_sha):
     if (context.get("repository") != fetch.REPOSITORY or context.get("repository_id") != fetch.REPOSITORY_ID
             or context.get("server_url") != "https://github.com" or context.get("event") != "workflow_dispatch"
             or context.get("ref") != "refs/heads/main" or context.get("profile") != profile
-            or context.get("control_sha") != control_sha or not fetch.GIT_SHA.fullmatch(control_sha)):
+            or context.get("control_sha") != control_sha or not bundle.GIT_SHA.fullmatch(control_sha)):
         _refuse("dispatch-context-invalid")
 
 
