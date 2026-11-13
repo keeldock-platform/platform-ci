@@ -155,7 +155,8 @@ PUBLIC_CODES = frozenset({
 })
 REFUSAL_LINE = re.compile(
     r"(?:(?:devlane_refusal|devlane_supervisor_refusal|dependency_preparation_refusal|"
-    r"devlane_deadline_refusal|devlane_macos_preflight_refusal|devlane_bootstrap_refusal)"
+    r"devlane_deadline_refusal|devlane_macos_preflight_refusal|devlane_windows_preflight_refusal|"
+    r"devlane_bootstrap_refusal)"
     r"=(?:[a-z0-9-]{1,64}|node-snapshot-manifest-invalid:"
     r"(?:link-row-path|source-row-kind|manifest-open|manifest-metadata|manifest-race|"
     r"manifest-missing|manifest-shape|manifest-digest|unlisted-site)))\Z"
@@ -185,6 +186,10 @@ DECRYPT_CHILD_ERROR_CODES = frozenset((
 AUDIT_REFUSAL_CODES = frozenset(("audit-contract", "audit-internal"))
 WINDOWS_BOOTSTRAP_REFUSAL_CODES = frozenset((
     "deadline-start-invalid", "deadline-file-invalid", "deadline-budget-invalid", "deadline-failed",
+))
+WINDOWS_PREFLIGHT_REFUSAL_CODES = frozenset((
+    "windows-admin-check-failed", "windows-admin-required", "windows-error-reporting-policy",
+    "windows-powershell-unavailable", "windows-sandbox-parse", "windows-sandbox-native-load",
 ))
 MACOS_PREFLIGHT_REFUSAL_CODES = frozenset((
     "macos-preflight-internal", "macos-root-identity-internal", "macos-preflight-host-identity",
@@ -594,6 +599,15 @@ class _Grammar:
             code = line[len("devlane_macos_preflight_refusal="):]
             if (self.job_runner != "macos-15" or step_name != "Prepare hosted runner isolation state"
                     or code not in MACOS_PREFLIGHT_REFUSAL_CODES):
+                return False
+            public_counts["early_failure_marker"] = public_counts.get("early_failure_marker", 0) + 1
+            public_counts["early_failure_step"] = step_name
+            public_counts["early_failure_code"] = code
+            return public_counts["early_failure_marker"] == 1
+        if line.startswith("devlane_windows_preflight_refusal="):
+            code = line[len("devlane_windows_preflight_refusal="):]
+            if (self.job_runner != "windows-2025" or step_name != "Prepare hosted Windows isolation state"
+                    or code not in WINDOWS_PREFLIGHT_REFUSAL_CODES):
                 return False
             public_counts["early_failure_marker"] = public_counts.get("early_failure_marker", 0) + 1
             public_counts["early_failure_step"] = step_name

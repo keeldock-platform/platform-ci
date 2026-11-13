@@ -635,6 +635,10 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
              "devlane_deadline_refusal=deadline-start-invalid", 1,
              "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed "
              "disposition=run-failed-at-bootstrap"),
+            ("windows", "Prepare hosted Windows isolation state",
+             "devlane_windows_preflight_refusal=windows-admin-required", 1,
+             "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed "
+             "disposition=run-failed-at-windows-preflight"),
         )
         for platform_name, failed_step, marker, exit_code, outcome in scenarios:
             with self.subTest(platform=platform_name):

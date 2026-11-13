@@ -1154,17 +1154,33 @@ jobs:
         timeout-minutes: 2
         run: |
           $ErrorActionPreference = 'Stop'
-          $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
-          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 1 }
-          New-Item -Path 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting' -Force | Out-Null; New-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting' -Name Disabled -Value 1 -PropertyType DWord -Force | Out-Null
-          if (-not (Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))) { exit 1 }
-          $sandboxRoot = Join-Path $env:CI_WORKSPACE 'kit\devlane'
-          $tokens = $null
-          $parseErrors = $null
-          [void][System.Management.Automation.Language.Parser]::ParseFile(
-            (Join-Path $sandboxRoot 'sandbox_windows.ps1'), [ref]$tokens, [ref]$parseErrors)
-          if ($parseErrors.Count -ne 0) { exit 1 }
-          $null = Add-Type -Path (Join-Path $sandboxRoot 'sandbox_windows_native.cs')
+          function Refuse-Preflight([string]$Code) {
+            Write-Output ('devlane_windows_preflight_refusal=' + $Code)
+            exit 1
+          }
+          try {
+            $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+          } catch { Refuse-Preflight 'windows-admin-check-failed' }
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            Refuse-Preflight 'windows-admin-required'
+          }
+          try {
+            New-Item -Path 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting' -Force | Out-Null
+            New-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting' -Name Disabled -Value 1 -PropertyType DWord -Force | Out-Null
+          } catch { Refuse-Preflight 'windows-error-reporting-policy' }
+          if (-not (Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))) {
+            Refuse-Preflight 'windows-powershell-unavailable'
+          }
+          try {
+            $sandboxRoot = Join-Path $env:CI_WORKSPACE 'kit\devlane'
+            $tokens = $null
+            $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $sandboxRoot 'sandbox_windows.ps1'), [ref]$tokens, [ref]$parseErrors)
+          } catch { Refuse-Preflight 'windows-sandbox-parse' }
+          if ($parseErrors.Count -ne 0) { Refuse-Preflight 'windows-sandbox-parse' }
+          try { $null = Add-Type -Path (Join-Path $sandboxRoot 'sandbox_windows_native.cs') }
+          catch { Refuse-Preflight 'windows-sandbox-native-load' }
           Write-Output 'windows_runner=hosted-admin verified=windows-2025'
       - name: Set up pinned Windows Node runtime
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
