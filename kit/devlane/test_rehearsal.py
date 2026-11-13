@@ -225,6 +225,16 @@ class RehearsalBuilderTests(unittest.TestCase):
                 supervisor._decrypt_child_receipt(returncode, b"receipt unavailable", bytearray())
             self.assertEqual(caught.exception.decrypt_refusal, expected)
 
+        script_open_stderr = bytearray(
+            b"/usr/bin/python3: can't open file '/control/devlane/decrypt_once.py': "
+            b"[Errno 13] Permission denied\n",
+        )
+        with self.assertRaises(supervisor.SupervisorRefusal) as caught:
+            supervisor._decrypt_child_receipt(2, b"", script_open_stderr)
+        self.assertEqual(caught.exception.decrypt_refusal, "child-script-unreadable")
+        self.assertEqual(caught.exception.decrypt_child_error, "other")
+        self.assertEqual(script_open_stderr, bytearray())
+
         for output, expected in ((b"", "child-no-output"), (b"not json", "child-output-invalid")):
             captured = bytearray(b"Traceback (most recent call last):\n  File \"x\", line 1\n"
                                  b"PanicException: PRIVATE_DETAIL")
@@ -1944,7 +1954,7 @@ class ProductionFailureDiagnosticsTests(unittest.TestCase):
         runner_source = runner.read_text(encoding="utf-8")
         self.assertIn('"/usr/bin/python3", "-B", "-I", "-S", "/control/devlane/rust_matrix_runner.py"',
                       supervisor_source)
-        self.assertIn('control_root / "kit/devlane", root / "control/devlane", readonly=True', supervisor_source)
+        self.assertIn("_stage_worker_control(root, control_root)", supervisor_source)
         self.assertIn("sys.path.insert(0, str(Path(__file__).resolve().parent))", runner_source)
         self.assertNotIn("/workspace/source/rust_matrix_runner.py", supervisor_source)
         result = subprocess.run(

@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import tarfile
@@ -1806,7 +1807,9 @@ class PreparationDefectTests(unittest.TestCase):
                     patch.object(supervisor, "_mount_fs"), \
                     patch.object(supervisor, "_make_worker_devices"), \
                     patch.object(supervisor.os, "chown"):
-                supervisor._mount_minimal_root(root, Path("/unused"), Path("/unused"), Path(temporary))
+                supervisor._mount_minimal_root(
+                    root, Path("/unused"), Path("/unused"), Path(__file__).resolve().parents[2],
+                )
             expected_readonly = ((Path(host), Path(guest), True) for host, guest in mount_sources
                                  if Path(host).exists())
             self.assertTrue(all(mount in mounted for mount in expected_readonly))
@@ -1817,6 +1820,64 @@ class PreparationDefectTests(unittest.TestCase):
         self.assertEqual(rust_environment["CC"], "/usr/bin/cc")
         self.assertEqual(rust_environment["CARGO_TARGET_" + "X" + "86_64_UNKNOWN_LINUX_GNU_LINKER"],
                          "/usr/bin/cc")
+
+    def test_minimal_root_stages_worker_inputs_readable_under_restrictive_umask(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "root"
+            ciphertext = Path(temporary) / "bundle.enc"
+            ciphertext.write_bytes(b"bound ciphertext payload")
+            ciphertext.chmod(0o600)
+            payload = ciphertext.read_bytes()
+            control_root = Path(__file__).resolve().parents[2]
+
+            def mount_tmpfs(path, _size, mode="0755", _options=""):
+                os.chmod(path, int(mode, 8))
+
+            previous_umask = os.umask(0o077)
+            try:
+                with patch.object(supervisor, "_host_toolchain_mounts", return_value=()), \
+                        patch.object(supervisor, "_mount_tmpfs", side_effect=mount_tmpfs), \
+                        patch.object(supervisor, "_mount_bind"), \
+                        patch.object(supervisor, "_mount_fs"), \
+                        patch.object(supervisor, "_make_worker_devices"), \
+                        patch.object(supervisor.os, "chown"):
+                    supervisor._mount_minimal_root(
+                        root, Path("/unused"), Path("/unused"), control_root,
+                    )
+                    supervisor._stage_network_probe(root)
+                    supervisor._stage_worker_bundle(
+                        root, ciphertext, len(payload), hashlib.sha256(payload).hexdigest(),
+                    )
+                    supervisor._prepare_trusted_files(root, {"allowed_tests": {}, "frames": {}})
+            finally:
+                os.umask(previous_umask)
+
+            worker_paths = [
+                *("control/devlane/" + name for name in supervisor.WORKER_CONTROL_FILES),
+                "control/profiles.json", "control/bundle.enc", "control/network_probe.py",
+                "trusted/manifest.json", "trusted/adapter-config.json",
+            ]
+            for relative in worker_paths:
+                with self.subTest(path=relative):
+                    current = root
+                    self.assertTrue(current.stat().st_mode & stat.S_IXOTH)
+                    for part in Path(relative).parts[:-1]:
+                        current = current / part
+                        self.assertFalse(current.is_symlink())
+                        self.assertTrue(current.stat().st_mode & stat.S_IXOTH)
+                    target = root / relative
+                    self.assertFalse(target.is_symlink())
+                    metadata = target.stat()
+                    self.assertTrue(stat.S_ISREG(metadata.st_mode))
+                    self.assertTrue(metadata.st_mode & stat.S_IROTH)
+                    if os.geteuid() == 0:
+                        self.assertEqual(metadata.st_uid, 0)
+                        self.assertEqual(metadata.st_gid, 0)
+                    with target.open("rb") as source:
+                        source.read(1)
+            self.assertEqual((root / "control/devlane").stat().st_mode & 0o777, 0o555)
+            self.assertEqual((root / "control").stat().st_mode & 0o777, 0o755)
+            self.assertEqual((root / "control/bundle.enc").read_bytes(), payload)
 
     def test_rust_matrix_worker_gets_writable_raw_logs_and_vendor_cargo_home(self):
         with tempfile.TemporaryDirectory() as temporary:

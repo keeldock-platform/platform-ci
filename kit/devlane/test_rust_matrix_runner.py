@@ -1275,12 +1275,13 @@ class RustMatrixRunnerTests(unittest.TestCase):
                         patch.object(supervisor, "_mount_private", side_effect=record("private-mount")), \
                         patch.object(supervisor, "_configure_firewall", side_effect=record("firewall")), \
                         patch.object(supervisor, "_mount_minimal_root", side_effect=record("minimal-root")), \
+                        patch.object(supervisor, "_stage_worker_bundle", side_effect=record("bundle-stage")), \
                         patch.object(supervisor, "_mount_bind", side_effect=record("bundle-bind")), \
                         patch.object(supervisor, "_read_profiles", side_effect=record("profile-read", {"schema": 1})), \
                         patch.object(supervisor.subprocess, "run", side_effect=recording_run):
                     self.assertTrue(service.prepare())
                 self.assertEqual(events, ["root", "swap", "private-mount", "firewall", "minimal-root",
-                                          "bundle-bind", "bundle-bind", "profile-read"])
+                                          "bundle-stage", "bundle-bind", "profile-read"])
                 self.assertEqual(service.projection_value, projection)
                 self.assertEqual(service.startup_phase, "ready")
                 self.assertEqual(service.tool_info["node_root"], snapshot["root"])
@@ -1679,6 +1680,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                             patch.object(supervisor, "_mount_private"), \
                             patch.object(supervisor, "_configure_firewall"), \
                             patch.object(supervisor, "_mount_minimal_root"), \
+                            patch.object(supervisor, "_stage_worker_bundle"), \
                             patch.object(supervisor, "_mount_bind",
                                          side_effect=lambda source, _target, **_kwargs:
                                          mount_sources.append(Path(source).resolve())), \
@@ -1817,6 +1819,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
                         patch.object(supervisor, "_mount_private"), \
                         patch.object(supervisor, "_configure_firewall"), \
                         patch.object(supervisor, "_mount_minimal_root"), \
+                        patch.object(supervisor, "_stage_worker_bundle"), \
                         patch.object(supervisor, "_mount_bind",
                                      side_effect=lambda source, _target, **_kwargs: mount_sources.append(Path(source).resolve())), \
                         patch.object(supervisor, "_read_profiles", return_value={"schema": 1}):
@@ -3423,8 +3426,7 @@ class RustMatrixRunnerTests(unittest.TestCase):
         runner_source = (root / "kit/devlane/rust_matrix_runner.py").read_text(encoding="utf-8")
         self.assertIn('"/usr/bin/python3", "-B", "-I", "-S", "/control/devlane/rust_matrix_runner.py"',
                       supervisor_source)
-        self.assertIn('control_root / "kit/devlane", root / "control/devlane", readonly=True',
-                      supervisor_source)
+        self.assertIn("_stage_worker_control(root, control_root)", supervisor_source)
         self.assertNotIn("/workspace/source/rust_matrix_runner.py", supervisor_source)
         self.assertIn("sys.path.insert(0, str(Path(__file__).resolve().parent))", runner_source)
         with tempfile.TemporaryDirectory() as temporary:

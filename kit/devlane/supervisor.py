@@ -54,6 +54,28 @@ MAX_SYNTHETIC_DIAGNOSTIC_FILE_BYTES = 4 * 1024 * 1024
 MAX_BROWSER_CGROUP_VALUE_BYTES = 1024
 MAX_BROWSER_FAILURE_DIAGNOSTIC_BYTES = 8 * 1024
 MAX_NETWORK_PROBE_COPY_BYTES = 256 * 1024
+MAX_WORKER_CONTROL_FILE_BYTES = 4 * 1024 * 1024
+MAX_WORKER_CONTROL_TREE_BYTES = 32 * 1024 * 1024
+WORKER_CONTROL_FILES = (
+    "bundle.py",
+    "bounded_registry_io.py",
+    "cgroup_exec.py",
+    "cargo_projection.py",
+    "constraint_resolver.py",
+    "decrypt_once.py",
+    "diagnostic_contract.py",
+    "network_probe.py",
+    "registry_prefetch.py",
+    "rust_matrix_runner.py",
+    "rust_test_runner.py",
+    "safe_json.mjs",
+    "semver-pins.json",
+    "semver_cargo_wrapper.py",
+    "semver_offline_cache.py",
+    "semver_stage.py",
+    "test_adapters.mjs",
+    "typescript_reporter.mjs",
+)
 CHROMIUM_RENDERER_FAILURE = re.compile(
     rb"(?:renderer|render) process.{0,160}(?:exit|crash|gone|signal|terminat|kill)|"
     rb"(?:exit|crash|gone|signal|terminat|kill).{0,160}(?:renderer|render) process",
@@ -171,7 +193,7 @@ REFUSAL_CODES = frozenset((
 DECRYPT_REFUSAL_CODES = frozenset((
     "archive-invalid", "auth-tag", "binding-mismatch", "crypto-unavailable",
     "child-import-failed", "child-no-output", "child-output-invalid", "child-panic",
-    "child-spawn-failed", "decrypt-failed", "decrypt-timeout", "expired",
+    "child-script-unreadable", "child-spawn-failed", "decrypt-failed", "decrypt-timeout", "expired",
     "invalid-envelope", "key-format", "request-invalid", "truncated",
 ))
 _DECRYPT_CHILD_SIGNAL_NAMES = (
@@ -193,6 +215,10 @@ DECRYPT_CHILD_ERROR_CODES = DECRYPT_CHILD_ERROR_CLASSES | frozenset(("other",))
 MAX_DECRYPT_CHILD_STDERR_BYTES = 8 * 1024
 _DECRYPT_CHILD_TRACEBACK_LINE = re.compile(
     rb"^(?:[A-Za-z_][A-Za-z0-9_]*\.)*([A-Za-z_][A-Za-z0-9_]*):(?: .*)?$"
+)
+_DECRYPT_CHILD_SCRIPT_UNREADABLE_LINE = re.compile(
+    rb"^/usr/bin/python3: can't open file '/control/devlane/decrypt_once\.py': "
+    rb"\[Errno 13\] Permission denied$"
 )
 NETWORK_PROBE_REFUSAL_CODES = frozenset(
     "network-probe-refusal:" + code for code in network_probe.REFUSAL_CODES
@@ -242,7 +268,7 @@ STARTUP_REFUSAL_CODES = frozenset((
 ))
 STARTUP_DIAGNOSTIC_PHASES = frozenset((
     "construct", "deadline", "projection", "linux", "swap", "priv-mount", "firewall",
-    "root-mount", "probe-stage", "bundle-bind", "tools", "profile", "versions", "socket", "listen",
+    "root-mount", "probe-stage", "bundle-copy", "tools", "profile", "versions", "socket", "listen",
     "ready", "serve", "parent",
 ))
 _STARTUP_EXCEPTION_LABELS = {
@@ -471,6 +497,13 @@ def _decrypt_child_error(stderr):
     return label if label in DECRYPT_CHILD_ERROR_CLASSES else "other"
 
 
+def _decrypt_child_script_unreadable(stderr):
+    if type(stderr) not in (bytes, bytearray):
+        return False
+    final_line = next((line.strip() for line in reversed(bytes(stderr).splitlines()) if line.strip()), b"")
+    return _DECRYPT_CHILD_SCRIPT_UNREADABLE_LINE.fullmatch(final_line) is not None
+
+
 def _scrub_decrypt_child_stderr(stderr):
     if type(stderr) is bytearray:
         for index in range(len(stderr)):
@@ -517,6 +550,8 @@ def _decrypt_child_receipt(returncode, output, stderr=b""):
         _scrub_decrypt_child_stderr(stderr)
         return receipt
     reason = _decrypt_child_failure_code(returncode, output)
+    if returncode == 2 and _decrypt_child_script_unreadable(stderr):
+        reason = "child-script-unreadable"
     child_error = _decrypt_child_error(stderr)
     _scrub_decrypt_child_stderr(stderr)
     _refuse(
@@ -889,6 +924,168 @@ def _mount_fs(argv, destination):
     MOUNT_TARGETS.append(Path(destination))
 
 
+def _checked_control_source(control_root, relative):
+    root = Path(control_root)
+    relative_path = PurePosixPath(relative)
+    if relative_path.is_absolute() or not relative_path.parts or ".." in relative_path.parts:
+        _refuse("mount-source-unavailable")
+    try:
+        metadata = root.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            _refuse("mount-source-unavailable")
+        current = root
+        for index, part in enumerate(relative_path.parts):
+            current = current / part
+            metadata = current.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                _refuse("mount-source-unavailable")
+            if index < len(relative_path.parts) - 1 and not stat.S_ISDIR(metadata.st_mode):
+                _refuse("mount-source-unavailable")
+        return current
+    except OSError:
+        _refuse("mount-source-unavailable")
+
+
+def _stage_verified_worker_file(source, destination, maximum, *, expected_size=None,
+                                expected_digest=None):
+    """Copy one bounded regular file into the root-owned chroot with a checked digest."""
+    source = Path(source)
+    destination = Path(destination)
+    source_fd = destination_fd = None
+    destination_created = False
+    owner_uid = 0 if os.geteuid() == 0 else os.geteuid()
+    owner_gid = 0 if os.geteuid() == 0 else os.getegid()
+    try:
+        source_fd = os.open(
+            str(source), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+        )
+        source_metadata = os.fstat(source_fd)
+        if (not stat.S_ISREG(source_metadata.st_mode) or source_metadata.st_nlink != 1
+                or source_metadata.st_size < 0 or source_metadata.st_size > maximum
+                or (expected_size is not None and source_metadata.st_size != expected_size)):
+            _refuse("mount-source-unavailable")
+        destination_fd = os.open(
+            str(destination), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), 0o444,
+        )
+        destination_created = True
+        if os.geteuid() == 0:
+            os.fchown(destination_fd, 0, 0)
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(source_fd, 64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > maximum or total > source_metadata.st_size:
+                _refuse("mount-source-unavailable")
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                if written <= 0:
+                    _refuse("mount-source-unavailable")
+                view = view[written:]
+        after = os.fstat(source_fd)
+        source_digest = digest.hexdigest()
+        if (total != source_metadata.st_size or after.st_size != source_metadata.st_size
+                or after.st_mtime_ns != source_metadata.st_mtime_ns
+                or (expected_digest is not None and source_digest != expected_digest)):
+            _refuse("mount-source-unavailable")
+        os.fchmod(destination_fd, 0o444)
+        os.fsync(destination_fd)
+        os.close(destination_fd)
+        destination_fd = None
+        staged_fd = os.open(
+            str(destination), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+        )
+        try:
+            staged_metadata = os.fstat(staged_fd)
+            if (not stat.S_ISREG(staged_metadata.st_mode) or staged_metadata.st_nlink != 1
+                    or staged_metadata.st_size != total
+                    or stat.S_IMODE(staged_metadata.st_mode) != 0o444
+                    or staged_metadata.st_uid != owner_uid or staged_metadata.st_gid != owner_gid):
+                _refuse("mount-source-unavailable")
+            staged_digest = hashlib.sha256()
+            while True:
+                chunk = os.read(staged_fd, 64 * 1024)
+                if not chunk:
+                    break
+                staged_digest.update(chunk)
+        finally:
+            os.close(staged_fd)
+        if staged_digest.hexdigest() != source_digest:
+            _refuse("mount-source-unavailable")
+        destination_created = False
+        return total, source_digest
+    except SupervisorRefusal:
+        raise
+    except OSError:
+        _refuse("mount-source-unavailable")
+    finally:
+        if source_fd is not None:
+            try:
+                os.close(source_fd)
+            except OSError:
+                pass
+        if destination_fd is not None:
+            try:
+                os.close(destination_fd)
+            except OSError:
+                pass
+        if destination_created:
+            try:
+                destination.unlink()
+            except OSError:
+                pass
+
+
+def _stage_worker_control(root, control_root):
+    """Stage only the fixed worker control surface, independent of umask."""
+    root = Path(root)
+    control = root / "control"
+    devlane = control / "devlane"
+    try:
+        for directory, mode in ((control, 0o755), (devlane, 0o755)):
+            if directory.is_symlink():
+                _refuse("mount-source-unavailable")
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if os.geteuid() == 0:
+                os.chown(str(directory), 0, 0)
+            os.chmod(str(directory), mode)
+        total = 0
+        for name in WORKER_CONTROL_FILES:
+            source = _checked_control_source(control_root, "kit/devlane/" + name)
+            size, _digest = _stage_verified_worker_file(
+                source, devlane / name, MAX_WORKER_CONTROL_FILE_BYTES,
+            )
+            total += size
+            if total > MAX_WORKER_CONTROL_TREE_BYTES:
+                _refuse("mount-source-unavailable")
+        profiles_source = _checked_control_source(control_root, PROFILE_FILE)
+        _stage_verified_worker_file(
+            profiles_source, control / "profiles.json", 128 * 1024,
+        )
+        if os.geteuid() == 0:
+            os.chown(str(devlane), 0, 0)
+        os.chmod(devlane, 0o555)
+    except SupervisorRefusal:
+        raise
+    except OSError:
+        _refuse("mount-source-unavailable")
+
+
+def _stage_worker_bundle(root, source, expected_size, expected_digest):
+    """Copy ciphertext into the chroot without exposing RUN_ROOT permissions."""
+    _stage_verified_worker_file(
+        source, Path(root) / "control/bundle.enc", bundle.MAX_CIPHERTEXT,
+        expected_size=expected_size, expected_digest=expected_digest,
+    )
+
+
 def _stage_network_probe(root, source=None):
     """Copy the trusted probe into the chroot with traversal and read bits for uid 65534."""
     source = Path(network_probe.__file__ if source is None else source)
@@ -1038,11 +1235,7 @@ def _mount_minimal_root(root, workspace, prepared, control_root):
     _mount_tmpfs(root / "workspace", "4g", "0755", "nosuid,nodev")
     _mount_tmpfs(root / "scratch", "4g", "0755", "nosuid,nodev")
     _mount_bind(prepared, root / "prepared", readonly=True)
-    _ensure_directory(root / "control/devlane")
-    (root / "control/bundle.enc").write_bytes(b"")
-    _mount_bind(control_root / "kit/devlane", root / "control/devlane", readonly=True)
-    (root / "control/profiles.json").write_text("{}", encoding="ascii")
-    _mount_bind(control_root / "ci/devlane-profiles.json", root / "control/profiles.json", readonly=True)
+    _stage_worker_control(root, control_root)
     _mount_fs(["mount", "-t", "proc", "-o", "ro,hidepid=2", "proc", str(root / "proc")],
               root / "proc")
     _mount_fs(["mount", "-t", "sysfs", "-o", "ro,nosuid,nodev,noexec", "sysfs", str(root / "sys")],
@@ -1647,6 +1840,9 @@ def _stage_baseline_runtime_after_cut(source_root, namespace_root, source_sets):
 def _prepare_trusted_files(root, manifest):
     trusted = root / "trusted"
     trusted.mkdir(mode=0o755, exist_ok=True)
+    if os.geteuid() == 0:
+        os.chown(str(trusted), 0, 0)
+    os.chmod(trusted, 0o755)
     manifest_bytes = bundle.canonical_json(manifest)
     adapter_config = {
         "tests": [[name, public_id] for name, public_id in manifest["allowed_tests"].items()],
@@ -1662,6 +1858,9 @@ def _prepare_trusted_files(root, manifest):
             output.write(payload)
             output.flush()
             os.fsync(output.fileno())
+        if os.geteuid() == 0:
+            os.chown(str(path), 0, 0)
+        os.chmod(path, 0o444)
 
 
 def _prepare_writable_scratch(root, *, registry_v2=False):
@@ -2160,8 +2359,11 @@ class Service:
         _mount_minimal_root(self.root, self.workspace, self.prepared, self.workspace)
         self.startup_phase = "probe-stage"
         _stage_network_probe(self.root)
-        self.startup_phase = "bundle-bind"
-        _mount_bind(self.bundle_path, self.root / "control/bundle.enc", readonly=True)
+        self.startup_phase = "bundle-copy"
+        _stage_worker_bundle(
+            self.root, self.bundle_path, self.context["bundle_size"],
+            self.context["bundle_sha256"],
+        )
         self.startup_phase = "tools"
         _ensure_directory(self.root / "tools/node")
         _ensure_directory(self.root / "tools/rust")
@@ -2173,8 +2375,8 @@ class Service:
             _mount_bind(self.tool_info["rust_root"], self.root / "tools/rust", readonly=True)
         self.mounts = [
             self.root / "proc", self.root / "sys", self.root / "dev/shm", self.root / "dev", self.root / "tmp", self.root / "workspace",
-            self.root / "scratch", self.root / "prepared", self.root / "control/profiles.json",
-            self.root / "control/devlane", self.root / "etc/ssl/certs", self.root / "etc/alternatives",
+            self.root / "scratch", self.root / "prepared",
+            self.root / "etc/ssl/certs", self.root / "etc/alternatives",
             self.root / "tools/rust", self.root / "tools/node", self.root / "lib64", self.root / "lib",
             self.root / "usr", self.root,
         ]

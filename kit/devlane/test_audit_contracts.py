@@ -1,6 +1,8 @@
 """Mutation tests for the workflow dispatch and exact auditor contracts."""
 
 import copy
+import contextlib
+import io
 import json
 import re
 import unittest
@@ -491,6 +493,121 @@ def _terminal_control_jobs(require_main=True):
 
 
 class EncryptedAuditorMutationTests(unittest.TestCase):
+    def test_decrypt_failed_four_job_graph_is_accepted_when_public_audit_succeeds(self):
+        jobs = _encrypted_jobs()
+        by_name = {job["name"]: job for job in jobs}
+        run_job = by_name[audit.RUN_JOB]
+        run_job["conclusion"] = "failure"
+        run_steps = {step["name"]: step for step in run_job["steps"]}
+        run_steps["Decrypt authenticated bundle"]["conclusion"] = "failure"
+        run_steps["Execute offline profile and filter public summary"]["conclusion"] = "skipped"
+        audit_job = by_name[audit.AUDIT_JOB]
+        audit_job["status"] = "completed"
+        audit_job["conclusion"] = "success"
+        for step in audit_job["steps"]:
+            step.update({"status": "completed", "conclusion": "success"})
+
+        terminal, audit_passed = audit.validate_terminal_job_contract(jobs, IDENTITY, "core-node")
+        self.assertTrue(audit_passed)
+        self.assertEqual(terminal[audit.RUN_JOB]["conclusion"], "failure")
+        terminal_steps = {step["name"]: step for step in terminal[audit.RUN_JOB]["steps"]}
+        self.assertEqual(terminal_steps["Decrypt authenticated bundle"]["conclusion"], "failure")
+        self.assertEqual(terminal_steps["Execute offline profile and filter public summary"]["conclusion"], "skipped")
+
+    def test_run_audit_accepts_public_four_job_decrypt_failure_shape(self):
+        jobs = _encrypted_jobs()
+        by_name = {job["name"]: job for job in jobs}
+        run_job = by_name[audit.RUN_JOB]
+        run_job["conclusion"] = "failure"
+        run_steps = {step["name"]: step for step in run_job["steps"]}
+        run_steps["Decrypt authenticated bundle"]["conclusion"] = "failure"
+        run_steps["Execute offline profile and filter public summary"]["conclusion"] = "skipped"
+        failure_log = _render_real_runner_encrypted_log(IDENTITY).replace(
+            b"authenticated_decryption=pass\n",
+            b"devlane_supervisor_refusal=decrypt-rejected\n"
+            b"decrypt_refusal=child-script-unreadable\n"
+            b"decrypt_child_error=other\n"
+            + (audit.LOG_MARKER + "[error]Process completed with exit code 2.\n").encode("ascii"),
+            1,
+        )
+        lines = []
+        skipping_execute = False
+        grammar = audit._Grammar(
+            ".github/workflows/devlane-encrypted.yml", audit.RUN_JOB, IDENTITY, "encrypted",
+        )
+        execute_position = next(
+            index for index, step in enumerate(grammar.steps)
+            if step["name"] == "Execute offline profile and filter public summary"
+        )
+        execute_group_index = sum(
+            step["name"] != "Install pinned Rust toolchain"
+            for step in grammar.steps[:execute_position]
+        )
+        group_index = 0
+        for line in failure_log.splitlines(keepends=True):
+            normalized = audit.TIME_PREFIX.sub("", line.decode("utf-8"), count=1).rstrip("\r\n")
+            if not skipping_execute and normalized.startswith(audit.LOG_MARKER + "[group]Run "):
+                if group_index == execute_group_index:
+                    skipping_execute = True
+                    group_index += 1
+                    continue
+                group_index += 1
+            if skipping_execute:
+                if normalized == audit.LOG_MARKER + "[endgroup]":
+                    skipping_execute = False
+                continue
+            lines.append(line)
+        failure_log = b"".join(lines)
+
+        class API:
+            def json(self, endpoint):
+                if endpoint.endswith("/actions/runs/" + IDENTITY["run_id"]):
+                    repository = {"full_name": audit.REPOSITORY, "id": audit.REPOSITORY_ID}
+                    return ({
+                        "id": int(IDENTITY["run_id"]), "path": audit.WORKFLOW_PATH,
+                        "event": "workflow_dispatch", "head_branch": "main",
+                        "head_sha": IDENTITY["control_sha"], "run_attempt": 1,
+                        "status": "in_progress", "conclusion": None,
+                        "repository": repository, "head_repository": repository,
+                    }, {})
+                if "/jobs?" in endpoint:
+                    return ({"total_count": 4, "jobs": jobs}, {})
+                if "/artifacts?" in endpoint:
+                    return ({"total_count": 0, "artifacts": []}, {})
+                return ({}, {})
+
+            def log_text(self, identifier):
+                if identifier != run_job["id"]:
+                    raise AssertionError("unexpected-run-job")
+                return failure_log
+
+        permit_key = "devlane-permit-v1-" + IDENTITY["bundle_id"]
+        control_key = "devlane-control-v1-" + IDENTITY["control_run_id"]
+        with patch.object(audit, "_fetch_cache_entries", return_value=[
+                {"key": permit_key, "size_in_bytes": 1}, {"key": control_key, "size_in_bytes": 1}]), \
+                patch.object(audit, "cache_inventory_digest", return_value=IDENTITY["cache_baseline_sha256"]), \
+                patch.object(audit, "validate_check_output"), \
+                patch.object(audit, "_read_annotations", return_value=[]):
+            self.assertIsNone(audit.run_audit(API(), IDENTITY))
+
+    def test_public_audit_refusal_prints_only_a_fixed_code(self):
+        output = io.StringIO()
+        with patch.object(audit, "audit_environment", side_effect=audit.AuditRefusal("audit-contract")), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(audit.main(), 1)
+        self.assertEqual(output.getvalue(), "devlane_audit=refused code=audit-contract\n")
+        refusal_log = _render_real_runner_encrypted_log(IDENTITY, job_key=audit.AUDIT_JOB).replace(
+            b"devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed",
+            b"devlane_audit=refused code=audit-contract",
+            1,
+        )
+        audit.validate_job_log_surface(refusal_log, audit.AUDIT_JOB, IDENTITY, completed=True)
+        with self.assertRaises(audit.AuditRefusal):
+            audit.validate_job_log_surface(
+                refusal_log.replace(b"audit-contract", b"private-path"),
+                audit.AUDIT_JOB, IDENTITY, completed=True,
+            )
+
     def test_two_job_contract_accepts_exact_names_steps_attempt_and_cleanup(self):
         jobs = _encrypted_jobs()
         result = audit.validate_job_contract(jobs, IDENTITY, "core-node")

@@ -164,7 +164,7 @@ NETWORK_PROBE_SUPERVISOR_CODES = {
 DECRYPT_REFUSAL_CODES = frozenset((
     "archive-invalid", "auth-tag", "binding-mismatch", "crypto-unavailable",
     "child-import-failed", "child-no-output", "child-output-invalid", "child-panic",
-    "child-spawn-failed", "decrypt-failed", "decrypt-timeout", "expired",
+    "child-script-unreadable", "child-spawn-failed", "decrypt-failed", "decrypt-timeout", "expired",
     "invalid-envelope", "key-format", "request-invalid", "truncated",
 ))
 DECRYPT_REFUSAL_CODES |= frozenset(
@@ -177,6 +177,7 @@ DECRYPT_CHILD_ERROR_CODES = frozenset((
     "ModuleNotFoundError", "ImportError", "PermissionError", "FileNotFoundError", "OSError",
     "MemoryError", "PanicException", "SystemError", "UnicodeDecodeError", "other",
 ))
+AUDIT_REFUSAL_CODES = frozenset(("audit-contract", "audit-internal"))
 DECRYPT_FAILURE_CODES = frozenset((
     "decrypt-key-unavailable", "decrypt-manifest-unavailable", "decrypt-rejected", "decrypt-timeout",
 ))
@@ -567,6 +568,16 @@ class _Grammar:
             "Run full source-free production-path acceptance": {"devlane_acceptance=pass"},
             "Probe the loopback-only Linux network boundary": {"devlane_linux_probe=pass"},
         }.get(step_name, set())
+        if step_name == "Audit exact four-job graph and public surfaces":
+            refusal_prefix = "devlane_audit=refused code="
+            if line.startswith(refusal_prefix):
+                code = line[len(refusal_prefix):]
+                if code not in AUDIT_REFUSAL_CODES:
+                    return False
+                public_counts["devlane_audit_refusal"] = public_counts.get(
+                    "devlane_audit_refusal", 0,
+                ) + 1
+                return public_counts["devlane_audit_refusal"] == 1
         if step_name == "Install pinned Rust toolchain":
             exact = exact | {"rust_matrix_fixture=loaded committed_locks=3 matrix_coverage_ids=23"}
         if step_name == "Install fixed Rust acceptance toolchain":
@@ -1475,7 +1486,8 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         if counts.get("dispatch") or counts.get("permit") or records:
             _refuse()
         audit_line = "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed"
-        if completed and counts.get(audit_line) != 1 or counts.get(audit_line, 0) > 1:
+        audit_outcome_count = counts.get(audit_line, 0) + counts.get("devlane_audit_refusal", 0)
+        if ((completed and audit_outcome_count != 1) or audit_outcome_count > 1):
             _refuse()
     else:
         cache_markers = ("devlane_cache_permit=claimed", "devlane_cache_permit=restored-and-single-use")
@@ -1895,8 +1907,11 @@ def main():
         run_audit(api, identity)
         print("devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed")
         return 0
+    except AuditRefusal:
+        print("devlane_audit=refused code=audit-contract")
+        return 1
     except Exception:
-        print("devlane_audit=refused")
+        print("devlane_audit=refused code=audit-internal")
         return 1
 
 
