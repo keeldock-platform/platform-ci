@@ -29,6 +29,7 @@ SOURCE_FREE_WAVE_CLASS = "source-free-synthetic"
 MAX_PROJECTION = 16 * 1024 * 1024
 MAX_CIPHERTEXT = 64 * 1024 * 1024
 MAX_REDIRECTS = 5
+MAX_TRANSIENT_RETRIES = 4
 ALLOWED_HOSTS = frozenset((
     "api.github.com", "github.com", "objects.githubusercontent.com",
     "release-assets.githubusercontent.com",
@@ -121,31 +122,52 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _open_limited(url, maximum, allowed_hosts):
+def _open_limited(url, maximum, allowed_hosts, *, transient_retries=0, sleep=time.sleep):
+    if type(transient_retries) is not int or not 0 <= transient_retries <= MAX_TRANSIENT_RETRIES:
+        _fail("download-retry-bounds")
     handlers = [_NoRedirect()]
     opener = urllib.request.build_opener(*handlers)
-    request = urllib.request.Request(
-        url,
-        headers={"Accept": "application/octet-stream", "User-Agent": "platform-devlane-fetch/1"},
-        method="GET",
-    )
-    current = _validate_url(url, allowed_hosts)
-    for _ in range(MAX_REDIRECTS + 1):
+    initial = _validate_url(url, allowed_hosts)
+    current = initial
+    redirects = retries = 0
+    while True:
+        request = urllib.request.Request(
+            current,
+            headers={"Accept": "application/octet-stream", "User-Agent": "platform-devlane-fetch/1"},
+            method="GET",
+        )
         try:
             response = opener.open(request, timeout=30)
         except urllib.error.HTTPError as error:
-            if error.code not in (301, 302, 303, 307, 308):
-                _fail("download-http")
-            location = error.headers.get("Location")
-            if type(location) is not str:
-                _fail("download-redirect")
-            current = _validate_url(urllib.parse.urljoin(current, location), allowed_hosts)
-            request = urllib.request.Request(
-                current,
-                headers={"Accept": "application/octet-stream", "User-Agent": "platform-devlane-fetch/1"},
-                method="GET",
-            )
-            continue
+            try:
+                if error.code in (301, 302, 303, 307, 308):
+                    if redirects >= MAX_REDIRECTS:
+                        _fail("download-redirect-limit")
+                    location = error.headers.get("Location")
+                    if type(location) is not str:
+                        _fail("download-redirect")
+                    current = _validate_url(urllib.parse.urljoin(current, location), allowed_hosts)
+                    redirects += 1
+                    continue
+                retryable = error.code in (408, 425, 429, 500, 502, 503, 504)
+                if error.code == 403 and (
+                        error.headers.get("Retry-After") is not None
+                        or error.headers.get("X-RateLimit-Remaining") == "0"):
+                    retryable = True
+                if not retryable or retries >= transient_retries:
+                    _fail("download-http")
+                delay = min(8, 2 ** retries)
+                retry_after = error.headers.get("Retry-After")
+                if type(retry_after) is str and len(retry_after) <= 3 and retry_after.isdecimal():
+                    delay = min(30, max(delay, int(retry_after)))
+                retries += 1
+                error.close()
+                sleep(delay)
+                current = initial
+                redirects = 0
+                continue
+            finally:
+                error.close()
         try:
             if response.status != 200 or urllib.parse.urlsplit(response.geturl()).hostname not in allowed_hosts:
                 _fail("download-http")
@@ -162,10 +184,10 @@ def _open_limited(url, maximum, allowed_hosts):
             return b"".join(chunks)
         finally:
             response.close()
-    _fail("download-redirect-limit")
 
 
-def download_release_asset(asset_id, expected_size, expected_sha256, destination, maximum=MAX_CIPHERTEXT):
+def download_release_asset(asset_id, expected_size, expected_sha256, destination, maximum=MAX_CIPHERTEXT,
+                           *, transient_retries=0):
     if type(asset_id) is not str or not re.fullmatch(r"[1-9][0-9]{0,18}", asset_id):
         _fail("asset-id")
     if type(expected_size) is not int or expected_size < 1 or expected_size > maximum:
@@ -173,7 +195,7 @@ def download_release_asset(asset_id, expected_size, expected_sha256, destination
     if type(expected_sha256) is not str or not SHA256.fullmatch(expected_sha256):
         _fail("asset-digest")
     url = "https://api.github.com/repos/" + REPOSITORY + "/releases/assets/" + asset_id
-    payload = _open_limited(url, maximum, ALLOWED_HOSTS)
+    payload = _open_limited(url, maximum, ALLOWED_HOSTS, transient_retries=transient_retries)
     if len(payload) != expected_size or hashlib.sha256(payload).hexdigest() != expected_sha256:
         _fail("asset-binding-mismatch")
     destination = Path(destination)
@@ -709,6 +731,7 @@ def main(argv=None):
     download.add_argument("--size", required=True, type=int)
     download.add_argument("--sha256", required=True)
     download.add_argument("--maximum", type=int, default=MAX_CIPHERTEXT)
+    download.add_argument("--transient-retries", type=int, default=0)
     download.add_argument("--output", required=True)
     projection = sub.add_parser("check-projection")
     projection.add_argument("--file", required=True)
@@ -721,7 +744,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.operation == "download":
-            size = download_release_asset(args.asset_id, args.size, args.sha256, args.output, args.maximum)
+            size = download_release_asset(
+                args.asset_id, args.size, args.sha256, args.output, args.maximum,
+                transient_retries=args.transient_retries,
+            )
             print("public_asset_verified=true bytes=" + str(size))
         elif args.operation == "check-projection":
             validate_projection(Path(args.file).read_bytes(), args.profile, expected_control_sha=args.control_sha)

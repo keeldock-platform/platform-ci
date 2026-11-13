@@ -481,6 +481,15 @@ class RehearsalBuilderTests(unittest.TestCase):
             self.assertEqual(
                 set(reserve), {"schema", "wave_id", "bundle_id", "control_run_id", "control_sha", "profile", "platform",
                                "expires", "release_id"})
+            with tempfile.TemporaryDirectory() as max_lifetime_temporary:
+                max_lifetime_owner = _private_directory(max_lifetime_temporary)
+                rehearsal.build_source(max_lifetime_owner)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    project.main(["--request", str(max_lifetime_owner / "projection-request.json"),
+                                  "--output", str(max_lifetime_owner / "projection.json")])
+                rehearsal.build_requests(max_lifetime_owner, CONTROL_SHA, "1234", WAVE, BUNDLE, "77", 3600)
+                with self.assertRaisesRegex(rehearsal.Refusal, "request-input"):
+                    rehearsal.build_requests(max_lifetime_owner, CONTROL_SHA, "1234", WAVE, BUNDLE, "77", 3601)
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(bundle.main(["create", "--request", str(owner / "bundle-request.json"),
                                               "--ciphertext", str(owner / "bundle.enc"),
@@ -569,7 +578,7 @@ class ProcedureDocumentTests(unittest.TestCase):
         required_dispatch = (
             ("kit/devlane/coordinator.py dispatch-wave", "single dispatch operation"),
             ("--key-file \"$DEVLANE_PRIVATE/key.hex\"", "key-file binding"),
-            ("300-second reconciliation deadline", "timed reconciliation deadline"),
+            ("3600-second reconciliation deadline", "timed reconciliation deadline"),
             ("watcher follows only the ledger-bound run", "ledger-bound watcher"),
             ("revokes when the decrypt step concludes or the run ends", "decrypt/run revocation"),
             ("revokes at the deadline if no run becomes visible", "deadline revocation"),
@@ -629,7 +638,7 @@ class ProcedureDocumentTests(unittest.TestCase):
 
     def test_the_procedure_states_the_integrated_dispatch_and_recovery_contract(self):
         for phrase in ("Install the key, dispatch once, reconcile and arm timed revocation as one coordinator operation",
-                       "DEVLANE_DECRYPT_KEY", "devlane-decrypt", "dispatch-wave", "300-second reconciliation deadline",
+                       "DEVLANE_DECRYPT_KEY", "devlane-decrypt", "dispatch-wave", "3600-second reconciliation deadline",
                        "watcher follows only the ledger-bound run", "revokes at the deadline if no run becomes visible",
                        "Failed or ambiguous dispatch responses still reconcile; no second dispatch is issued",
                        "Before reserving any later wave, explicitly recover durable secret obligations",
@@ -653,7 +662,7 @@ class ProcedureDocumentTests(unittest.TestCase):
 
         self.assertIn("--key-file \"$DEVLANE_PRIVATE/key.hex\"", dispatch)
         self.assertIn("DEVLANE_DECRYPT_KEY", self.text)
-        self.assertIn("300-second reconciliation deadline", dispatch)
+        self.assertIn("3600-second reconciliation deadline", dispatch)
         self.assertIn("watcher follows only the ledger-bound run", dispatch)
         self.assertIn("recover-pending-secrets", recovery)
         self.assertIn("blocks `reserve-wave` until recovery completes", recovery)
@@ -663,7 +672,7 @@ class ProcedureDocumentTests(unittest.TestCase):
             (dispatch.replace("kit/devlane/coordinator.py dispatch-wave", "kit/devlane/coordinator.py manual-dispatch", 1),
              "dispatch operation", "single dispatch operation"),
             (dispatch.replace('--key-file "$DEVLANE_PRIVATE/key.hex"', "", 1), "key-file binding", "key-file binding"),
-            (dispatch.replace("300-second reconciliation deadline", "bounded reconciliation", 1), "timed revocation",
+            (dispatch.replace("3600-second reconciliation deadline", "bounded reconciliation", 1), "timed revocation",
              "timed reconciliation deadline"),
             (dispatch.replace("watcher follows only the ledger-bound run", "watcher follows the run", 1), "run binding",
              "ledger-bound watcher"),

@@ -901,8 +901,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- bash -euo pipefail -c "$(cat <<'DEVLANE_FETCH'
-          python3 -B kit/devlane/fetch.py download --asset-id "$DEVLANE_BUNDLE_ASSET_ID" --size "$DEVLANE_BUNDLE_SIZE" --sha256 "$DEVLANE_BUNDLE_SHA256" --output "$RUN_ROOT/bundle.enc"
-          python3 -B kit/devlane/fetch.py download --maximum 16777216 --asset-id "$DEVLANE_PROJECTION_ASSET_ID" --size "$DEVLANE_PROJECTION_SIZE" --sha256 "$DEVLANE_PROJECTION_SHA256" --output "$RUN_ROOT/projection.json"
+          python3 -B kit/devlane/fetch.py download --transient-retries 4 --asset-id "$DEVLANE_BUNDLE_ASSET_ID" --size "$DEVLANE_BUNDLE_SIZE" --sha256 "$DEVLANE_BUNDLE_SHA256" --output "$RUN_ROOT/bundle.enc"
+          python3 -B kit/devlane/fetch.py download --transient-retries 4 --maximum 16777216 --asset-id "$DEVLANE_PROJECTION_ASSET_ID" --size "$DEVLANE_PROJECTION_SIZE" --sha256 "$DEVLANE_PROJECTION_SHA256" --output "$RUN_ROOT/projection.json"
           python3 -B kit/devlane/fetch.py check-projection --file "$RUN_ROOT/projection.json" --profile "$DEVLANE_PROFILE" --control-sha "$CI_SHA"
           DEVLANE_FETCH
           )"

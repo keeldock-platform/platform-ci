@@ -46,7 +46,7 @@ PLATFORM_RUN_JOBS = {
 DECRYPT_WATCH_TIMEOUT_SECONDS = 7200
 MAX_REVOKE_LATENCY_SECONDS = 120
 GH_STATUS_TIMEOUT_SECONDS = 15
-DISPATCH_RECONCILE_SECONDS = 300
+DISPATCH_RECONCILE_SECONDS = 3600
 CONTROL_RECONCILE_SECONDS = 300
 DECRYPT_ENVIRONMENT = "devlane-decrypt"
 TERMINAL = {"success", "failure", "cancelled", "skipped", "timed_out", "action_required", "neutral", "stale"}
@@ -680,7 +680,10 @@ def _verify_secret_absent():
 def _verify_run_identity(run_id, record, *, terminal=False):
     run = _gh_json("repos/%s/actions/runs/%s" % (fetch.REPOSITORY, run_id))
     repository = run.get("repository") if type(run) is dict else None
-    valid_status = (run.get("status") == "completed" if terminal else run.get("status") in ("queued", "in_progress", "completed")) if type(run) is dict else False
+    allowed_statuses = {"completed"} if terminal else {
+        "requested", "waiting", "pending", "queued", "in_progress", "completed",
+    }
+    valid_status = type(run) is dict and run.get("status") in allowed_statuses
     if (type(run) is not dict or str(run.get("id")) != run_id or run.get("path") != fetch.WORKFLOW_PATH
             or run.get("event") != "workflow_dispatch" or run.get("run_attempt") != 1
             or run.get("head_branch") != "main" or run.get("head_sha") != record["control_sha"]
@@ -1489,7 +1492,7 @@ def dispatch_wave(ledger, wave_id, key_file, *, platform=None, poll_seconds=10,
     watcher = None
     try:
         _validate_wave_id(wave_id, "wave-id")
-        if (not 1 <= poll_seconds <= 30 or not 30 <= timeout_seconds <= 600
+        if (not 1 <= poll_seconds <= 30 or not 30 <= timeout_seconds <= 3600
                 or not 60 <= decrypt_timeout_seconds <= DECRYPT_WATCH_TIMEOUT_SECONDS):
             _fail("dispatch-wave-bounds")
         record = _wave_record(root, wave_id)

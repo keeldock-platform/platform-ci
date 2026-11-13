@@ -142,7 +142,7 @@ def build_requests(directory, control_sha, control_run_id, wave_id, bundle_id, r
     if (platform not in ("linux", "macos", "windows")
             or type(control_sha) is not str or not re.fullmatch(r"[a-f0-9]{40}", control_sha)
             or not DECIMAL.fullmatch(str(control_run_id)) or not DECIMAL.fullmatch(str(release_id))
-            or type(lifetime_seconds) is not int or not 60 <= lifetime_seconds <= 3300):
+            or type(lifetime_seconds) is not int or not 60 <= lifetime_seconds <= 3600):
         _refuse("request-input")
     request = bundle.strict_json((root / "projection-request.json").read_bytes(), 1024 * 1024)
     if platform != "linux" and request.get("profile") != "core-node":
@@ -216,7 +216,7 @@ def main(argv=None):
     requests.add_argument("--bundle-id", required=True)
     requests.add_argument("--release-id", required=True)
     requests.add_argument("--platform", choices=("linux", "macos", "windows"), default="linux")
-    requests.add_argument("--lifetime-seconds", type=int, default=3000)
+    requests.add_argument("--lifetime-seconds", type=int, default=3600)
     staged = sub.add_parser("staged")
     staged.add_argument("--directory", required=True)
     intent = sub.add_parser("intent")

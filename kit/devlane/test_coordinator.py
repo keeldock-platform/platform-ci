@@ -150,6 +150,46 @@ class CoordinatorLedgerAcceptanceTests(unittest.TestCase):
             self.assertIsNone(record["run_id"])
             self.assertIsNone(record["authorized_run_id"])
 
+    def test_recorded_github_run_status_sequence_is_valid_during_attachment(self):
+        record = _ledger_record(state="dispatch-requested")
+        recorded_sequence = ("requested", "waiting", "pending", "queued", "in_progress", "completed")
+        for status in recorded_sequence:
+            with self.subTest(status=status):
+                run = {
+                    "id": "54321", "path": coordinator.fetch.WORKFLOW_PATH,
+                    "event": "workflow_dispatch", "run_attempt": 1,
+                    "head_branch": "main", "head_sha": record["control_sha"], "status": status,
+                    "repository": {"full_name": coordinator.fetch.REPOSITORY,
+                                   "id": int(coordinator.fetch.REPOSITORY_ID)},
+                }
+                with mock.patch.object(coordinator, "_gh_json", return_value=run):
+                    self.assertEqual(coordinator._verify_run_identity("54321", record), run)
+        for status in ("cancelled", "failure", "unknown"):
+            with self.subTest(status=status):
+                run = {
+                    "id": "54321", "path": coordinator.fetch.WORKFLOW_PATH,
+                    "event": "workflow_dispatch", "run_attempt": 1,
+                    "head_branch": "main", "head_sha": record["control_sha"], "status": status,
+                    "repository": {"full_name": coordinator.fetch.REPOSITORY,
+                                   "id": int(coordinator.fetch.REPOSITORY_ID)},
+                }
+                with mock.patch.object(coordinator, "_gh_json", return_value=run), \
+                        self.assertRaisesRegex(coordinator.Refusal, "run-identity-mismatch"):
+                    coordinator._verify_run_identity("54321", record)
+        run["status"] = "waiting"
+        run["head_sha"] = "0" * 40
+        with mock.patch.object(coordinator, "_gh_json", return_value=run), \
+                self.assertRaisesRegex(coordinator.Refusal, "run-identity-mismatch"):
+            coordinator._verify_run_identity("54321", record)
+        run["head_sha"] = record["control_sha"]
+        run["status"] = "completed"
+        with mock.patch.object(coordinator, "_gh_json", return_value=run):
+            self.assertEqual(coordinator._verify_run_identity("54321", record, terminal=True), run)
+        run["status"] = "waiting"
+        with mock.patch.object(coordinator, "_gh_json", return_value=run), \
+                self.assertRaisesRegex(coordinator.Refusal, "run-identity-mismatch"):
+            coordinator._verify_run_identity("54321", record, terminal=True)
+
     def test_ambiguous_dispatch_uses_complete_paged_inventory_and_never_picks_one(self):
         with tempfile.TemporaryDirectory() as temporary:
             ledger = self._new_ledger(temporary)
@@ -1457,7 +1497,7 @@ class ControlDispatchReconciliationTests(unittest.TestCase):
                         contextlib.redirect_stdout(io.StringIO()) as output:
                     status = coordinator.main([
                         "dispatch-wave", "--ledger", str(ledger), "--wave-id", "wave-test-0001",
-                        "--key-file", str(key_path), "--poll-seconds", "2", "--timeout-seconds", "30",
+                        "--key-file", str(key_path), "--poll-seconds", "2", "--timeout-seconds", "2700",
                         "--decrypt-timeout-seconds", "60", "--platform", "macos",
                     ])
                     live_process.assert_not_called()
@@ -1471,7 +1511,7 @@ class ControlDispatchReconciliationTests(unittest.TestCase):
             self.assertIn("dispatch_wave=attached run-id=54321", output.getvalue())
             self.assertEqual(cleanup_calls, [(ledger, "wave-test-0001")])
             updated = coordinator._read(ledger / "wave-test-0001.json")
-            self.assertEqual(updated["reconcile_deadline_at"], fixed_now + 30)
+            self.assertEqual(updated["reconcile_deadline_at"], fixed_now + 2700)
             self.assertEqual(updated["cleanup_obligations"]["secret"],
                              {"state": "absent", "verified_at": fixed_timestamp})
             self.assertFalse(key_path.exists())

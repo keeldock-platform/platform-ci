@@ -860,8 +860,96 @@ class OneRunPermitAcceptanceTests(unittest.TestCase):
             with self.assertRaisesRegex(permit.PermitRefusal, "bundle-run-permit-binding"):
                 permit.verify_claim(claim_path, wrong_bundle)
 
+    def test_one_hour_permit_remains_valid_after_a_45_minute_runner_queue(self):
+        queued_at = int(time.time())
+        environment = self._environment(DEVLANE_EXPIRES=str(queued_at + 3600))
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+                permit.time, "time", return_value=queued_at + 2700):
+            claim = permit.claim(Path(temporary) / "permit.json", environment)
+        self.assertEqual(claim["expires"], queued_at + 3600)
+
 
 class FetchProjectionAcceptanceTests(unittest.TestCase):
+    def test_transient_download_retries_are_enabled_only_for_the_macos_job(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml").read_text(
+            encoding="utf-8"
+        )
+        macos_start = workflow.index("  devlane-encrypted-run-macos:")
+        windows_start = workflow.index("  devlane-encrypted-run-windows:", macos_start)
+        linux_job, macos_job, windows_job = workflow[:macos_start], workflow[macos_start:windows_start], workflow[windows_start:]
+        self.assertNotIn("--transient-retries", linux_job)
+        self.assertEqual(macos_job.count("--transient-retries 4"), 2)
+        self.assertNotIn("--transient-retries", windows_job)
+
+    def test_release_asset_download_retries_transient_http_errors_and_refetches_redirect(self):
+        payload = b"ciphertext"
+        api_url = "https://api.github.com/repos/keeldock-platform/platform-ci/releases/assets/123"
+        asset_url = "https://release-assets.githubusercontent.com/download/asset"
+        refreshed_asset_url = "https://release-assets.githubusercontent.com/download/refreshed"
+        first_redirect = fetch.urllib.error.HTTPError(
+            api_url, 302, "Found", {"Location": asset_url}, None,
+        )
+        transient = fetch.urllib.error.HTTPError(
+            asset_url, 503, "Service Unavailable", {}, None,
+        )
+        second_redirect = fetch.urllib.error.HTTPError(
+            api_url, 302, "Found", {"Location": refreshed_asset_url}, None,
+        )
+
+        class Response:
+            status = 200
+
+            def __init__(self, url, body):
+                self.url = url
+                self.body = body
+
+            def geturl(self):
+                return self.url
+
+            def read(self, size):
+                result, self.body = self.body[:size], self.body[size:]
+                return result
+
+            def close(self):
+                return None
+
+        class Opener:
+            def __init__(self):
+                self.responses = [first_redirect, transient, second_redirect, Response(refreshed_asset_url, payload)]
+                self.urls = []
+
+            def open(self, request, timeout):
+                self.urls.append(request.full_url)
+                result = self.responses.pop(0)
+                if isinstance(result, BaseException):
+                    raise result
+                return result
+
+        opener = Opener()
+        delays = []
+        with patch.object(fetch.urllib.request, "build_opener", return_value=opener):
+            self.assertEqual(fetch._open_limited(api_url, 64, fetch.ALLOWED_HOSTS,
+                                                transient_retries=1, sleep=delays.append), payload)
+        self.assertEqual(opener.urls, [api_url, asset_url, api_url, refreshed_asset_url])
+        self.assertEqual(delays, [1])
+
+    def test_release_asset_missing_is_not_retried(self):
+        missing = fetch.urllib.error.HTTPError(
+            "https://api.github.com/repos/keeldock-platform/platform-ci/releases/assets/123",
+            404, "Not Found", {}, None,
+        )
+
+        class Opener:
+            def open(self, request, timeout):
+                raise missing
+
+        delays = []
+        with patch.object(fetch.urllib.request, "build_opener", return_value=Opener()):
+            with self.assertRaisesRegex(bundle.Refusal, "download-http"):
+                fetch._open_limited(missing.url, 64, fetch.ALLOWED_HOSTS,
+                                    transient_retries=4, sleep=delays.append)
+        self.assertEqual(delays, [])
+
     def test_dispatch_identity_and_npm_projection_are_strict(self):
         identity = {
             "repository": fetch.REPOSITORY,
@@ -886,6 +974,10 @@ class FetchProjectionAcceptanceTests(unittest.TestCase):
             "platform": "linux",
         }
         self.assertEqual(fetch.validate_dispatch(identity, now=1_999_999_000), identity)
+        one_hour = {**identity, "expires": 2_000_003_600}
+        self.assertEqual(fetch.validate_dispatch(one_hour, now=2_000_000_000), one_hour)
+        with self.assertRaisesRegex(bundle.Refusal, "request-expiry-range"):
+            fetch.validate_dispatch({**identity, "expires": 2_000_003_601}, now=2_000_000_000)
         local_sync_identity = {**identity, "profile": "local-sync-rust"}
         self.assertEqual(fetch.validate_dispatch(local_sync_identity, now=1_999_999_000), local_sync_identity)
         source_free = {**identity, "wave_class": fetch.SOURCE_FREE_WAVE_CLASS}
