@@ -104,6 +104,23 @@ REFUSAL_CODES = frozenset((
     "tool-version-unavailable", "total-deadline-exhausted", "total-deadline-unavailable",
     "typescript-report-incomplete",
 ))
+MACOS_PREFLIGHT_REFUSAL_CODES = frozenset((
+    "macos-preflight-internal", "macos-root-identity-internal", "macos-preflight-host-identity",
+    "macos-preflight-node-tools", "macos-preflight-command-line-tools", "macos-preflight-platform-policy",
+    "macos-preflight-temp-permissions", "macos-preflight-root-helper", "macos-preflight-state-record",
+    "macos-run-root-missing", "macos-state-directory-create", "macos-python3-unavailable",
+    "macos-user-list", "macos-user-name-conflict", "macos-user-id-exhausted", "macos-user-create",
+    "macos-user-attribute-set", "macos-worker-home-create", "macos-worker-home-permissions",
+    "macos-user-verify", "macos-cleanup-intent-write", "macos-identity-record-write",
+    "macos-runner-required", "profile-unknown", "dispatch-context-invalid", "state-directory-permissions",
+    "node-toolchain-missing", "node-toolchain-version", "npm-toolchain-version",
+    "node-runtime-version-invalid", "npm-runtime-install-failed", "npm-runtime-version-invalid",
+    "tool-file-type-invalid", "tool-owner-invalid", "tool-mode-invalid", "tool-symlink",
+    "tool-path-resolve-mismatch", "tool-file-unavailable",
+    "clt-missing", "developer-dir-unexpected", "developer-dir-trust-invalid", "clang-path-invalid",
+    "tool-digest-mismatch", "developer-clang-mismatch", "tool-version-unavailable",
+    "supervisor-operation-failed", "raw-record-size",
+))
 DECRYPT_REFUSAL_CODES = frozenset((
     "archive-invalid", "auth-tag", "binding-mismatch", "crypto-unavailable",
     "child-import-failed", "child-no-output", "child-output-invalid", "child-panic",

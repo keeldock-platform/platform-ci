@@ -27,6 +27,7 @@ import deadline as deadline_budget
 import macos_boundary_guard as boundary_guard
 import filter as output_filter
 import supervisor as linux_supervisor
+import refusal_codes
 
 WORKER_NAME_PREFIX = "kddevlane"
 WORKER_GROUP = 20
@@ -47,6 +48,9 @@ CLEANUP_INTENT_FILE = "cleanup-intent.json"
 PF_STATE_FILE = "pf.json"
 ANCHOR_NAME = "com.apple/devlane-private"
 MACOS_ROOT_DIRECTORY = chr(47) + "private" + chr(47) + "var" + chr(47) + "root"
+CLT_DEVELOPER_DIRECTORY = "/Library/Developer/CommandLineTools"
+CLT_BIN_DIRECTORY = CLT_DEVELOPER_DIRECTORY + "/usr/bin"
+CLT_CLANG_PATH = CLT_DEVELOPER_DIRECTORY + "/usr/bin/clang"
 
 
 DECRYPT_REFUSAL_CODES = frozenset((
@@ -55,30 +59,14 @@ DECRYPT_REFUSAL_CODES = frozenset((
     "request-invalid", "truncated",
 ))
 
-MACOS_PREFLIGHT_REFUSAL_CODES = frozenset((
-    "macos-preflight-internal", "macos-root-identity-internal", "macos-preflight-host-identity", "macos-preflight-node-tools",
-    "macos-preflight-command-line-tools", "macos-preflight-platform-policy",
-    "macos-preflight-temp-permissions", "macos-preflight-root-helper", "macos-preflight-state-record",
-    "macos-run-root-missing", "macos-state-directory-create", "macos-python3-unavailable",
-    "macos-user-list", "macos-user-name-conflict", "macos-user-id-exhausted", "macos-user-create",
-    "macos-user-attribute-set", "macos-worker-home-create", "macos-worker-home-permissions",
-    "macos-user-verify", "macos-cleanup-intent-write", "macos-identity-record-write",
-    "macos-runner-required", "profile-unknown", "dispatch-context-invalid", "state-directory-permissions",
-    "node-toolchain-missing", "node-toolchain-version", "npm-toolchain-version",
-    "node-runtime-version-invalid", "npm-runtime-install-failed", "npm-runtime-version-invalid",
-    "tool-file-type-invalid", "tool-owner-invalid", "tool-mode-invalid", "tool-symlink", "tool-path-resolve-mismatch",
-    "tool-file-unavailable",
-    "developer-dir-unexpected", "developer-dir-trust-invalid", "clang-path-invalid",
-    "tool-digest-mismatch", "developer-clang-mismatch",
-    "tool-version-unavailable", "supervisor-operation-failed", "raw-record-size",
-))
+MACOS_PREFLIGHT_REFUSAL_CODES = refusal_codes.MACOS_PREFLIGHT_REFUSAL_CODES
 
 MACOS_ROOT_IDENTITY_REFUSAL_CODES = frozenset(
     code for code in MACOS_PREFLIGHT_REFUSAL_CODES if code.startswith("macos-")
 ) | frozenset(("state-directory-permissions", "dispatch-context-invalid",
                "tool-file-type-invalid", "tool-owner-invalid", "tool-mode-invalid", "tool-symlink", "tool-path-resolve-mismatch",
                "tool-file-unavailable",
-               "developer-dir-unexpected", "developer-dir-trust-invalid", "clang-path-invalid",
+               "clt-missing", "developer-dir-unexpected", "developer-dir-trust-invalid", "clang-path-invalid",
                "developer-clang-mismatch",
                "tool-version-unavailable", "node-toolchain-missing", "node-toolchain-version",
                "npm-toolchain-version", "supervisor-operation-failed", "raw-record-size"))
@@ -284,12 +272,13 @@ def _run_root_helper(operation, arguments, *, preserve=()):
 def _clean_env(state, *, preparation=False):
     ident = _identity(state)
     return {
-        "PATH": str(Path(ident["node"]).parent) + ":/usr/bin:/bin:/usr/sbin:/sbin",
+        "PATH": str(Path(ident["node"]).parent) + ":" + CLT_BIN_DIRECTORY + ":/usr/bin:/bin:/usr/sbin:/sbin",
         "HOME": str(Path(state.parent) / "preparation-home") if preparation else str(Path(ident["home"])),
         "TMPDIR": str(state.parent / "preparation-tmp") if preparation else str(Path(_worker_state(state)["scratch"])),
         "LC_ALL": "C", "LANG": "C", "CI": "1", "NPM_CONFIG_IGNORE_SCRIPTS": "true",
         "NPM_CONFIG_AUDIT": "false", "NPM_CONFIG_FUND": "false", "NPM_CONFIG_UPDATE_NOTIFIER": "false",
         "PLAYWRIGHT_BROWSERS_PATH": str(Path(state.parent) / "prepared" / "ms-playwright"),
+        "DEVELOPER_DIR": CLT_DEVELOPER_DIRECTORY,
     }
 
 
@@ -496,29 +485,34 @@ def _trusted_developer_directory(path, anchor, *, worker_account=None, defer_gro
 
 def _validate_clt(*, worker_account=None, defer_group_membership=False):
     env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"}
-    developer_name = _command_output(("/usr/bin/xcode-select", "-p"), env=env)
     try:
-        developer_path = Path(developer_name).resolve(strict=True)
+        developer_path = Path(CLT_DEVELOPER_DIRECTORY)
+        developer_path.lstat()
+    except FileNotFoundError:
+        _refuse("clt-missing")
     except OSError:
-        _refuse("developer-dir-unexpected")
-    developer = str(developer_path)
-    if ((developer != "/Library/Developer/CommandLineTools"
-             and re.fullmatch(r"/Applications/Xcode(?:_[A-Za-z0-9.]+)?\.app/Contents/Developer", developer) is None)
-            or not developer_path.is_dir()):
-        _refuse("developer-dir-unexpected")
-    anchor = Path("/Library") if developer == "/Library/Developer/CommandLineTools" else Path("/Applications")
+        _refuse("developer-dir-trust-invalid")
+    developer = CLT_DEVELOPER_DIRECTORY
     _trusted_developer_directory(
-        developer_path, anchor, worker_account=worker_account,
+        developer_path, Path("/Library"), worker_account=worker_account,
         defer_group_membership=defer_group_membership,
     )
-    clang_name = _command_output(("/usr/bin/xcrun", "--find", "clang"), env={**env, "DEVELOPER_DIR": developer})
+    clang_name = _command_output(
+        ("/usr/bin/xcrun", "--find", "clang"), env={**env, "DEVELOPER_DIR": CLT_DEVELOPER_DIRECTORY},
+    )
+    if clang_name != CLT_CLANG_PATH:
+        _refuse("clang-path-invalid")
     try:
         clang_path = Path(clang_name).resolve(strict=True)
     except OSError:
         _refuse("clang-path-invalid")
-    clang = _trusted_file(clang_path, executable=True)
-    if not clang.is_relative_to(Path(developer)):
+    if not clang_path.is_relative_to(developer_path):
         _refuse("clang-path-invalid")
+    _trusted_developer_directory(
+        clang_path.parent, developer_path, worker_account=worker_account,
+        defer_group_membership=defer_group_membership,
+    )
+    clang = _trusted_file(clang_path, executable=True, owners=(0,))
     return developer, str(clang)
 
 
@@ -591,10 +585,13 @@ def preparation_profile_text(*, project, prepared, cache, home, temporary, node,
     npm_root = Path(npm_cli).parent.parent
     readable = {
         "/System/Library", "/System/Volumes/Preboot/Cryptexes/OS", "/usr/lib", "/usr/share",
-        "/usr/bin", "/bin", "/dev", str(node_root), str(npm_root), str(project),
+        "/usr/bin", "/bin", "/dev", CLT_DEVELOPER_DIRECTORY, str(node_root), str(npm_root), str(project),
         str(prepared), str(cache), str(home), str(temporary),
     }
-    executable = {"/bin/sh", "/bin/bash", "/usr/bin/env", "/usr/bin/sandbox-exec", str(node)}
+    executable = {
+        "/bin/sh", "/bin/bash", "/usr/bin/env", "/usr/bin/sandbox-exec", "/usr/bin/xcrun",
+        CLT_CLANG_PATH, str(node),
+    }
     writable = {str(project), str(prepared), str(cache), str(home), str(temporary)}
     lines = [
         "(version 1)", "(deny default)", "(allow process-fork)",
@@ -610,6 +607,18 @@ def preparation_profile_text(*, project, prepared, cache, home, temporary, node,
         "(allow file-map-executable (subpath " + _quote(project) + ") (subpath " + _quote(prepared) + "))",
     ))
     return "\n".join(lines) + "\n"
+
+
+def _preparation_env(ident, *, home, temporary, cache, prepared):
+    return {
+        "PATH": str(Path(ident["node"]).parent) + ":" + CLT_BIN_DIRECTORY + ":/usr/bin:/bin",
+        "DEVELOPER_DIR": CLT_DEVELOPER_DIRECTORY,
+        "HOME": str(home), "TMPDIR": str(temporary), "NPM_CONFIG_CACHE": str(cache),
+        "NPM_CONFIG_IGNORE_SCRIPTS": "true", "NPM_CONFIG_AUDIT": "false",
+        "NPM_CONFIG_FUND": "false", "NPM_CONFIG_UPDATE_NOTIFIER": "false",
+        "CI": "1", "LC_ALL": "C", "LANG": "C",
+        "PLAYWRIGHT_BROWSERS_PATH": str(Path(prepared) / "ms-playwright"),
+    }
 
 
 def _npm_preparation_command(ident):
@@ -736,14 +745,7 @@ def _prepare(state, projection_path, output_path, profile, control_sha, deadline
         node=ident["node"], npm_cli=ident["npm_cli"],
     ), encoding="utf-8")
     os.chmod(profile_path, 0o444)
-    env = {
-        "PATH": str(Path(ident["node"]).parent) + ":/usr/bin:/bin",
-        "HOME": str(home), "TMPDIR": str(temporary), "NPM_CONFIG_CACHE": str(cache),
-        "NPM_CONFIG_IGNORE_SCRIPTS": "true", "NPM_CONFIG_AUDIT": "false",
-        "NPM_CONFIG_FUND": "false", "NPM_CONFIG_UPDATE_NOTIFIER": "false",
-        "CI": "1", "LC_ALL": "C", "LANG": "C",
-        "PLAYWRIGHT_BROWSERS_PATH": str(prepared / "ms-playwright"),
-    }
+    env = _preparation_env(ident, home=home, temporary=temporary, cache=cache, prepared=prepared)
     timeout = min(3600, deadline_budget.remaining(deadline_file))
     with log.open("xb") as output_log:
         code = _run_preparation_process(
@@ -807,7 +809,8 @@ def profile_text(*, workspace, prepared, scratch, home, control, node, developer
     if npm_cli is not None:
         allowed_reads.add(str(Path(npm_cli).parent.parent))
     allowed_exec = {
-        "/bin/sh", "/bin/bash", "/usr/bin/env", "/usr/bin/sandbox-exec", str(Path(node)), str(Path(clang)),
+        "/bin/sh", "/bin/bash", "/usr/bin/env", "/usr/bin/sandbox-exec", "/usr/bin/xcrun",
+        str(Path(node)), str(Path(clang)),
     }
     lines = [
         "(version 1)", "(deny default)", "(allow process-fork)", "(deny network*)", "(deny lsopen)",
@@ -1429,7 +1432,8 @@ def _mapped_command(command, worker):
 
 def _worker_env(worker, ident):
     return {
-        "PATH": str(Path(worker["node"]).parent) + ":/usr/bin:/bin",
+        "PATH": str(Path(worker["node"]).parent) + ":" + CLT_BIN_DIRECTORY + ":/usr/bin:/bin",
+        "DEVELOPER_DIR": CLT_DEVELOPER_DIRECTORY,
         "HOME": worker["home"], "TMPDIR": str(Path(worker["scratch"]) / "tmp"),
         "CI": "1", "LC_ALL": "C", "LANG": "C", "NPM_CONFIG_IGNORE_SCRIPTS": "true",
         "NPM_CONFIG_AUDIT": "false", "NPM_CONFIG_FUND": "false", "NPM_CONFIG_UPDATE_NOTIFIER": "false",

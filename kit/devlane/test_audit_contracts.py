@@ -857,12 +857,7 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         cases = [
             ("macos", "Prepare hosted runner isolation state",
              "devlane_macos_preflight_refusal=" + code, 2)
-            for code in (
-                "tool-file-type-invalid", "tool-owner-invalid", "tool-mode-invalid", "tool-symlink", "tool-path-resolve-mismatch",
-                "tool-file-unavailable",
-                "developer-dir-unexpected", "clang-path-invalid", "tool-digest-mismatch",
-                "developer-clang-mismatch",
-            )
+            for code in sorted(refusal_codes.MACOS_PREFLIGHT_REFUSAL_CODES)
         ]
         cases.extend(
             ("macos", "Prepare hosted runner isolation state",
@@ -929,6 +924,105 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 changed_steps["Shred runner-local workspace"]["conclusion"] = "failure"
                 with self.assertRaises(audit.AuditRefusal):
                     audit.validate_job_log_metadata_binding(surface, changed, identity)
+
+    def test_saved_macos_round_three_log_audits_as_a_step_bound_preflight_failure(self):
+        identity = dict(
+            IDENTITY,
+            control_sha="9fc48ebd432f104e7c12349358c260553077463d",
+            run_id="43449960851", control_run_id="43449059870", platform="macos",
+            runner="macos-15", wave_id="wave-20261113150525-73280748",
+            bundle_id="bundle-20261113150525-f7b37b88",
+            cache_baseline_sha256="0d3fc3aceee6b35f8dc244cabeac7e64bd35353e892dab7b1360fdd7f09235d7",
+        )
+        runner_marker = bytes((35, 35))
+        refusal_line, exit_line, cleanup_line, completion_line = (
+            b"2026-11-13T15:21:23.5486390Z devlane_macos_preflight_refusal=developer-dir-trust-invalid",
+            b"2026-11-13T15:21:23.5665770Z " + runner_marker + b"[error]Process completed with exit code 2.",
+            b"2026-11-13T15:21:25.1574690Z cleanup_receipt=confirmed",
+            b"2026-11-13T15:21:25.1780190Z devlane_job=completed public_output=filtered cleanup=confirmed",
+        )
+        log = _render_real_runner_encrypted_log(
+            identity, early_failure={
+                "step": "Prepare hosted runner isolation state",
+                "marker": "devlane_macos_preflight_refusal=developer-dir-trust-invalid", "exit_code": 2,
+            },
+        )
+        log_rows = log.splitlines(keepends=True)
+        input_start = next(index for index, line in enumerate(log_rows)
+                           if line.rstrip().endswith(runner_marker + b"[group] Inputs"))
+        input_end = next(index for index in range(input_start + 1, len(log_rows))
+                         if log_rows[index].rstrip().endswith(runner_marker + b"[endgroup]"))
+        del log_rows[input_start:input_end + 1]
+        replacements = (
+            (b"devlane_macos_preflight_refusal=developer-dir-trust-invalid", refusal_line),
+            (runner_marker + b"[error]Process completed with exit code 2.", exit_line),
+            (b"cleanup_receipt=confirmed", cleanup_line),
+            (b"devlane_job=completed public_output=filtered cleanup=confirmed", completion_line),
+        )
+        for marker, actual_line in replacements:
+            index = next(i for i, line in enumerate(log_rows) if line.rstrip().endswith(marker))
+            log_rows[index] = actual_line + b"\n"
+        log = b"".join(log_rows)
+
+        jobs = _encrypted_jobs(platform="macos")
+        for job in jobs:
+            job["run_id"] = int(identity["run_id"])
+            job["head_sha"] = identity["control_sha"]
+        by_name = {job["name"]: job for job in jobs}
+        run_job = by_name[audit.MACOS_RUN_JOB]
+        run_job["conclusion"] = "failure"
+        failure_index = next(i for i, step in enumerate(run_job["steps"])
+                             if step["name"] == "Prepare hosted runner isolation state")
+        for index, step in enumerate(run_job["steps"]):
+            if step["name"] == "Shred runner-local workspace":
+                step["conclusion"] = "success"
+            elif step["name"] == "Install pinned Rust toolchain":
+                step["conclusion"] = "skipped"
+            elif index < failure_index:
+                step["conclusion"] = "success"
+            elif index == failure_index:
+                step["conclusion"] = "failure"
+            else:
+                step["conclusion"] = "skipped"
+
+        expected_outcome = (
+            "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed "
+            "disposition=run-failed-at-macos-preflight"
+        )
+        audit_log = _render_real_runner_encrypted_log(identity, job_key=audit.AUDIT_JOB)
+        audit_log = audit_log.replace(
+            b"devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed",
+            expected_outcome.encode("ascii"), 1,
+        )
+
+        class API:
+            def json(self, endpoint):
+                if endpoint.endswith("/actions/runs/" + identity["run_id"]):
+                    repository = {"full_name": audit.REPOSITORY, "id": audit.REPOSITORY_ID}
+                    return ({
+                        "id": int(identity["run_id"]), "path": audit.WORKFLOW_PATH,
+                        "event": "workflow_dispatch", "head_branch": "main",
+                        "head_sha": identity["control_sha"], "run_attempt": 1,
+                        "status": "in_progress", "conclusion": None,
+                        "repository": repository, "head_repository": repository,
+                    }, {})
+                if "/jobs?" in endpoint:
+                    return ({"total_count": 4, "jobs": jobs}, {})
+                if "/artifacts?" in endpoint:
+                    return ({"total_count": 0, "artifacts": []}, {})
+                return ({}, {})
+
+            def log_text(self, identifier):
+                return log if identifier == run_job["id"] else audit_log
+
+        permit_key = "devlane-permit-v1-" + identity["bundle_id"]
+        control_key = "devlane-control-v1-" + identity["control_run_id"]
+        with patch.object(audit, "_fetch_cache_entries", return_value=[
+                {"key": permit_key, "size_in_bytes": 1}, {"key": control_key, "size_in_bytes": 1}]), \
+                patch.object(audit, "cache_inventory_digest", return_value=identity["cache_baseline_sha256"]), \
+                patch.object(audit, "validate_check_output"), \
+                patch.object(audit, "_read_annotations", return_value=[]):
+            self.assertEqual(audit.run_audit(API(), identity), expected_outcome)
 
     def test_bootstrap_refusal_vocabulary_is_fixed_and_step_bound(self):
         identity = dict(IDENTITY, platform="linux")

@@ -60,6 +60,8 @@ class MacProfileTests(unittest.TestCase):
         self.assertIn("(deny lsopen)", text)
         self.assertIn("(deny mach-lookup)", text)
         self.assertIn('(allow process-exec (literal "/usr/bin/python3"))', text)
+        self.assertIn('(allow process-exec (literal "/usr/bin/xcrun"))', text)
+        self.assertIn('(allow file-read* (subpath "' + sandbox.CLT_DEVELOPER_DIRECTORY + '"))', text)
         self.assertIn('(allow process-exec (literal "/bin/bash"))', text)
         self.assertIn('(allow process-exec (subpath "/tmp/devlane-workspace/source"))', text)
         self.assertIn('(allow file-read* (subpath "/opt/node/lib/node_modules/npm"))', text)
@@ -289,50 +291,52 @@ class MacRoundOneRegressionTests(unittest.TestCase):
                 with self.assertRaisesRegex(sandbox.Refusal, "tool-path-resolve-mismatch"):
                     sandbox._trusted_file(tool, owners=(os.getuid(),))
 
-    def test_xcode_developer_alias_and_clang_symlink_resolve_inside_xcode(self):
-        developer_alias = "/Applications/Xcode.app/Contents/Developer"
-        developer_real = Path("/Applications/Xcode_16.4.app/Contents/Developer")
-        clang_alias = developer_alias + "/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"
-        clang_real = developer_real / "Toolchains/XcodeDefault.xctoolchain/usr/bin/clang-1700"
+    def test_clt_validation_ignores_xcode_select_and_pins_clang_path(self):
+        developer = Path(sandbox.CLT_DEVELOPER_DIRECTORY)
+        clang_alias = sandbox.CLT_CLANG_PATH
+        clang_real = developer / "usr/bin/clang-1600.0.26.4"
         original_resolve = Path.resolve
 
         def resolve(path, *, strict=False):
-            mapped = {
-                developer_alias: developer_real,
-                clang_alias: clang_real,
-            }
-            if str(path) in mapped:
-                return mapped[str(path)]
+            if str(path) == clang_alias:
+                return clang_real
             return original_resolve(path, strict=strict)
 
-        with mock.patch.object(sandbox, "_command_output", side_effect=(developer_alias, clang_alias)), \
+        metadata = type("Metadata", (), {"st_mode": 0o40755, "st_uid": 0, "st_gid": 0})()
+        with mock.patch.object(sandbox, "_command_output", return_value=clang_alias) as command, \
+                mock.patch.object(Path, "lstat", return_value=metadata), \
                 mock.patch.object(Path, "resolve", autospec=True, side_effect=resolve), \
-                mock.patch.object(Path, "is_dir", return_value=True), \
                 mock.patch.object(sandbox, "_trusted_developer_directory"), \
-                mock.patch.object(sandbox, "_trusted_file", side_effect=lambda path, **_kwargs: path):
-            self.assertEqual(sandbox._validate_clt(), (str(developer_real), str(clang_real)))
+                mock.patch.object(sandbox, "_trusted_file", side_effect=lambda path, **_kwargs: path) as trusted_file:
+            self.assertEqual(sandbox._validate_clt(), (str(developer), str(clang_real)))
+        command.assert_called_once_with(
+            ("/usr/bin/xcrun", "--find", "clang"),
+            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C",
+                 "DEVELOPER_DIR": sandbox.CLT_DEVELOPER_DIRECTORY},
+        )
+        trusted_file.assert_called_once_with(clang_real, executable=True, owners=(0,))
 
-    def test_xcode_developer_tree_rejects_writable_directory_and_wrong_owner(self):
-        developer = Path("/Applications/Xcode.app/Contents/Developer")
+    def test_clt_developer_tree_rejects_writable_directory_and_wrong_owner(self):
+        developer = Path(sandbox.CLT_DEVELOPER_DIRECTORY)
         trusted = type("Metadata", (), {"st_mode": 0o40755, "st_uid": 0, "st_gid": 0})()
         header = lambda path: "drwxr-xr-x  1 root  wheel  1 Nov 13 00:00 " + str(path)
         with mock.patch.object(Path, "lstat", return_value=trusted), \
                 mock.patch.object(sandbox, "_command_output", side_effect=lambda argv, **_kwargs: header(argv[-1])) as ls:
-            sandbox._trusted_developer_directory(developer, Path("/Applications"))
+            sandbox._trusted_developer_directory(developer, Path("/Library"))
         self.assertEqual(
             [Path(call.args[0][-1]) for call in ls.call_args_list],
-            [developer, developer.parent, developer.parent.parent, Path("/Applications")],
+            [developer, developer.parent, Path("/Library")],
         )
 
         staff_writable = type("Metadata", (), {"st_mode": 0o40775, "st_uid": 0, "st_gid": 20})()
         with mock.patch.object(Path, "lstat", return_value=staff_writable), \
                 self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
-            sandbox._trusted_developer_directory(developer, Path("/Applications"))
+            sandbox._trusted_developer_directory(developer, Path("/Library"))
 
         wrong_owner = type("Metadata", (), {"st_mode": 0o40755, "st_uid": 501, "st_gid": 0})()
         with mock.patch.object(Path, "lstat", return_value=wrong_owner), \
                 self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
-            sandbox._trusted_developer_directory(developer, Path("/Applications"))
+            sandbox._trusted_developer_directory(developer, Path("/Library"))
 
         parent = developer.parent.parent
 
@@ -341,15 +345,15 @@ class MacRoundOneRegressionTests(unittest.TestCase):
 
         with mock.patch.object(Path, "lstat", autospec=True, side_effect=metadata_for), \
                 self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
-            sandbox._trusted_developer_directory(developer, Path("/Applications"))
+            sandbox._trusted_developer_directory(developer, Path("/Library"))
 
         other_writable = type("Metadata", (), {"st_mode": 0o40777, "st_uid": 0, "st_gid": 80})()
         with mock.patch.object(Path, "lstat", return_value=other_writable), \
                 self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
-            sandbox._trusted_developer_directory(developer, Path("/Applications"))
+            sandbox._trusted_developer_directory(developer, Path("/Library"))
 
-    def test_xcode_developer_tree_allows_admin_group_write_only_for_non_admin_worker(self):
-        developer = Path("/Applications/Xcode.app/Contents/Developer")
+    def test_clt_developer_tree_allows_admin_group_write_only_for_non_admin_worker(self):
+        developer = Path(sandbox.CLT_DEVELOPER_DIRECTORY)
         admin_writable = type("Metadata", (), {"st_mode": 0o40775, "st_uid": 0, "st_gid": 80})()
         header = lambda path: "drwxrwxr-x  1 root  admin  1 Nov 13 00:00 " + str(path)
         groups = type("Result", (), {"stdout": b"20 501\n"})()
@@ -357,7 +361,7 @@ class MacRoundOneRegressionTests(unittest.TestCase):
                 mock.patch.object(sandbox, "_command_output", side_effect=lambda argv, **_kwargs: header(argv[-1])), \
                 mock.patch.object(sandbox, "_directory_service", return_value=groups) as ds:
             sandbox._trusted_developer_directory(
-                developer, Path("/Applications"), worker_account="kddevlane123",
+                developer, Path("/Library"), worker_account="kddevlane123",
             )
         self.assertEqual(ds.call_args.args[0], ("/usr/bin/id", "-G", "kddevlane123"))
 
@@ -366,16 +370,16 @@ class MacRoundOneRegressionTests(unittest.TestCase):
                 self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"), \
                 mock.patch.object(sandbox, "_directory_service", return_value=admin_worker_groups):
             sandbox._trusted_developer_directory(
-                developer, Path("/Applications"), worker_account="kddevlane123",
+                developer, Path("/Library"), worker_account="kddevlane123",
             )
 
-    def test_xcode_developer_tree_rejects_admin_group_and_unsafe_acl_grants(self):
-        developer = Path("/Applications/Xcode.app/Contents/Developer")
+    def test_clt_developer_tree_rejects_admin_group_and_unsafe_acl_grants(self):
+        developer = Path(sandbox.CLT_DEVELOPER_DIRECTORY)
         staff_writable = type("Metadata", (), {"st_mode": 0o40775, "st_uid": 0, "st_gid": 20})()
         with mock.patch.object(Path, "lstat", return_value=staff_writable), \
                 self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
             sandbox._trusted_developer_directory(
-                developer, Path("/Applications"), worker_account="kddevlane123",
+                developer, Path("/Library"), worker_account="kddevlane123",
             )
 
         metadata = type("Metadata", (), {"st_mode": 0o40755, "st_uid": 0, "st_gid": 0})()
@@ -388,11 +392,11 @@ class MacRoundOneRegressionTests(unittest.TestCase):
                 mock.patch.object(sandbox, "_command_output", side_effect=output), \
                 self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
             sandbox._trusted_developer_directory(
-                developer, Path("/Applications"), worker_account="kddevlane123",
+                developer, Path("/Library"), worker_account="kddevlane123",
             )
 
-    def test_xcode_developer_tree_allows_admin_acl_only_for_non_admin_worker(self):
-        developer = Path("/Applications/Xcode.app/Contents/Developer")
+    def test_clt_developer_tree_allows_admin_acl_only_for_non_admin_worker(self):
+        developer = Path(sandbox.CLT_DEVELOPER_DIRECTORY)
         metadata = type("Metadata", (), {"st_mode": 0o40755, "st_uid": 0, "st_gid": 0})()
         header = lambda path: "drwxr-xr-x+ 1 root wheel 1 Nov 13 00:00 " + str(path)
 
@@ -404,7 +408,7 @@ class MacRoundOneRegressionTests(unittest.TestCase):
                 mock.patch.object(sandbox, "_command_output", side_effect=output), \
                 mock.patch.object(sandbox, "_directory_service", return_value=groups):
             sandbox._trusted_developer_directory(
-                developer, Path("/Applications"), worker_account="kddevlane123",
+                developer, Path("/Library"), worker_account="kddevlane123",
             )
 
         admin_worker_groups = type("Result", (), {"stdout": b"20 80 501\n"})()
@@ -413,11 +417,11 @@ class MacRoundOneRegressionTests(unittest.TestCase):
                 mock.patch.object(sandbox, "_directory_service", return_value=admin_worker_groups), \
                 self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
             sandbox._trusted_developer_directory(
-                developer, Path("/Applications"), worker_account="kddevlane123",
+                developer, Path("/Library"), worker_account="kddevlane123",
             )
 
-    def test_xcode_developer_tree_rejects_acl_write_grants(self):
-        developer = Path("/Applications/Xcode.app/Contents/Developer")
+    def test_clt_developer_tree_rejects_acl_write_grants(self):
+        developer = Path(sandbox.CLT_DEVELOPER_DIRECTORY)
         metadata = type("Metadata", (), {"st_mode": 0o40755, "st_uid": 0, "st_gid": 0})()
         header = lambda path: "drwxr-xr-x+ 1 root wheel 1 Nov 13 00:00 " + str(path)
 
@@ -427,7 +431,7 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         with mock.patch.object(Path, "lstat", return_value=metadata), \
                 mock.patch.object(sandbox, "_command_output", side_effect=output), \
                 self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
-            sandbox._trusted_developer_directory(developer, Path("/Applications"))
+            sandbox._trusted_developer_directory(developer, Path("/Library"))
 
         app_bundle = developer.parent.parent
 
@@ -438,14 +442,20 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         with mock.patch.object(Path, "lstat", return_value=metadata), \
                 mock.patch.object(sandbox, "_command_output", side_effect=parent_acl), \
                 self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
-            sandbox._trusted_developer_directory(developer, Path("/Applications"))
+            sandbox._trusted_developer_directory(developer, Path("/Library"))
 
-    def test_xcode_selector_rejects_unexpected_developer_directory(self):
-        developer = str(Path(os.sep, "Users", "runner", "Developer"))
-        with mock.patch.object(sandbox, "_command_output", return_value=developer), \
-                mock.patch.object(Path, "resolve", return_value=Path(developer)), \
-                mock.patch.object(Path, "is_dir", return_value=True):
-            with self.assertRaisesRegex(sandbox.Refusal, "developer-dir-unexpected"):
+    def test_clt_missing_has_a_fixed_refusal_code(self):
+        with mock.patch.object(Path, "lstat", side_effect=FileNotFoundError):
+            with self.assertRaisesRegex(sandbox.Refusal, "clt-missing"):
+                sandbox._validate_clt()
+
+    def test_xcode_clang_path_is_not_accepted_as_the_clt_compiler(self):
+        metadata = type("Metadata", (), {"st_mode": 0o40755, "st_uid": 0, "st_gid": 0})()
+        with mock.patch.object(sandbox, "_command_output", return_value=
+                               "/Applications/Xcode_16.4.app/Contents/Developer/usr/bin/clang"), \
+                mock.patch.object(Path, "lstat", return_value=metadata), \
+                mock.patch.object(sandbox, "_trusted_developer_directory"):
+            with self.assertRaisesRegex(sandbox.Refusal, "clang-path-invalid"):
                 sandbox._validate_clt()
 
     def test_root_identity_parses_the_directory_services_uid_inventory(self):
@@ -496,6 +506,15 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         self.assertNotIn("(allow network*)", profile)
         self.assertIn('(allow file-write* (subpath "' + PRIVATE_RUN + '/cache")', profile)
         self.assertNotIn('(allow file-write* (subpath "/Users")', profile)
+        self.assertIn('(allow process-exec (literal "/usr/bin/xcrun"))', profile)
+        self.assertIn('(allow file-read* (subpath "' + sandbox.CLT_DEVELOPER_DIRECTORY + '"))', profile)
+        preparation_env = sandbox._preparation_env(
+            {"node": "/opt/node/bin/node"}, home=PRIVATE_RUN + "/home",
+            temporary=PRIVATE_RUN + "/tmp", cache=PRIVATE_RUN + "/cache",
+            prepared=PRIVATE_RUN + "/prepared",
+        )
+        self.assertEqual(preparation_env["DEVELOPER_DIR"], sandbox.CLT_DEVELOPER_DIRECTORY)
+        self.assertEqual(preparation_env["PATH"].split(":")[1], sandbox.CLT_BIN_DIRECTORY)
         ident = {"uid": 544, "gid": sandbox.WORKER_GROUP, "node": "/opt/node/bin/node",
                  "npm_cli": PRIVATE_RUN + "/control-npm/lib/node_modules/npm/bin/npm-cli.js"}
         command = sandbox._npm_preparation_command(ident)
@@ -519,6 +538,15 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         self.assertEqual(spawn.call_args.kwargs["user"], 544)
         self.assertEqual(spawn.call_args.kwargs["group"], sandbox.WORKER_GROUP)
         self.assertEqual(spawn.call_args.kwargs["extra_groups"], ())
+
+    def test_workload_build_environment_pins_the_clt_developer_directory(self):
+        worker = {
+            "node": "/opt/node/bin/node", "home": PRIVATE_RUN + "/worker-home",
+            "scratch": PRIVATE_RUN + "/scratch", "prepared": PRIVATE_RUN + "/prepared",
+        }
+        workload_env = sandbox._worker_env(worker, {})
+        self.assertEqual(workload_env["DEVELOPER_DIR"], sandbox.CLT_DEVELOPER_DIRECTORY)
+        self.assertEqual(workload_env["PATH"].split(":")[1], sandbox.CLT_BIN_DIRECTORY)
 
     def test_worker_can_read_but_not_write_control_npm_tree(self):
         with tempfile.TemporaryDirectory(prefix="macos-control-npm-") as temporary:
