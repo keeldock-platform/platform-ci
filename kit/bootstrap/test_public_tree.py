@@ -1019,6 +1019,7 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/safe_json.mjs',
             'kit/devlane/supervisor.py',
             'kit/devlane/test_acceptance.py',
+            'kit/devlane/test_worker_control_imports.py',
             'kit/devlane/test_adapters.mjs',
             'kit/devlane/test_audit_contracts.py',
             'kit/devlane/fixtures/control-synthetic-43245798187.log.hex',
