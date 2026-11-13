@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import stat
 import sys
 import time
@@ -109,12 +110,33 @@ def validate_dispatch(identity, expected_profile=None, now=None):
 
 
 def _validate_url(url, allowed_hosts):
-    parsed = urllib.parse.urlsplit(url)
+    if type(url) is not str:
+        _fail("download-redirect-invalid")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+    except (TypeError, ValueError, UnicodeError):
+        _fail("download-redirect-invalid")
     if (parsed.scheme != "https" or parsed.username is not None or parsed.password is not None
-            or parsed.hostname not in allowed_hosts or parsed.port not in (None, 443)
+            or parsed.hostname not in allowed_hosts or port not in (None, 443)
             or parsed.fragment):
-        _fail("download-redirect")
+        _fail("download-redirect-invalid")
     return url
+
+
+def _http_status_refusal(status):
+    if type(status) is not int or not 100 <= status <= 599:
+        return "download-http-other"
+    if status in (401, 403, 404, 410, 429):
+        return "download-http-" + str(status)
+    return "download-http-" + str(status // 100) + "xx"
+
+
+def _is_timeout(error):
+    if isinstance(error, (TimeoutError, socket.timeout)):
+        return True
+    return (isinstance(error, urllib.error.URLError)
+            and isinstance(error.reason, (TimeoutError, socket.timeout)))
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -142,10 +164,10 @@ def _open_limited(url, maximum, allowed_hosts, *, transient_retries=0, sleep=tim
             try:
                 if error.code in (301, 302, 303, 307, 308):
                     if redirects >= MAX_REDIRECTS:
-                        _fail("download-redirect-limit")
+                        _fail("download-redirect-invalid")
                     location = error.headers.get("Location")
                     if type(location) is not str:
-                        _fail("download-redirect")
+                        _fail("download-redirect-invalid")
                     current = _validate_url(urllib.parse.urljoin(current, location), allowed_hosts)
                     redirects += 1
                     continue
@@ -155,7 +177,7 @@ def _open_limited(url, maximum, allowed_hosts, *, transient_retries=0, sleep=tim
                         or error.headers.get("X-RateLimit-Remaining") == "0"):
                     retryable = True
                 if not retryable or retries >= transient_retries:
-                    _fail("download-http")
+                    _fail(_http_status_refusal(error.code))
                 delay = min(8, 2 ** retries)
                 retry_after = error.headers.get("Retry-After")
                 if type(retry_after) is str and len(retry_after) <= 3 and retry_after.isdecimal():
@@ -168,19 +190,33 @@ def _open_limited(url, maximum, allowed_hosts, *, transient_retries=0, sleep=tim
                 continue
             finally:
                 error.close()
+        except (TimeoutError, socket.timeout):
+            _fail("download-timeout")
+        except urllib.error.URLError as error:
+            if _is_timeout(error):
+                _fail("download-timeout")
+            raise
         try:
-            if response.status != 200 or urllib.parse.urlsplit(response.geturl()).hostname not in allowed_hosts:
-                _fail("download-http")
+            _validate_url(response.geturl(), allowed_hosts)
+            if response.status != 200:
+                _fail(_http_status_refusal(response.status))
             chunks = []
             size = 0
-            while True:
-                chunk = response.read(min(65536, maximum + 1 - size))
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > maximum:
-                    _fail("download-size")
-                chunks.append(chunk)
+            try:
+                while True:
+                    chunk = response.read(min(65536, maximum + 1 - size))
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > maximum:
+                        _fail("download-size")
+                    chunks.append(chunk)
+            except (TimeoutError, socket.timeout):
+                _fail("download-timeout")
+            except urllib.error.URLError as error:
+                if _is_timeout(error):
+                    _fail("download-timeout")
+                raise
             return b"".join(chunks)
         finally:
             response.close()

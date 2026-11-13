@@ -945,10 +945,67 @@ class FetchProjectionAcceptanceTests(unittest.TestCase):
 
         delays = []
         with patch.object(fetch.urllib.request, "build_opener", return_value=Opener()):
-            with self.assertRaisesRegex(bundle.Refusal, "download-http"):
+            with self.assertRaisesRegex(bundle.Refusal, "download-http-404"):
                 fetch._open_limited(missing.url, 64, fetch.ALLOWED_HOSTS,
                                     transient_retries=4, sleep=delays.append)
         self.assertEqual(delays, [])
+
+    def test_download_refusals_use_fixed_status_classes_and_safe_redirect_timeout_codes(self):
+        api_url = "https://api.github.com/repos/keeldock-platform/platform-ci/releases/assets/123"
+
+        class Opener:
+            def __init__(self, response):
+                self.response = response
+                self.calls = 0
+
+            def open(self, request, timeout):
+                self.calls += 1
+                if isinstance(self.response, BaseException):
+                    raise self.response
+                return self.response
+
+        for status, code in (
+            (401, "download-http-401"), (403, "download-http-403"),
+            (404, "download-http-404"), (410, "download-http-410"),
+            (429, "download-http-429"), (400, "download-http-4xx"),
+            (503, "download-http-5xx"), (300, "download-http-3xx"),
+        ):
+            error = fetch.urllib.error.HTTPError(api_url, status, "private reason", {}, None)
+            opener = Opener(error)
+            with self.subTest(status=status), patch.object(fetch.urllib.request, "build_opener", return_value=opener):
+                with self.assertRaisesRegex(bundle.Refusal, code):
+                    fetch._open_limited(api_url, 64, fetch.ALLOWED_HOSTS)
+                self.assertEqual(opener.calls, 1)
+
+        transient = fetch.urllib.error.HTTPError(api_url, 503, "private reason", {}, None)
+        final = fetch.urllib.error.HTTPError(api_url, 410, "private reason", {}, None)
+
+        class RetriedOpener:
+            def __init__(self):
+                self.responses = [transient, final]
+
+            def open(self, request, timeout):
+                result = self.responses.pop(0)
+                raise result
+
+        delays = []
+        with patch.object(fetch.urllib.request, "build_opener", return_value=RetriedOpener()):
+            with self.assertRaisesRegex(bundle.Refusal, "download-http-410"):
+                fetch._open_limited(api_url, 64, fetch.ALLOWED_HOSTS,
+                                    transient_retries=1, sleep=delays.append)
+        self.assertEqual(delays, [1])
+
+        invalid_redirect = fetch.urllib.error.HTTPError(
+            api_url, 302, "private reason", {"Location": "https://example.invalid/private"}, None,
+        )
+        with patch.object(fetch.urllib.request, "build_opener", return_value=Opener(invalid_redirect)):
+            with self.assertRaisesRegex(bundle.Refusal, "download-redirect-invalid"):
+                fetch._open_limited(api_url, 64, fetch.ALLOWED_HOSTS)
+
+        timeout_opener = Opener(TimeoutError("private timeout detail"))
+        with patch.object(fetch.urllib.request, "build_opener", return_value=timeout_opener):
+            with self.assertRaisesRegex(bundle.Refusal, "download-timeout"):
+                fetch._open_limited(api_url, 64, fetch.ALLOWED_HOSTS)
 
     def test_dispatch_identity_and_npm_projection_are_strict(self):
         identity = {

@@ -925,6 +925,55 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 with self.assertRaises(audit.AuditRefusal):
                     audit.validate_job_log_metadata_binding(surface, changed, identity)
 
+    def test_asset_fetch_refusals_are_fixed_and_step_bound_on_all_platforms(self):
+        failed_step = "Fetch ciphertext and sanitized dependency projection"
+        outcome = (
+            "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed "
+            "disposition=run-failed-at-asset-fetch"
+        )
+        for platform_name in ("linux", "macos", "windows"):
+            identity = dict(IDENTITY, platform=platform_name)
+            for code in sorted(audit.FETCH_REFUSAL_CODES):
+                marker = "devlane_refusal=" + code
+                with self.subTest(platform=platform_name, code=code):
+                    jobs = _encrypted_jobs(platform=platform_name)
+                    run_job = next(job for job in jobs
+                                   if job["name"] == audit.PLATFORM_RUN_JOBS[platform_name])
+                    run_job["conclusion"] = "failure"
+                    names = [step["name"] for step in run_job["steps"]]
+                    failed_index = names.index(failed_step)
+                    for index, step in enumerate(run_job["steps"]):
+                        if step["name"] == "Shred runner-local workspace":
+                            step["conclusion"] = "success"
+                        elif step["name"] == "Install pinned Rust toolchain" and platform_name == "macos":
+                            step["conclusion"] = "skipped"
+                        elif index < failed_index:
+                            step["conclusion"] = "success"
+                        elif index == failed_index:
+                            step["conclusion"] = "failure"
+                        else:
+                            step["conclusion"] = "skipped"
+
+                    log = _render_real_runner_encrypted_log(
+                        identity, early_failure={"step": failed_step, "marker": marker, "exit_code": 2},
+                    )
+                    surface = audit.validate_job_log_surface(
+                        log, audit.PLATFORM_RUN_JOBS[platform_name], identity, completed=True,
+                    )
+                    self.assertEqual(surface["early_failure"], failed_step)
+                    self.assertEqual(surface["early_failure_code"], code)
+                    audit.validate_job_log_metadata_binding(surface, run_job, identity)
+                    self.assertEqual(audit._audit_outcome_line([run_job], identity), outcome)
+
+                    for unknown in ("download-http-418", "private-path", "download-http-" + "9" * 48):
+                        mutated = log.replace(marker.encode("ascii"),
+                                              ("devlane_refusal=" + unknown).encode("ascii"), 1)
+                        with self.subTest(platform=platform_name, code=code, unknown=unknown), \
+                                self.assertRaises(audit.AuditRefusal):
+                            audit.validate_job_log_surface(
+                                mutated, audit.PLATFORM_RUN_JOBS[platform_name], identity, completed=True,
+                            )
+
     def test_saved_macos_round_three_log_audits_as_a_step_bound_preflight_failure(self):
         identity = dict(
             IDENTITY,

@@ -11,6 +11,13 @@ CLEANUP_SUBREASONS = frozenset((
     "umount-busy", "umount-missing", "tree-remove", "process-alive", "cgroup-nonempty",
 ))
 
+DOWNLOAD_REFUSAL_CODES = frozenset((
+    "download-http-1xx", "download-http-2xx", "download-http-3xx", "download-http-4xx",
+    "download-http-5xx", "download-http-401", "download-http-403", "download-http-404",
+    "download-http-410", "download-http-429", "download-http-other",
+    "download-redirect-invalid", "download-timeout",
+))
+
 REFUSAL_CODES = frozenset((
     "matrix-semver-cgroup-unavailable",
     "matrix-semver-cgroup-cleanup",

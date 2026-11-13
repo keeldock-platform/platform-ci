@@ -3,6 +3,7 @@
 import re
 
 import network_probe
+import refusal_codes
 
 
 PREPARATION_STAGES = frozenset((
@@ -62,8 +63,7 @@ PREPARATION_REFUSAL_CODES = frozenset((
     "cargo-lock-version", "cargo-vendor-missing", "control-run-id", "control-sha", "deadline-budget-invalid",
     "deadline-cleanup-reserve-invalid", "deadline-command-invalid", "deadline-file-invalid",
     "deadline-start-invalid", "dispatch-control-ref", "dispatch-input", "dispatch-origin",
-    "dispatch-run-id", "dispatch-shape", "download-http", "download-redirect",
-    "download-redirect-limit", "download-size", "duplicate-json-key", "input-id", "json-invalid",
+    "dispatch-run-id", "dispatch-shape", "download-size", "duplicate-json-key", "input-id", "json-invalid",
     "json-size", "node-snapshot-base-invalid", "node-snapshot-base-owner",
     "node-snapshot-base-unavailable", "node-snapshot-cleanup-incomplete", "node-snapshot-cleanup-owner",
     "node-snapshot-content-changed", "node-snapshot-content-invalid", "node-snapshot-copy-failed",
@@ -121,7 +121,7 @@ PREPARATION_REFUSAL_CODES = frozenset((
     "run-attempt", "rust-tool-layout", "rust-toolchain-missing", "rust-toolchain-path",
     "rust-toolchain-version", "total-deadline-exhausted", "total-deadline-unavailable",
     "toolchain-version", "playwright-browsers-missing", "playwright-cli-missing", "cleanup-incomplete",
-))
+)) | refusal_codes.DOWNLOAD_REFUSAL_CODES
 
 PREPARATION_EXCEPTION_LABELS = frozenset((
     "assertion-error", "attribute-error", "file-exists", "file-not-found", "index-error",

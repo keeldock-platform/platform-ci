@@ -198,12 +198,14 @@ EARLY_FAILURE_STEP_IDS = {
     "Fetch public control and validate dispatch": "bootstrap",
     "Prepare hosted runner isolation state": "macos-preflight",
     "Prepare hosted Windows isolation state": "windows-preflight",
+    "Fetch ciphertext and sanitized dependency projection": "asset-fetch",
 }
 AUDIT_OUTCOME_LINES = frozenset((
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-bootstrap",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-macos-preflight",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-windows-preflight",
+    "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-asset-fetch",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-probe",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-decrypt",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-during-execution",
@@ -214,7 +216,7 @@ DECRYPT_FAILURE_CODES = frozenset((
     "decrypt-key-unavailable", "decrypt-manifest-unavailable", "decrypt-rejected", "decrypt-timeout",
 ))
 WINDOWS_RUNNER_REFUSAL_CODES = frozenset(("windows-runner-failed", "boundary"))
-FETCH_REFUSAL_CODES = diagnostic_contract.PREPARATION_REFUSAL_CODES | frozenset(("fetch-failed",))
+FETCH_REFUSAL_CODES = refusal_codes.DOWNLOAD_REFUSAL_CODES | frozenset(("fetch-failed",))
 SUPERVISOR_START_REFUSAL_CODES = (
     refusal_codes.STARTUP_REFUSAL_CODES | refusal_codes.STARTUP_DIAGNOSTIC_CODES
     | frozenset(("supervisor-failed", "supervisor-start-failed", "supervisor-start-timeout", "runner-unknown"))
@@ -876,6 +878,14 @@ class _Grammar:
         if step_name == "Fetch ciphertext and sanitized dependency projection":
             if GITHUB_ASSET_LINE.fullmatch(line) or line == "fetch_projection_valid=true":
                 return True
+        if line.startswith("devlane_refusal=") and step_name == "Fetch ciphertext and sanitized dependency projection":
+            code = line.removeprefix("devlane_refusal=")
+            if code not in FETCH_REFUSAL_CODES:
+                return False
+            public_counts["early_failure_marker"] = public_counts.get("early_failure_marker", 0) + 1
+            public_counts["early_failure_step"] = step_name
+            public_counts["early_failure_code"] = code
+            return public_counts["early_failure_marker"] == 1
         if step_name == "Verify permit and emit bound dispatch marker":
             if line.startswith("devlane_permit=consumed "):
                 public_counts["permit"] = public_counts.get("permit", 0) + 1
@@ -1610,7 +1620,10 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
             early_failure = counts.get("early_failure_step")
             if (counts.get("early_failure_marker") != 1 or counts.get("early_failure_exit") not in (1, 2)
                     or counts.get("early_failed_step") != early_failure
-                    or counts.get("dispatch") or counts.get("permit") or records
+                    or ((counts.get("dispatch") != 1 or counts.get("permit") != 1)
+                        if early_failure == "Fetch ciphertext and sanitized dependency projection"
+                        else counts.get("dispatch") or counts.get("permit"))
+                    or records
                     or counts.get("network_probe_refusal") or counts.get("network_probe_supervisor_refusal")
                     or counts.get("network_cut_probe=pass") or counts.get("authenticated_decryption=pass")
                     or counts.get("windows_decrypt=accepted manifest=bound") or counts.get("decrypt_failure_marker")
@@ -2037,6 +2050,8 @@ def validate_job_log_metadata_binding(surface, run_job, identity):
             allowed = (identity.get("platform") == "windows" and code in WINDOWS_PREFLIGHT_REFUSAL_CODES)
         elif early_failure == "Prepare hosted runner isolation state":
             allowed = (identity.get("platform") == "macos" and code in MACOS_PREFLIGHT_REFUSAL_CODES)
+        elif early_failure == "Fetch ciphertext and sanitized dependency projection":
+            allowed = (identity.get("platform") in PLATFORM_RUNNERS and code in FETCH_REFUSAL_CODES)
         else:
             allowed = False
         failed_step = step_by_name.get(early_failure)
