@@ -236,12 +236,35 @@ WINDOWS_PREFLIGHT_REFUSAL_CODES = frozenset((
 ))
 MACOS_PREFLIGHT_REFUSAL_CODES = refusal_codes.MACOS_PREFLIGHT_REFUSAL_CODES
 MACOS_SUPERVISOR_START_STEP = "Cut network and start the isolated supervisor"
+MACOS_PREPARE_STEP = "Prepare dependencies before the cut"
+MACOS_PROBE_STEP = "Probe isolation before decryption"
+MACOS_EXECUTE_STEP = "Execute offline profile and filter public summary"
+MACOS_CLEANUP_STEP = "Shred runner-local workspace"
+MACOS_PREPARE_REFUSAL_CODES = refusal_codes.MACOS_PREPARE_REFUSAL_CODES
+MACOS_PROBE_REFUSAL_CODES = refusal_codes.MACOS_PROBE_REFUSAL_CODES
+MACOS_EXECUTE_REFUSAL_CODES = refusal_codes.MACOS_EXECUTE_REFUSAL_CODES
+MACOS_CLEANUP_REFUSAL_CODES = refusal_codes.MACOS_CLEANUP_REFUSAL_CODES
+MACOS_ROOT_PF_CLEANUP_REFUSAL_CODES = refusal_codes.MACOS_ROOT_PF_CLEANUP_REFUSAL_CODES
+MACOS_SUPERVISOR_START_REFUSAL_CODES = refusal_codes.MACOS_SUPERVISOR_START_REFUSAL_CODES
+MACOS_OPERATION_STEP_REFUSALS = {
+    MACOS_PREPARE_STEP: MACOS_PREPARE_REFUSAL_CODES,
+    MACOS_SUPERVISOR_START_STEP: MACOS_SUPERVISOR_START_REFUSAL_CODES,
+    MACOS_PROBE_STEP: MACOS_PROBE_REFUSAL_CODES,
+    MACOS_EXECUTE_STEP: MACOS_EXECUTE_REFUSAL_CODES,
+    MACOS_CLEANUP_STEP: MACOS_CLEANUP_REFUSAL_CODES | MACOS_ROOT_PF_CLEANUP_REFUSAL_CODES,
+}
+MACOS_DIAGNOSED_FAILURE_STEPS = frozenset((
+    MACOS_PREPARE_STEP, MACOS_SUPERVISOR_START_STEP, MACOS_PROBE_STEP, MACOS_EXECUTE_STEP,
+))
 EARLY_FAILURE_STEP_IDS = {
     "Fetch public control and validate dispatch": "bootstrap",
     "Prepare hosted runner isolation state": "macos-preflight",
     "Prepare hosted Windows isolation state": "windows-preflight",
     "Fetch ciphertext and sanitized dependency projection": "asset-fetch",
     MACOS_SUPERVISOR_START_STEP: "macos-supervisor-start",
+    MACOS_PREPARE_STEP: "macos-prepare",
+    MACOS_PROBE_STEP: "macos-probe",
+    MACOS_EXECUTE_STEP: "macos-execute",
 }
 AUDIT_OUTCOME_LINES = frozenset((
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed",
@@ -250,6 +273,9 @@ AUDIT_OUTCOME_LINES = frozenset((
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-windows-preflight",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-asset-fetch",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-macos-supervisor-start",
+    "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-macos-prepare",
+    "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-macos-probe",
+    "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-macos-execute",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-probe",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-decrypt",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-during-execution",
@@ -265,7 +291,6 @@ SUPERVISOR_START_REFUSAL_CODES = (
     refusal_codes.STARTUP_REFUSAL_CODES | refusal_codes.STARTUP_DIAGNOSTIC_CODES
     | frozenset(("supervisor-failed", "supervisor-start-failed", "supervisor-start-timeout", "runner-unknown"))
 )
-MACOS_SUPERVISOR_START_REFUSAL_CODES = refusal_codes.MACOS_SUPERVISOR_START_REFUSAL_CODES
 SUPERVISOR_EXECUTION_REFUSAL_CODES = (
     refusal_codes.REFUSAL_CODES - refusal_codes.NETWORK_PROBE_DIAGNOSTIC_CODES
     - refusal_codes.DECRYPT_REFUSAL_CODES - refusal_codes.STARTUP_DIAGNOSTIC_CODES
@@ -287,7 +312,7 @@ REFUSAL_LINE = re.compile(
     r"(?:devlane_refusal=" + _code_alternative(FETCH_REFUSAL_CODES | WINDOWS_RUNNER_REFUSAL_CODES)
     + r"|devlane_supervisor_refusal=" + _code_alternative(
         refusal_codes.REFUSAL_CODES | SUPERVISOR_START_REFUSAL_CODES | SUPERVISOR_CLEANUP_REFUSAL_CODES
-        | MACOS_DECRYPT_SUPERVISOR_REFUSAL_CODES | MACOS_SUPERVISOR_START_REFUSAL_CODES
+        | MACOS_DECRYPT_SUPERVISOR_REFUSAL_CODES | refusal_codes.MACOS_OPERATION_REFUSAL_CODES
     )
     + r"|dependency_preparation_refusal=runner-unknown"
     + r"|devlane_crypto_refusal=" + _code_alternative(CRYPTO_CONTROL_REFUSAL_CODES)
@@ -673,6 +698,8 @@ class _Grammar:
                     and code in CRYPTO_CONTROL_REFUSAL_CODES)
         if prefix != "devlane_supervisor_refusal":
             return False
+        if self.job_runner == "macos-15" and step_name in MACOS_OPERATION_STEP_REFUSALS:
+            return code in MACOS_OPERATION_STEP_REFUSALS[step_name]
         if step_name == "Cut network and start the isolated supervisor":
             if self.job_runner == "macos-15":
                 return code in MACOS_SUPERVISOR_START_REFUSAL_CODES
@@ -697,15 +724,17 @@ class _Grammar:
         """Fixed output lines, each bound to the step that is allowed to print it."""
         step = next((item for item in self.steps if item["name"] == step_name), None)
         uses = (step or {}).get("uses") or ""
-        if (line.startswith("devlane_supervisor_refusal=") and step_name == MACOS_SUPERVISOR_START_STEP
-                and self.job_runner == "macos-15"):
+        if line.startswith("devlane_supervisor_refusal=") and self.job_runner == "macos-15":
             code = line[len("devlane_supervisor_refusal="):]
-            if code not in MACOS_SUPERVISOR_START_REFUSAL_CODES:
+            allowed_codes = MACOS_OPERATION_STEP_REFUSALS.get(step_name)
+            if allowed_codes is None or code not in allowed_codes:
                 return False
-            public_counts["early_failure_marker"] = public_counts.get("early_failure_marker", 0) + 1
-            public_counts["early_failure_step"] = step_name
-            public_counts["early_failure_code"] = code
-            return public_counts["early_failure_marker"] == 1
+            if step_name in MACOS_DIAGNOSED_FAILURE_STEPS:
+                public_counts["early_failure_marker"] = public_counts.get("early_failure_marker", 0) + 1
+                public_counts["early_failure_step"] = step_name
+                public_counts["early_failure_code"] = code
+                return public_counts["early_failure_marker"] == 1
+            return True
         if uses.startswith("actions/cache/"):
             key = self.expected_cache_key(step)
             return key is not None and any(
@@ -1697,7 +1726,7 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         if counts.get("early_failure_marker"):
             early_failure = counts.get("early_failure_step")
             dispatch_bound_failure = early_failure in (
-                "Fetch ciphertext and sanitized dependency projection", MACOS_SUPERVISOR_START_STEP,
+                "Fetch ciphertext and sanitized dependency projection", *MACOS_DIAGNOSED_FAILURE_STEPS,
             )
             if (counts.get("early_failure_marker") != 1 or counts.get("early_failure_exit") not in (1, 2)
                     or counts.get("early_failed_step") != early_failure
@@ -1705,15 +1734,35 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
                         if dispatch_bound_failure else counts.get("dispatch") or counts.get("permit"))
                     or records
                     or counts.get("network_probe_refusal") or counts.get("network_probe_supervisor_refusal")
-                    or counts.get("network_cut_probe=pass") or counts.get("authenticated_decryption=pass")
                     or counts.get("windows_decrypt=accepted manifest=bound") or counts.get("decrypt_failure_marker")
-                    or counts.get("decrypt_refusal_detail") or "Probe isolation before decryption" in seen_steps
-                    or "Decrypt authenticated bundle" in seen_steps
-                    or "Execute offline profile and filter public summary" in seen_steps):
+                    or counts.get("decrypt_refusal_detail")):
                 _refuse()
-            if (early_failure == MACOS_SUPERVISOR_START_STEP
+            if early_failure in (MACOS_PREPARE_STEP, MACOS_SUPERVISOR_START_STEP):
+                if ("Probe isolation before decryption" in seen_steps
+                        or "Decrypt authenticated bundle" in seen_steps
+                        or "Execute offline profile and filter public summary" in seen_steps
+                        or counts.get("network_cut_probe=pass") or counts.get("authenticated_decryption=pass")):
+                    _refuse()
+            elif early_failure == MACOS_PROBE_STEP:
+                if (MACOS_PROBE_STEP not in seen_steps or "Decrypt authenticated bundle" in seen_steps
+                        or "Execute offline profile and filter public summary" in seen_steps
+                        or counts.get("network_cut_probe=pass") or counts.get("authenticated_decryption=pass")):
+                    _refuse()
+            elif early_failure == MACOS_EXECUTE_STEP:
+                if ("Probe isolation before decryption" not in seen_steps
+                        or "Decrypt authenticated bundle" not in seen_steps
+                        or MACOS_EXECUTE_STEP not in seen_steps
+                        or counts.get("network_cut_probe=pass") != 1
+                        or counts.get("authenticated_decryption=pass") != 1):
+                    _refuse()
+            elif ("Probe isolation before decryption" in seen_steps
+                  or "Decrypt authenticated bundle" in seen_steps
+                  or "Execute offline profile and filter public summary" in seen_steps
+                  or counts.get("network_cut_probe=pass") or counts.get("authenticated_decryption=pass")):
+                _refuse()
+            if (early_failure in MACOS_DIAGNOSED_FAILURE_STEPS
                     and (identity.get("platform") != "macos"
-                         or counts.get("early_failure_code") not in MACOS_SUPERVISOR_START_REFUSAL_CODES
+                         or counts.get("early_failure_code") not in MACOS_OPERATION_STEP_REFUSALS[early_failure]
                          or counts.get("early_failure_exit") != 2)):
                 _refuse()
         elif counts.get("dispatch") != 1 or counts.get("permit") != 1:
@@ -1950,7 +1999,7 @@ def validate_job_contract(jobs, identity, profile):
         platform_early_steps = {
             "linux": {"Fetch public control and validate dispatch"},
             "macos": {"Fetch public control and validate dispatch", "Prepare hosted runner isolation state",
-                      MACOS_SUPERVISOR_START_STEP},
+                      MACOS_PREPARE_STEP, MACOS_SUPERVISOR_START_STEP},
             "windows": {"Fetch public control and validate dispatch", "Prepare hosted Windows isolation state"},
         }.get(platform, set())
         if candidate in platform_early_steps:
@@ -2156,6 +2205,10 @@ def validate_job_log_metadata_binding(surface, run_job, identity):
             allowed = (identity.get("platform") == "windows" and code in WINDOWS_PREFLIGHT_REFUSAL_CODES)
         elif early_failure == "Prepare hosted runner isolation state":
             allowed = (identity.get("platform") == "macos" and code in MACOS_PREFLIGHT_REFUSAL_CODES)
+        elif early_failure in (MACOS_PREPARE_STEP, MACOS_PROBE_STEP, MACOS_EXECUTE_STEP):
+            allowed = (identity.get("platform") == "macos"
+                       and code in MACOS_OPERATION_STEP_REFUSALS[early_failure]
+                       and surface.get("early_failure_exit") == 2)
         elif early_failure == MACOS_SUPERVISOR_START_STEP:
             allowed = (identity.get("platform") == "macos"
                        and code in MACOS_SUPERVISOR_START_REFUSAL_CODES

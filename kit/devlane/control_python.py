@@ -26,6 +26,16 @@ PINNED_VERSIONS = {
     "pycparser": "3.12",
 }
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
+_POWERSHELL_ACL_EXIT_REASONS = {
+    3: "crypto-acl-reparse-point",
+    4: "crypto-acl-owner-unresolved",
+    5: "crypto-acl-owner-untrusted",
+    6: "crypto-acl-writer-untrusted",
+}
+
+
+def _powershell_acl_exit_reason(exit_code):
+    return _POWERSHELL_ACL_EXIT_REASONS.get(exit_code, "crypto-acl-output-invalid")
 
 
 class CryptoRefusal(ValueError):
@@ -67,7 +77,7 @@ def _powershell_acl_owner(root):
     )
     try:
         if not powershell.is_file():
-            _refuse("crypto-acl-invalid")
+            _refuse("crypto-acl-powershell-unavailable")
         encoded_root = base64.b64encode(str(root).encode("utf-8")).decode("ascii")
         script = r'''
 $ErrorActionPreference = 'Stop'
@@ -89,6 +99,7 @@ foreach ($item in $items) {
     catch { exit 4 }
     if ($trustedOwners -notcontains $itemOwner) { exit 5 }
     foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if (($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
         if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
         $sid = $rule.IdentityReference.Value
         if ($trustedWriters -contains $sid) { continue }
@@ -103,12 +114,24 @@ foreach ($item in $items) {
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=30, check=False,
         )
-        owner = result.stdout.decode("ascii", "strict").strip()
-        if result.returncode != 0 or result.stderr or not re.fullmatch(r"S-1-(?:[0-9]+-)*[0-9]+", owner):
-            _refuse("crypto-acl-invalid")
-        return owner
-    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
-        _refuse("crypto-acl-invalid")
+    except CryptoRefusal:
+        raise
+    except OSError:
+        _refuse("crypto-acl-powershell-unavailable")
+    except (subprocess.SubprocessError, UnicodeError, ValueError):
+        _refuse("crypto-acl-output-invalid")
+    if result.returncode in _POWERSHELL_ACL_EXIT_REASONS:
+        _refuse(_powershell_acl_exit_reason(result.returncode))
+    try:
+        output = result.stdout.decode("ascii", "strict")
+    except UnicodeError:
+        _refuse("crypto-acl-output-invalid")
+    if result.returncode != 0 or result.stderr:
+        _refuse("crypto-acl-output-invalid")
+    match = re.fullmatch(r"(S-1-(?:[0-9]+-)*[0-9]+)\r?\n?", output)
+    if match is None:
+        _refuse("crypto-acl-output-invalid")
+    return match.group(1)
 
 
 def _expected_owner(platform_name, owner_uid=None):

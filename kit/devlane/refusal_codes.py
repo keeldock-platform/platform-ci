@@ -111,7 +111,9 @@ REFUSAL_CODES = frozenset((
     "typescript-report-incomplete",
 ))
 CRYPTO_CONTROL_REFUSAL_CODES = frozenset((
-    "crypto-target-invalid", "crypto-acl-invalid", "crypto-platform-invalid",
+    "crypto-target-invalid", "crypto-acl-powershell-unavailable", "crypto-acl-reparse-point",
+    "crypto-acl-owner-unresolved", "crypto-acl-owner-untrusted", "crypto-acl-writer-untrusted",
+    "crypto-acl-output-invalid", "crypto-platform-invalid",
     "crypto-metadata-invalid", "crypto-file-invalid", "crypto-tree-invalid",
     "crypto-manifest-invalid", "crypto-seal-write-failed", "crypto-tree-mismatch",
     "crypto-import-invalid", "crypto-key-present", "crypto-script-invalid",
@@ -125,6 +127,82 @@ MACOS_SUPERVISOR_START_REFUSAL_CODES = frozenset((
     "macos-supervisor-start-boundary", "macos-supervisor-start-os-error",
     "macos-supervisor-start-value-error", "macos-supervisor-start-type-error",
 ))
+MACOS_OPERATION_RAW_REFUSALS = {
+    "prepare": frozenset((
+        "macos-root-required", "dispatch-context-invalid", "input-unavailable", "state-directory-permissions",
+        "profile-unknown", "deadline-file-invalid", "total-deadline-exhausted", "projection-invalid",
+        "prepare-run-root-invalid", "prepared-output-invalid", "prepared-output-path-invalid",
+        "prepared-output-exists", "preparation-path-invalid", "profile-config-invalid",
+        "dependency-preparation-refused", "process-cleanup-incomplete", "prepared-file-count",
+        "prepared-link-invalid", "prepared-tree-size", "prepared-member-type", "prepared-input-invalid",
+        "cleanup-incomplete",
+    )),
+    "probe": frozenset((
+        "macos-root-required", "input-unavailable", "state-directory-permissions", "dispatch-context-invalid",
+        "probe-replay", "firewall-unavailable", "profile-config-invalid", "positive-control-failed",
+        "total-deadline-exhausted", "raw-record-size", "supervisor-operation-failed",
+        "cleanup-process-inventory", "cleanup-process-termination", "cleanup-process-incomplete",
+    )),
+    "execute": frozenset((
+        "macos-root-required", "input-unavailable", "state-directory-permissions", "dispatch-context-invalid",
+        "execution-order", "profile-unknown", "profile-config-invalid", "firewall-unavailable",
+        "tool-version-mismatch", "total-deadline-exhausted", "raw-record-size", "supervisor-operation-failed",
+        "cleanup-process-inventory", "cleanup-process-termination", "cleanup-process-incomplete",
+        "process-cleanup-incomplete", "tool-symlink", "tool-file-type-invalid", "tool-owner-invalid",
+        "tool-mode-invalid", "tool-path-resolve-mismatch", "tool-file-unavailable", "report-file-invalid",
+        "report-file-incomplete", "report-file-unavailable", "report-file-exists", "report-file-changed",
+        "record-count", "summary-record-invalid", "summary-response-invalid", "summary-not-ready",
+        "prepared-member-type", "prepared-link-invalid", "cleanup-incomplete",
+    )),
+    "cleanup": frozenset((
+        "macos-root-required", "input-unavailable", "state-directory-permissions", "cleanup-root-invalid",
+        "cleanup-intent-invalid", "cleanup-incomplete", "cleanup-process-inventory",
+        "cleanup-process-termination", "cleanup-process-incomplete", "firewall-unavailable",
+    )),
+    "root-pf-cleanup": frozenset((
+        "macos-root-required", "input-unavailable", "state-directory-permissions", "dispatch-context-invalid",
+        "firewall-unavailable",
+    )),
+}
+_MACOS_OPERATION_ALIASES = {
+    "macos-root-required": "root-required", "prepare-run-root-invalid": "run-root-invalid",
+    "prepared-output-invalid": "output-invalid", "prepared-output-path-invalid": "output-path-invalid",
+    "prepared-output-exists": "output-exists", "prepared-file-count": "file-count",
+    "prepared-link-invalid": "link-invalid", "prepared-tree-size": "tree-size",
+    "prepared-member-type": "member-type", "prepared-input-invalid": "input-invalid",
+    "preparation-path-invalid": "path-invalid", "cleanup-root-invalid": "root-invalid",
+    "cleanup-intent-invalid": "intent-invalid", "cleanup-incomplete": "incomplete",
+    "cleanup-process-inventory": "process-inventory", "cleanup-process-termination": "process-termination",
+    "cleanup-process-incomplete": "process-incomplete",
+}
+_MACOS_OPERATION_PREFIXES = {
+    "prepare": "macos-prepare", "probe": "macos-probe", "execute": "macos-execute",
+    "cleanup": "macos-cleanup", "root-pf-cleanup": "macos-root-pf-cleanup",
+}
+MACOS_OPERATION_REFUSAL_CODE_MAPS = {
+    operation: {
+        raw_code: prefix + "-" + _MACOS_OPERATION_ALIASES.get(raw_code, raw_code)
+        for raw_code in raw_codes
+    }
+    for operation, raw_codes in MACOS_OPERATION_RAW_REFUSALS.items()
+    if (prefix := _MACOS_OPERATION_PREFIXES[operation])
+}
+_MACOS_OPERATION_EXCEPTION_CODES = {
+    operation: frozenset((
+        prefix + "-boundary", prefix + "-internal", prefix + "-os-error",
+        prefix + "-value-error", prefix + "-type-error",
+    ))
+    for operation, prefix in _MACOS_OPERATION_PREFIXES.items()
+}
+MACOS_PREPARE_REFUSAL_CODES = frozenset(MACOS_OPERATION_REFUSAL_CODE_MAPS["prepare"].values()) | _MACOS_OPERATION_EXCEPTION_CODES["prepare"]
+MACOS_PROBE_REFUSAL_CODES = frozenset(MACOS_OPERATION_REFUSAL_CODE_MAPS["probe"].values()) | _MACOS_OPERATION_EXCEPTION_CODES["probe"]
+MACOS_EXECUTE_REFUSAL_CODES = frozenset(MACOS_OPERATION_REFUSAL_CODE_MAPS["execute"].values()) | _MACOS_OPERATION_EXCEPTION_CODES["execute"]
+MACOS_CLEANUP_REFUSAL_CODES = frozenset(MACOS_OPERATION_REFUSAL_CODE_MAPS["cleanup"].values()) | _MACOS_OPERATION_EXCEPTION_CODES["cleanup"]
+MACOS_ROOT_PF_CLEANUP_REFUSAL_CODES = frozenset(MACOS_OPERATION_REFUSAL_CODE_MAPS["root-pf-cleanup"].values()) | _MACOS_OPERATION_EXCEPTION_CODES["root-pf-cleanup"]
+MACOS_OPERATION_REFUSAL_CODES = frozenset().union(
+    MACOS_PREPARE_REFUSAL_CODES, MACOS_PROBE_REFUSAL_CODES, MACOS_EXECUTE_REFUSAL_CODES,
+    MACOS_CLEANUP_REFUSAL_CODES, MACOS_ROOT_PF_CLEANUP_REFUSAL_CODES,
+)
 MACOS_PREFLIGHT_REFUSAL_CODES = frozenset((
     "macos-preflight-internal", "macos-root-identity-internal", "macos-preflight-host-identity",
     "macos-preflight-node-tools", "macos-preflight-command-line-tools", "macos-preflight-platform-policy",

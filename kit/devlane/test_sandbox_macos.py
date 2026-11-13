@@ -36,6 +36,80 @@ def _hosted_profile_probe_available():
     return product.startswith("15.") and node_version == "v24.22.1"
 
 
+class MacPrepareBoundaryTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, "getuid"), "requires POSIX ownership metadata")
+    def test_prepare_run_root_must_remain_runner_owned_with_hosted_modes(self):
+        with tempfile.TemporaryDirectory(prefix="devlane-prepare-root-") as temporary:
+            root = Path(temporary).resolve(strict=True) / "devlane-12345"
+            root.mkdir(mode=0o700)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            root.chmod(0o711)
+            ident = {"runner_uid": os.getuid()}
+            sandbox._validate_prepare_run_root(state, ident)
+
+            with self.assertRaisesRegex(sandbox.Refusal, "prepare-run-root-invalid"):
+                sandbox._validate_prepare_run_root(state, {"runner_uid": os.getuid() + 1})
+
+            arguments = (
+                state, root / "projection.json", root / "prepared", "core-node", "a" * 40,
+                root / "deadline.json",
+            )
+            with mock.patch.object(sandbox.os, "geteuid", return_value=0), \
+                    mock.patch.object(sandbox, "_identity", return_value={"runner_uid": os.getuid() + 1}), \
+                    self.assertRaisesRegex(sandbox.Refusal, "prepare-run-root-invalid"):
+                sandbox._prepare(*arguments)
+
+            state.chmod(0o755)
+            with self.assertRaisesRegex(sandbox.Refusal, "prepare-run-root-invalid"):
+                sandbox._validate_prepare_run_root(state, ident)
+
+    def test_prepare_output_path_distinguishes_bad_shape_from_noncanonical_path(self):
+        with tempfile.TemporaryDirectory(prefix="devlane-prepare-output-") as temporary:
+            root = Path(temporary).resolve(strict=True)
+            output = root / "prepared"
+            self.assertEqual(sandbox._prepare_output_path(output), output)
+            separator = chr(47)
+            hosted_path = Path(separator + separator.join((
+                "Users", "runner", "work", "_temp", "devlane-12345", "prepared",
+            )))
+            self.assertEqual(sandbox._prepare_output_path(hosted_path), hosted_path)
+            with self.assertRaisesRegex(sandbox.Refusal, "prepared-output-invalid"):
+                sandbox._prepare_output_path("relative/prepared")
+            var_alias = Path(separator + "var")
+            if var_alias.resolve(strict=True) != var_alias:
+                with self.assertRaisesRegex(sandbox.Refusal, "prepared-output-path-invalid"):
+                    sandbox._prepare_output_path(var_alias / "tmp" / "devlane-12345" / "prepared")
+
+            original_resolve = Path.resolve
+
+            def resolve(path, *, strict=False):
+                if path == output:
+                    return root / "canonical-prepared"
+                return original_resolve(path, strict=strict)
+
+            with mock.patch.object(Path, "resolve", autospec=True, side_effect=resolve), \
+                    self.assertRaisesRegex(sandbox.Refusal, "prepared-output-path-invalid"):
+                sandbox._prepare_output_path(output)
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() != 0,
+                         "requires a local unprivileged process")
+    def test_prepare_refuses_before_root_only_work_without_sudo(self):
+        with tempfile.TemporaryDirectory(prefix="devlane-prepare-unprivileged-") as temporary:
+            root = Path(temporary).resolve(strict=True)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            arguments = [
+                "prepare", "--state-dir", str(state), "--projection", str(root / "projection.json"),
+                "--output", str(root / "prepared"), "--profile", "core-node",
+                "--control-sha", "a" * 40, "--deadline-file", str(root / "deadline.json"),
+            ]
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                self.assertEqual(sandbox.main(arguments), 2)
+            self.assertEqual(stderr.getvalue(), "devlane_supervisor_refusal=macos-prepare-root-required\n")
+
+
 class MacProfileTests(unittest.TestCase):
     @unittest.skipUnless(NODE, "Node.js is unavailable")
     def test_deny_probe_javascript_passes_node_syntax_check(self):
@@ -649,6 +723,38 @@ class MacRoundOneRegressionTests(unittest.TestCase):
                 self.assertEqual(sandbox.main(arguments), 2)
             self.assertEqual(stderr.getvalue(), "devlane_supervisor_refusal=" + code + "\n")
             self.assertNotIn("sensitive-host-detail", stderr.getvalue())
+
+    def test_operation_refusals_and_exceptions_use_operation_scoped_codes(self):
+        state = Path(PRIVATE_RUN + "/state")
+        cases = (
+            (["prepare", "--state-dir", str(state), "--projection", PRIVATE_RUN + "/projection",
+              "--output", PRIVATE_RUN + "/prepared", "--profile", "core-node", "--control-sha", "a" * 40,
+              "--deadline-file", PRIVATE_RUN + "/deadline"], "_prepare",
+             sandbox.Refusal("projection-invalid"), "macos-prepare-projection-invalid"),
+            (["prepare", "--state-dir", str(state), "--projection", PRIVATE_RUN + "/projection",
+              "--output", PRIVATE_RUN + "/prepared", "--profile", "core-node", "--control-sha", "a" * 40,
+              "--deadline-file", PRIVATE_RUN + "/deadline"], "_prepare",
+             PermissionError("sensitive-path"), "macos-prepare-os-error"),
+            (["probe", "--state-dir", str(state)], "_probe",
+             sandbox.boundary_guard.GuardError("cleanup_incomplete"), "macos-probe-boundary"),
+            (["execute", "--state-dir", str(state), "--context", PRIVATE_RUN + "/context",
+              "--deadline-file", PRIVATE_RUN + "/deadline"], "_execute",
+             TypeError("sensitive-type"), "macos-execute-type-error"),
+            (["cleanup", "--state-dir", str(state), "--root", PRIVATE_RUN,
+              "--runner-temp", PRIVATE_RUN, "--workspace", PRIVATE_RUN + "/workspace", "--run-id", "12345"],
+             "_root_cleanup", ValueError("sensitive-value"), "macos-cleanup-value-error"),
+            (["root-pf-cleanup", "--state-dir", str(state)], "_root_pf_cleanup",
+             sandbox.Refusal("private-path"), "macos-root-pf-cleanup-internal"),
+        )
+        for arguments, target, error, code in cases:
+            stderr = io.StringIO()
+            with self.subTest(code=code), \
+                    mock.patch.object(sandbox, "_state_paths", return_value=(state, state.parent)), \
+                    mock.patch.object(sandbox, target, side_effect=error), \
+                    mock.patch("sys.stderr", stderr):
+                self.assertEqual(sandbox.main(arguments), 2)
+            self.assertEqual(stderr.getvalue(), "devlane_supervisor_refusal=" + code + "\n")
+            self.assertNotIn("sensitive", stderr.getvalue())
 
     def test_decrypt_refusal_prints_the_safe_reason_grammar(self):
         stderr = io.StringIO()

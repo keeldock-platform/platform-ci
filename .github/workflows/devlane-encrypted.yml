@@ -705,7 +705,12 @@ jobs:
           crypto_print_reason() {
             case "$1" in
               devlane_crypto_refusal=crypto-target-invalid) printf 'devlane_crypto_refusal=crypto-target-invalid\n' >&2 ;;
-              devlane_crypto_refusal=crypto-acl-invalid) printf 'devlane_crypto_refusal=crypto-acl-invalid\n' >&2 ;;
+              devlane_crypto_refusal=crypto-acl-powershell-unavailable) printf 'devlane_crypto_refusal=crypto-acl-powershell-unavailable\n' >&2 ;;
+              devlane_crypto_refusal=crypto-acl-reparse-point) printf 'devlane_crypto_refusal=crypto-acl-reparse-point\n' >&2 ;;
+              devlane_crypto_refusal=crypto-acl-owner-unresolved) printf 'devlane_crypto_refusal=crypto-acl-owner-unresolved\n' >&2 ;;
+              devlane_crypto_refusal=crypto-acl-owner-untrusted) printf 'devlane_crypto_refusal=crypto-acl-owner-untrusted\n' >&2 ;;
+              devlane_crypto_refusal=crypto-acl-writer-untrusted) printf 'devlane_crypto_refusal=crypto-acl-writer-untrusted\n' >&2 ;;
+              devlane_crypto_refusal=crypto-acl-output-invalid) printf 'devlane_crypto_refusal=crypto-acl-output-invalid\n' >&2 ;;
               devlane_crypto_refusal=crypto-platform-invalid) printf 'devlane_crypto_refusal=crypto-platform-invalid\n' >&2 ;;
               devlane_crypto_refusal=crypto-metadata-invalid) printf 'devlane_crypto_refusal=crypto-metadata-invalid\n' >&2 ;;
               devlane_crypto_refusal=crypto-file-invalid) printf 'devlane_crypto_refusal=crypto-file-invalid\n' >&2 ;;
@@ -1200,6 +1205,24 @@ jobs:
           $runRoot = Join-Path $env:RUNNER_TEMP ('devlane-' + $env:CI_RUN_ID)
           if (Test-Path -LiteralPath $runRoot) { exit 1 }
           New-Item -ItemType Directory -Path $runRoot | Out-Null
+          $runnerSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+          function Protect-PrivateDirectory([string]$Path, [Security.Principal.SecurityIdentifier]$OwnerSid) {
+            $security = [Security.AccessControl.DirectorySecurity]::new()
+            $security.SetAccessRuleProtection($true, $false)
+            $security.SetOwner($OwnerSid)
+            $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+            foreach ($sidText in @($OwnerSid.Value, 'S-1-5-18', 'S-1-5-32-544')) {
+              $sid = [Security.Principal.SecurityIdentifier]::new($sidText)
+              $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+                $sid, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance,
+                [Security.AccessControl.PropagationFlags]::None,
+                [Security.AccessControl.AccessControlType]::Allow
+              )
+              [void]$security.AddAccessRule($rule)
+            }
+            Set-Acl -LiteralPath $Path -AclObject $security
+          }
+          Protect-PrivateDirectory $runRoot $runnerSid
           $env:RUN_ROOT = $runRoot
           Add-Content -LiteralPath $env:GITHUB_ENV -Value ('RUN_ROOT=' + $runRoot) -Encoding utf8
           $started = Join-Path $runRoot 'deadline-start'
@@ -1230,7 +1253,11 @@ jobs:
           }
           function Write-Crypto-Reason([object[]]$Output) {
             $allowed = @(
-              'devlane_crypto_refusal=crypto-target-invalid', 'devlane_crypto_refusal=crypto-acl-invalid',
+              'devlane_crypto_refusal=crypto-target-invalid',
+              'devlane_crypto_refusal=crypto-acl-powershell-unavailable',
+              'devlane_crypto_refusal=crypto-acl-reparse-point', 'devlane_crypto_refusal=crypto-acl-owner-unresolved',
+              'devlane_crypto_refusal=crypto-acl-owner-untrusted', 'devlane_crypto_refusal=crypto-acl-writer-untrusted',
+              'devlane_crypto_refusal=crypto-acl-output-invalid',
               'devlane_crypto_refusal=crypto-platform-invalid', 'devlane_crypto_refusal=crypto-metadata-invalid',
               'devlane_crypto_refusal=crypto-file-invalid', 'devlane_crypto_refusal=crypto-tree-invalid',
               'devlane_crypto_refusal=crypto-manifest-invalid', 'devlane_crypto_refusal=crypto-seal-write-failed',
@@ -1254,6 +1281,8 @@ jobs:
             Refuse-Bootstrap 'crypto-python-version-invalid'
           }
           $cryptoTarget = Join-Path $runRoot 'control-python-deps'
+          New-Item -ItemType Directory -Path $cryptoTarget | Out-Null
+          Protect-PrivateDirectory $cryptoTarget $runnerSid
           python -B kit/devlane/deadline.py run --file (Join-Path $runRoot 'deadline.json') -- `
             python -B -m pip install --quiet --disable-pip-version-check --no-input --no-cache-dir `
               --index-url https://pypi.org/simple --target $cryptoTarget --require-hashes `

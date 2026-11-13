@@ -2218,10 +2218,13 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 "Cut network and start the isolated supervisor", "devlane_supervisor_refusal=" + code,
             ))
         self.assertTrue(grammar.step_output_ok(
+            "Fetch public control and validate dispatch", "devlane_crypto_refusal=crypto-acl-owner-untrusted", {},
+        ))
+        self.assertFalse(grammar.step_output_ok(
             "Fetch public control and validate dispatch", "devlane_crypto_refusal=crypto-acl-invalid", {},
         ))
         self.assertFalse(grammar.step_output_ok(
-            "Prepare hosted runner isolation state", "devlane_crypto_refusal=crypto-acl-invalid", {},
+            "Prepare hosted runner isolation state", "devlane_crypto_refusal=crypto-acl-owner-untrusted", {},
         ))
         self.assertFalse(grammar.step_output_ok(
             "Fetch public control and validate dispatch", "devlane_crypto_refusal=private-path", {},
@@ -2338,6 +2341,124 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 with self.assertRaises(audit.AuditRefusal) as caught:
                     audit.validate_job_log_metadata_binding(surface, changed, identity)
                 self.assertEqual(caught.exception.reason, "step-metadata-binding")
+
+    def test_macos_operation_refusals_pass_the_complete_step_contract(self):
+        stages = (
+            (audit.MACOS_PREPARE_STEP, audit.MACOS_PREPARE_REFUSAL_CODES, "macos-prepare"),
+            (audit.MACOS_PROBE_STEP, audit.MACOS_PROBE_REFUSAL_CODES, "macos-probe"),
+            (audit.MACOS_EXECUTE_STEP, audit.MACOS_EXECUTE_REFUSAL_CODES, "macos-execute"),
+        )
+        identity = dict(IDENTITY, platform="macos")
+        for failed_step, codes, disposition in stages:
+            expected_outcome = (
+                "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed "
+                "disposition=run-failed-at-" + disposition
+            )
+            for code in sorted(codes):
+                with self.subTest(step=failed_step, code=code):
+                    jobs = _encrypted_jobs(platform="macos")
+                    run_job = next(job for job in jobs if job["name"] == audit.MACOS_RUN_JOB)
+                    run_job["conclusion"] = "failure"
+                    names = [step["name"] for step in run_job["steps"]]
+                    failed_index = names.index(failed_step)
+                    for index, step in enumerate(run_job["steps"]):
+                        if step["name"] == audit.MACOS_CLEANUP_STEP:
+                            step["conclusion"] = "success"
+                        elif step["name"] in ("Install pinned Rust toolchain", "Install Tauri Linux build dependencies"):
+                            step["conclusion"] = "skipped"
+                        elif index < failed_index:
+                            step["conclusion"] = "success"
+                        elif index == failed_index:
+                            step["conclusion"] = "failure"
+                        else:
+                            step["conclusion"] = "skipped"
+                    marker = "devlane_supervisor_refusal=" + code
+                    log = _render_real_runner_encrypted_log(
+                        identity, early_failure={"step": failed_step, "marker": marker, "exit_code": 2},
+                    )
+                    surface = audit.validate_job_log_surface(
+                        log, audit.MACOS_RUN_JOB, identity, completed=True,
+                    )
+                    self.assertEqual(surface["early_failure"], failed_step)
+                    self.assertEqual(surface["early_failure_code"], code)
+                    self.assertEqual(surface["early_failure_exit"], 2)
+                    audit.validate_job_contract(jobs, identity, "core-node")
+                    audit.validate_job_log_metadata_binding(surface, run_job, identity)
+                    audit.validate_dispatch_marker(log, identity, allow_missing=False)
+                    self.assertEqual(audit._audit_outcome_line(jobs, identity), expected_outcome)
+
+                    wrong_exit = _render_real_runner_encrypted_log(
+                        identity, early_failure={"step": failed_step, "marker": marker, "exit_code": 1},
+                    )
+                    with self.assertRaises(audit.AuditRefusal):
+                        audit.validate_job_log_surface(wrong_exit, audit.MACOS_RUN_JOB, identity, completed=True)
+
+                    if code == min(codes):
+                        missing_dispatch = log.replace(b"KD-DEVLANE-DISPATCH", b"KD-DEVLANE-DISPATCH-MUTATED", 1)
+                        with self.assertRaises(audit.AuditRefusal):
+                            audit.validate_job_log_surface(
+                                missing_dispatch, audit.MACOS_RUN_JOB, identity, completed=True,
+                            )
+                        changed = copy.deepcopy(jobs)
+                        changed_run = next(job for job in changed if job["name"] == audit.MACOS_RUN_JOB)
+                        changed_steps = {step["name"]: step for step in changed_run["steps"]}
+                        if failed_step == audit.MACOS_PREPARE_STEP:
+                            changed_steps[audit.MACOS_PROBE_STEP]["conclusion"] = "success"
+                        elif failed_step == audit.MACOS_PROBE_STEP:
+                            changed_steps["Decrypt authenticated bundle"]["conclusion"] = "success"
+                        else:
+                            changed_steps[audit.MACOS_CLEANUP_STEP]["conclusion"] = "failure"
+                        with self.assertRaises(audit.AuditRefusal):
+                            audit.validate_job_contract(changed, identity, "core-node")
+
+                    other_step = audit.MACOS_EXECUTE_STEP if failed_step != audit.MACOS_EXECUTE_STEP else audit.MACOS_PREPARE_STEP
+                    grammar = audit._Grammar(
+                        Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml",
+                        audit.MACOS_RUN_JOB, identity, "encrypted",
+                    )
+                    self.assertFalse(grammar.step_output_ok(
+                        other_step, marker, {},
+                    ))
+
+    def test_macos_cleanup_refusal_codes_are_scoped_and_unconfirmed_cleanup_is_rejected(self):
+        identity = dict(IDENTITY, platform="macos")
+        grammar = audit._Grammar(
+            Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml",
+            audit.MACOS_RUN_JOB, identity, "encrypted",
+        )
+        for code in sorted(audit.MACOS_CLEANUP_REFUSAL_CODES | audit.MACOS_ROOT_PF_CLEANUP_REFUSAL_CODES):
+            marker = "devlane_supervisor_refusal=" + code
+            self.assertTrue(grammar.step_output_ok(audit.MACOS_CLEANUP_STEP, marker, {}))
+            self.assertFalse(grammar.step_output_ok(audit.MACOS_PREPARE_STEP, marker, {}))
+            log = _render_real_runner_encrypted_log(
+                identity, early_failure={"step": audit.MACOS_CLEANUP_STEP, "marker": marker, "exit_code": 2},
+            )
+            with self.subTest(code=code), self.assertRaises(audit.AuditRefusal) as caught:
+                audit.validate_job_log_surface(log, audit.MACOS_RUN_JOB, identity, completed=True)
+            self.assertEqual(caught.exception.reason, "job-log-surface")
+
+    def test_new_macos_operation_codes_do_not_widen_linux_or_windows_sets(self):
+        root = Path(__file__).resolve().parents[2]
+        self.assertTrue(refusal_codes.MACOS_OPERATION_REFUSAL_CODES.isdisjoint(refusal_codes.REFUSAL_CODES))
+        for step_name, codes in audit.MACOS_OPERATION_STEP_REFUSALS.items():
+            if step_name == audit.MACOS_SUPERVISOR_START_STEP:
+                continue
+            for code in sorted(codes):
+                line = "devlane_supervisor_refusal=" + code
+                macos = audit._Grammar(
+                    root / ".github/workflows/devlane-encrypted.yml", audit.MACOS_RUN_JOB,
+                    dict(IDENTITY, platform="macos"), "encrypted",
+                )
+                self.assertTrue(macos.refusal_line_ok(step_name, line), (step_name, code, "macos"))
+                for other_step in set(audit.MACOS_OPERATION_STEP_REFUSALS) - {step_name}:
+                    self.assertFalse(macos.refusal_line_ok(other_step, line), (other_step, code, "macos"))
+                for platform_name in ("linux", "windows"):
+                    job = audit.PLATFORM_RUN_JOBS[platform_name]
+                    grammar = audit._Grammar(
+                        root / ".github/workflows/devlane-encrypted.yml", job,
+                        dict(IDENTITY, platform=platform_name), "encrypted",
+                    )
+                    self.assertFalse(grammar.refusal_line_ok(step_name, line), (step_name, code, platform_name))
 
     def test_new_audit_contract_reasons_are_fixed_and_accepted_by_the_log_grammar(self):
         root = Path(__file__).resolve().parents[2]
@@ -2967,7 +3088,7 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
         bash_function = re.search(r"(?ms)^\s*crypto_print_reason\(\) \{\n(.*?)^\s*\}", mac_script)
         self.assertIsNotNone(bash_function)
         bash_callable = "crypto_print_reason() {\n" + bash_function.group(1) + "}\ncrypto_print_reason \"$1\"\n"
-        canonical = "devlane_crypto_refusal=crypto-acl-invalid"
+        canonical = "devlane_crypto_refusal=crypto-acl-owner-untrusted"
         bash_allowed = sorted(refusal_codes.CRYPTO_CONTROL_REFUSAL_CODES)
         run_bash = sys.platform != "win32"
         for code in bash_allowed if run_bash else ():
@@ -2979,7 +3100,7 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stderr, candidate + "\n")
         malformed = (
-            canonical.replace("crypto-acl-invalid", "Crypto-acl-invalid"),
+            canonical.replace("crypto-acl-owner-untrusted", "Crypto-acl-owner-untrusted"),
             canonical + " ", canonical + "\r", "prefix-" + canonical, canonical + "-suffix",
             "prefix\n" + canonical + "\nsuffix",
         )

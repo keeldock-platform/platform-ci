@@ -83,6 +83,40 @@ def _refuse(code="macos-supervisor-start-internal", *, decrypt_refusal=None):
     raise Refusal(code, decrypt_refusal=decrypt_refusal)
 
 
+_MACOS_OPERATION_REFUSAL_CODES = {
+    "prepare": refusal_codes.MACOS_PREPARE_REFUSAL_CODES,
+    "probe": refusal_codes.MACOS_PROBE_REFUSAL_CODES,
+    "execute": refusal_codes.MACOS_EXECUTE_REFUSAL_CODES,
+    "cleanup": refusal_codes.MACOS_CLEANUP_REFUSAL_CODES,
+    "root-pf-cleanup": refusal_codes.MACOS_ROOT_PF_CLEANUP_REFUSAL_CODES,
+}
+_MACOS_OPERATION_PREFIXES = {
+    "prepare": "macos-prepare", "probe": "macos-probe", "execute": "macos-execute",
+    "cleanup": "macos-cleanup", "root-pf-cleanup": "macos-root-pf-cleanup",
+}
+
+
+def _operation_refusal_code(operation, error, *, boundary=False):
+    allowed = _MACOS_OPERATION_REFUSAL_CODES.get(operation)
+    prefix = _MACOS_OPERATION_PREFIXES.get(operation)
+    known_refusals = refusal_codes.MACOS_OPERATION_REFUSAL_CODE_MAPS.get(operation, {})
+    if allowed is None or prefix is None:
+        return "supervisor-failed"
+    if boundary:
+        return prefix + "-boundary"
+    if isinstance(error, Refusal):
+        if error.code in allowed:
+            return error.code
+        return known_refusals.get(error.code, prefix + "-internal")
+    if isinstance(error, OSError):
+        return prefix + "-os-error"
+    if isinstance(error, ValueError):
+        return prefix + "-value-error"
+    if isinstance(error, TypeError):
+        return prefix + "-type-error"
+    return prefix + "-internal"
+
+
 def _safe_path(value, *, must_exist=False):
     try:
         path = Path(value)
@@ -580,6 +614,35 @@ def _validate_projection_file(path, profile, control_sha):
     return value
 
 
+def _prepare_output_path(value):
+    try:
+        path = Path(value)
+        if (not path.is_absolute() or len(os.fsencode(path)) > MAX_PATH_BYTES
+                or ".." in path.parts):
+            _refuse("prepared-output-invalid")
+        if path.resolve(strict=False) != path:
+            _refuse("prepared-output-path-invalid")
+        return path
+    except Refusal:
+        raise
+    except (OSError, RuntimeError, ValueError, TypeError):
+        _refuse("prepared-output-path-invalid")
+
+
+def _validate_prepare_run_root(state, ident):
+    root = Path(state).parent
+    try:
+        root_info = root.lstat()
+        state_info = Path(state).lstat()
+    except OSError:
+        _refuse("prepare-run-root-invalid")
+    if (not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode)
+            or root_info.st_uid != ident["runner_uid"] or stat.S_IMODE(root_info.st_mode) != 0o711
+            or not stat.S_ISDIR(state_info.st_mode) or stat.S_ISLNK(state_info.st_mode)
+            or state_info.st_uid != ident["runner_uid"] or stat.S_IMODE(state_info.st_mode) != 0o700):
+        _refuse("prepare-run-root-invalid")
+
+
 def preparation_profile_text(*, project, prepared, cache, home, temporary, node, npm_cli):
     node_root = Path(node).parent
     npm_root = Path(npm_cli).parent.parent
@@ -704,12 +767,13 @@ def _prepare(state, projection_path, output_path, profile, control_sha, deadline
     if os.geteuid() != 0:
         _refuse("macos-root-required")
     ident = _identity(state)
+    _validate_prepare_run_root(state, ident)
     if profile != PROFILE_NAME:
         _refuse("profile-unknown")
     deadline_budget.remaining(deadline_file)
     projection = _validate_projection_file(projection_path, profile, control_sha)
     root = state.parent
-    output = _safe_path(output_path)
+    output = _prepare_output_path(output_path)
     project = root / "preparation-project"
     prepared = root / "prepared"
     cache = root / "preparation-npm-cache"
@@ -2041,7 +2105,8 @@ def main(argv=None):
             if error.decrypt_refusal in DECRYPT_REFUSAL_CODES:
                 print("decrypt_refusal=" + error.decrypt_refusal, file=sys.stderr)
         else:
-            print("devlane_supervisor_refusal=supervisor-failed", file=sys.stderr)
+            code = _operation_refusal_code(args.operation, error)
+            print("devlane_supervisor_refusal=" + code, file=sys.stderr)
         return 2
     except boundary_guard.GuardError as error:
         if args.operation == "preflight":
@@ -2055,7 +2120,8 @@ def main(argv=None):
         if args.operation == "start":
             print("devlane_supervisor_refusal=macos-supervisor-start-boundary", file=sys.stderr)
             return 2
-        print("devlane_supervisor_refusal=supervisor-failed", file=sys.stderr)
+        code = _operation_refusal_code(args.operation, error, boundary=True)
+        print("devlane_supervisor_refusal=" + code, file=sys.stderr)
         return 2
     except Exception as error:
         if args.operation == "root-identity":
@@ -2075,7 +2141,8 @@ def main(argv=None):
                 code = "macos-supervisor-start-internal"
             print("devlane_supervisor_refusal=" + code, file=sys.stderr)
             return 2
-        print("devlane_supervisor_refusal=supervisor-failed", file=sys.stderr)
+        code = _operation_refusal_code(args.operation, error)
+        print("devlane_supervisor_refusal=" + code, file=sys.stderr)
         return 2
 
 

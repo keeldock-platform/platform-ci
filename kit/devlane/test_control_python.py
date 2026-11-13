@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 import control_python
+import public_audit as audit
 
 
 def _control_tree(parent, *, posix_modes):
@@ -186,12 +187,12 @@ class ControlPythonWindowsTests(unittest.TestCase):
 class ControlPythonPortableTests(unittest.TestCase):
     def test_seal_and_check_print_only_fixed_subreason_codes(self):
         output = io.StringIO()
-        with mock.patch.object(control_python, "seal", side_effect=control_python.CryptoRefusal("crypto-acl-invalid")), \
+        with mock.patch.object(control_python, "seal", side_effect=control_python.CryptoRefusal("crypto-acl-owner-untrusted")), \
                 mock.patch("sys.stderr", output):
             self.assertEqual(control_python.main([
                 "--target", "/tmp/control-python-deps", "--platform", "windows", "seal",
             ]), 2)
-        self.assertEqual(output.getvalue(), "devlane_crypto_refusal=crypto-acl-invalid\n")
+        self.assertEqual(output.getvalue(), "devlane_crypto_refusal=crypto-acl-owner-untrusted\n")
 
         output = io.StringIO()
         with mock.patch.object(control_python, "validate", side_effect=control_python.CryptoRefusal("private-path")), \
@@ -200,6 +201,66 @@ class ControlPythonPortableTests(unittest.TestCase):
                 "--target", "/tmp/control-python-deps", "--platform", "windows", "check",
             ]), 2)
         self.assertEqual(output.getvalue(), "devlane_crypto_refusal=crypto-control-invalid\n")
+
+    def test_windows_acl_exit_codes_have_fixed_subreasons(self):
+        expected = {
+            3: "crypto-acl-reparse-point",
+            4: "crypto-acl-owner-unresolved",
+            5: "crypto-acl-owner-untrusted",
+            6: "crypto-acl-writer-untrusted",
+        }
+        for exit_code, reason in expected.items():
+            with self.subTest(exit_code=exit_code):
+                self.assertEqual(control_python._powershell_acl_exit_reason(exit_code), reason)
+        self.assertEqual(control_python._powershell_acl_exit_reason(0), "crypto-acl-output-invalid")
+        self.assertEqual(control_python._powershell_acl_exit_reason(7), "crypto-acl-output-invalid")
+
+    def test_windows_acl_command_output_failures_have_fixed_subreasons(self):
+        with mock.patch.object(Path, "is_file", return_value=False):
+            with self.assertRaises(control_python.CryptoRefusal) as caught:
+                control_python._powershell_acl_owner(Path("D:/run/control-python-deps"))
+        self.assertEqual(caught.exception.reason, "crypto-acl-powershell-unavailable")
+
+        for result, reason in (
+            (mock.Mock(returncode=3, stdout=b"", stderr=b""), "crypto-acl-reparse-point"),
+            (mock.Mock(returncode=4, stdout=b"", stderr=b""), "crypto-acl-owner-unresolved"),
+            (mock.Mock(returncode=5, stdout=b"", stderr=b""), "crypto-acl-owner-untrusted"),
+            (mock.Mock(returncode=6, stdout=b"", stderr=b""), "crypto-acl-writer-untrusted"),
+            (mock.Mock(returncode=0, stdout=b"not-a-sid\n", stderr=b""), "crypto-acl-output-invalid"),
+            (mock.Mock(returncode=0, stdout=b"S-1-5-21-100\nextra\n", stderr=b""), "crypto-acl-output-invalid"),
+            (mock.Mock(returncode=0, stdout=b"S-1-5-21-100\n", stderr=b"warning\n"), "crypto-acl-output-invalid"),
+            (mock.Mock(returncode=7, stdout=b"", stderr=b""), "crypto-acl-output-invalid"),
+        ):
+            with self.subTest(reason=reason, returncode=result.returncode), \
+                    mock.patch.object(Path, "is_file", return_value=True), \
+                    mock.patch.object(control_python.subprocess, "run", return_value=result), \
+                    self.assertRaises(control_python.CryptoRefusal) as caught:
+                control_python._powershell_acl_owner(Path("D:/run/control-python-deps"))
+            self.assertEqual(caught.exception.reason, reason)
+
+    def test_windows_crypto_acl_bootstrap_is_protected_before_install(self):
+        root = Path(__file__).resolve().parents[2]
+        workflow = audit.parse_workflow(root / ".github/workflows/devlane-encrypted.yml")
+        steps = workflow[audit.WINDOWS_RUN_JOB]["steps"]
+        bootstrap = next(step for step in steps if step["name"] == "Fetch public control and validate dispatch")
+        script = "\n".join(bootstrap["run"])
+        run_root_protection = script.index("Protect-PrivateDirectory $runRoot $runnerSid")
+        start_marker = script.index("$started = Join-Path $runRoot 'deadline-start'")
+        target_creation = script.index("New-Item -ItemType Directory -Path $cryptoTarget")
+        install = script.index("python -B -m pip install")
+        self.assertLess(run_root_protection, start_marker)
+        self.assertLess(target_creation, install)
+        self.assertLess(script.index("Protect-PrivateDirectory $cryptoTarget $runnerSid"), install)
+        self.assertIn("$security.SetAccessRuleProtection($true, $false)", script)
+        self.assertIn("[Security.AccessControl.FileSystemRights]::FullControl", script)
+        self.assertIn("'S-1-5-18'", script)
+        self.assertIn("'S-1-5-32-544'", script)
+        self.assertIn("[Security.AccessControl.InheritanceFlags]::ContainerInherit", script)
+        self.assertIn("[Security.AccessControl.InheritanceFlags]::ObjectInherit", script)
+
+        source = (root / "kit/devlane/control_python.py").read_text(encoding="utf-8")
+        self.assertIn("$rule.PropagationFlags", source)
+        self.assertIn("[Security.AccessControl.PropagationFlags]::InheritOnly", source)
 
 
 if __name__ == "__main__":
