@@ -83,6 +83,9 @@ MACOS_STEP_NAMES = tuple(
     "Prepare hosted runner isolation state" if name == "Prepare hosted Linux isolation state" else name
     for name in STEP_NAMES
 )
+MACOS_STEP_NAMES = (
+    MACOS_STEP_NAMES[0], "Set up pinned macOS Node runtime", "Install pinned macOS npm runtime",
+) + MACOS_STEP_NAMES[1:]
 WINDOWS_STEP_NAMES = tuple(
     "Prepare hosted Windows isolation state" if name == "Prepare hosted Linux isolation state" else name
     for name in STEP_NAMES if name != "Install Tauri Linux build dependencies"
@@ -112,6 +115,8 @@ RUNNER_HOME = chr(47) + "home" + chr(47) + "runner"
 TEMP = RUNNER_HOME + "/work/_temp"
 MACOS_RUNNER_HOME = chr(47) + "Users" + chr(47) + "runner"
 MACOS_TEMP = MACOS_RUNNER_HOME + "/work/_temp"
+MACOS_HOSTED_TOOL_CACHE = MACOS_RUNNER_HOME + "/hostedtoolcache/node/24.22.1/arm64"
+MACOS_GNU_TAR = chr(47) + "opt/homebrew/bin/gtar"
 WINDOWS_RUNNER_HOME = r"D:\a\_work"
 WINDOWS_TEMP = r"D:\a\_temp"
 WINDOWS_PWSH = 'shell: C:\\Program Files\\PowerShell\\7\\pwsh.EXE -command ". \'{0}\'"'
@@ -183,12 +188,27 @@ def cache_line_patterns(key, temp=TEMP, platform="linux"):
         create = re.compile(
             r"(?:" + LOG_MARKER + r")?\[command\]" + tar
             + r" --posix -cf cache\.tzst --exclude cache\.tzst -P -C " + re.escape(workspace)
-            + r" --files-from manifest\.txt --force-local --use-compress-program \"zstd -T0 --long=30\"\Z"
+            + r" --files-from manifest\.txt --force-local --use-compress-program \"zstd -T0(?: --long=30)?\"\Z"
         )
         restore = re.compile(
             r"(?:" + LOG_MARKER + r")?\[command\]" + tar + r" -xf D:/a/_temp/" + UUID
             + r"/cache\.tzst -P -C " + re.escape(workspace)
-            + r" --force-local --use-compress-program \"zstd -d --long=30\"\Z"
+            + r" --force-local --use-compress-program \"zstd -d(?: --long=30)?\"\Z"
+        )
+        return common + (create, restore)
+    if platform == "macos":
+        tar = re.escape(MACOS_GNU_TAR)
+        workspace = re.escape(MACOS_RUNNER_HOME + "/work/platform-ci/platform-ci")
+        create = re.compile(
+            r"(?:" + LOG_MARKER + r")?\[command\]" + tar
+            + r" --posix -cf cache\.tzst --exclude cache\.tzst -P -C " + workspace
+            + r" --files-from manifest\.txt --delay-directory-restore --use-compress-program "
+            + r"(?:zstdmt(?: --long=30)?)\Z"
+        )
+        restore = re.compile(
+            r"(?:" + LOG_MARKER + r")?\[command\]" + tar + r" -xf " + re.escape(MACOS_TEMP) + "/" + UUID
+            + r"/cache\.tzst -P -C " + workspace
+            + r" --delay-directory-restore --use-compress-program (?:unzstd(?: --long=30)?)\Z"
         )
         return common + (create, restore)
     tar_command = re.compile(
@@ -211,6 +231,22 @@ NODE_LINES = (
                + re.escape(TEMP) + "/" + UUID + " -f " + re.escape(TEMP) + "/" + UUID + r"\Z"),
     re.compile(r"Environment details\Z"),
     re.compile(r"(?:node: v24\.22\.1|npm: 11\.19\.1|yarn: [0-9]+\.[0-9]+\.[0-9]+)\Z"),
+    re.compile(r"Finished\Z"),
+    re.compile(r"Post job cleanup\.\Z"),
+)
+MACOS_NODE_LINES = (
+    re.compile(r"Found in cache @ " + re.escape(MACOS_HOSTED_TOOL_CACHE) + r"\Z"),
+    re.compile(r"Attempting to download 24\.22\.1\.\.\.\Z"),
+    re.compile(r"Acquiring 24\.22\.1 - arm64 from https://github\.com/actions/node-versions/releases/download/"
+               r"24\.22\.1-[0-9]+/node-24\.22\.1-darwin-arm64\.tar\.gz\Z"),
+    re.compile(r"Extracting \.\.\.\Z"),
+    re.compile(r"Adding to the cache \.\.\.\Z"),
+    re.compile(r"Successfully cached node to " + re.escape(MACOS_HOSTED_TOOL_CACHE) + r"\Z"),
+    re.compile(r"Added node to the tool cache\Z"),
+    re.compile(r"(?:" + LOG_MARKER + r")?\[command\]/usr/bin/tar xz --strip 1 --warning=no-unknown-keyword --overwrite -C "
+               + re.escape(MACOS_TEMP) + "/" + UUID + " -f " + re.escape(MACOS_TEMP) + "/" + UUID + r"\Z"),
+    re.compile(r"Environment details\Z"),
+    re.compile(r"(?:node: v24\.22\.1|npm: [0-9]+\.[0-9]+\.[0-9]+|yarn: [0-9]+\.[0-9]+\.[0-9]+)\Z"),
     re.compile(r"Finished\Z"),
     re.compile(r"Post job cleanup\.\Z"),
 )
@@ -363,6 +399,14 @@ class _Grammar:
                             "node-version": "24.22.1", "check-latest": "false", "package-manager-cache": "false",
                         }):
                     _refuse()
+            elif self.platform == "macos":
+                if (len(node_steps) != 1
+                        or node_steps[0]["uses"] != "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1"
+                        or node_steps[0]["with"] != {
+                            "node-version": "24.22.1", "check-latest": "false", "cache": "",
+                            "package-manager-cache": "false",
+                        }):
+                    _refuse()
             elif node_steps:
                 _refuse()
         self.names = [step["name"] for step in self.steps]
@@ -449,8 +493,9 @@ class _Grammar:
             expected_suffix = ("/devlane-control-evidence/permit.json"
                                if step["name"] == "Restore exact source-free control evidence"
                                else "/devlane-bundle-permit/permit.json")
-            runner_suffix = expected_suffix.replace("/", "\\") if self.job_runner == "windows-2025" else expected_suffix
-            return suffix == expected_suffix and value == self.temp + runner_suffix
+            actual_path = value.replace("\\", "/") if self.job_runner == "windows-2025" else value
+            expected_path = self.temp.replace("\\", "/") + expected_suffix
+            return suffix == expected_suffix and actual_path == expected_path
         if key == "key":
             return value == self.expected_cache_key(step)
         if key == "token" and "github.token" in declared:
@@ -483,8 +528,11 @@ class _Grammar:
                 pattern.fullmatch(line) for pattern in cache_line_patterns(key, self.temp, self.platform)
             )
         if uses.startswith("actions/setup-node@") or step_name.startswith("Post Set up"):
-            patterns = WINDOWS_NODE_LINES if self.job_runner == "windows-2025" else NODE_LINES
+            patterns = (WINDOWS_NODE_LINES if self.job_runner == "windows-2025" else
+                        MACOS_NODE_LINES if self.job_runner == "macos-15" else NODE_LINES)
             return any(pattern.fullmatch(line) for pattern in patterns)
+        if step_name == "Install pinned macOS npm runtime":
+            return line == "macos_node_runtime=ready"
         exact = {
             "Fetch public control and validate dispatch": {"dispatch_context=validated"},
             "Prepare hosted runner isolation state": set(),
@@ -1120,8 +1168,16 @@ def _canonicalize_github_hosted_log(text, grammar, job_name, identity, workflow_
                         _refuse()
                     env_details.append(lines[index])
                     index += 1
-                expected_details = ["node: v24.22.1", "npm: 11.19.1", "yarn: 1.22.22"]
-                if index >= len(lines) or env_details != expected_details:
+                if grammar.job_runner == "macos-15":
+                    details_valid = (
+                        len(env_details) == 4 and env_details[0] == "node: v24.22.1"
+                        and re.fullmatch(r"npm: [0-9]+\.[0-9]+\.[0-9]+", env_details[1]) is not None
+                        and re.fullmatch(r"yarn: [0-9]+\.[0-9]+\.[0-9]+", env_details[2]) is not None
+                        and env_details[3] == "Finished"
+                    )
+                else:
+                    details_valid = env_details == ["node: v24.22.1", "npm: 11.19.1", "yarn: 1.22.22"]
+                if index >= len(lines) or not details_valid:
                     _refuse()
                 output.extend(env_details)
                 index += 1

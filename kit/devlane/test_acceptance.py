@@ -43,10 +43,11 @@ CONTROL_SHA = "a" * 40
 FETCH_SHA = "b" * 64
 KEY = bytes(range(32))
 BINDINGS = {
-    "format": "kd-public-devlane-aesgcm-v1",
+    "format": "kd-public-devlane-aesgcm-v2",
     "repository_id": "1430960557",
     "control_sha": CONTROL_SHA,
     "workflow_path": ".github/workflows/devlane-encrypted.yml",
+    "platform": "linux",
     "profile": "core-node",
     "wave_id": "wave-test-0001",
     "bundle_id": "bundle-test-0001",
@@ -222,6 +223,14 @@ class EnvelopeAcceptanceTests(unittest.TestCase):
             with self.subTest(now=now, expected=expected["wave_id"]):
                 with self.assertRaises(bundle.Refusal):
                     bundle.parse_envelope(payload, key, expected, now=now)
+
+    def test_authenticated_platform_binding_is_checked_before_aes_decryption(self):
+        archive = _sealed_archive([("src/example.ts", b"synthetic source fixture", "file")])
+        envelope = bundle.build_envelope(archive, KEY, BINDINGS)
+        with patch.object(bundle, "AESGCM", wraps=bundle.AESGCM) as aead:
+            with self.assertRaisesRegex(bundle.Refusal, "binding-mismatch"):
+                bundle.parse_envelope(envelope, KEY, {**BINDINGS, "platform": "windows"}, now=1_900_000_000)
+            aead.assert_not_called()
 
     def test_duplicate_json_keys_fail(self):
         with self.assertRaises(bundle.Refusal):
@@ -596,7 +605,10 @@ class NodeVendorIntegrationAcceptanceTests(unittest.TestCase):
         prepare_step = workflow.split("- name: Prepare dependencies before the cut", 1)[1].split(
             "- name:", 1,
         )[0]
-        self.assertNotIn("actions/setup-node@", workflow.split("devlane-encrypted-run-windows", 1)[0])
+        linux_job = workflow.split("  devlane-encrypted-run:", 1)[1].split(
+            "  devlane-encrypted-run-macos:", 1,
+        )[0]
+        self.assertNotIn("actions/setup-node@", linux_job)
         windows_job = workflow.split("devlane-encrypted-run-windows", 1)[1]
         self.assertIn("actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1", windows_job)
         self.assertIn('node-version: "24.22.1"', windows_job)
@@ -831,6 +843,9 @@ class OneRunPermitAcceptanceTests(unittest.TestCase):
             wrong_run = self._environment(CI_RUN_ID="54322")
             with self.assertRaisesRegex(permit.PermitRefusal, "bundle-run-permit-binding"):
                 permit.verify_claim(claim_path, wrong_run)
+            wrong_platform = self._environment(DEVLANE_PLATFORM="windows")
+            with self.assertRaisesRegex(permit.PermitRefusal, "bundle-run-permit-binding"):
+                permit.verify_claim(claim_path, wrong_platform)
             wrong_bundle = self._environment(DEVLANE_BUNDLE_ID="bundle-test-0002")
             with self.assertRaisesRegex(permit.PermitRefusal, "bundle-run-permit-binding"):
                 permit.verify_claim(claim_path, wrong_bundle)

@@ -36,6 +36,7 @@ RUNNER_HOME = chr(47) + "home" + chr(47) + "runner"
 TMP = RUNNER_HOME + "/work/_temp"
 MACOS_RUNNER_HOME = chr(47) + "Users" + chr(47) + "runner"
 MACOS_TMP = MACOS_RUNNER_HOME + "/work/_temp"
+MACOS_WORKSPACE = MACOS_RUNNER_HOME + "/work/platform-ci/platform-ci"
 
 
 def _env_value(name, identity=IDENTITY, kind="encrypted", job_runner=None):
@@ -78,6 +79,9 @@ def _with_value(step, key, identity, kind):
         platform = identity.get("platform", "linux")
         if step["name"] == "Restore exact source-free control evidence":
             return "devlane-control-evidence/permit.json"
+        if step["name"] in ("Restore one-run bundle permit", "Save one-run bundle permit",
+                             "Restore and verify persisted one-run permit"):
+            return "devlane-bundle-permit/permit.json"
         runner_temp = (audit.WINDOWS_TEMP if platform == "windows" else
                        MACOS_TMP if platform == "macos" else TMP)
         separator = "\\" if platform == "windows" else "/"
@@ -108,7 +112,14 @@ def _step_outputs(step, identity, kind, records):
             cache_outputs.append(
                 MARK + '[command]"C:\\Program Files\\Git\\usr\\bin\\tar.exe" -xf '
                 + 'D:/a/_temp/01234567-89ab-cdef-0123-456789abcdef/cache.tzst -P -C D:/a/platform-ci/platform-ci '
-                + '--force-local --use-compress-program "zstd -d --long=30"'
+                + '--force-local --use-compress-program "zstd -d"'
+            )
+        if identity.get("platform") == "macos" and "fail-on-cache-miss" in step["with"]:
+            cache_outputs.append(
+                MARK + "[command]" + audit.MACOS_GNU_TAR + " -xf "
+                + MACOS_TMP + "/01234567-89ab-cdef-0123-456789abcdef/cache.tzst -P -C "
+                + MACOS_WORKSPACE + " --delay-directory-restore "
+                + "--use-compress-program unzstd"
             )
         return cache_outputs
     if uses.startswith("actions/cache/save"):
@@ -118,10 +129,26 @@ def _step_outputs(step, identity, kind, records):
             cache_outputs.append(
                 MARK + '[command]"C:\\Program Files\\Git\\usr\\bin\\tar.exe" --posix -cf cache.tzst '
                 + '--exclude cache.tzst -P -C D:/a/platform-ci/platform-ci --files-from manifest.txt '
-                + '--force-local --use-compress-program "zstd -T0 --long=30"'
+                + '--force-local --use-compress-program "zstd -T0"'
+            )
+        if identity.get("platform") == "macos":
+            cache_outputs.append(
+                MARK + "[command]" + audit.MACOS_GNU_TAR
+                + " --posix -cf cache.tzst --exclude cache.tzst -P -C "
+                + MACOS_WORKSPACE + " --files-from manifest.txt "
+                + "--delay-directory-restore --use-compress-program zstdmt"
             )
         return cache_outputs
     if uses.startswith("actions/setup-node"):
+        if identity.get("platform") == "macos":
+            return ["Attempting to download 24.22.1...",
+                    "Acquiring 24.22.1 - arm64 from https:" + chr(47) * 2
+                    + "github.com/actions/node-versions/releases/download/"
+                    "24.22.1-123456/node-24.22.1-darwin-arm64.tar.gz",
+                    "Extracting ...", "Adding to the cache ...",
+                    "Successfully cached node to " + audit.MACOS_HOSTED_TOOL_CACHE,
+                    "Added node to the tool cache", "Environment details", "node: v24.22.1",
+                    "npm: 11.6.2", "yarn: 1.22.22", "Finished"]
         if identity.get("platform") == "windows":
             return ["Found in cache @ " + audit.WINDOWS_HOSTED_TOOL_CACHE, "Environment details", "node: v24.22.1",
                     "npm: 11.19.1", "yarn: 1.22.22"]
@@ -229,9 +256,10 @@ def _render_log(job_key, identity=None, *, records=(), kind="encrypted", skip=("
         lines.append(MARK + "[endgroup]")
         lines.extend(_step_outputs(step, identity, kind, records))
         lines.append(MARK + "[section]Finishing: " + step["name"])
-    if any(step["uses"] and "setup-node" in step["uses"] for step in job["steps"]) and identity["profile"] == "core-node":
-        lines += [MARK + "[section]Starting: Post Set up pinned Node toolchain",
-                  MARK + "[section]Finishing: Post Set up pinned Node toolchain"]
+    node_step = next((step for step in job["steps"] if step["uses"] and "setup-node" in step["uses"]), None)
+    if node_step and identity["profile"] == "core-node":
+        lines += [MARK + "[section]Starting: Post " + node_step["name"],
+                  MARK + "[section]Finishing: Post " + node_step["name"]]
     lines += [MARK + "[section]Starting: Complete job", "Cleaning up orphan processes",
               MARK + "[section]Finishing: Complete job"]
     return "".join(stamp + line + "\n" for line in lines).encode("utf-8")
@@ -512,6 +540,50 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         _record(kind="test", stage="unit", test="case_0001"),
     )
 
+    def test_pinned_cache_action_zstd_without_long_commands_match_windows_and_macos(self):
+        key = "devlane-permit-v1-bundle-test-0001"
+        windows_lines = (
+            MARK + '[command]"C:\\Program Files\\Git\\usr\\bin\\tar.exe" --posix -cf cache.tzst '
+            + '--exclude cache.tzst -P -C D:/a/platform-ci/platform-ci --files-from manifest.txt '
+            + '--force-local --use-compress-program "zstd -T0"',
+            MARK + '[command]"C:\\Program Files\\Git\\usr\\bin\\tar.exe" -xf '
+            + 'D:/a/_temp/01234567-89ab-cdef-0123-456789abcdef/cache.tzst -P -C D:/a/platform-ci/platform-ci '
+            + '--force-local --use-compress-program "zstd -d"',
+        )
+        windows_patterns = audit.cache_line_patterns(key, audit.WINDOWS_TEMP, "windows")
+        for line in windows_lines:
+            with self.subTest(platform="windows", line=line):
+                self.assertTrue(any(pattern.fullmatch(line) for pattern in windows_patterns))
+
+        macos_lines = (
+            MARK + "[command]" + audit.MACOS_GNU_TAR
+            + " --posix -cf cache.tzst --exclude cache.tzst -P -C "
+            + MACOS_WORKSPACE + " --files-from manifest.txt "
+            + "--delay-directory-restore --use-compress-program zstdmt",
+            MARK + "[command]" + audit.MACOS_GNU_TAR + " -xf "
+            + MACOS_TMP + "/01234567-89ab-cdef-0123-456789abcdef/cache.tzst -P -C "
+            + MACOS_WORKSPACE + " --delay-directory-restore "
+            + "--use-compress-program unzstd",
+        )
+        macos_patterns = audit.cache_line_patterns(key, audit.MACOS_TEMP, "macos")
+        for line in macos_lines:
+            with self.subTest(platform="macos", line=line):
+                self.assertTrue(any(pattern.fullmatch(line) for pattern in macos_patterns))
+
+    def test_windows_runner_temp_input_accepts_the_real_mixed_slash_interpolation(self):
+        grammar = audit._Grammar(
+            ".github/workflows/devlane-encrypted.yml", audit.WINDOWS_RUN_JOB,
+            dict(IDENTITY, platform="windows"), "encrypted",
+        )
+        step = {
+            "name": "Restore one-run bundle permit", "uses": "actions/cache/restore@pinned",
+            "with": {"path": "${{ runner.temp }}/devlane-bundle-permit/permit.json"},
+        }
+        self.assertTrue(grammar.with_value_ok(
+            step, "path", r"D:\a\_temp/devlane-bundle-permit/permit.json"))
+        self.assertFalse(grammar.with_value_ok(
+            step, "path", r"E:\a\_temp/devlane-bundle-permit/permit.json"))
+
     def _valid_run_log(self, records=None):
         return _render_log(audit.RUN_JOB, records=self.RECORDS if records is None else records)
 
@@ -527,6 +599,9 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         desktop = dict(IDENTITY, profile="desktop")
         audit.validate_job_log_surface(
             _render_log(audit.RUN_JOB, desktop), audit.RUN_JOB, desktop)
+        macos = dict(IDENTITY, platform="macos")
+        audit.validate_job_log_surface(
+            _render_log(audit.MACOS_RUN_JOB, macos), audit.MACOS_RUN_JOB, macos)
 
     def test_known_github_sgr_is_accepted_on_the_encrypted_lane_log_path(self):
         log = self._valid_run_log()
@@ -1794,6 +1869,25 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
         self.assertIn("inputs.control_wave_id", control)
         self.assertNotIn("pull_request", control)
 
+    def test_macos_pinned_node_and_npm_are_provisioned_before_preflight(self):
+        encrypted = audit.parse_workflow(self.root / ".github/workflows/devlane-encrypted.yml")
+        steps = encrypted[audit.MACOS_RUN_JOB]["steps"]
+        names = [step["name"] for step in steps]
+        setup = steps[names.index("Set up pinned macOS Node runtime")]
+        npm = steps[names.index("Install pinned macOS npm runtime")]
+        preflight = names.index("Prepare hosted runner isolation state")
+        self.assertEqual(setup["uses"], "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1")
+        self.assertEqual(setup["with"], {
+            "node-version": "24.22.1", "check-latest": "false", "cache": "",
+            "package-manager-cache": "false",
+        })
+        self.assertLess(names.index(setup["name"]), preflight)
+        self.assertLess(names.index(npm["name"]), preflight)
+        self.assertIn("npm install --global --ignore-scripts --no-audit --no-fund --silent npm@11.19.1",
+                      "\n".join(npm["run"]))
+        self.assertIn('[[ "$(node --version)" == "v24.22.1" ]]', "\n".join(npm["run"]))
+        self.assertIn('[[ "$(npm --version)" == "11.19.1" ]]', "\n".join(npm["run"]))
+
     def test_windows_deadline_starts_before_manual_checkout_and_wer_dumps_are_disabled(self):
         encrypted = self._workflow("devlane-encrypted.yml")
         windows = encrypted.split("  devlane-encrypted-run-windows:", 1)[1]
@@ -1823,12 +1917,12 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
         self.assertNotIn("  push:", control)
 
     def test_cache_authorization_paths_and_keys_are_run_independent_and_identical(self):
-        """Fails on the old workflow: the saved and restored records used different, run-specific paths, so the Actions cache version (derived from the path) never matched."""
+        """The portable path and key stay identical through claim, save, and persisted verification."""
         encrypted = audit.parse_workflow(self.root / ".github/workflows/devlane-encrypted.yml")[audit.RUN_JOB]
         steps = {step["name"]: step for step in encrypted["steps"]}
         permit_paths = {steps[name]["with"]["path"] for name in (
             "Restore one-run bundle permit", "Save one-run bundle permit", "Restore and verify persisted one-run permit")}
-        self.assertEqual(permit_paths, {"${{ runner.temp }}/devlane-bundle-permit/permit.json"})
+        self.assertEqual(permit_paths, {"devlane-bundle-permit/permit.json"})
         permit_keys = {steps[name]["with"]["key"] for name in (
             "Restore one-run bundle permit", "Save one-run bundle permit", "Restore and verify persisted one-run permit")}
         self.assertEqual(permit_keys, {"devlane-permit-v1-${{ inputs.bundle_id }}"})
@@ -1851,6 +1945,23 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
                         names.index("Verify permit and emit bound dispatch marker"))
         self.assertLess(names.index("Claim this bundle for one run before decryption"),
                         names.index("Fetch ciphertext and sanitized dependency projection"))
+
+    def test_bundle_permit_cache_version_is_shared_by_every_platform_job(self):
+        jobs = audit.parse_workflow(self.root / ".github/workflows/devlane-encrypted.yml")
+        action_names = (
+            "Restore one-run bundle permit", "Save one-run bundle permit",
+            "Restore and verify persisted one-run permit",
+        )
+        versions = set()
+        for platform, job_name in audit.PLATFORM_RUN_JOBS.items():
+            steps = {step["name"]: step for step in jobs[job_name]["steps"]}
+            for name in action_names:
+                action = steps[name]
+                self.assertEqual(action["with"]["path"], "devlane-bundle-permit/permit.json")
+                self.assertEqual(action["with"]["key"], "devlane-permit-v1-${{ inputs.bundle_id }}")
+                self.assertEqual(action["with"]["enableCrossOsArchive"], "true")
+                versions.add((action["with"]["path"], "zstd-without-long", action["with"]["enableCrossOsArchive"]))
+        self.assertEqual(len(versions), 1)
 
     def test_synthetic_control_exercises_the_cache_claim_restore_sequence_for_real(self):
         steps = audit.parse_workflow(self.root / ".github/workflows/devlane-synthetic.yml")["devlane-synthetic"]["steps"]

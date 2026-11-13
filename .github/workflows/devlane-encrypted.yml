@@ -315,15 +315,16 @@ jobs:
         timeout-minutes: 1
         uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
         with:
-          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          path: devlane-bundle-permit/permit.json
+          enableCrossOsArchive: true
           key: devlane-permit-v1-${{ inputs.bundle_id }}
       - name: Claim this bundle for one run before decryption
         run: |
           set -euo pipefail
           umask 077
-          mkdir -p "$RUNNER_TEMP/devlane-bundle-permit"
-          chmod 700 "$RUNNER_TEMP/devlane-bundle-permit"
-          python3 -B kit/devlane/permit.py claim --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json"
+          mkdir -p "$GITHUB_WORKSPACE/devlane-bundle-permit"
+          chmod 700 "$GITHUB_WORKSPACE/devlane-bundle-permit"
+          python3 -B kit/devlane/permit.py claim --file "$GITHUB_WORKSPACE/devlane-bundle-permit/permit.json"
       - name: Reserve work time for permit cache save
         timeout-minutes: 1
         run: |
@@ -334,13 +335,14 @@ jobs:
         timeout-minutes: 1
         uses: actions/cache/save@3edfce9056124e459a23f683a21433670d47daca
         with:
-          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          path: devlane-bundle-permit/permit.json
+          enableCrossOsArchive: true
           key: devlane-permit-v1-${{ inputs.bundle_id }}
       - name: Discard local permit copy before persisted verification
         run: |
           set -euo pipefail
-          rm -rf -- "$RUNNER_TEMP/devlane-bundle-permit"
-          [[ ! -e "$RUNNER_TEMP/devlane-bundle-permit" ]]
+          rm -rf -- "$GITHUB_WORKSPACE/devlane-bundle-permit"
+          [[ ! -e "$GITHUB_WORKSPACE/devlane-bundle-permit" ]]
       - name: Reserve work time for persisted permit cache restore
         timeout-minutes: 1
         run: |
@@ -351,14 +353,15 @@ jobs:
         timeout-minutes: 1
         uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
         with:
-          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          path: devlane-bundle-permit/permit.json
+          enableCrossOsArchive: true
           key: devlane-permit-v1-${{ inputs.bundle_id }}
           fail-on-cache-miss: true
       - name: Verify permit and emit bound dispatch marker
         run: |
           set -euo pipefail
           python3 -B kit/devlane/permit.py verify-claim \
-            --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json"
+            --file "$GITHUB_WORKSPACE/devlane-bundle-permit/permit.json"
           printf 'KD-DEVLANE-DISPATCH schema=1 wave-id=%s bundle-id=%s control-sha=%s run-id=%s run-attempt=1\n' \
             "$DEVLANE_WAVE_ID" "$DEVLANE_BUNDLE_ID" "$CI_SHA" "$CI_RUN_ID"
       - name: Install Tauri Linux build dependencies
@@ -686,6 +689,20 @@ jobs:
             python3 -B -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; import cryptography; assert AESGCM is not None and cryptography.__version__'
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             python3 -B kit/devlane/fetch.py context --output "$RUN_ROOT/context.json"
+      - name: Set up pinned macOS Node runtime
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: "24.22.1"
+          check-latest: false
+          cache: ""
+          package-manager-cache: false
+      - name: Install pinned macOS npm runtime
+        run: |
+          set -euo pipefail
+          npm install --global --ignore-scripts --no-audit --no-fund --silent npm@11.19.1
+          [[ "$(node --version)" == "v24.22.1" ]]
+          [[ "$(npm --version)" == "11.19.1" ]]
+          printf 'macos_node_runtime=ready\n'
       - name: Prepare hosted runner isolation state
         timeout-minutes: 2
         run: |
@@ -781,15 +798,16 @@ jobs:
         timeout-minutes: 1
         uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
         with:
-          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          path: devlane-bundle-permit/permit.json
+          enableCrossOsArchive: true
           key: devlane-permit-v1-${{ inputs.bundle_id }}
       - name: Claim this bundle for one run before decryption
         run: |
           set -euo pipefail
           umask 077
-          mkdir -p "$RUNNER_TEMP/devlane-bundle-permit"
-          chmod 700 "$RUNNER_TEMP/devlane-bundle-permit"
-          python3 -B kit/devlane/permit.py claim --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json"
+          mkdir -p "$GITHUB_WORKSPACE/devlane-bundle-permit"
+          chmod 700 "$GITHUB_WORKSPACE/devlane-bundle-permit"
+          python3 -B kit/devlane/permit.py claim --file "$GITHUB_WORKSPACE/devlane-bundle-permit/permit.json"
       - name: Reserve work time for permit cache save
         timeout-minutes: 1
         run: |
@@ -800,13 +818,14 @@ jobs:
         timeout-minutes: 1
         uses: actions/cache/save@3edfce9056124e459a23f683a21433670d47daca
         with:
-          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          path: devlane-bundle-permit/permit.json
+          enableCrossOsArchive: true
           key: devlane-permit-v1-${{ inputs.bundle_id }}
       - name: Discard local permit copy before persisted verification
         run: |
           set -euo pipefail
-          rm -rf -- "$RUNNER_TEMP/devlane-bundle-permit"
-          [[ ! -e "$RUNNER_TEMP/devlane-bundle-permit" ]]
+          rm -rf -- "$GITHUB_WORKSPACE/devlane-bundle-permit"
+          [[ ! -e "$GITHUB_WORKSPACE/devlane-bundle-permit" ]]
       - name: Reserve work time for persisted permit cache restore
         timeout-minutes: 1
         run: |
@@ -817,14 +836,15 @@ jobs:
         timeout-minutes: 1
         uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
         with:
-          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          path: devlane-bundle-permit/permit.json
+          enableCrossOsArchive: true
           key: devlane-permit-v1-${{ inputs.bundle_id }}
           fail-on-cache-miss: true
       - name: Verify permit and emit bound dispatch marker
         run: |
           set -euo pipefail
           python3 -B kit/devlane/permit.py verify-claim \
-            --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json"
+            --file "$GITHUB_WORKSPACE/devlane-bundle-permit/permit.json"
           printf 'KD-DEVLANE-DISPATCH schema=1 wave-id=%s bundle-id=%s control-sha=%s run-id=%s run-attempt=1\n' \
             "$DEVLANE_WAVE_ID" "$DEVLANE_BUNDLE_ID" "$CI_SHA" "$CI_RUN_ID"
       - name: Install Tauri Linux build dependencies
@@ -1176,11 +1196,12 @@ jobs:
         timeout-minutes: 1
         uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
         with:
-          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          path: devlane-bundle-permit/permit.json
+          enableCrossOsArchive: true
           key: devlane-permit-v1-${{ inputs.bundle_id }}
       - name: Claim this bundle for one run before decryption
         run: |
-          $permitRoot = Join-Path $env:RUNNER_TEMP 'devlane-bundle-permit'
+          $permitRoot = Join-Path $env:CI_WORKSPACE 'devlane-bundle-permit'
           New-Item -ItemType Directory -Force -Path $permitRoot | Out-Null
           python -B kit/devlane/permit.py claim --file (Join-Path $permitRoot 'permit.json')
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -1193,12 +1214,13 @@ jobs:
         timeout-minutes: 1
         uses: actions/cache/save@3edfce9056124e459a23f683a21433670d47daca
         with:
-          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          path: devlane-bundle-permit/permit.json
+          enableCrossOsArchive: true
           key: devlane-permit-v1-${{ inputs.bundle_id }}
       - name: Discard local permit copy before persisted verification
         run: |
-          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'devlane-bundle-permit') -Recurse -Force -ErrorAction SilentlyContinue
-          if (Test-Path -LiteralPath (Join-Path $env:RUNNER_TEMP 'devlane-bundle-permit')) { exit 1 }
+          Remove-Item -LiteralPath (Join-Path $env:CI_WORKSPACE 'devlane-bundle-permit') -Recurse -Force -ErrorAction SilentlyContinue
+          if (Test-Path -LiteralPath (Join-Path $env:CI_WORKSPACE 'devlane-bundle-permit')) { exit 1 }
       - name: Reserve work time for persisted permit cache restore
         timeout-minutes: 1
         run: |
@@ -1208,12 +1230,13 @@ jobs:
         timeout-minutes: 1
         uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
         with:
-          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          path: devlane-bundle-permit/permit.json
+          enableCrossOsArchive: true
           key: devlane-permit-v1-${{ inputs.bundle_id }}
           fail-on-cache-miss: true
       - name: Verify permit and emit bound dispatch marker
         run: |
-          python -B kit/devlane/permit.py verify-claim --file (Join-Path $env:RUNNER_TEMP 'devlane-bundle-permit\permit.json')
+          python -B kit/devlane/permit.py verify-claim --file (Join-Path $env:CI_WORKSPACE 'devlane-bundle-permit\permit.json')
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Write-Output ('KD-DEVLANE-DISPATCH schema=1 wave-id=' + $env:DEVLANE_WAVE_ID + ' bundle-id=' + $env:DEVLANE_BUNDLE_ID + ' control-sha=' + $env:CI_SHA + ' run-id=' + $env:CI_RUN_ID + ' run-attempt=1')
       - name: Fetch ciphertext and sanitized dependency projection
