@@ -28,10 +28,10 @@ try {
         exit 0
     }
     $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
-        if ($state.schema -ne 1 -or $state.profile_name -notmatch '^KDDevLane[a-f0-9]{32}$'
-        -or $state.package_sid -notmatch '^S-1-15-2-(?:[0-9]+-){6}[0-9]+$'
-            -or $state.firewall_rule -ne ('KD-DevLane-' + $env:CI_RUN_ID)
-            -or $null -eq $state.acl_grants) { throw }
+    if ($state.schema -ne 1 -or $state.profile_name -notmatch '^KDDevLane[a-f0-9]{32}$' -or
+            $state.package_sid -notmatch '^S-1-15-2-(?:[0-9]+-){6}[0-9]+$' -or
+            $state.firewall_rule -ne ('KD-DevLane-' + $env:CI_RUN_ID) -or
+            $null -eq $state.acl_grants) { throw }
     if ($Mode -eq 'firewall-install') {
         $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
         if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw }
@@ -39,8 +39,8 @@ try {
         New-NetFirewallRule -Name $state.firewall_rule -DisplayName $state.firewall_rule -Group 'KeelDock devlane' `
             -Direction Outbound -Action Block -Enabled True -Profile Any -RemoteAddress Any -Package $state.package_sid | Out-Null
         $rules = @(Get-NetFirewallRule -Name $state.firewall_rule -ErrorAction Stop)
-        if ($rules.Count -ne 1 -or -not $rules[0].Enabled -or $rules[0].Direction -ne 'Outbound'
-            -or $rules[0].Action -ne 'Block' -or $rules[0].Profile -ne 'Any') { throw }
+        if ($rules.Count -ne 1 -or -not $rules[0].Enabled -or $rules[0].Direction -ne 'Outbound' -or
+            $rules[0].Action -ne 'Block' -or $rules[0].Profile -ne 'Any') { throw }
         $application = Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $rules[0] -ErrorAction Stop
         $address = Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $rules[0] -ErrorAction Stop
         if ($application.Package -ne $state.package_sid -or @($address.RemoteAddress) -notcontains 'Any') { throw }
@@ -55,11 +55,11 @@ try {
     }
     if ($Mode -eq 'run') {
         $request = Get-Content -LiteralPath $RequestFile -Raw | ConvertFrom-Json
-        if ($request.schema -ne 1 -or $request.profile_name -ne $state.profile_name
-            -or $request.package_sid -ne $state.package_sid
-            -or $request.executable -notmatch '^[A-Za-z]:\\[^\r\n]{1,240}\.exe$'
-            -or $request.working_directory -notmatch '^[A-Za-z]:\\[^\r\n]{1,240}$'
-            -or @($request.arguments).Count -gt 128 -or @($request.environment).Count -gt 128) { throw }
+        if ($request.schema -ne 1 -or $request.profile_name -ne $state.profile_name -or
+            $request.package_sid -ne $state.package_sid -or
+            $request.executable -notmatch '^[A-Za-z]:\\[^\r\n]{1,240}\.exe$' -or
+            $request.working_directory -notmatch '^[A-Za-z]:\\[^\r\n]{1,240}$' -or
+            @($request.arguments).Count -gt 128 -or @($request.environment).Count -gt 128) { throw }
         $internetClient = $false
         if ($request.PSObject.Properties.Name -contains 'internet_client') {
             if ($request.internet_client -isnot [bool]) { throw }
@@ -127,8 +127,8 @@ try {
         $result = [KeelDock.Platform.DevLaneWindows.Boundary]::Run(
             [string]$state.profile_name, [string]$state.package_sid, [string]$request.executable,
             $arguments, [string]$request.working_directory, $environment, [int]$request.timeout_milliseconds, $internetClient)
-        if (-not $result.Created -or -not $result.Exited -or $result.AppContainer -notlike 'lpac=verified*'
-            -or $result.Job -notlike 'assigned kill_on_close=enabled breakaway=disabled*') { throw }
+        if (-not $result.Created -or -not $result.Exited -or $result.AppContainer -notlike 'lpac=verified*' -or
+            $result.Job -notlike 'assigned kill_on_close=enabled breakaway=disabled*') { throw }
         $status = if ($result.TimedOut) { 'timeout' } elseif ($result.ExitCode -eq 0) { 'pass' } else { 'fail' }
         [ordered]@{ status = $status; exit_code = [uint32]$result.ExitCode; token = $result.AppContainer; job = $result.Job } |
             ConvertTo-Json -Compress

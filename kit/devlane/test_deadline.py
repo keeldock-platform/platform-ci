@@ -397,7 +397,8 @@ class DeadlineTests(unittest.TestCase):
         self.assertEqual(workflow.count("deadline.py run"), 5)
         self.assertEqual(Counter(re.findall(r"(?m)^\s+quiet ([a-z0-9-]+) bounded ", workflow)),
                          Counter(("crypto-dependency-probe", "rust-v2-preparation-tests",
-                                  "rust-v2-lock-tests", "rust-v2-source-tests", "rust-v2-public-runtime",
+                                  "rust-v2-lock-tests", "rust-v2-source-tests", "powershell-static-regression",
+                                  "rust-v2-public-runtime",
                                   "acceptance-unit-tests", "coordinator-contract-tests",
                                   "rust-matrix-runner-tests", "rust-report-tests", "node-adapter-tests",
                                   "audit-contract-tests", "rehearsal-tests", "production-path-e2e")))
@@ -584,6 +585,7 @@ class DeadlineTests(unittest.TestCase):
         expected_counts = Counter({
             ("devlane-synthetic.yml", "devlane-synthetic", "deadline.py"): 8,
             ("devlane-synthetic.yml", "devlane-synthetic", "permit.py"): 3,
+            ("devlane-synthetic.yml", "devlane-synthetic", "test_powershell_static.py"): 1,
             ("devlane-synthetic.yml", "devlane-synthetic", "test_acceptance.py"): 1,
             ("devlane-synthetic.yml", "devlane-synthetic", "test_audit_contracts.py"): 1,
             ("devlane-synthetic.yml", "devlane-synthetic", "test_coordinator.py"): 1,
@@ -779,6 +781,8 @@ class DeadlineTests(unittest.TestCase):
                                 else ("--file",))
                     for option in required:
                         self._assert_required_argument(permit.main, arguments, option)
+                elif script == "test_powershell_static.py":
+                    self.assertEqual(arguments, [])
                 elif script == "network_probe.py":
                     self._assert_required_argument(network_probe.main, arguments, "--output")
                 elif script == "sandbox_macos.py":

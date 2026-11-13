@@ -1,0 +1,231 @@
+"""Static PowerShell syntax guard for hosts where pwsh cannot run reliably."""
+
+import re
+import unittest
+from dataclasses import dataclass
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+HASH = chr(35)
+LEADING_OPERATOR = re.compile(
+    r"^(?:-(?:or|and|xor|eq|ne|gt|ge|lt|le|match|notmatch|like|notlike|contains|"
+    r"notcontains|in|notin|replace|join|split|f|is|isnot|as|band|bor|bxor|shl|shr)\b|[|+])",
+    re.IGNORECASE,
+)
+LEADING_METHOD = re.compile(r"^\.[A-Za-z_][A-Za-z0-9_]*\s*(?:\(|$)")
+JOB_START = re.compile(r"^  ([A-Za-z0-9_-]+):\s*(?:" + re.escape(HASH) + r".*)?$")
+STEP_START = re.compile(r"^ {6}-\s+")
+SHELL_VALUE = re.compile(r"^\s*shell:\s*[\"']?([A-Za-z0-9_-]+)", re.IGNORECASE)
+RUN_VALUE = re.compile(r"^(?P<indent> *)run:\s*(?P<value>.*)$")
+
+
+@dataclass(frozen=True)
+class PowerShellSource:
+    name: str
+    text: str
+    first_line: int = 1
+
+
+def _shell_kind(value):
+    token = value.strip().split(None, 1)[0].strip("\"'").lower() if value.strip() else ""
+    return token if token in {"pwsh", "powershell"} else ""
+
+
+def _workflow_powershell_blocks(path):
+    lines = path.read_text(encoding="utf-8").splitlines()
+    jobs_index = next((index for index, line in enumerate(lines) if line == "jobs:"), None)
+    if jobs_index is None:
+        return []
+
+    workflow_default = ""
+    for index, line in enumerate(lines[:jobs_index]):
+        if line == "defaults:":
+            for nested in lines[index + 1:jobs_index]:
+                if nested and len(nested) - len(nested.lstrip()) <= 0:
+                    break
+                if nested == "  run:":
+                    continue
+                if nested.startswith("    shell:"):
+                    match = SHELL_VALUE.match(nested)
+                    workflow_default = _shell_kind(match.group(1)) if match else ""
+
+    starts = [index for index in range(jobs_index + 1, len(lines)) if JOB_START.match(lines[index])]
+    blocks = []
+    for position, start in enumerate(starts):
+        end = starts[position + 1] if position + 1 < len(starts) else len(lines)
+        job_lines = lines[start + 1:end]
+        default_shell = workflow_default
+        for index, line in enumerate(job_lines):
+            if line != "    defaults:":
+                continue
+            for nested in job_lines[index + 1:]:
+                if nested and len(nested) - len(nested.lstrip()) <= 4:
+                    break
+                if nested.startswith("        shell:"):
+                    match = SHELL_VALUE.match(nested)
+                    default_shell = _shell_kind(match.group(1)) if match else ""
+
+        step_starts = [index for index, line in enumerate(job_lines) if STEP_START.match(line)]
+        for step_position, step_start in enumerate(step_starts):
+            step_end = step_starts[step_position + 1] if step_position + 1 < len(step_starts) else len(job_lines)
+            step_lines = job_lines[step_start:step_end]
+            explicit_shell = ""
+            for line in step_lines:
+                if len(line) - len(line.lstrip()) == 8 and line.lstrip().startswith("shell:"):
+                    match = SHELL_VALUE.match(line)
+                    explicit_shell = _shell_kind(match.group(1)) if match else ""
+                    break
+            shell = explicit_shell or default_shell
+            if not shell:
+                continue
+            for line_index, line in enumerate(step_lines):
+                match = RUN_VALUE.match(line)
+                if not match:
+                    continue
+                value = match.group("value")
+                run_indent = len(match.group("indent"))
+                if value.startswith(("|", ">")):
+                    body_end = line_index + 1
+                    while body_end < len(step_lines):
+                        candidate = step_lines[body_end]
+                        if candidate.strip() and len(candidate) - len(candidate.lstrip()) <= run_indent:
+                            break
+                        body_end += 1
+                    body = step_lines[line_index + 1:body_end]
+                    nonblank_indents = [len(item) - len(item.lstrip()) for item in body if item.strip()]
+                    content_indent = min(nonblank_indents, default=run_indent + 1)
+                    content = "\n".join(item[content_indent:] if item.strip() else "" for item in body)
+                    first_line = start + 1 + step_start + line_index + 2
+                    blocks.append(PowerShellSource(f"{path.relative_to(ROOT)} run block", content, first_line))
+                elif _shell_kind(shell):
+                    first_line = start + 1 + step_start + line_index + 1
+                    blocks.append(PowerShellSource(f"{path.relative_to(ROOT)} run line", value, first_line))
+    return blocks
+
+
+def powershell_sources(root=ROOT):
+    sources = [
+        PowerShellSource(str(path.relative_to(root)), path.read_text(encoding="utf-8"))
+        for path in sorted(root.rglob("*.ps1"))
+        if ".git" not in path.parts and "node_modules" not in path.parts
+    ]
+    workflow_dir = root / ".github/workflows"
+    for path in sorted((*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml"))):
+        sources.extend(_workflow_powershell_blocks(path))
+    return sources
+
+
+def _masked_code(text):
+    """Mask strings, comments, and here-string bodies while preserving line numbers."""
+    output = []
+    quote = None
+    quote_line = None
+    here_end = None
+    here_line = None
+    for line_number, line in enumerate(text.splitlines(), 1):
+        masked = [" "] * len(line)
+        if here_end is not None:
+            if line.startswith(here_end):
+                tail = line[len(here_end):]
+                if not tail.strip() or tail.lstrip().startswith(HASH):
+                    here_end = None
+                    here_line = None
+            output.append("".join(masked))
+            continue
+
+        index = 0
+        while index < len(line):
+            char = line[index]
+            if quote is not None:
+                if quote == "'" and char == "'" and index + 1 < len(line) and line[index + 1] == "'":
+                    index += 2
+                    continue
+                if quote == '"' and char == "`":
+                    index += 2
+                    continue
+                if char == quote:
+                    quote = None
+                    quote_line = None
+                index += 1
+                continue
+            if char == HASH:
+                break
+            if line[index:index + 2] in ("@'", '@"') and not line[index + 2:].strip():
+                here_end = "'@" if line[index:index + 2] == "@'" else '"@'
+                here_line = line_number
+                index = len(line)
+                break
+            if char in ("'", '"'):
+                quote = char
+                quote_line = line_number
+                index += 1
+                continue
+            masked[index] = char
+            index += 1
+        output.append("".join(masked))
+
+    hazards = []
+    if here_end is not None:
+        hazards.append((here_line, "unclosed-here-string"))
+    if quote is not None:
+        hazards.append((quote_line, "unclosed-string"))
+    return output, hazards
+
+
+def syntax_hazards(text):
+    masked_lines, hazards = _masked_code(text)
+    source_lines = text.splitlines()
+    for line_number, line in enumerate(source_lines, 1):
+        stripped = line.lstrip().lstrip("\ufeff")
+        if not masked_lines[line_number - 1].strip():
+            continue
+        if LEADING_OPERATOR.match(stripped):
+            hazards.append((line_number, "line-leading-operator"))
+        elif LEADING_METHOD.match(stripped):
+            hazards.append((line_number, "line-leading-method"))
+
+    delimiters = {"}": "{", ")": "(", "]": "["}
+    opening = set(delimiters.values())
+    stack = []
+    for line_number, line in enumerate(masked_lines, 1):
+        for column, char in enumerate(line):
+            if char in opening:
+                stack.append((char, line_number, column + 1))
+            elif char in delimiters:
+                if not stack or stack[-1][0] != delimiters[char]:
+                    hazards.append((line_number, "unbalanced-delimiter"))
+                else:
+                    stack.pop()
+    hazards.extend((line_number, "unbalanced-delimiter") for _char, line_number, _column in stack)
+    return sorted(set(hazards))
+
+
+class PowerShellStaticTests(unittest.TestCase):
+    def test_repository_scripts_and_workflow_blocks_have_no_static_parse_hazards(self):
+        sources = powershell_sources()
+        self.assertTrue(sources, "PowerShell source inventory is empty")
+        workflow_sources = [source for source in sources if source.name.startswith(".github/workflows/")]
+        self.assertGreaterEqual(len(workflow_sources), 50)
+        workflow_names = {source.name for source in workflow_sources}
+        self.assertIn(".github/workflows/devlane-encrypted.yml run block", workflow_names)
+        self.assertIn(".github/workflows/windows-confinement.yml run block", workflow_names)
+        failures = []
+        for source in sources:
+            for line_number, hazard in syntax_hazards(source.text):
+                failures.append(f"{source.name}:{source.first_line + line_number - 1}: {hazard}")
+        self.assertEqual(failures, [])
+
+    def test_checker_rejects_line_leading_operators_methods_and_open_constructs(self):
+        sample = "if ($x -eq 1)\n    -or $y -eq 2\n| ForEach-Object {}\n.Trim()\nif ($open) {\n$x = @'\nbody\n"
+        hazards = {hazard for _line, hazard in syntax_hazards(sample)}
+        self.assertIn("line-leading-operator", hazards)
+        self.assertIn("line-leading-method", hazards)
+        self.assertIn("unclosed-here-string", hazards)
+        self.assertIn("unbalanced-delimiter", hazards)
+        self.assertEqual(syntax_hazards("$value = @'\ntext\n'@\n"), [])
+        self.assertEqual(syntax_hazards('"value" | Add-Content\n'), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -177,7 +177,7 @@ jobs:
       - name: Claim a synthetic bundle permit
         run: |
           set -euo pipefail
-          export CI_RUN_ID="$GITHUB_RUN_ID" CI_RUN_ATTEMPT=1 CI_CONTROL_RUN_ID="$GITHUB_RUN_ID"
+          export CI_RUN_ID="$GITHUB_RUN_ID" CI_RUN_ATTEMPT=1 CI_CONTROL_RUN_ID="$GITHUB_RUN_ID" DEVLANE_PLATFORM=linux
           export DEVLANE_PROFILE=core-node DEVLANE_WAVE_ID=synthetic-wave-0001 DEVLANE_BUNDLE_ID="synthetic-bundle-$GITHUB_RUN_ID"
           export DEVLANE_EXPIRES="$(( $(date +%s) + 3000 ))"
           mkdir -m 700 -p "$RUNNER_TEMP/devlane-bundle-permit"
@@ -216,7 +216,7 @@ jobs:
       - name: Verify the restored permit and refuse a second claim
         run: |
           set -euo pipefail
-          export CI_RUN_ID="$GITHUB_RUN_ID" CI_RUN_ATTEMPT=1 CI_CONTROL_RUN_ID="$GITHUB_RUN_ID"
+          export CI_RUN_ID="$GITHUB_RUN_ID" CI_RUN_ATTEMPT=1 CI_CONTROL_RUN_ID="$GITHUB_RUN_ID" DEVLANE_PLATFORM=linux
           export DEVLANE_PROFILE=core-node DEVLANE_WAVE_ID=synthetic-wave-0001 DEVLANE_BUNDLE_ID="synthetic-bundle-$GITHUB_RUN_ID"
           export DEVLANE_EXPIRES="$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["expires"])' "$RUNNER_TEMP/devlane-bundle-permit/permit.json")"
           python3 -B kit/devlane/permit.py verify-claim --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json" >/dev/null
@@ -244,6 +244,7 @@ jobs:
           quiet rust-v2-preparation-tests bounded python3 -B kit/devlane/test_rust_preparation_v2.py
           quiet rust-v2-lock-tests bounded python3 -B kit/devlane/test_rust_lock_generation.py
           quiet rust-v2-source-tests bounded python3 -B kit/devlane/test_source_projection.py
+          quiet powershell-static-regression bounded python3 -B kit/devlane/test_powershell_static.py
           cargo_path="$(rustup which --toolchain 1.99.1 cargo)"
           rustc_path="$(rustup which --toolchain 1.99.1 rustc)"
           quiet rust-v2-public-runtime bounded sudo -n unshare --mount --pid --fork --mount-proc \

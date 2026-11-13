@@ -812,6 +812,15 @@ class PostCutBaselineStagingAcceptanceTests(unittest.TestCase):
 
 
 class OneRunPermitAcceptanceTests(unittest.TestCase):
+    def test_synthetic_permit_claim_and_restore_verify_export_linux_platform(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/devlane-synthetic.yml").read_text(
+            encoding="utf-8"
+        )
+        for name in ("Claim a synthetic bundle permit", "Verify the restored permit and refuse a second claim"):
+            with self.subTest(step=name):
+                block = workflow.split("      - name: " + name + "\n", 1)[1].split("\n      - name:", 1)[0]
+                self.assertIn("DEVLANE_PLATFORM=linux", block)
+
     def _environment(self, **changes):
         environment = {
             "CI_SHA": CONTROL_SHA, "CI_CONTROL_RUN_ID": "12345", "DEVLANE_PLATFORM": "linux", "DEVLANE_PROFILE": "core-node",

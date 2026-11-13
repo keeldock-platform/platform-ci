@@ -1123,11 +1123,11 @@ jobs:
           $env:RUN_ROOT = $runRoot
           Add-Content -LiteralPath $env:GITHUB_ENV -Value ('RUN_ROOT=' + $runRoot) -Encoding utf8
           $started = Join-Path $runRoot 'deadline-start'
-          if ($env:CI_REPOSITORY -ne 'keeldock-platform/platform-ci' -or $env:CI_REPOSITORY_ID -ne '1430960557'
-              -or $env:CI_SERVER_URL -ne 'https://github.com' -or $env:CI_EVENT_NAME -ne 'workflow_dispatch'
-              -or $env:CI_REF -ne 'refs/heads/main' -or $env:DEVLANE_PLATFORM -ne 'windows'
-              -or $env:DEVLANE_PROFILE -ne 'core-node' -or $env:CI_RUN_ATTEMPT -ne '1'
-              -or $env:CI_SHA -notmatch '^[a-f0-9]{40}$') { exit 1 }
+          if ($env:CI_REPOSITORY -ne 'keeldock-platform/platform-ci' -or $env:CI_REPOSITORY_ID -ne '1430960557' -or
+              $env:CI_SERVER_URL -ne 'https://github.com' -or $env:CI_EVENT_NAME -ne 'workflow_dispatch' -or
+              $env:CI_REF -ne 'refs/heads/main' -or $env:DEVLANE_PLATFORM -ne 'windows' -or
+              $env:DEVLANE_PROFILE -ne 'core-node' -or $env:CI_RUN_ATTEMPT -ne '1' -or
+              $env:CI_SHA -notmatch '^[a-f0-9]{40}$') { exit 1 }
           python -B -c 'import os,sys,time; fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600); f=os.fdopen(fd,"w",encoding="ascii"); f.write("%.17g\n" % time.monotonic()); f.flush(); os.fsync(f.fileno()); f.close()' $started
           if ($LASTEXITCODE -ne 0) { exit 1 }
           git -C $env:CI_WORKSPACE init -q 2>$null
