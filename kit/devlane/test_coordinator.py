@@ -349,7 +349,9 @@ class RunLifecycleTests(unittest.TestCase):
             _write_record(ledger, record)
             run = {"id": 54321, "path": coordinator.fetch.WORKFLOW_PATH, "head_branch": "main",
                    "head_sha": CONTROL_SHA, "event": "workflow_dispatch", "run_attempt": 1}
-            response = {"total_count": 2, "jobs": [{"name": "run"}, {"name": "audit"}]}
+            response = {"total_count": 4, "jobs": [
+                {"name": "run"}, {"name": "macos"}, {"name": "windows"}, {"name": "audit"},
+            ]}
             observed = {}
 
             def validate(_api, _jobs, identity, _profile):
@@ -359,10 +361,29 @@ class RunLifecycleTests(unittest.TestCase):
             with mock.patch.object(coordinator, "_gh_json", return_value=response), \
                     mock.patch.object(coordinator, "_verify_wave_marker"), \
                     mock.patch.object(coordinator.public_audit, "validate_final_public_surfaces", side_effect=validate), \
-                    mock.patch.object(coordinator, "_preserve_diagnostics"), \
+                    mock.patch.object(coordinator, "_preserve_diagnostics") as preserve, \
                     mock.patch.object(coordinator, "_cli_token", return_value="opaque"):
                 self.assertEqual(coordinator._terminal_audit_disposition("54321", record, run, ledger), "accepted")
             self.assertEqual(observed["platform"], "macos")
+            preserve.assert_called_once_with(ledger, record, [])
+
+    def test_terminal_audit_preserves_the_historical_two_job_count_only_for_legacy_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = self._ledger(temporary)
+            record = _ledger_record(state="run-attached")
+            record["control_sha"] = coordinator.public_audit.LEGACY_ENCRYPTED_CONTROL_SHA
+            record.update({"run_id": "54321", "authorized_run_id": "54321", "run_attempt": 1})
+            run = {"id": 54321, "path": coordinator.fetch.WORKFLOW_PATH, "head_branch": "main",
+                   "head_sha": record["control_sha"], "event": "workflow_dispatch", "run_attempt": 1}
+            response = {"total_count": 2, "jobs": [{"name": "run"}, {"name": "audit"}]}
+
+            with mock.patch.object(coordinator, "_gh_json", return_value=response), \
+                    mock.patch.object(coordinator, "_verify_wave_marker"), \
+                    mock.patch.object(coordinator.public_audit, "validate_final_public_surfaces",
+                                      return_value={"records": []}), \
+                    mock.patch.object(coordinator, "_preserve_diagnostics"), \
+                    mock.patch.object(coordinator, "_cli_token", return_value="opaque"):
+                self.assertEqual(coordinator._terminal_audit_disposition("54321", record, run, ledger), "accepted")
 
     def test_decrypt_watch_uses_one_two_hour_deadline_for_every_platform(self):
         self.assertEqual(coordinator.DECRYPT_WATCH_TIMEOUT_SECONDS, 7200)

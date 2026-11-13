@@ -1075,7 +1075,8 @@ def _terminal_audit_disposition(run_id, record, run, root=None):
         public = public_audit.validate_final_public_surfaces(
             public_audit.GitHubAPI(_cli_token()), jobs, identity, record["profile"],
         )
-        if response.get("total_count") != 2:
+        expected_job_count = 2 if public_audit._legacy_encrypted_workflow_path(identity) else 4
+        if response.get("total_count") != expected_job_count:
             return "refused"
         _verify_wave_marker(run_id, record, run)
     except Exception:
