@@ -256,6 +256,16 @@ class MacProfileTests(unittest.TestCase):
 
 
 class MacRoundOneRegressionTests(unittest.TestCase):
+    def test_root_identity_parses_the_directory_services_uid_inventory(self):
+        names, raw_ids, normalized_ids = sandbox._directory_service_uid_inventory(
+            b"root 0\nrunner 501\nnobody -2\n_analyticsd 272\n"
+        )
+        self.assertEqual(names, {"root", "runner", "nobody", "_analyticsd"})
+        self.assertEqual(raw_ids, [0, 501, -2, 272])
+        self.assertEqual(normalized_ids, {0, 501, 4294967294, 272})
+        with self.assertRaisesRegex(sandbox.Refusal, "macos-user-list"):
+            sandbox._directory_service_uid_inventory(b"runner not-a-uid\n")
+
     def test_preflight_refusal_names_the_fixed_failed_directory_services_stage(self):
         stderr = io.StringIO()
         state = Path(PRIVATE_RUN + "/state")

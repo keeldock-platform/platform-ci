@@ -30,6 +30,9 @@ import supervisor as linux_supervisor
 
 WORKER_NAME_PREFIX = "kddevlane"
 WORKER_GROUP = 20
+DARWIN_SIGNED_UID_MIN = -(1 << 31)
+DARWIN_UID_MAX = (1 << 32) - 1
+DARWIN_UID_MODULUS = 1 << 32
 MAX_OUTPUT_BYTES = 256 * 1024 * 1024
 MAX_LOG_BYTES = 256 * 1024 * 1024
 MAX_PATH_BYTES = 4096
@@ -817,6 +820,39 @@ def _directory_service(argv, refusal, *, timeout=10):
     return result
 
 
+def _parse_darwin_uid(value):
+    if re.fullmatch(r"-?[0-9]+", value) is None:
+        return None
+    try:
+        parsed = int(value, 10)
+    except ValueError:
+        return None
+    if parsed < DARWIN_SIGNED_UID_MIN or parsed > DARWIN_UID_MAX:
+        return None
+    return parsed, parsed % DARWIN_UID_MODULUS
+
+
+def _directory_service_uid_inventory(payload):
+    try:
+        lines = payload.decode("ascii", "strict").splitlines()
+    except UnicodeDecodeError:
+        _refuse("macos-user-list")
+    raw_ids = []
+    normalized_ids = set()
+    names = set()
+    for line in lines:
+        fields = line.split()
+        if len(fields) != 2 or re.fullmatch(r"[A-Za-z0-9._-]+", fields[0]) is None:
+            _refuse("macos-user-list")
+        parsed = _parse_darwin_uid(fields[1])
+        if parsed is None or fields[0] in names:
+            _refuse("macos-user-list")
+        names.add(fields[0])
+        raw_ids.append(parsed[0])
+        normalized_ids.add(parsed[1])
+    return names, raw_ids, normalized_ids
+
+
 def _root_identity(args):
     state, _ = _state_paths(args.state_dir)
     workspace = _safe_path(args.workspace, must_exist=True)
@@ -855,23 +891,12 @@ def _root_identity(args):
         _refuse("tool-path-invalid")
     account = WORKER_NAME_PREFIX + run_id
     listing = _directory_service(("/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"), "macos-user-list")
-    raw_ids = []
-    names = set()
-    try:
-        for line in listing.stdout.decode("ascii", "strict").splitlines():
-            fields = line.split()
-            if len(fields) != 2:
-                _refuse("macos-user-list")
-            names.add(fields[0])
-            parsed = boundary_guard._parse_darwin_uid(fields[1])
-            if parsed is None:
-                _refuse("macos-user-list")
-            raw_ids.append(parsed[0])
-    except UnicodeDecodeError:
-        _refuse("macos-user-list")
+    names, raw_ids, normalized_ids = _directory_service_uid_inventory(listing.stdout)
     if account in names:
         _refuse("macos-user-name-conflict")
     uid = max((item for item in raw_ids if 500 <= item < 60000), default=500) + 1
+    while uid in normalized_ids and uid < 60000:
+        uid += 1
     if uid >= 60000:
         _refuse("macos-user-id-exhausted")
     host_identity = {
