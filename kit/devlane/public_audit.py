@@ -20,6 +20,7 @@ from macos_public_audit import (
 )
 import diagnostic_contract
 import network_probe
+import supervisor
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -153,14 +154,6 @@ PUBLIC_CODES = frozenset({
     "E0001", "E0002", "E0277", "E0308", "E0425", "E0432", "E0599", "E0609",
     "DEVLANE_FAILURE",
 })
-REFUSAL_LINE = re.compile(
-    r"(?:(?:devlane_refusal|devlane_supervisor_refusal|dependency_preparation_refusal|"
-    r"devlane_deadline_refusal|devlane_macos_preflight_refusal|devlane_windows_preflight_refusal|"
-    r"devlane_bootstrap_refusal)"
-    r"=(?:[a-z0-9-]{1,64}|node-snapshot-manifest-invalid:"
-    r"(?:link-row-path|source-row-kind|manifest-open|manifest-metadata|manifest-race|"
-    r"manifest-missing|manifest-shape|manifest-digest|unlisted-site)))\Z"
-)
 NETWORK_PROBE_SUPERVISOR_PREFIX = "devlane_supervisor_refusal=network-probe-refusal:"
 NETWORK_PROBE_SUPERVISOR_CODES = {
     "devlane_supervisor_refusal=network-probe-command-failed": "probe-command-failed",
@@ -186,6 +179,11 @@ DECRYPT_CHILD_ERROR_CODES = frozenset((
 AUDIT_REFUSAL_CODES = frozenset(("audit-contract", "audit-internal"))
 WINDOWS_BOOTSTRAP_REFUSAL_CODES = frozenset((
     "deadline-start-invalid", "deadline-file-invalid", "deadline-budget-invalid", "deadline-failed",
+))
+BOOTSTRAP_REFUSAL_CODES = frozenset((
+    "bootstrap-run-root", "bootstrap-start-marker", "bootstrap-reap-unconfirmed",
+    "bootstrap-work-deadline", "bootstrap-command-timeout", "bootstrap-command-failed",
+    "dispatch-identity", "bootstrap-origin-mismatch", "bootstrap-sha-mismatch",
 ))
 WINDOWS_PREFLIGHT_REFUSAL_CODES = frozenset((
     "windows-admin-check-failed", "windows-admin-required", "windows-error-reporting-policy",
@@ -222,6 +220,46 @@ AUDIT_OUTCOME_LINES = frozenset((
 DECRYPT_FAILURE_CODES = frozenset((
     "decrypt-key-unavailable", "decrypt-manifest-unavailable", "decrypt-rejected", "decrypt-timeout",
 ))
+WINDOWS_RUNNER_REFUSAL_CODES = frozenset(("windows-runner-failed", "boundary"))
+FETCH_REFUSAL_CODES = diagnostic_contract.PREPARATION_REFUSAL_CODES | frozenset(("fetch-failed",))
+SUPERVISOR_START_REFUSAL_CODES = (
+    supervisor.STARTUP_REFUSAL_CODES | supervisor.STARTUP_DIAGNOSTIC_CODES
+    | frozenset(("supervisor-failed", "supervisor-start-failed", "supervisor-start-timeout", "runner-unknown"))
+)
+SUPERVISOR_EXECUTION_REFUSAL_CODES = (
+    supervisor.REFUSAL_CODES - supervisor.NETWORK_PROBE_DIAGNOSTIC_CODES
+    - supervisor.DECRYPT_REFUSAL_CODES - supervisor.STARTUP_DIAGNOSTIC_CODES
+)
+SUPERVISOR_CLEANUP_REFUSAL_CODES = frozenset((
+    "cleanup-incomplete", "cleanup-process-remains", "cleanup-receipt-invalid", "cleanup-root-invalid",
+    "supervisor-failed", "supervisor-operation-failed",
+)) | frozenset("cleanup-incomplete:" + code for code in (
+    "umount-busy", "umount-missing", "tree-remove", "process-alive", "cgroup-nonempty",
+))
+MACOS_DECRYPT_SUPERVISOR_REFUSAL_CODES = DECRYPT_FAILURE_CODES | frozenset((
+    "decrypt-order", "bundle-binding-mismatch", "supervisor-failed", "supervisor-operation-failed",
+))
+
+
+def _code_alternative(codes):
+    return "(?:" + "|".join(re.escape(code) for code in sorted(codes, key=lambda item: (-len(item), item))) + ")"
+
+
+REFUSAL_LINE = re.compile(
+    r"(?:devlane_refusal=" + _code_alternative(FETCH_REFUSAL_CODES | WINDOWS_RUNNER_REFUSAL_CODES)
+    + r"|devlane_supervisor_refusal=" + _code_alternative(
+        supervisor.REFUSAL_CODES | SUPERVISOR_START_REFUSAL_CODES | SUPERVISOR_CLEANUP_REFUSAL_CODES
+        | MACOS_DECRYPT_SUPERVISOR_REFUSAL_CODES
+    )
+    + r"|dependency_preparation_refusal=runner-unknown"
+    + r"|devlane_deadline_refusal=" + _code_alternative(WINDOWS_BOOTSTRAP_REFUSAL_CODES)
+    + r"|devlane_bootstrap_refusal=" + _code_alternative(BOOTSTRAP_REFUSAL_CODES)
+    + r"|devlane_macos_preflight_refusal=" + _code_alternative(MACOS_PREFLIGHT_REFUSAL_CODES)
+    + r"|devlane_windows_preflight_refusal=" + _code_alternative(WINDOWS_PREFLIGHT_REFUSAL_CODES)
+    + r")\Z"
+)
+
+
 def cache_line_patterns(key, temp=TEMP, platform="linux"):
     """Output lines of the pinned cache actions, bound to the one key the step may use."""
     escaped = re.escape(key)
@@ -570,6 +608,46 @@ class _Grammar:
             return "devlane-permit-v1-" + str(identity.get("bundle_id"))
         return None
 
+    def refusal_line_ok(self, step_name, line):
+        """Accept only a fixed refusal vocabulary at the step that emits it."""
+        prefix, separator, code = line.partition("=")
+        if not separator or not code:
+            return False
+        if prefix == "devlane_refusal":
+            if (step_name == "Fetch ciphertext and sanitized dependency projection"
+                    and code in FETCH_REFUSAL_CODES):
+                return True
+            windows_steps = {
+                "Prepare dependencies before the cut", "Prove public connectivity before the cut",
+                "Cut network and start the isolated supervisor", "Probe isolation before decryption",
+                "Execute offline profile and filter public summary", "Shred runner-local workspace",
+            }
+            return (self.job_runner == "windows-2025" and step_name in windows_steps
+                    and code in WINDOWS_RUNNER_REFUSAL_CODES)
+        if prefix == "dependency_preparation_refusal":
+            return step_name == "Prepare dependencies before the cut" and code == "runner-unknown"
+        if prefix != "devlane_supervisor_refusal":
+            return False
+        if step_name == "Cut network and start the isolated supervisor":
+            if self.job_runner == "macos-15":
+                return code == "supervisor-failed"
+            return self.job_runner != "windows-2025" and code in SUPERVISOR_START_REFUSAL_CODES
+        if step_name == "Probe isolation before decryption":
+            return self.job_runner != "windows-2025" and code == "supervisor-failed"
+        if step_name == "Decrypt authenticated bundle":
+            if self.job_runner == "macos-15":
+                return code in MACOS_DECRYPT_SUPERVISOR_REFUSAL_CODES
+            return False
+        if step_name == "Execute offline profile and filter public summary":
+            if self.job_runner == "macos-15":
+                return code == "supervisor-failed"
+            return self.job_runner != "windows-2025" and code in SUPERVISOR_EXECUTION_REFUSAL_CODES
+        if step_name == "Shred runner-local workspace":
+            if self.job_runner == "macos-15":
+                return code == "supervisor-failed"
+            return self.job_runner != "windows-2025" and code in SUPERVISOR_CLEANUP_REFUSAL_CODES
+        return False
+
     def step_output_ok(self, step_name, line, public_counts):
         """Fixed output lines, each bound to the step that is allowed to print it."""
         step = next((item for item in self.steps if item["name"] == step_name), None)
@@ -590,6 +668,16 @@ class _Grammar:
             if (self.job_runner != "windows-2025"
                     or step_name != "Fetch public control and validate dispatch"
                     or code not in WINDOWS_BOOTSTRAP_REFUSAL_CODES):
+                return False
+            public_counts["early_failure_marker"] = public_counts.get("early_failure_marker", 0) + 1
+            public_counts["early_failure_step"] = step_name
+            public_counts["early_failure_code"] = code
+            return public_counts["early_failure_marker"] == 1
+        if line.startswith("devlane_bootstrap_refusal="):
+            code = line[len("devlane_bootstrap_refusal="):]
+            if (self.job_runner == "windows-2025"
+                    or step_name != "Fetch public control and validate dispatch"
+                    or code not in BOOTSTRAP_REFUSAL_CODES):
                 return False
             public_counts["early_failure_marker"] = public_counts.get("early_failure_marker", 0) + 1
             public_counts["early_failure_step"] = step_name
@@ -803,7 +891,7 @@ class _Grammar:
             if line.startswith("KD-DEVLANE-DISPATCH "):
                 public_counts["dispatch"] = public_counts.get("dispatch", 0) + 1
                 return True
-        if REFUSAL_LINE.fullmatch(line) or line == "devlane_permit=refused":
+        if self.refusal_line_ok(step_name, line) or line == "devlane_permit=refused":
             return True
         return False
 
@@ -1597,7 +1685,16 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         elif (counts.get("devlane_acceptance=pass") != 1 or counts.get("acceptance_refused")
               or counts.get("devlane_linux_probe=pass") != 1):
             _refuse()
+    failure_stage = None
+    if early_failure is not None:
+        failure_stage = early_failure
+    elif counts.get("network_probe_failed_exit") == 1:
+        failure_stage = "Probe isolation before decryption"
+    elif counts.get("decrypt_failed_exit") == 1:
+        failure_stage = "Decrypt authenticated bundle"
     return {"records": [record.encode("ascii") for record in records], "early_failure": early_failure,
+            "early_failure_code": counts.get("early_failure_code"),
+            "early_failure_exit": counts.get("early_failure_exit"), "failure_stage": failure_stage,
             "counts": counts if job_name == AUDIT_JOB else None}
 
 
@@ -1740,7 +1837,8 @@ def validate_job_contract(jobs, identity, profile):
     if run_job.get("conclusion") == "failure" and len(pre_probe_failures) == 1:
         candidate = pre_probe_failures[0]
         platform_early_steps = {
-            "macos": {"Prepare hosted runner isolation state"},
+            "linux": {"Fetch public control and validate dispatch"},
+            "macos": {"Fetch public control and validate dispatch", "Prepare hosted runner isolation state"},
             "windows": {"Fetch public control and validate dispatch", "Prepare hosted Windows isolation state"},
         }.get(platform, set())
         if candidate in platform_early_steps:
@@ -1920,6 +2018,98 @@ def _audit_outcome_line(jobs, identity):
             "disposition=run-failed-" + suffix)
 
 
+def validate_job_log_metadata_binding(surface, run_job, identity):
+    """Bind failure evidence in the active job log to its completed job and step metadata."""
+    if type(surface) is not dict or type(run_job) is not dict:
+        _refuse()
+    conclusion = run_job.get("conclusion")
+    steps = _steps(run_job)
+    step_by_name = {step.get("name"): step for step in steps}
+    failed = [step.get("name") for step in steps
+              if step.get("status") == "completed" and step.get("conclusion") == "failure"]
+    early_failure = surface.get("early_failure")
+    failure_stage = surface.get("failure_stage")
+    if early_failure is not None:
+        code = surface.get("early_failure_code")
+        if early_failure == "Fetch public control and validate dispatch":
+            allowed = (
+                identity.get("platform") == "windows" and code in WINDOWS_BOOTSTRAP_REFUSAL_CODES
+            ) or (
+                identity.get("platform") in ("linux", "macos") and code in BOOTSTRAP_REFUSAL_CODES
+            )
+        elif early_failure == "Prepare hosted Windows isolation state":
+            allowed = (identity.get("platform") == "windows" and code in WINDOWS_PREFLIGHT_REFUSAL_CODES)
+        elif early_failure == "Prepare hosted runner isolation state":
+            allowed = (identity.get("platform") == "macos" and code in MACOS_PREFLIGHT_REFUSAL_CODES)
+        else:
+            allowed = False
+        failed_step = step_by_name.get(early_failure)
+        if (not allowed or conclusion != "failure" or failed != [early_failure]
+                or type(surface.get("early_failure_exit")) is not int
+                or surface["early_failure_exit"] not in (1, 2)
+                or type(failed_step) is not dict or failed_step.get("status") != "completed"
+                or failed_step.get("conclusion") != "failure" or failure_stage != early_failure):
+            _refuse()
+        names = [step.get("name") for step in steps]
+        failed_index = names.index(early_failure)
+        cleanup = step_by_name.get("Shred runner-local workspace")
+        if (type(cleanup) is not dict or cleanup.get("status") != "completed"
+                or cleanup.get("conclusion") != "success"):
+            _refuse()
+        for name in names[failed_index + 1:]:
+            if name == "Shred runner-local workspace":
+                continue
+            downstream = step_by_name[name]
+            if downstream.get("status") != "completed" or downstream.get("conclusion") != "skipped":
+                _refuse()
+        outcome = _audit_outcome_line([run_job], identity)
+        disposition = EARLY_FAILURE_STEP_IDS.get(early_failure)
+        expected_disposition = "disposition=run-failed-at-" + str(disposition)
+        if (disposition is None or expected_disposition not in outcome
+                or outcome == "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed"):
+            _refuse()
+        return
+
+    if surface.get("early_failure_exit") is not None:
+        _refuse()
+    if conclusion == "success":
+        if failed or failure_stage is not None:
+            _refuse()
+        return
+    if conclusion == "failure":
+        if len(failed) != 1:
+            _refuse()
+        failed_step = failed[0]
+        if failed_step in EARLY_FAILURE_STEP_IDS:
+            _refuse()
+        if failed_step in ("Probe isolation before decryption", "Decrypt authenticated bundle"):
+            if failure_stage != failed_step:
+                _refuse()
+            cleanup = step_by_name.get("Shred runner-local workspace")
+            if (type(cleanup) is not dict or cleanup.get("status") != "completed"
+                    or cleanup.get("conclusion") != "success"):
+                _refuse()
+            names = [step.get("name") for step in steps]
+            failed_index = names.index(failed_step)
+            for name in names[failed_index + 1:]:
+                if name == "Shred runner-local workspace":
+                    continue
+                downstream = step_by_name[name]
+                if downstream.get("status") != "completed" or downstream.get("conclusion") != "skipped":
+                    _refuse()
+            return
+        if failed_step == "Execute offline profile and filter public summary":
+            if failure_stage is not None:
+                _refuse()
+            return
+        _refuse()
+    if conclusion in ("cancelled", "timed_out"):
+        if failed or failure_stage is not None:
+            _refuse()
+        return
+    _refuse()
+
+
 def audit_environment(env):
     required = (
         "CI_REPOSITORY", "CI_REPOSITORY_ID", "CI_EVENT_NAME", "CI_REF", "CI_SHA", "CI_CONTROL_RUN_ID",
@@ -1969,6 +2159,7 @@ def run_audit(api, identity):
     run_job = jobs[active_name]
     log = api.log_text(run_job["id"])
     surface = validate_job_log_surface(log, active_name, identity, completed=True)
+    validate_job_log_metadata_binding(surface, run_job, identity)
     validate_dispatch_marker(log, identity, allow_missing=surface["early_failure"] is not None)
     artifacts, _ = api.json(prefix + "/artifacts?per_page=100&page=1")
     if (type(artifacts) is not dict or artifacts.get("total_count") != 0
@@ -2051,6 +2242,7 @@ def validate_final_public_surfaces(api, jobs, identity, profile):
         log = surface.get("log")
         surface_result = validate_job_log_surface(log, job_name, identity, completed=True)
         if job_name == active_name:
+            validate_job_log_metadata_binding(surface_result, job, identity)
             public_records = surface_result["records"]
             validate_dispatch_marker(log, identity, allow_missing=surface_result["early_failure"] is not None)
         elif surface_result.get("counts", {}).get("devlane_audit_outcome_line") != _audit_outcome_line(
