@@ -685,8 +685,24 @@ jobs:
               "--started-at-file", start_file,
           ])
           PY
-          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
-            python3 -B -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; import cryptography; assert AESGCM is not None and cryptography.__version__'
+          crypto_target="$RUN_ROOT/control-python-deps"
+          crypto_refuse() {
+            printf 'devlane_bootstrap_refusal=%s\n' "$1" >&2
+            exit 1
+          }
+          [[ "$(python3 -B -c 'import sys; print("%d.%d" % sys.version_info[:2])')" == "3.15" ]] || crypto_refuse crypto-dependency-verification-failed
+          if ! python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            python3 -B -m pip install --quiet --disable-pip-version-check --no-input --no-cache-dir \
+              --index-url https://pypi.org/simple --target "$crypto_target" --require-hashes \
+              --only-binary=:all: --no-deps -r "$GITHUB_WORKSPACE/kit/devlane/control-crypto-requirements.txt" \
+              >/dev/null 2>&1; then
+            crypto_refuse crypto-dependency-install-failed
+          fi
+          export PYTHONPATH="$crypto_target"
+          printf 'PYTHONPATH=%s\n' "$crypto_target" >> "$GITHUB_ENV"
+          if ! python3 -B -c 'import cffi, cryptography, pycparser; from cryptography.hazmat.primitives.ciphers.aead import AESGCM; assert (cffi.__version__, cryptography.__version__, pycparser.__version__) == ("2.1.1", "50.0.2", "3.12") and AESGCM is not None' >/dev/null 2>&1; then
+            crypto_refuse crypto-dependency-verification-failed
+          fi
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             python3 -B kit/devlane/fetch.py context --output "$RUN_ROOT/context.json"
       - name: Set up pinned macOS Node runtime
@@ -696,13 +712,6 @@ jobs:
           check-latest: false
           cache: ""
           package-manager-cache: false
-      - name: Install pinned macOS npm runtime
-        run: |
-          set -euo pipefail
-          npm install --global --ignore-scripts --no-audit --no-fund --silent npm@11.19.1
-          [[ "$(node --version)" == "v24.22.1" ]]
-          [[ "$(npm --version)" == "11.19.1" ]]
-          printf 'macos_node_runtime=ready\n'
       - name: Prepare hosted runner isolation state
         timeout-minutes: 2
         run: |
@@ -711,6 +720,20 @@ jobs:
             [[ -n "$RUN_ROOT" ]] || { printf 'devlane_macos_preflight_refusal=macos-run-root-missing\n' >&2; exit 1; }
             mkdir -m 700 "$RUN_ROOT/state" || { printf 'devlane_macos_preflight_refusal=macos-state-directory-create\n' >&2; exit 1; }
             command -v python3 >/dev/null 2>&1 || { printf 'devlane_macos_preflight_refusal=macos-python3-unavailable\n' >&2; exit 1; }
+            macos_preflight_refuse() {
+              printf 'devlane_macos_preflight_refusal=%s\n' "$1" >&2
+              exit 1
+            }
+            [[ "$(node --version 2>/dev/null)" == "v24.22.1" ]] || macos_preflight_refuse node-runtime-version-invalid
+            npm_prefix="$RUN_ROOT/control-npm"
+            mkdir -m 700 "$npm_prefix" || macos_preflight_refuse npm-runtime-install-failed
+            if ! npm install --global --prefix "$npm_prefix" --ignore-scripts --no-audit --no-fund --silent npm@11.19.1 \
+              >/dev/null 2>&1; then
+              macos_preflight_refuse npm-runtime-install-failed
+            fi
+            export PATH="$npm_prefix/bin:$PATH"
+            printf '%s\n' "$npm_prefix/bin" >> "$GITHUB_PATH"
+            [[ "$(npm --version 2>/dev/null)" == "11.19.1" ]] || macos_preflight_refuse npm-runtime-version-invalid
             python3 -B kit/devlane/sandbox_macos.py preflight \
               --state-dir "$RUN_ROOT/state" --workspace "$GITHUB_WORKSPACE" \
               --profile "$DEVLANE_PROFILE" --run-id "$CI_RUN_ID" --control-sha "$CI_SHA"
@@ -1146,10 +1169,32 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $actualSha.Trim() -ne $env:CI_SHA) { exit 1 }
           python -B kit/devlane/deadline.py create --file (Join-Path $runRoot 'deadline.json') --budget-seconds 8700 --cleanup-reserve-seconds 2100 --job-seconds 10800 --started-at-file $started
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          python -B -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; import cryptography; assert AESGCM is not None and cryptography.__version__'
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          function Refuse-Bootstrap([string]$Code) {
+            Write-Output ('devlane_deadline_refusal=' + $Code)
+            exit 1
+          }
+          $pythonVersion = python -B -c 'import sys; print("%d.%d" % sys.version_info[:2])'
+          if ($LASTEXITCODE -ne 0 -or $pythonVersion.Trim() -ne '3.12') {
+            Refuse-Bootstrap 'crypto-dependency-verification-failed'
+          }
+          $cryptoTarget = Join-Path $runRoot 'control-python-deps'
+          python -B kit/devlane/deadline.py run --file (Join-Path $runRoot 'deadline.json') -- `
+            python -B -m pip install --quiet --disable-pip-version-check --no-input --no-cache-dir `
+              --index-url https://pypi.org/simple --target $cryptoTarget --require-hashes `
+              --only-binary=:all: --no-deps -r (Join-Path $env:CI_WORKSPACE 'kit\devlane\control-crypto-requirements.txt') *> $null
+          if ($LASTEXITCODE -ne 0) { Refuse-Bootstrap 'crypto-dependency-install-failed' }
+          $env:PYTHONPATH = $cryptoTarget
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value ('PYTHONPATH=' + $cryptoTarget) -Encoding utf8
+          python -B -c 'import cffi, cryptography, pycparser; from cryptography.hazmat.primitives.ciphers.aead import AESGCM; assert (cffi.__version__, cryptography.__version__, pycparser.__version__) == ("2.1.1", "50.0.2", "3.12") and AESGCM is not None' *> $null
+          if ($LASTEXITCODE -ne 0) { Refuse-Bootstrap 'crypto-dependency-verification-failed' }
           python -B kit/devlane/fetch.py context --output (Join-Path $runRoot 'context.json')
           if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Set up pinned Windows Node runtime
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: "24.22.1"
+          check-latest: false
+          package-manager-cache: false
       - name: Prepare hosted Windows isolation state
         timeout-minutes: 2
         run: |
@@ -1181,13 +1226,29 @@ jobs:
           if ($parseErrors.Count -ne 0) { Refuse-Preflight 'windows-sandbox-parse' }
           try { $null = Add-Type -Path (Join-Path $sandboxRoot 'sandbox_windows_native.cs') }
           catch { Refuse-Preflight 'windows-sandbox-native-load' }
+          if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+            Refuse-Preflight 'windows-node-runtime-invalid'
+          }
+          $nodeVersion = & node --version 2>$null
+          if ($LASTEXITCODE -ne 0 -or $nodeVersion.Trim() -ne 'v24.22.1') {
+            Refuse-Preflight 'windows-node-runtime-invalid'
+          }
+          $npmPrefix = Join-Path $env:RUN_ROOT 'control-npm'
+          try { New-Item -ItemType Directory -Path $npmPrefix | Out-Null }
+          catch { Refuse-Preflight 'windows-npm-runtime-install-failed' }
+          npm install --global --prefix $npmPrefix --ignore-scripts --no-audit --no-fund --silent npm@11.19.1 *> $null
+          if ($LASTEXITCODE -ne 0) { Refuse-Preflight 'windows-npm-runtime-install-failed' }
+          $env:PATH = $npmPrefix + [IO.Path]::PathSeparator + $env:PATH
+          try { Add-Content -LiteralPath $env:GITHUB_PATH -Value $npmPrefix -Encoding utf8 }
+          catch { Refuse-Preflight 'windows-npm-runtime-install-failed' }
+          if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+            Refuse-Preflight 'windows-npm-runtime-version-invalid'
+          }
+          $npmVersion = & npm --version 2>$null
+          if ($LASTEXITCODE -ne 0 -or $npmVersion.Trim() -ne '11.19.1') {
+            Refuse-Preflight 'windows-npm-runtime-version-invalid'
+          }
           Write-Output 'windows_runner=hosted-admin verified=windows-2025'
-      - name: Set up pinned Windows Node runtime
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
-        with:
-          node-version: "24.22.1"
-          check-latest: false
-          package-manager-cache: false
       - name: Reserve work time for control evidence cache restore
         timeout-minutes: 1
         run: |

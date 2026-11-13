@@ -851,6 +851,81 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                             self.assertRaises(audit.AuditRefusal):
                         audit.validate_job_log_metadata_binding(surface, changed_run, identity)
 
+    def test_new_platform_refusal_codes_keep_their_step_bound_failure_shapes(self):
+        cases = [
+            ("macos", "Prepare hosted runner isolation state",
+             "devlane_macos_preflight_refusal=" + code, 2)
+            for code in (
+                "tool-file-type-invalid", "tool-owner-invalid", "tool-mode-invalid", "tool-symlink", "tool-path-resolve-mismatch",
+                "tool-file-unavailable",
+                "developer-dir-unexpected", "clang-path-invalid", "tool-digest-mismatch",
+                "developer-clang-mismatch",
+            )
+        ]
+        cases.extend(
+            ("macos", "Prepare hosted runner isolation state",
+             "devlane_macos_preflight_refusal=" + code, 2)
+            for code in (
+                "node-runtime-version-invalid", "npm-runtime-install-failed", "npm-runtime-version-invalid",
+            )
+        )
+        cases.extend(
+            ("windows", "Prepare hosted Windows isolation state",
+             "devlane_windows_preflight_refusal=" + code, 1)
+            for code in (
+                "windows-node-runtime-invalid", "windows-npm-runtime-install-failed",
+                "windows-npm-runtime-version-invalid",
+            )
+        )
+        for platform_name in ("macos", "windows"):
+            prefix = "devlane_bootstrap_refusal=" if platform_name == "macos" else "devlane_deadline_refusal="
+            cases.extend(
+                (platform_name, "Fetch public control and validate dispatch", prefix + code, 1)
+                for code in (
+                    "crypto-dependency-install-failed", "crypto-dependency-verification-failed",
+                )
+            )
+
+        for platform_name, failed_step, marker, exit_code in cases:
+            with self.subTest(platform=platform_name, marker=marker):
+                identity = dict(IDENTITY, platform=platform_name)
+                jobs = _encrypted_jobs(platform=platform_name)
+                run_job = next(job for job in jobs
+                               if job["name"] == audit.PLATFORM_RUN_JOBS[platform_name])
+                run_job["conclusion"] = "failure"
+                names = [step["name"] for step in run_job["steps"]]
+                failed_index = names.index(failed_step)
+                for index, step in enumerate(run_job["steps"]):
+                    if step["name"] == "Shred runner-local workspace":
+                        step["conclusion"] = "success"
+                    elif step["name"] == "Install pinned Rust toolchain":
+                        step["conclusion"] = "skipped"
+                    elif index < failed_index:
+                        step["conclusion"] = "success"
+                    elif index == failed_index:
+                        step["conclusion"] = "failure"
+                    else:
+                        step["conclusion"] = "skipped"
+                log = _render_real_runner_encrypted_log(
+                    identity, early_failure={"step": failed_step, "marker": marker, "exit_code": exit_code},
+                )
+                surface = audit.validate_job_log_surface(
+                    log, audit.PLATFORM_RUN_JOBS[platform_name], identity, completed=True,
+                )
+                self.assertEqual(surface["early_failure"], failed_step)
+                self.assertEqual(surface["early_failure_code"], marker.split("=", 1)[1])
+                audit.validate_job_log_metadata_binding(surface, run_job, identity)
+                with self.assertRaises(audit.AuditRefusal):
+                    audit.validate_job_log_surface(
+                        log.replace(marker.encode("ascii"), b"devlane_bootstrap_refusal=private-path", 1),
+                        audit.PLATFORM_RUN_JOBS[platform_name], identity, completed=True,
+                    )
+                changed = copy.deepcopy(run_job)
+                changed_steps = {step["name"]: step for step in changed["steps"]}
+                changed_steps["Shred runner-local workspace"]["conclusion"] = "failure"
+                with self.assertRaises(audit.AuditRefusal):
+                    audit.validate_job_log_metadata_binding(surface, changed, identity)
+
     def test_bootstrap_refusal_vocabulary_is_fixed_and_step_bound(self):
         identity = dict(IDENTITY, platform="linux")
         valid = _render_real_runner_encrypted_log(
@@ -870,6 +945,16 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         ):
             with self.subTest(marker=changed[:180]), self.assertRaises(audit.AuditRefusal):
                 audit.validate_job_log_surface(changed, audit.RUN_JOB, identity, completed=True)
+
+        linux_crypto_failure = _render_real_runner_encrypted_log(
+            identity,
+            early_failure={
+                "step": "Fetch public control and validate dispatch",
+                "marker": "devlane_bootstrap_refusal=crypto-dependency-install-failed", "exit_code": 1,
+            },
+        )
+        with self.assertRaises(audit.AuditRefusal):
+            audit.validate_job_log_surface(linux_crypto_failure, audit.RUN_JOB, identity, completed=True)
 
         after_decrypt = _render_real_runner_encrypted_log(IDENTITY).replace(
             b"authenticated_decryption=pass\n",
@@ -2340,19 +2425,76 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
         steps = encrypted[audit.MACOS_RUN_JOB]["steps"]
         names = [step["name"] for step in steps]
         setup = steps[names.index("Set up pinned macOS Node runtime")]
-        npm = steps[names.index("Install pinned macOS npm runtime")]
-        preflight = names.index("Prepare hosted runner isolation state")
+        preflight_step = steps[names.index("Prepare hosted runner isolation state")]
+        preflight = names.index(preflight_step["name"])
         self.assertEqual(setup["uses"], "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1")
         self.assertEqual(setup["with"], {
             "node-version": "24.22.1", "check-latest": "false", "cache": "",
             "package-manager-cache": "false",
         })
         self.assertLess(names.index(setup["name"]), preflight)
-        self.assertLess(names.index(npm["name"]), preflight)
-        self.assertIn("npm install --global --ignore-scripts --no-audit --no-fund --silent npm@11.19.1",
-                      "\n".join(npm["run"]))
-        self.assertIn('[[ "$(node --version)" == "v24.22.1" ]]', "\n".join(npm["run"]))
-        self.assertIn('[[ "$(npm --version)" == "11.19.1" ]]', "\n".join(npm["run"]))
+        self.assertNotIn("Install pinned macOS npm runtime", names)
+        preflight_script = "\n".join(preflight_step["run"])
+        self.assertIn("npm install --global --prefix", preflight_script)
+        self.assertIn("control-npm", preflight_script)
+        self.assertIn("npm-runtime-install-failed", preflight_script)
+        self.assertIn('"$(node --version 2>/dev/null)" == "v24.22.1"', preflight_script)
+        self.assertIn('"$(npm --version 2>/dev/null)" == "11.19.1"', preflight_script)
+
+    def test_hosted_crypto_runtime_is_hash_pinned_and_stays_out_of_workload_env(self):
+        workflow = audit.parse_workflow(self.root / ".github/workflows/devlane-encrypted.yml")
+        requirements = (self.root / "kit/devlane/control-crypto-requirements.txt").read_text(encoding="ascii")
+        self.assertEqual(
+            [line.split("==", 1)[0] for line in requirements.splitlines() if "==" in line],
+            ["cryptography", "cffi", "pycparser"],
+        )
+        self.assertIn("cryptography==50.0.2", requirements)
+        self.assertIn("cffi==2.1.1", requirements)
+        self.assertIn("pycparser==3.12", requirements)
+        self.assertEqual(requirements.count("--hash=sha256:"), 5)
+        for code in (
+            "crypto-dependency-install-failed", "crypto-dependency-verification-failed",
+            "tool-file-type-invalid", "tool-owner-invalid", "tool-mode-invalid", "tool-symlink", "tool-path-resolve-mismatch",
+            "tool-file-unavailable",
+            "developer-dir-unexpected", "clang-path-invalid", "tool-digest-mismatch",
+            "developer-clang-mismatch", "node-runtime-version-invalid", "npm-runtime-install-failed",
+            "npm-runtime-version-invalid", "windows-node-runtime-invalid",
+            "windows-npm-runtime-install-failed", "windows-npm-runtime-version-invalid",
+        ):
+            self.assertIn(code, refusal_codes.REFUSAL_CODES)
+        for job_key, platform_name in ((audit.MACOS_RUN_JOB, "macos"),
+                                       (audit.WINDOWS_RUN_JOB, "windows")):
+            steps = workflow[job_key]["steps"]
+            bootstrap = next(step for step in steps
+                             if step["name"] == "Fetch public control and validate dispatch")
+            script = "\n".join(bootstrap["run"])
+            self.assertIn("--require-hashes", script)
+            self.assertIn("--only-binary=:all:", script)
+            self.assertIn("--no-deps", script)
+            self.assertIn("--index-url https://pypi.org/simple", script)
+            self.assertIn("control-python-deps", script)
+            self.assertIn("PYTHONPATH", script)
+            expected_python = "3.15" if platform_name == "macos" else "3.12"
+            self.assertIn(("== \"" + expected_python + "\"") if platform_name == "macos"
+                          else ("-ne '" + expected_python + "'"), script)
+            steps = workflow[job_key]["steps"]
+            runtime_label = "macOS" if platform_name == "macos" else "Windows"
+            node_setup_index = next(index for index, step in enumerate(steps)
+                                    if step["name"] == "Set up pinned " + runtime_label + " Node runtime")
+            preflight_step = next(step for step in steps
+                                  if step["name"] == ("Prepare hosted runner isolation state" if platform_name == "macos"
+                                                      else "Prepare hosted Windows isolation state"))
+            preflight_script = "\n".join(preflight_step["run"])
+            self.assertLess(node_setup_index, steps.index(preflight_step))
+            self.assertIn("--global --prefix", preflight_script)
+            self.assertIn("npm@11.19.1", preflight_script)
+        windows_sandbox = (self.root / "kit/devlane/sandbox_windows.py").read_text(encoding="utf-8")
+        self.assertIn('SAFE_ENVIRONMENT = frozenset((', windows_sandbox)
+        safe_env = windows_sandbox.split('SAFE_ENVIRONMENT = frozenset((', 1)[1].split('))', 1)[0]
+        self.assertNotIn('"PYTHONPATH"', safe_env)
+        mac_sandbox = (self.root / "kit/devlane/sandbox_macos.py").read_text(encoding="utf-8")
+        clean_env = mac_sandbox.split("def _clean_env(", 1)[1].split("\n\ndef ", 1)[0]
+        self.assertNotIn('"PYTHONPATH"', clean_env)
 
     def test_windows_deadline_starts_before_manual_checkout_and_wer_dumps_are_disabled(self):
         encrypted = self._workflow("devlane-encrypted.yml")

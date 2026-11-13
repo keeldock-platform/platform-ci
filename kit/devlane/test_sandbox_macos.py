@@ -256,6 +256,69 @@ class MacProfileTests(unittest.TestCase):
 
 
 class MacRoundOneRegressionTests(unittest.TestCase):
+    def test_trusted_tool_checks_emit_distinct_fixed_refusals(self):
+        with tempfile.TemporaryDirectory(prefix="devlane-tool-check-") as temporary:
+            root = Path(temporary).resolve(strict=True)
+            tool = root / "tool"
+            tool.write_bytes(b"tool")
+            os.chmod(tool, 0o755)
+            self.assertEqual(sandbox._trusted_file(tool, executable=True, owners=(os.getuid(),)), tool)
+
+            with self.assertRaisesRegex(sandbox.Refusal, "tool-owner-invalid"):
+                sandbox._trusted_file(tool, executable=True, owners=(os.getuid() + 1000,))
+
+            os.chmod(tool, 0o644)
+            with self.assertRaisesRegex(sandbox.Refusal, "tool-mode-invalid"):
+                sandbox._trusted_file(tool, executable=True, owners=(os.getuid(),))
+
+            link = root / "tool-link"
+            link.symlink_to(tool)
+            with self.assertRaisesRegex(sandbox.Refusal, "tool-symlink"):
+                sandbox._trusted_file(link, owners=(os.getuid(),))
+
+            directory = root / "tool-directory"
+            directory.mkdir()
+            with self.assertRaisesRegex(sandbox.Refusal, "tool-file-type-invalid"):
+                sandbox._trusted_file(directory, owners=(os.getuid(),))
+
+            missing = root / "missing-tool"
+            with self.assertRaisesRegex(sandbox.Refusal, "tool-file-unavailable"):
+                sandbox._trusted_file(missing, owners=(os.getuid(),))
+
+            with mock.patch.object(Path, "resolve", return_value=root / "different-tool"):
+                with self.assertRaisesRegex(sandbox.Refusal, "tool-path-resolve-mismatch"):
+                    sandbox._trusted_file(tool, owners=(os.getuid(),))
+
+    def test_xcode_developer_alias_and_clang_symlink_resolve_inside_xcode(self):
+        developer_alias = "/Applications/Xcode.app/Contents/Developer"
+        developer_real = Path("/Applications/Xcode_16.4.app/Contents/Developer")
+        clang_alias = developer_alias + "/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"
+        clang_real = developer_real / "Toolchains/XcodeDefault.xctoolchain/usr/bin/clang-1700"
+        original_resolve = Path.resolve
+
+        def resolve(path, *, strict=False):
+            mapped = {
+                developer_alias: developer_real,
+                clang_alias: clang_real,
+            }
+            if str(path) in mapped:
+                return mapped[str(path)]
+            return original_resolve(path, strict=strict)
+
+        with mock.patch.object(sandbox, "_command_output", side_effect=(developer_alias, clang_alias)), \
+                mock.patch.object(Path, "resolve", autospec=True, side_effect=resolve), \
+                mock.patch.object(Path, "is_dir", return_value=True), \
+                mock.patch.object(sandbox, "_trusted_file", side_effect=lambda path, **_kwargs: path):
+            self.assertEqual(sandbox._validate_clt(), (str(developer_real), str(clang_real)))
+
+    def test_xcode_selector_rejects_unexpected_developer_directory(self):
+        developer = str(Path(os.sep, "Users", "runner", "Developer"))
+        with mock.patch.object(sandbox, "_command_output", return_value=developer), \
+                mock.patch.object(Path, "resolve", return_value=Path(developer)), \
+                mock.patch.object(Path, "is_dir", return_value=True):
+            with self.assertRaisesRegex(sandbox.Refusal, "developer-dir-unexpected"):
+                sandbox._validate_clt()
+
     def test_root_identity_parses_the_directory_services_uid_inventory(self):
         names, raw_ids, normalized_ids = sandbox._directory_service_uid_inventory(
             b"root 0\nrunner 501\nnobody -2\n_analyticsd 272\n"

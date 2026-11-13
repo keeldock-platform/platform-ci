@@ -95,14 +95,12 @@ MACOS_STEP_NAMES = tuple(
     "Prepare hosted runner isolation state" if name == "Prepare hosted Linux isolation state" else name
     for name in STEP_NAMES
 )
-MACOS_STEP_NAMES = (
-    MACOS_STEP_NAMES[0], "Set up pinned macOS Node runtime", "Install pinned macOS npm runtime",
-) + MACOS_STEP_NAMES[1:]
+MACOS_STEP_NAMES = (MACOS_STEP_NAMES[0], "Set up pinned macOS Node runtime") + MACOS_STEP_NAMES[1:]
 WINDOWS_STEP_NAMES = tuple(
     "Prepare hosted Windows isolation state" if name == "Prepare hosted Linux isolation state" else name
     for name in STEP_NAMES if name != "Install Tauri Linux build dependencies"
 )
-WINDOWS_STEP_NAMES = WINDOWS_STEP_NAMES[:2] + ("Set up pinned Windows Node runtime",) + WINDOWS_STEP_NAMES[2:]
+WINDOWS_STEP_NAMES = WINDOWS_STEP_NAMES[:1] + ("Set up pinned Windows Node runtime",) + WINDOWS_STEP_NAMES[1:]
 PERMIT_MARKER = re.compile(
     rb"(?m)^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z )?"
     rb"devlane_permit=consumed run-id=([1-9][0-9]{0,18}) run-attempt=1$"
@@ -179,15 +177,21 @@ DECRYPT_CHILD_ERROR_CODES = frozenset((
 AUDIT_REFUSAL_CODES = frozenset(("audit-contract", "audit-internal"))
 WINDOWS_BOOTSTRAP_REFUSAL_CODES = frozenset((
     "deadline-start-invalid", "deadline-file-invalid", "deadline-budget-invalid", "deadline-failed",
+    "crypto-dependency-install-failed", "crypto-dependency-verification-failed",
 ))
 BOOTSTRAP_REFUSAL_CODES = frozenset((
     "bootstrap-run-root", "bootstrap-start-marker", "bootstrap-reap-unconfirmed",
     "bootstrap-work-deadline", "bootstrap-command-timeout", "bootstrap-command-failed",
     "dispatch-identity", "bootstrap-origin-mismatch", "bootstrap-sha-mismatch",
 ))
+MACOS_BOOTSTRAP_REFUSAL_CODES = frozenset((
+    "crypto-dependency-install-failed", "crypto-dependency-verification-failed",
+))
 WINDOWS_PREFLIGHT_REFUSAL_CODES = frozenset((
     "windows-admin-check-failed", "windows-admin-required", "windows-error-reporting-policy",
     "windows-powershell-unavailable", "windows-sandbox-parse", "windows-sandbox-native-load",
+    "windows-node-runtime-invalid", "windows-npm-runtime-install-failed",
+    "windows-npm-runtime-version-invalid",
 ))
 MACOS_PREFLIGHT_REFUSAL_CODES = frozenset((
     "macos-preflight-internal", "macos-root-identity-internal", "macos-preflight-host-identity",
@@ -198,7 +202,11 @@ MACOS_PREFLIGHT_REFUSAL_CODES = frozenset((
     "macos-user-attribute-set", "macos-worker-home-create", "macos-worker-home-permissions",
     "macos-user-verify", "macos-cleanup-intent-write", "macos-identity-record-write",
     "macos-runner-required", "profile-unknown", "dispatch-context-invalid", "state-directory-permissions",
-    "node-toolchain-missing", "node-toolchain-version", "npm-toolchain-version", "tool-path-invalid",
+    "node-toolchain-missing", "node-toolchain-version", "npm-toolchain-version",
+    "node-runtime-version-invalid", "npm-runtime-install-failed", "npm-runtime-version-invalid",
+    "tool-file-type-invalid", "tool-owner-invalid", "tool-mode-invalid", "tool-symlink", "tool-path-resolve-mismatch",
+    "tool-file-unavailable",
+    "developer-dir-unexpected", "clang-path-invalid", "tool-digest-mismatch", "developer-clang-mismatch",
     "tool-version-unavailable", "supervisor-operation-failed", "raw-record-size",
 ))
 EARLY_FAILURE_STEP_IDS = {
@@ -659,8 +667,6 @@ class _Grammar:
             patterns = (WINDOWS_NODE_LINES if self.job_runner == "windows-2025" else
                         MACOS_NODE_LINES if self.job_runner == "macos-15" else NODE_LINES)
             return any(pattern.fullmatch(line) for pattern in patterns)
-        if step_name == "Install pinned macOS npm runtime":
-            return line == "macos_node_runtime=ready"
         if line.startswith("devlane_deadline_refusal="):
             code = line[len("devlane_deadline_refusal="):]
             if (self.job_runner != "windows-2025"
@@ -673,9 +679,12 @@ class _Grammar:
             return public_counts["early_failure_marker"] == 1
         if line.startswith("devlane_bootstrap_refusal="):
             code = line[len("devlane_bootstrap_refusal="):]
+            allowed_codes = BOOTSTRAP_REFUSAL_CODES
+            if self.job_runner == "macos-15":
+                allowed_codes |= MACOS_BOOTSTRAP_REFUSAL_CODES
             if (self.job_runner == "windows-2025"
                     or step_name != "Fetch public control and validate dispatch"
-                    or code not in BOOTSTRAP_REFUSAL_CODES):
+                    or code not in allowed_codes):
                 return False
             public_counts["early_failure_marker"] = public_counts.get("early_failure_marker", 0) + 1
             public_counts["early_failure_step"] = step_name
@@ -2033,7 +2042,10 @@ def validate_job_log_metadata_binding(surface, run_job, identity):
             allowed = (
                 identity.get("platform") == "windows" and code in WINDOWS_BOOTSTRAP_REFUSAL_CODES
             ) or (
-                identity.get("platform") in ("linux", "macos") and code in BOOTSTRAP_REFUSAL_CODES
+                identity.get("platform") == "linux" and code in BOOTSTRAP_REFUSAL_CODES
+            ) or (
+                identity.get("platform") == "macos"
+                and code in (BOOTSTRAP_REFUSAL_CODES | MACOS_BOOTSTRAP_REFUSAL_CODES)
             )
         elif early_failure == "Prepare hosted Windows isolation state":
             allowed = (identity.get("platform") == "windows" and code in WINDOWS_PREFLIGHT_REFUSAL_CODES)

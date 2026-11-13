@@ -64,13 +64,21 @@ MACOS_PREFLIGHT_REFUSAL_CODES = frozenset((
     "macos-user-attribute-set", "macos-worker-home-create", "macos-worker-home-permissions",
     "macos-user-verify", "macos-cleanup-intent-write", "macos-identity-record-write",
     "macos-runner-required", "profile-unknown", "dispatch-context-invalid", "state-directory-permissions",
-    "node-toolchain-missing", "node-toolchain-version", "npm-toolchain-version", "tool-path-invalid",
+    "node-toolchain-missing", "node-toolchain-version", "npm-toolchain-version",
+    "node-runtime-version-invalid", "npm-runtime-install-failed", "npm-runtime-version-invalid",
+    "tool-file-type-invalid", "tool-owner-invalid", "tool-mode-invalid", "tool-symlink", "tool-path-resolve-mismatch",
+    "tool-file-unavailable",
+    "developer-dir-unexpected", "clang-path-invalid", "tool-digest-mismatch", "developer-clang-mismatch",
     "tool-version-unavailable", "supervisor-operation-failed", "raw-record-size",
 ))
 
 MACOS_ROOT_IDENTITY_REFUSAL_CODES = frozenset(
     code for code in MACOS_PREFLIGHT_REFUSAL_CODES if code.startswith("macos-")
-) | frozenset(("state-directory-permissions", "dispatch-context-invalid", "tool-path-invalid",
+) | frozenset(("state-directory-permissions", "dispatch-context-invalid",
+               "tool-file-type-invalid", "tool-owner-invalid", "tool-mode-invalid", "tool-symlink", "tool-path-resolve-mismatch",
+               "tool-file-unavailable",
+               "developer-dir-unexpected", "clang-path-invalid", "tool-digest-mismatch",
+               "developer-clang-mismatch",
                "tool-version-unavailable", "node-toolchain-missing", "node-toolchain-version",
                "npm-toolchain-version", "supervisor-operation-failed", "raw-record-size"))
 
@@ -307,16 +315,20 @@ def _trusted_file(path, *, executable=False, owners=None):
     try:
         info = candidate.lstat()
         allowed_owners = set((0, os.getuid()) if owners is None else owners)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid not in allowed_owners:
-            _refuse("tool-path-invalid")
+        if stat.S_ISLNK(info.st_mode):
+            _refuse("tool-symlink")
+        if not stat.S_ISREG(info.st_mode):
+            _refuse("tool-file-type-invalid")
+        if info.st_uid not in allowed_owners:
+            _refuse("tool-owner-invalid")
         mode = stat.S_IMODE(info.st_mode)
         if mode & 0o022 or executable and not mode & 0o111:
-            _refuse("tool-path-invalid")
+            _refuse("tool-mode-invalid")
         real = candidate.resolve(strict=True)
         if real != candidate:
-            _refuse("tool-path-invalid")
+            _refuse("tool-path-resolve-mismatch")
     except OSError:
-        _refuse("tool-path-invalid")
+        _refuse("tool-file-unavailable")
     return candidate
 
 
@@ -335,7 +347,7 @@ def _find_node_tools():
     npm_name = shutil.which("npm")
     if not node_name or not npm_name:
         _refuse("node-toolchain-missing")
-    node = _trusted_file(Path(node_name).resolve(strict=True), executable=True)
+    node = _trusted_file(Path(node_name), executable=True)
     npm_launcher = Path(npm_name).resolve(strict=True)
     if npm_launcher.name == "npm-cli.js":
         npm_entry = npm_launcher
@@ -353,13 +365,24 @@ def _find_node_tools():
 
 def _validate_clt():
     env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"}
-    developer = _command_output(("/usr/bin/xcode-select", "-p"), env=env)
-    if developer != "/Library/Developer/CommandLineTools":
-        _refuse("tool-path-invalid")
+    developer_name = _command_output(("/usr/bin/xcode-select", "-p"), env=env)
+    try:
+        developer_path = Path(developer_name).resolve(strict=True)
+    except OSError:
+        _refuse("developer-dir-unexpected")
+    developer = str(developer_path)
+    if ((developer != "/Library/Developer/CommandLineTools"
+             and re.fullmatch(r"/Applications/Xcode(?:_[A-Za-z0-9.]+)?\.app/Contents/Developer", developer) is None)
+            or not developer_path.is_dir()):
+        _refuse("developer-dir-unexpected")
     clang_name = _command_output(("/usr/bin/xcrun", "--find", "clang"), env={**env, "DEVELOPER_DIR": developer})
-    clang = _trusted_file(Path(clang_name), executable=True)
+    try:
+        clang_path = Path(clang_name).resolve(strict=True)
+    except OSError:
+        _refuse("clang-path-invalid")
+    clang = _trusted_file(clang_path, executable=True)
     if not clang.is_relative_to(Path(developer)):
-        _refuse("tool-path-invalid")
+        _refuse("clang-path-invalid")
     return developer, str(clang)
 
 
@@ -881,14 +904,14 @@ def _root_identity(args):
     npm_cli = _trusted_file(args.npm_cli, owners=(0, runner_uid))
     if (not SHA256_RE.fullmatch(args.node_sha256) or not SHA256_RE.fullmatch(args.npm_sha256)
             or args.node_sha256 != _sha256_file(node) or args.npm_sha256 != _sha256_file(npm_cli)):
-        _refuse("tool-path-invalid")
+        _refuse("tool-digest-mismatch")
     version_env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
     if (_command_output((str(node), "--version"), env=version_env) != "v24.22.1"
             or _command_output((str(node), str(npm_cli), "--version"), env=version_env) != "11.19.1"):
         _refuse("tool-version-unavailable")
     developer, clang = _validate_clt()
     if developer != args.developer_directory or clang != args.clang:
-        _refuse("tool-path-invalid")
+        _refuse("developer-clang-mismatch")
     account = WORKER_NAME_PREFIX + run_id
     listing = _directory_service(("/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"), "macos-user-list")
     names, raw_ids, normalized_ids = _directory_service_uid_inventory(listing.stdout)
