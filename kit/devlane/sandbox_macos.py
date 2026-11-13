@@ -412,7 +412,21 @@ def _trusted_worker_readonly_tree(root):
         _refuse("tool-file-unavailable")
 
 
-def _trusted_developer_directory(path, anchor):
+def _directory_service_group_ids(account):
+    result = _directory_service(
+        ("/usr/bin/id", "-G", account), "developer-dir-trust-invalid", timeout=5,
+    )
+    try:
+        groups = result.stdout.decode("ascii", "strict").split()
+        if (not groups or any(re.fullmatch(r"[0-9]+", group) is None for group in groups)
+                or any(int(group, 10) > DARWIN_UID_MAX for group in groups)):
+            _refuse("developer-dir-trust-invalid")
+        return frozenset(int(group, 10) for group in groups)
+    except (UnicodeDecodeError, ValueError):
+        _refuse("developer-dir-trust-invalid")
+
+
+def _trusted_developer_directory(path, anchor, *, worker_account=None, defer_group_membership=False):
     env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"}
     current = Path(path)
     anchor = Path(anchor)
@@ -429,12 +443,30 @@ def _trusted_developer_directory(path, anchor):
         "add_file", "add_subdirectory", "append", "chown", "delete", "delete_child",
         "write", "writeattr", "writeextattr", "writesecurity",
     ))
+    worker_groups = None
+
+    def groups():
+        nonlocal worker_groups
+        if worker_groups is None:
+            if worker_account is None:
+                if defer_group_membership:
+                    return None
+                _refuse("developer-dir-trust-invalid")
+            worker_groups = _directory_service_group_ids(worker_account)
+        return worker_groups
+
     for directory in directories:
         try:
             metadata = directory.lstat()
             if (not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
-                    or metadata.st_uid != 0 or metadata.st_mode & 0o022):
+                    or metadata.st_uid != 0 or metadata.st_mode & 0o002):
                 _refuse("developer-dir-trust-invalid")
+            if metadata.st_mode & 0o020:
+                if metadata.st_gid not in (0, 80):
+                    _refuse("developer-dir-trust-invalid")
+                memberships = groups()
+                if memberships is not None and metadata.st_gid in memberships:
+                    _refuse("developer-dir-trust-invalid")
             output = _command_output(("/bin/ls", "-lde", str(directory)), env=env, maximum=16384)
         except Refusal:
             _refuse("developer-dir-trust-invalid")
@@ -446,16 +478,23 @@ def _trusted_developer_directory(path, anchor):
         for line in lines[1:]:
             if not line.strip():
                 continue
-            match = re.fullmatch(r"\s*[0-9]+:\s+.*?\s+(allow|deny)\s+(.+)", line)
+            match = re.fullmatch(r"\s*[0-9]+:\s+(.*?)\s+(allow|deny)\s+(.+)", line)
             if match is None:
                 _refuse("developer-dir-trust-invalid")
-            if match.group(1) == "allow":
-                rights = {part.strip().lower() for part in match.group(2).split(",")}
+            if match.group(2) == "allow":
+                rights = {part.strip().lower() for part in match.group(3).split(",")}
                 if rights & write_rights:
+                    principal = match.group(1).strip().lower()
+                    if principal == "user:root":
+                        continue
+                    if principal == "group:admin":
+                        memberships = groups()
+                        if memberships is None or 80 not in memberships:
+                            continue
                     _refuse("developer-dir-trust-invalid")
 
 
-def _validate_clt():
+def _validate_clt(*, worker_account=None, defer_group_membership=False):
     env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"}
     developer_name = _command_output(("/usr/bin/xcode-select", "-p"), env=env)
     try:
@@ -468,7 +507,10 @@ def _validate_clt():
             or not developer_path.is_dir()):
         _refuse("developer-dir-unexpected")
     anchor = Path("/Library") if developer == "/Library/Developer/CommandLineTools" else Path("/Applications")
-    _trusted_developer_directory(developer_path, anchor)
+    _trusted_developer_directory(
+        developer_path, anchor, worker_account=worker_account,
+        defer_group_membership=defer_group_membership,
+    )
     clang_name = _command_output(("/usr/bin/xcrun", "--find", "clang"), env={**env, "DEVELOPER_DIR": developer})
     try:
         clang_path = Path(clang_name).resolve(strict=True)
@@ -496,7 +538,7 @@ def _host_preflight(state, workspace, profile, run_id):
     except Exception:
         _refuse("macos-preflight-node-tools")
     try:
-        developer, clang = _validate_clt()
+        developer, clang = _validate_clt(defer_group_membership=True)
     except Refusal:
         raise
     except Exception:
@@ -1009,9 +1051,6 @@ def _root_identity(args):
     if (_command_output((str(node), "--version"), env=version_env) != "v24.22.1"
             or _command_output((str(node), str(npm_cli), "--version"), env=version_env) != "11.19.1"):
         _refuse("tool-version-unavailable")
-    developer, clang = _validate_clt()
-    if developer != args.developer_directory or clang != args.clang:
-        _refuse("developer-clang-mismatch")
     account = WORKER_NAME_PREFIX + run_id
     listing = _directory_service(("/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"), "macos-user-list")
     names, raw_ids, normalized_ids = _directory_service_uid_inventory(listing.stdout)
@@ -1053,6 +1092,9 @@ def _root_identity(args):
     actual_uid = _directory_service(("/usr/bin/id", "-u", account), "macos-user-verify", timeout=5)
     if actual_uid.stdout != (str(uid) + "\n").encode("ascii"):
         _refuse("macos-user-verify")
+    developer, clang = _validate_clt(worker_account=account)
+    if developer != args.developer_directory or clang != args.clang:
+        _refuse("developer-clang-mismatch")
     try:
         _write_json(state / IDENTITY_FILE, {
             "schema": 1, "run_id": run_id, "runner_uid": runner_uid, "uid": uid,

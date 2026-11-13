@@ -314,7 +314,7 @@ class MacRoundOneRegressionTests(unittest.TestCase):
 
     def test_xcode_developer_tree_rejects_writable_directory_and_wrong_owner(self):
         developer = Path("/Applications/Xcode.app/Contents/Developer")
-        trusted = type("Metadata", (), {"st_mode": 0o40755, "st_uid": 0})()
+        trusted = type("Metadata", (), {"st_mode": 0o40755, "st_uid": 0, "st_gid": 0})()
         header = lambda path: "drwxr-xr-x  1 root  wheel  1 Nov 13 00:00 " + str(path)
         with mock.patch.object(Path, "lstat", return_value=trusted), \
                 mock.patch.object(sandbox, "_command_output", side_effect=lambda argv, **_kwargs: header(argv[-1])) as ls:
@@ -324,12 +324,12 @@ class MacRoundOneRegressionTests(unittest.TestCase):
             [developer, developer.parent, developer.parent.parent, Path("/Applications")],
         )
 
-        writable = type("Metadata", (), {"st_mode": 0o40775, "st_uid": 0})()
-        with mock.patch.object(Path, "lstat", return_value=writable), \
+        staff_writable = type("Metadata", (), {"st_mode": 0o40775, "st_uid": 0, "st_gid": 20})()
+        with mock.patch.object(Path, "lstat", return_value=staff_writable), \
                 self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
             sandbox._trusted_developer_directory(developer, Path("/Applications"))
 
-        wrong_owner = type("Metadata", (), {"st_mode": 0o40755, "st_uid": 501})()
+        wrong_owner = type("Metadata", (), {"st_mode": 0o40755, "st_uid": 501, "st_gid": 0})()
         with mock.patch.object(Path, "lstat", return_value=wrong_owner), \
                 self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
             sandbox._trusted_developer_directory(developer, Path("/Applications"))
@@ -343,9 +343,82 @@ class MacRoundOneRegressionTests(unittest.TestCase):
                 self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
             sandbox._trusted_developer_directory(developer, Path("/Applications"))
 
+        other_writable = type("Metadata", (), {"st_mode": 0o40777, "st_uid": 0, "st_gid": 80})()
+        with mock.patch.object(Path, "lstat", return_value=other_writable), \
+                self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
+            sandbox._trusted_developer_directory(developer, Path("/Applications"))
+
+    def test_xcode_developer_tree_allows_admin_group_write_only_for_non_admin_worker(self):
+        developer = Path("/Applications/Xcode.app/Contents/Developer")
+        admin_writable = type("Metadata", (), {"st_mode": 0o40775, "st_uid": 0, "st_gid": 80})()
+        header = lambda path: "drwxrwxr-x  1 root  admin  1 Nov 13 00:00 " + str(path)
+        groups = type("Result", (), {"stdout": b"20 501\n"})()
+        with mock.patch.object(Path, "lstat", return_value=admin_writable), \
+                mock.patch.object(sandbox, "_command_output", side_effect=lambda argv, **_kwargs: header(argv[-1])), \
+                mock.patch.object(sandbox, "_directory_service", return_value=groups) as ds:
+            sandbox._trusted_developer_directory(
+                developer, Path("/Applications"), worker_account="kddevlane123",
+            )
+        self.assertEqual(ds.call_args.args[0], ("/usr/bin/id", "-G", "kddevlane123"))
+
+        admin_worker_groups = type("Result", (), {"stdout": b"20 80 501\n"})()
+        with mock.patch.object(Path, "lstat", return_value=admin_writable), \
+                self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"), \
+                mock.patch.object(sandbox, "_directory_service", return_value=admin_worker_groups):
+            sandbox._trusted_developer_directory(
+                developer, Path("/Applications"), worker_account="kddevlane123",
+            )
+
+    def test_xcode_developer_tree_rejects_admin_group_and_unsafe_acl_grants(self):
+        developer = Path("/Applications/Xcode.app/Contents/Developer")
+        staff_writable = type("Metadata", (), {"st_mode": 0o40775, "st_uid": 0, "st_gid": 20})()
+        with mock.patch.object(Path, "lstat", return_value=staff_writable), \
+                self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
+            sandbox._trusted_developer_directory(
+                developer, Path("/Applications"), worker_account="kddevlane123",
+            )
+
+        metadata = type("Metadata", (), {"st_mode": 0o40755, "st_uid": 0, "st_gid": 0})()
+        header = lambda path: "drwxr-xr-x+ 1 root wheel 1 Nov 13 00:00 " + str(path)
+
+        def output(argv, **_kwargs):
+            return header(argv[-1]) + "\n 0: everyone allow write"
+
+        with mock.patch.object(Path, "lstat", return_value=metadata), \
+                mock.patch.object(sandbox, "_command_output", side_effect=output), \
+                self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
+            sandbox._trusted_developer_directory(
+                developer, Path("/Applications"), worker_account="kddevlane123",
+            )
+
+    def test_xcode_developer_tree_allows_admin_acl_only_for_non_admin_worker(self):
+        developer = Path("/Applications/Xcode.app/Contents/Developer")
+        metadata = type("Metadata", (), {"st_mode": 0o40755, "st_uid": 0, "st_gid": 0})()
+        header = lambda path: "drwxr-xr-x+ 1 root wheel 1 Nov 13 00:00 " + str(path)
+
+        def output(argv, **_kwargs):
+            return header(argv[-1]) + "\n 0: group:admin allow write"
+
+        groups = type("Result", (), {"stdout": b"20 501\n"})()
+        with mock.patch.object(Path, "lstat", return_value=metadata), \
+                mock.patch.object(sandbox, "_command_output", side_effect=output), \
+                mock.patch.object(sandbox, "_directory_service", return_value=groups):
+            sandbox._trusted_developer_directory(
+                developer, Path("/Applications"), worker_account="kddevlane123",
+            )
+
+        admin_worker_groups = type("Result", (), {"stdout": b"20 80 501\n"})()
+        with mock.patch.object(Path, "lstat", return_value=metadata), \
+                mock.patch.object(sandbox, "_command_output", side_effect=output), \
+                mock.patch.object(sandbox, "_directory_service", return_value=admin_worker_groups), \
+                self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
+            sandbox._trusted_developer_directory(
+                developer, Path("/Applications"), worker_account="kddevlane123",
+            )
+
     def test_xcode_developer_tree_rejects_acl_write_grants(self):
         developer = Path("/Applications/Xcode.app/Contents/Developer")
-        metadata = type("Metadata", (), {"st_mode": 0o40755, "st_uid": 0})()
+        metadata = type("Metadata", (), {"st_mode": 0o40755, "st_uid": 0, "st_gid": 0})()
         header = lambda path: "drwxr-xr-x+ 1 root wheel 1 Nov 13 00:00 " + str(path)
 
         def output(argv, **_kwargs):
