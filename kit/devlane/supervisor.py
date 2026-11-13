@@ -2458,10 +2458,11 @@ class Service:
         if size != self.context["bundle_size"] or digest != self.context["bundle_sha256"]:
             _refuse("bundle-binding-mismatch")
         expected = {
-            "format": "kd-public-devlane-aesgcm-v1",
+            "format": "kd-public-devlane-aesgcm-v2",
             "repository_id": self.context["repository_id"],
             "control_sha": self.context["control_sha"],
             "workflow_path": fetch.WORKFLOW_PATH,
+            "platform": self.context["platform"],
             "profile": self.context["profile"],
             "wave_id": self.context["wave_id"],
             "bundle_id": self.context["bundle_id"],

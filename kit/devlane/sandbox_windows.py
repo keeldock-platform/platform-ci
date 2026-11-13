@@ -860,9 +860,9 @@ def decrypt_bundle(context_path, bundle_path, source_path, manifest_path):
         if hashlib.sha256(envelope).hexdigest() != identity["bundle_sha256"]:
             _refuse("bundle-binding")
         expected = {
-            "format": "kd-public-devlane-aesgcm-v1", "repository_id": identity["repository_id"],
+            "format": "kd-public-devlane-aesgcm-v2", "repository_id": identity["repository_id"],
             "control_sha": identity["control_sha"], "workflow_path": fetch.WORKFLOW_PATH,
-            "profile": identity["profile"], "wave_id": identity["wave_id"],
+            "platform": identity["platform"], "profile": identity["profile"], "wave_id": identity["wave_id"],
             "bundle_id": identity["bundle_id"], "fetch_sha256": identity["projection_sha256"],
             "expires": identity["expires"],
         }

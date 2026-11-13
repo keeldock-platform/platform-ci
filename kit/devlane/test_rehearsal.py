@@ -73,10 +73,11 @@ class RehearsalBuilderTests(unittest.TestCase):
             self.assertEqual(github_cli_secret, gh_stdin)
             secret_environment = {coordinator.SECRET_NAME: github_cli_secret.decode("ascii")}
             expected = {
-                "format": "kd-public-devlane-aesgcm-v1",
+                "format": "kd-public-devlane-aesgcm-v2",
                 "repository_id": "1430960557",
                 "control_sha": CONTROL_SHA,
                 "workflow_path": ".github/workflows/devlane-encrypted.yml",
+                "platform": request["platform"],
                 "profile": request["profile"],
                 "wave_id": WAVE,
                 "bundle_id": BUNDLE,
@@ -310,7 +311,7 @@ class RehearsalBuilderTests(unittest.TestCase):
                 "bundle_size": envelope.stat().st_size,
                 "bundle_sha256": hashlib.sha256(envelope.read_bytes()).hexdigest(),
                 "repository_id": "1430960557", "control_sha": "a" * 40,
-                "profile": "core-node", "wave_id": "rehearsal-wave-0001",
+                "platform": "linux", "profile": "core-node", "wave_id": "rehearsal-wave-0001",
                 "bundle_id": "rehearsal-bundle-0001", "projection_sha256": "b" * 64,
                 "expires": 4_000_000_000,
             }
@@ -422,9 +423,9 @@ class RehearsalBuilderTests(unittest.TestCase):
                                               "--key-file", str(owner / "key.hex")]), 0)
             key = bundle.read_key_file(owner / "key.hex")
             bindings = {
-                "format": "kd-public-devlane-aesgcm-v1", "repository_id": "1430960557",
+                "format": "kd-public-devlane-aesgcm-v2", "repository_id": "1430960557",
                 "control_sha": CONTROL_SHA, "workflow_path": ".github/workflows/devlane-encrypted.yml",
-                "profile": "core-rust", "wave_id": WAVE, "bundle_id": BUNDLE,
+                "platform": "linux", "profile": "core-rust", "wave_id": WAVE, "bundle_id": BUNDLE,
                 "fetch_sha256": bundle_request_digest(owner), "expires": expires,
             }
             archive = bundle.parse_envelope((owner / "bundle.enc").read_bytes(), key, bindings)
@@ -460,9 +461,13 @@ class RehearsalBuilderTests(unittest.TestCase):
                                            "--output", str(owner / "projection.json")]), 0)
             with self.assertRaisesRegex(rehearsal.Refusal, "request-input"):
                 rehearsal.build_requests(owner, "b" * 39, "1234", WAVE, BUNDLE, "77", 3000)
-            expires = rehearsal.build_requests(owner, CONTROL_SHA, "1234", WAVE, BUNDLE, "77", 3000)
+            expires = rehearsal.build_requests(owner, CONTROL_SHA, "1234", WAVE, BUNDLE, "77", 3000,
+                                               platform="windows")
             reserve = json.loads((owner / "reserve.json").read_text(encoding="utf-8"))
+            bundle_request = json.loads((owner / "bundle-request.json").read_text(encoding="utf-8"))
             self.assertEqual(reserve["expires"], expires)
+            self.assertEqual(reserve["platform"], "windows")
+            self.assertEqual(bundle_request["platform"], reserve["platform"])
             self.assertEqual(
                 set(reserve), {"schema", "wave_id", "bundle_id", "control_run_id", "control_sha", "profile", "platform",
                                "expires", "release_id"})
@@ -472,9 +477,9 @@ class RehearsalBuilderTests(unittest.TestCase):
                                               "--key-file", str(owner / "key.hex")]), 0)
             key = bundle.read_key_file(owner / "key.hex")
             bindings = {
-                "format": "kd-public-devlane-aesgcm-v1", "repository_id": "1430960557",
+                "format": "kd-public-devlane-aesgcm-v2", "repository_id": "1430960557",
                 "control_sha": CONTROL_SHA, "workflow_path": ".github/workflows/devlane-encrypted.yml",
-                "profile": "core-node", "wave_id": WAVE, "bundle_id": BUNDLE,
+                "platform": "windows", "profile": "core-node", "wave_id": WAVE, "bundle_id": BUNDLE,
                 "fetch_sha256": bundle_request_digest(owner), "expires": expires,
             }
             archive = bundle.parse_envelope((owner / "bundle.enc").read_bytes(), key, bindings)
@@ -483,6 +488,11 @@ class RehearsalBuilderTests(unittest.TestCase):
             self.assertIn(".devlane/manifest.json", names)
             self.assertIn("packages/kernel-ui-kit/src/example.ts", names)
             self.assertNotIn(".git", " ".join(names))
+            with mock.patch.object(bundle, "AESGCM", wraps=bundle.AESGCM) as aead:
+                wrong_platform = dict(bindings, platform="macos")
+                with self.assertRaisesRegex(bundle.Refusal, "binding-mismatch"):
+                    bundle.parse_envelope((owner / "bundle.enc").read_bytes(), key, wrong_platform)
+                aead.assert_not_called()
 
             rehearsal.build_staged(owner)
             staged = json.loads((owner / "staged-assets.json").read_text(encoding="utf-8"))

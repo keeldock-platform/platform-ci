@@ -25,14 +25,14 @@ except ImportError:
 
 
 MAGIC = b"KDLDEVL\x00"
-VERSION = 1
+VERSION = 2
 MAX_HEADER = 16384
 MAX_CIPHERTEXT = 64 * 1024 * 1024
 MAX_EXPANDED = 512 * 1024 * 1024
 MAX_FILES = 10_000
 MAX_FILE = 32 * 1024 * 1024
 ENVELOPE_FIELDS = frozenset((
-    "format", "repository_id", "control_sha", "workflow_path", "profile",
+    "format", "repository_id", "control_sha", "workflow_path", "platform", "profile",
     "wave_id", "bundle_id", "fetch_sha256", "expires",
 ))
 MANIFEST_FIELDS_V1 = frozenset((
@@ -128,7 +128,7 @@ def r4_source_map_sha256(path_hashes):
 def _valid_bindings(bindings):
     if type(bindings) is not dict or set(bindings) != ENVELOPE_FIELDS:
         _refuse("binding-shape")
-    if bindings.get("format") != "kd-public-devlane-aesgcm-v1":
+    if bindings.get("format") != "kd-public-devlane-aesgcm-v2":
         _refuse("envelope-version")
     if type(bindings.get("repository_id")) is not str or not re.fullmatch(r"[1-9][0-9]{0,18}", bindings["repository_id"]):
         _refuse("binding-repository")
@@ -136,6 +136,9 @@ def _valid_bindings(bindings):
         _refuse("binding-control")
     if bindings.get("workflow_path") != ".github/workflows/devlane-encrypted.yml":
         _refuse("binding-workflow")
+    if (bindings.get("platform") not in ("linux", "macos", "windows")
+            or (bindings["platform"] != "linux" and bindings.get("profile") != "core-node")):
+        _refuse("binding-platform")
     if bindings.get("profile") not in ENCRYPTED_PROFILES:
         _refuse("binding-profile")
     for name in ("wave_id", "bundle_id"):
@@ -884,7 +887,7 @@ def main(argv=None):
     try:
         if args.operation == "create":
             request = strict_json(Path(args.request).read_bytes(), 1024 * 1024)
-            required_v1 = {"repository", "source_revision", "profile", "fetch_sha256", "wave_id",
+            required_v1 = {"repository", "source_revision", "profile", "platform", "fetch_sha256", "wave_id",
                            "bundle_id", "control_sha", "expires", "source_files", "allowed_files",
                            "allowed_tests", "frames"}
             required_v2 = required_v1 | {"baseline_runtime_root", "source_sets"}
@@ -897,10 +900,11 @@ def main(argv=None):
             if key is None:
                 _refuse("crypto-unavailable")
             bindings = {
-                "format": "kd-public-devlane-aesgcm-v1",
+                "format": "kd-public-devlane-aesgcm-v2",
                 "repository_id": "1430960557",
                 "control_sha": request["control_sha"],
                 "workflow_path": ".github/workflows/devlane-encrypted.yml",
+                "platform": request["platform"],
                 "profile": request["profile"],
                 "wave_id": request["wave_id"],
                 "bundle_id": request["bundle_id"],

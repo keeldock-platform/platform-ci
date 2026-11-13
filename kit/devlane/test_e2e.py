@@ -1642,8 +1642,9 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
                          "rust-matrix-envelope-lock-binding")
         with DIAGNOSTICS.phase("variant-envelope-build"):
             bindings = {
-                "format": "kd-public-devlane-aesgcm-v1", "repository_id": fetch.REPOSITORY_ID,
-                "control_sha": CONTROL_SHA, "workflow_path": fetch.WORKFLOW_PATH, "profile": profile,
+                "format": "kd-public-devlane-aesgcm-v2", "repository_id": fetch.REPOSITORY_ID,
+                "control_sha": CONTROL_SHA, "workflow_path": fetch.WORKFLOW_PATH,
+                "platform": "linux", "profile": profile,
                 "wave_id": wave_id, "bundle_id": bundle_id, "fetch_sha256": projection_sha, "expires": expires,
             }
             envelope = bundle.build_envelope(archive, key_bytes, bindings)
@@ -1654,7 +1655,7 @@ def _run_variant(scenario, projection_bytes, prepared_path, tool_paths, key_byte
                 "repository": fetch.REPOSITORY, "repository_id": fetch.REPOSITORY_ID,
                 "server_url": "https://github.com", "event": "workflow_dispatch", "ref": "refs/heads/main",
                 "control_sha": CONTROL_SHA, "control_run_id": CONTROL_RUN_ID,
-                "workflow_path": fetch.WORKFLOW_PATH, "run_attempt": 1, "profile": profile,
+                "workflow_path": fetch.WORKFLOW_PATH, "run_attempt": 1, "platform": "linux", "profile": profile,
                 "wave_id": wave_id, "bundle_id": bundle_id, "bundle_asset_id": "123456",
                 "bundle_sha256": hashlib.sha256(envelope).hexdigest(), "bundle_size": len(envelope),
                 "projection_asset_id": "123457", "projection_sha256": projection_sha,

@@ -167,7 +167,7 @@ def build_requests(directory, control_sha, control_run_id, wave_id, bundle_id, r
     source_files = sorted(item for item in tracked.split("\x00") if item)
     bundle_request = {
         "repository": request["repository"], "source_revision": request["source_revision"],
-        "profile": profile, "fetch_sha256": _sha256_file(projection), "wave_id": wave_id,
+        "profile": profile, "platform": platform, "fetch_sha256": _sha256_file(projection), "wave_id": wave_id,
         "bundle_id": bundle_id, "control_sha": control_sha, "expires": expires, "source_files": source_files,
         "allowed_files": dict(allowed_files), "allowed_tests": dict(allowed_tests), "frames": {},
     }
