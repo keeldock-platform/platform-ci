@@ -272,14 +272,15 @@ jobs:
       - name: Audit the exact 18-job control graph
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          DEVLANE_CONTROL_EVIDENCE_PATH: ${{ runner.temp }}/devlane-control-evidence/permit.json
+          DEVLANE_CONTROL_EVIDENCE_PATH: ${{ github.workspace }}/devlane-control-evidence/permit.json
         run: python3 -B kit/devlane/control_audit.py
       - name: Save exact source-free control evidence
         if: ${{ github.ref == 'refs/heads/main' }}
         uses: actions/cache/save@3edfce9056124e459a23f683a21433670d47daca
         with:
-          path: ${{ runner.temp }}/devlane-control-evidence/permit.json
+          path: devlane-control-evidence/permit.json
           key: devlane-control-v1-${{ github.run_id }}
+          enableCrossOsArchive: true
 """
 MACOS_CAPABILITY_WORKFLOW_TEMPLATE = """name: macos-capability
 on:
