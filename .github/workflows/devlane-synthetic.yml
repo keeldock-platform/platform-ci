@@ -180,7 +180,7 @@ jobs:
           export CI_RUN_ID="$GITHUB_RUN_ID" CI_RUN_ATTEMPT=1 CI_CONTROL_RUN_ID="$GITHUB_RUN_ID" DEVLANE_PLATFORM=linux
           export DEVLANE_PROFILE=core-node DEVLANE_WAVE_ID=synthetic-wave-0001 DEVLANE_BUNDLE_ID="synthetic-bundle-$GITHUB_RUN_ID"
           export DEVLANE_EXPIRES="$(( $(date +%s) + 3000 ))"
-          mkdir -m 700 -p "$RUNNER_TEMP/devlane-bundle-permit"
+          mkdir -m 700 "$RUNNER_TEMP/devlane-bundle-permit"
           python3 -B kit/devlane/permit.py claim --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json" >/dev/null
           printf 'devlane_cache_permit=claimed\n'
       - name: Reserve work time for permit cache save
@@ -218,7 +218,8 @@ jobs:
           set -euo pipefail
           export CI_RUN_ID="$GITHUB_RUN_ID" CI_RUN_ATTEMPT=1 CI_CONTROL_RUN_ID="$GITHUB_RUN_ID" DEVLANE_PLATFORM=linux
           export DEVLANE_PROFILE=core-node DEVLANE_WAVE_ID=synthetic-wave-0001 DEVLANE_BUNDLE_ID="synthetic-bundle-$GITHUB_RUN_ID"
-          export DEVLANE_EXPIRES="$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["expires"])' "$RUNNER_TEMP/devlane-bundle-permit/permit.json")"
+          DEVLANE_EXPIRES="$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["expires"])' "$RUNNER_TEMP/devlane-bundle-permit/permit.json")"
+          export DEVLANE_EXPIRES
           python3 -B kit/devlane/permit.py verify-claim --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json" >/dev/null
           if python3 -B kit/devlane/permit.py claim --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json" >/dev/null 2>&1; then
             exit 1

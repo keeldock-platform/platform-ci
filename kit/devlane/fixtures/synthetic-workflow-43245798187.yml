@@ -1,0 +1,270 @@
+name: devlane-synthetic
+on:
+  workflow_call:
+permissions: {}
+jobs:
+  devlane-synthetic:
+    name: devlane-synthetic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions: {}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REPOSITORY_ID: ${{ github.repository_id }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      CI_WORKSPACE: ${{ github.workspace }}
+    steps:
+      - name: Fetch public control and validate protected-branch dispatch
+        timeout-minutes: 90
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PY'
+          import os
+          import re
+          import signal
+          import subprocess
+          import sys
+          import time
+
+          def refuse(code):
+              print("devlane_bootstrap_refusal=" + code, file=sys.stderr)
+              raise SystemExit(1)
+
+          started_at = time.monotonic()
+          runner_temp = os.environ["RUNNER_TEMP"]
+          start_file = os.path.join(runner_temp, "devlane-deadline-start-" + os.environ.get("GITHUB_RUN_ID", ""))
+          try:
+              descriptor = os.open(start_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+              with os.fdopen(descriptor, "w", encoding="ascii") as output:
+                  output.write("%.17g\n" % started_at)
+                  output.flush()
+                  os.fsync(output.fileno())
+          except OSError:
+              refuse("bootstrap-start-marker")
+
+          work_deadline = started_at + 5100
+          reap_seconds = 5
+          child_environment = {
+              "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+              "LC_ALL": "C",
+              "GIT_CONFIG_GLOBAL": "/dev/null",
+              "GIT_CONFIG_NOSYSTEM": "1",
+              "GIT_TERMINAL_PROMPT": "0",
+              "PYTHONDONTWRITEBYTECODE": "1",
+          }
+
+          def terminate_and_reap(process):
+              try:
+                  os.killpg(process.pid, signal.SIGTERM)
+              except ProcessLookupError:
+                  pass
+              try:
+                  process.communicate(timeout=2)
+              except subprocess.TimeoutExpired:
+                  pass
+              try:
+                  os.killpg(process.pid, signal.SIGKILL)
+              except ProcessLookupError:
+                  pass
+              try:
+                  process.communicate(timeout=3)
+              except subprocess.TimeoutExpired:
+                  refuse("bootstrap-reap-unconfirmed")
+
+          def run(argv, *, capture=False):
+              remaining = work_deadline - time.monotonic()
+              if remaining <= reap_seconds:
+                  refuse("bootstrap-work-deadline")
+              timeout = min(540, remaining - reap_seconds)
+              try:
+                  process = subprocess.Popen(
+                      argv, cwd=os.environ["CI_WORKSPACE"], env=child_environment,
+                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL,
+                      close_fds=True, start_new_session=True,
+                  )
+                  remaining = work_deadline - time.monotonic()
+                  if remaining <= reap_seconds:
+                      terminate_and_reap(process)
+                      refuse("bootstrap-work-deadline")
+                  timeout = min(timeout, 540, remaining - reap_seconds)
+                  try:
+                      output, _errors = process.communicate(timeout=timeout)
+                  except subprocess.TimeoutExpired:
+                      terminate_and_reap(process)
+                      refuse("bootstrap-command-timeout")
+              except OSError:
+                  refuse("bootstrap-command-failed")
+              if process.returncode != 0:
+                  refuse("bootstrap-command-failed")
+              return output if capture else b""
+
+          if (os.environ.get("CI_REPOSITORY") != "keeldock-platform/platform-ci"
+                  or os.environ.get("CI_REPOSITORY_ID") != "1430960557"
+                  or os.environ.get("CI_SERVER_URL") != "https://github.com"
+                  or os.environ.get("CI_EVENT_NAME") != "workflow_dispatch"
+                  or not re.fullmatch(r"refs/heads/[A-Za-z0-9._/-]{1,200}", os.environ.get("CI_REF", ""))
+                  or not re.fullmatch(r"[a-f0-9]{40}", os.environ.get("CI_SHA", ""))):
+              refuse("dispatch-identity")
+
+          workspace = os.environ["CI_WORKSPACE"]
+          origin = os.environ["CI_SERVER_URL"].rstrip("/") + "/" + os.environ["CI_REPOSITORY"] + ".git"
+          run(["git", "-C", workspace, "init", "-q"])
+          run(["git", "-C", workspace, "config", "core.autocrlf", "false"])
+          run(["git", "-C", workspace, "remote", "add", "origin", origin])
+          if run(["git", "-C", workspace, "remote", "get-url", "origin"], capture=True).decode("utf-8").strip() != origin:
+              refuse("bootstrap-origin-mismatch")
+          run(["git", "-C", workspace, "fetch", "--quiet", "--no-tags", "--depth=1", "origin", os.environ["CI_SHA"]])
+          run(["git", "-C", workspace, "checkout", "--quiet", "--detach", "FETCH_HEAD"])
+          actual_sha = run(["git", "-C", workspace, "rev-parse", "--verify", "HEAD"], capture=True).decode("ascii").strip()
+          if actual_sha != os.environ["CI_SHA"]:
+              refuse("bootstrap-sha-mismatch")
+          deadline_script = os.path.join(workspace, "kit/devlane/deadline.py")
+          deadline_file = os.path.join(runner_temp, "devlane-deadline.json")
+          run([
+              sys.executable, "-B", deadline_script, "create", "--file", deadline_file,
+              "--budget-seconds", "5100", "--cleanup-reserve-seconds", "300", "--job-seconds", "5400",
+              "--started-at-file", start_file,
+          ])
+          PY
+      - name: Prepare hosted Linux isolation state
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          refuse() {
+            printf 'devlane_host_preflight=refused code=%s\n' "$1" >&2
+            exit 1
+          }
+          command -v timeout >/dev/null 2>&1 || refuse timeout-unavailable
+          sudo -n true >/dev/null 2>&1 || refuse sudo-unavailable
+          if ! timeout --signal=TERM --kill-after=5s 90s sudo -n swapoff -a >/dev/null 2>&1; then
+            refuse swapoff-failed
+          fi
+          if ! python3 -B -c 'from pathlib import Path; lines=Path("/proc/swaps").read_text(encoding="ascii").splitlines(); expected=["Filename", "Type", "Size", "Used", "Priority"]; raise SystemExit(0 if len(lines) == 1 and lines[0].split() == expected else 1)'; then
+            refuse swap-remains
+          fi
+          printf 'devlane_swap=disabled\n'
+      - name: Reserve work time for pinned Node action
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/deadline.py guard-action --file "$RUNNER_TEMP/devlane-deadline.json" \
+            --step-timeout-seconds 600 --margin-seconds 60
+      - name: Set up pinned Node toolchain
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        timeout-minutes: 10
+        with:
+          node-version: "24.22.1"
+          check-latest: false
+          cache: ""
+          package-manager-cache: false
+      - name: Install fixed Rust acceptance toolchain
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/deadline.py run --file "$RUNNER_TEMP/devlane-deadline.json" -- \
+            rustup toolchain install 1.88.0 --profile minimal --component rustfmt >/dev/null 2>&1
+          python3 -B kit/devlane/deadline.py run --file "$RUNNER_TEMP/devlane-deadline.json" -- \
+            rustup toolchain install 1.99.1 --profile minimal --component rustfmt >/dev/null 2>&1
+          python3 -B kit/devlane/deadline.py run --file "$RUNNER_TEMP/devlane-deadline.json" -- \
+            python3 -B kit/devlane/test_e2e.py --deadline-file "$RUNNER_TEMP/devlane-deadline.json" \
+            --generate-rust-fixture "$RUNNER_TEMP/devlane-rust-fixture"
+      - name: Claim a synthetic bundle permit
+        run: |
+          set -euo pipefail
+          export CI_RUN_ID="$GITHUB_RUN_ID" CI_RUN_ATTEMPT=1 CI_CONTROL_RUN_ID="$GITHUB_RUN_ID"
+          export DEVLANE_PROFILE=core-node DEVLANE_WAVE_ID=synthetic-wave-0001 DEVLANE_BUNDLE_ID="synthetic-bundle-$GITHUB_RUN_ID"
+          export DEVLANE_EXPIRES="$(( $(date +%s) + 3000 ))"
+          mkdir -m 700 -p "$RUNNER_TEMP/devlane-bundle-permit"
+          python3 -B kit/devlane/permit.py claim --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json" >/dev/null
+          printf 'devlane_cache_permit=claimed\n'
+      - name: Reserve work time for permit cache save
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/deadline.py guard-action --file "$RUNNER_TEMP/devlane-deadline.json" \
+            --step-timeout-seconds 120 --margin-seconds 60
+      - name: Save the synthetic permit through the Actions cache
+        timeout-minutes: 2
+        uses: actions/cache/save@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          key: devlane-permit-v1-synthetic-bundle-${{ github.run_id }}
+      - name: Discard the local synthetic permit
+        run: |
+          set -euo pipefail
+          rm -rf -- "$RUNNER_TEMP/devlane-bundle-permit"
+          [[ ! -e "$RUNNER_TEMP/devlane-bundle-permit" ]]
+      - name: Reserve work time for permit cache restore
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          python3 -B kit/devlane/deadline.py guard-action --file "$RUNNER_TEMP/devlane-deadline.json" \
+            --step-timeout-seconds 120 --margin-seconds 60
+      - name: Restore the synthetic permit with the encrypted-lane path and key shape
+        timeout-minutes: 2
+        uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/devlane-bundle-permit/permit.json
+          key: devlane-permit-v1-synthetic-bundle-${{ github.run_id }}
+          fail-on-cache-miss: true
+      - name: Verify the restored permit and refuse a second claim
+        run: |
+          set -euo pipefail
+          export CI_RUN_ID="$GITHUB_RUN_ID" CI_RUN_ATTEMPT=1 CI_CONTROL_RUN_ID="$GITHUB_RUN_ID"
+          export DEVLANE_PROFILE=core-node DEVLANE_WAVE_ID=synthetic-wave-0001 DEVLANE_BUNDLE_ID="synthetic-bundle-$GITHUB_RUN_ID"
+          export DEVLANE_EXPIRES="$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["expires"])' "$RUNNER_TEMP/devlane-bundle-permit/permit.json")"
+          python3 -B kit/devlane/permit.py verify-claim --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json" >/dev/null
+          if python3 -B kit/devlane/permit.py claim --file "$RUNNER_TEMP/devlane-bundle-permit/permit.json" >/dev/null 2>&1; then
+            exit 1
+          fi
+          printf 'devlane_cache_permit=restored-and-single-use\n'
+      - name: Run full source-free production-path acceptance
+        run: |
+          set -euo pipefail
+          ulimit -S -c 0
+          ulimit -H -c 0
+          quiet() {
+            local stage="$1"; shift
+            local out="$RUNNER_TEMP/devlane-acceptance.log"
+            if "$@" >"$out" 2>&1; then rm -f -- "$out"; return 0; fi
+            printf 'devlane_acceptance=refused stage=%s\n' "$stage"
+            python3 -B kit/devlane/acceptance_diagnostics.py --stage "$stage" --file "$out" || true
+            rm -f -- "$out"
+            return 1
+          }
+          bounded() { python3 -B kit/devlane/deadline.py run --file "$RUNNER_TEMP/devlane-deadline.json" \
+            --timeout-cleanup-reserve-seconds 300 -- "$@"; }
+          quiet crypto-dependency-probe bounded python3 -B -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; assert AESGCM is not None'
+          quiet rust-v2-preparation-tests bounded python3 -B kit/devlane/test_rust_preparation_v2.py
+          quiet rust-v2-lock-tests bounded python3 -B kit/devlane/test_rust_lock_generation.py
+          quiet rust-v2-source-tests bounded python3 -B kit/devlane/test_source_projection.py
+          cargo_path="$(rustup which --toolchain 1.99.1 cargo)"
+          rustc_path="$(rustup which --toolchain 1.99.1 rustc)"
+          quiet rust-v2-public-runtime bounded sudo -n unshare --mount --pid --fork --mount-proc \
+            python3 -B kit/devlane/rust_preparation_smoke.py --cargo-path "$cargo_path" \
+            --rustc-path "$rustc_path" --control-sha "$CI_SHA" \
+            --deadline-file "$RUNNER_TEMP/devlane-deadline.json" \
+            --owner-uid "$(id -u)" --owner-gid "$(id -g)"
+          quiet acceptance-unit-tests bounded python3 -B kit/devlane/test_acceptance.py
+          quiet coordinator-contract-tests bounded python3 -B kit/devlane/test_coordinator.py
+          quiet rust-matrix-runner-tests bounded python3 -B kit/devlane/test_rust_test_runner.py
+          quiet rust-report-tests bounded python3 -B kit/devlane/test_rust_report.py
+          quiet node-adapter-tests bounded node --test kit/devlane/test_adapters.mjs
+          quiet audit-contract-tests bounded python3 -B kit/devlane/test_audit_contracts.py
+          quiet rehearsal-tests bounded python3 -B kit/devlane/test_rehearsal.py
+          quiet production-path-e2e bounded python3 -B kit/devlane/test_e2e.py --deadline-file "$RUNNER_TEMP/devlane-deadline.json" \
+            --rust-fixture "$RUNNER_TEMP/devlane-rust-fixture"
+          printf 'devlane_acceptance=pass\n'
+      - name: Probe the loopback-only Linux network boundary
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/devlane-linux-probe.log"
+          if ! python3 -B kit/devlane/deadline.py run --file "$RUNNER_TEMP/devlane-deadline.json" -- \
+              python3 -B kit/devlane/test_linux_runtime.py >"$out" 2>&1; then cat "$out"; exit 1; fi
+          printf 'devlane_linux_probe=pass\n'

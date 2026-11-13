@@ -39,6 +39,17 @@ LEGACY_ENCRYPTED_WORKFLOWS = {
 
 def _legacy_encrypted_workflow_path(identity):
     return LEGACY_ENCRYPTED_WORKFLOWS.get(identity.get("control_sha"))
+
+
+LEGACY_SYNTHETIC_CONTROL_SHA = "bda18e03c451a00ec91bb7c34d616a55295a7eee"
+LEGACY_SYNTHETIC_WORKFLOW_PATH = "kit/devlane/fixtures/synthetic-workflow-43245798187.yml"
+LEGACY_SYNTHETIC_WORKFLOWS = {
+    LEGACY_SYNTHETIC_CONTROL_SHA: LEGACY_SYNTHETIC_WORKFLOW_PATH,
+}
+
+
+def _legacy_synthetic_workflow_path(identity):
+    return LEGACY_SYNTHETIC_WORKFLOWS.get(identity.get("control_sha"))
 RUN_JOB = "devlane-encrypted-run"
 MACOS_RUN_JOB = "devlane-encrypted-run-macos"
 WINDOWS_RUN_JOB = "devlane-encrypted-run-windows"
@@ -1242,12 +1253,15 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
     if any(ord(char) < 32 and char != "\n" or 127 <= ord(char) <= 159 for char in text):
         _refuse()
     kind = "synthetic" if workflow == "synthetic" else "encrypted"
-    legacy_workflow = _legacy_encrypted_workflow_path(identity) if kind == "encrypted" else None
-    workflow_path = (".github/workflows/devlane-synthetic.yml" if kind == "synthetic"
-                     else str(REPOSITORY_ROOT / legacy_workflow) if legacy_workflow
-                     else ".github/workflows/devlane-encrypted.yml")
+    legacy_workflow = (_legacy_encrypted_workflow_path(identity) if kind == "encrypted"
+                       else _legacy_synthetic_workflow_path(identity))
+    workflow_path = (str(REPOSITORY_ROOT / legacy_workflow)
+                     if legacy_workflow and kind == "encrypted" else
+                     ".github/workflows/devlane-synthetic.yml" if kind == "synthetic" else
+                     ".github/workflows/devlane-encrypted.yml")
+    grammar_path = str(REPOSITORY_ROOT / legacy_workflow) if legacy_workflow else workflow_path
     job_key = job_name if kind == "encrypted" else "devlane-synthetic"
-    grammar = _Grammar(workflow_path, job_key, identity, kind)
+    grammar = _Grammar(grammar_path, job_key, identity, kind)
     first_line = text.splitlines()[0] if text else ""
     if TIME_PREFIX.sub("", first_line, count=1).startswith("Current runner version: "):
         text = _canonicalize_github_hosted_log(text, grammar, job_name, identity, workflow_path)

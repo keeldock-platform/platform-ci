@@ -877,6 +877,10 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             "ref": "refs/heads/devlane/d211-1110",
             "wave_id": "control-20261112T151518Z-082fe3",
         }
+        self.assertEqual(
+            audit._legacy_synthetic_workflow_path(identity),
+            audit.LEGACY_SYNTHETIC_WORKFLOW_PATH,
+        )
         audit.validate_job_log_surface(log, "devlane-synthetic", identity, workflow="synthetic")
         mutations = {
             "free text": log.replace(
