@@ -185,7 +185,7 @@ BOOTSTRAP_REFUSAL_CODES = frozenset((
     "dispatch-identity", "bootstrap-origin-mismatch", "bootstrap-sha-mismatch",
 ))
 MACOS_BOOTSTRAP_REFUSAL_CODES = frozenset((
-    "crypto-dependency-install-failed", "crypto-dependency-verification-failed",
+    "crypto-dependency-install-failed", "crypto-dependency-verification-failed", "crypto-unavailable",
 ))
 WINDOWS_PREFLIGHT_REFUSAL_CODES = frozenset((
     "windows-admin-check-failed", "windows-admin-required", "windows-error-reporting-policy",
@@ -206,7 +206,8 @@ MACOS_PREFLIGHT_REFUSAL_CODES = frozenset((
     "node-runtime-version-invalid", "npm-runtime-install-failed", "npm-runtime-version-invalid",
     "tool-file-type-invalid", "tool-owner-invalid", "tool-mode-invalid", "tool-symlink", "tool-path-resolve-mismatch",
     "tool-file-unavailable",
-    "developer-dir-unexpected", "clang-path-invalid", "tool-digest-mismatch", "developer-clang-mismatch",
+    "developer-dir-unexpected", "developer-dir-trust-invalid", "clang-path-invalid",
+    "tool-digest-mismatch", "developer-clang-mismatch",
     "tool-version-unavailable", "supervisor-operation-failed", "raw-record-size",
 ))
 EARLY_FAILURE_STEP_IDS = {

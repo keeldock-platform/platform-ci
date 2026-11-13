@@ -308,8 +308,64 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         with mock.patch.object(sandbox, "_command_output", side_effect=(developer_alias, clang_alias)), \
                 mock.patch.object(Path, "resolve", autospec=True, side_effect=resolve), \
                 mock.patch.object(Path, "is_dir", return_value=True), \
+                mock.patch.object(sandbox, "_trusted_developer_directory"), \
                 mock.patch.object(sandbox, "_trusted_file", side_effect=lambda path, **_kwargs: path):
             self.assertEqual(sandbox._validate_clt(), (str(developer_real), str(clang_real)))
+
+    def test_xcode_developer_tree_rejects_writable_directory_and_wrong_owner(self):
+        developer = Path("/Applications/Xcode.app/Contents/Developer")
+        trusted = type("Metadata", (), {"st_mode": 0o40755, "st_uid": 0})()
+        header = lambda path: "drwxr-xr-x  1 root  wheel  1 Nov 13 00:00 " + str(path)
+        with mock.patch.object(Path, "lstat", return_value=trusted), \
+                mock.patch.object(sandbox, "_command_output", side_effect=lambda argv, **_kwargs: header(argv[-1])) as ls:
+            sandbox._trusted_developer_directory(developer, Path("/Applications"))
+        self.assertEqual(
+            [Path(call.args[0][-1]) for call in ls.call_args_list],
+            [developer, developer.parent, developer.parent.parent, Path("/Applications")],
+        )
+
+        writable = type("Metadata", (), {"st_mode": 0o40775, "st_uid": 0})()
+        with mock.patch.object(Path, "lstat", return_value=writable), \
+                self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
+            sandbox._trusted_developer_directory(developer, Path("/Applications"))
+
+        wrong_owner = type("Metadata", (), {"st_mode": 0o40755, "st_uid": 501})()
+        with mock.patch.object(Path, "lstat", return_value=wrong_owner), \
+                self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
+            sandbox._trusted_developer_directory(developer, Path("/Applications"))
+
+        parent = developer.parent.parent
+
+        def metadata_for(path):
+            return wrong_owner if Path(path) == parent else trusted
+
+        with mock.patch.object(Path, "lstat", autospec=True, side_effect=metadata_for), \
+                self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
+            sandbox._trusted_developer_directory(developer, Path("/Applications"))
+
+    def test_xcode_developer_tree_rejects_acl_write_grants(self):
+        developer = Path("/Applications/Xcode.app/Contents/Developer")
+        metadata = type("Metadata", (), {"st_mode": 0o40755, "st_uid": 0})()
+        header = lambda path: "drwxr-xr-x+ 1 root wheel 1 Nov 13 00:00 " + str(path)
+
+        def output(argv, **_kwargs):
+            return header(argv[-1]) + "\n 0: group:staff allow write"
+
+        with mock.patch.object(Path, "lstat", return_value=metadata), \
+                mock.patch.object(sandbox, "_command_output", side_effect=output), \
+                self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
+            sandbox._trusted_developer_directory(developer, Path("/Applications"))
+
+        app_bundle = developer.parent.parent
+
+        def parent_acl(argv, **_kwargs):
+            path = Path(argv[-1])
+            return header(path) + ("\n 0: group:staff allow add_file" if path == app_bundle else "")
+
+        with mock.patch.object(Path, "lstat", return_value=metadata), \
+                mock.patch.object(sandbox, "_command_output", side_effect=parent_acl), \
+                self.assertRaisesRegex(sandbox.Refusal, "developer-dir-trust-invalid"):
+            sandbox._trusted_developer_directory(developer, Path("/Applications"))
 
     def test_xcode_selector_rejects_unexpected_developer_directory(self):
         developer = str(Path(os.sep, "Users", "runner", "Developer"))
@@ -367,11 +423,18 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         self.assertNotIn("(allow network*)", profile)
         self.assertIn('(allow file-write* (subpath "' + PRIVATE_RUN + '/cache")', profile)
         self.assertNotIn('(allow file-write* (subpath "/Users")', profile)
+        ident = {"uid": 544, "gid": sandbox.WORKER_GROUP, "node": "/opt/node/bin/node",
+                 "npm_cli": PRIVATE_RUN + "/control-npm/lib/node_modules/npm/bin/npm-cli.js"}
+        command = sandbox._npm_preparation_command(ident)
+        self.assertEqual(command, (
+            "/opt/node/bin/node", PRIVATE_RUN + "/control-npm/lib/node_modules/npm/bin/npm-cli.js",
+            "ci", "--ignore-scripts", "--include=dev", "--include=optional", "--no-audit", "--no-fund",
+        ))
         process = mock.Mock(returncode=0)
         with mock.patch.object(sandbox.subprocess, "Popen", return_value=process) as spawn, \
                 mock.patch.object(sandbox, "_terminate_worker_processes"):
             self.assertEqual(sandbox._run_preparation_process(
-                ("/opt/node/bin/node", "/opt/npm/cli.js", "ci"),
+                command,
                 ident={"uid": 544, "gid": sandbox.WORKER_GROUP}, profile=PRIVATE_RUN + "/preparation.sb",
                 cwd=PRIVATE_RUN + "/preparation-project", env={"PATH": "/usr/bin:/bin"},
                 output=io.BytesIO(), timeout=20,
@@ -379,9 +442,27 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         self.assertEqual(spawn.call_args.args[0][:4], [
             "/usr/bin/sandbox-exec", "-f", PRIVATE_RUN + "/preparation.sb", "/opt/node/bin/node",
         ])
+        self.assertEqual(spawn.call_args.args[0][3:], list(command))
         self.assertEqual(spawn.call_args.kwargs["user"], 544)
         self.assertEqual(spawn.call_args.kwargs["group"], sandbox.WORKER_GROUP)
         self.assertEqual(spawn.call_args.kwargs["extra_groups"], ())
+
+    def test_worker_can_read_but_not_write_control_npm_tree(self):
+        with tempfile.TemporaryDirectory(prefix="macos-control-npm-") as temporary:
+            parent = Path(temporary).resolve(strict=True)
+            os.chmod(parent, 0o711)
+            root = parent / "control-npm"
+            nested = root / "lib" / "node_modules" / "npm"
+            nested.mkdir(parents=True)
+            cli = nested / "npm-cli.js"
+            cli.write_text("npm cli fixture", encoding="ascii")
+            for directory in (root, root / "lib", root / "lib" / "node_modules", nested):
+                os.chmod(directory, 0o755)
+            os.chmod(cli, 0o644)
+            sandbox._trusted_worker_readonly_tree(root)
+            os.chmod(nested, 0o775)
+            with self.assertRaisesRegex(sandbox.Refusal, "tool-mode-invalid"):
+                sandbox._trusted_worker_readonly_tree(root)
 
     def test_capture_log_finalization_uses_the_open_descriptor_after_path_swap(self):
         with tempfile.TemporaryDirectory() as temporary:

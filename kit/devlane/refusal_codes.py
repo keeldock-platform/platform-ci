@@ -26,6 +26,7 @@ REFUSAL_CODES = frozenset((
     "matrix-semver-worker-peer",
     "crypto-dependency-install-failed",
     "crypto-dependency-verification-failed",
+    "crypto-unavailable",
     "windows-node-runtime-invalid",
     "windows-npm-runtime-install-failed",
     "windows-npm-runtime-version-invalid",
@@ -99,7 +100,7 @@ REFUSAL_CODES = frozenset((
     "swap-state-unavailable", "clang-path-invalid", "tool-digest-mismatch", "tool-file-unavailable",
     "tool-file-type-invalid", "tool-manifest-invalid", "tool-mode-invalid", "tool-owner-invalid", "tool-path-invalid", "tool-symlink",
     "tool-path-resolve-mismatch",
-    "developer-clang-mismatch", "developer-dir-unexpected", "tool-version-mismatch",
+    "developer-clang-mismatch", "developer-dir-trust-invalid", "developer-dir-unexpected", "tool-version-mismatch",
     "tool-version-unavailable", "total-deadline-exhausted", "total-deadline-unavailable",
     "typescript-report-incomplete",
 ))

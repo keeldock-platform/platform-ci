@@ -1098,6 +1098,8 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/sandbox_macos.py',
             'kit/devlane/control-crypto-requirements.txt',
             'kit/devlane/test_sandbox_macos.py',
+            'kit/devlane/control_python.py',
+            'kit/devlane/test_control_python.py',
         })
         self.assertEqual(set(PINNED_FILE_SHA256), expected)
         self.assertTrue({name for name in expected if type(name) is str}.issubset(PLATFORM_FILES))

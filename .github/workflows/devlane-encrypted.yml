@@ -698,10 +698,18 @@ jobs:
               >/dev/null 2>&1; then
             crypto_refuse crypto-dependency-install-failed
           fi
-          export PYTHONPATH="$crypto_target"
-          printf 'PYTHONPATH=%s\n' "$crypto_target" >> "$GITHUB_ENV"
-          if ! python3 -B -c 'import cffi, cryptography, pycparser; from cryptography.hazmat.primitives.ciphers.aead import AESGCM; assert (cffi.__version__, cryptography.__version__, pycparser.__version__) == ("2.1.1", "50.0.2", "3.12") and AESGCM is not None' >/dev/null 2>&1; then
+          runner_uid="$(id -u)"
+          if ! python3 -B kit/devlane/control_python.py --target "$crypto_target" \
+            --platform macos --owner-uid "$runner_uid" seal >/dev/null 2>&1 || \
+             ! python3 -B kit/devlane/control_python.py --target "$crypto_target" \
+               --platform macos --owner-uid "$runner_uid" check --require-key-absent >/dev/null 2>&1; then
             crypto_refuse crypto-dependency-verification-failed
+          fi
+          python_bin="$(python3 -B -c 'import sys; print(sys.executable)')"
+          if ! python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+            sudo -n "$python_bin" -B kit/devlane/control_python.py --target "$crypto_target" \
+              --platform macos --owner-uid "$runner_uid" check --require-key-absent >/dev/null 2>&1; then
+            crypto_refuse crypto-unavailable
           fi
           python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
             python3 -B kit/devlane/fetch.py context --output "$RUN_ROOT/context.json"
@@ -726,11 +734,12 @@ jobs:
             }
             [[ "$(node --version 2>/dev/null)" == "v24.22.1" ]] || macos_preflight_refuse node-runtime-version-invalid
             npm_prefix="$RUN_ROOT/control-npm"
-            mkdir -m 700 "$npm_prefix" || macos_preflight_refuse npm-runtime-install-failed
+            mkdir -m 755 "$npm_prefix" || macos_preflight_refuse npm-runtime-install-failed
             if ! npm install --global --prefix "$npm_prefix" --ignore-scripts --no-audit --no-fund --silent npm@11.19.1 \
               >/dev/null 2>&1; then
               macos_preflight_refuse npm-runtime-install-failed
             fi
+            chmod -R a+rX,go-w "$npm_prefix" || macos_preflight_refuse npm-runtime-install-failed
             export PATH="$npm_prefix/bin:$PATH"
             printf '%s\n' "$npm_prefix/bin" >> "$GITHUB_PATH"
             [[ "$(npm --version 2>/dev/null)" == "11.19.1" ]] || macos_preflight_refuse npm-runtime-version-invalid
@@ -1043,8 +1052,11 @@ jobs:
           set +x
           if [[ "$DEVLANE_PLATFORM" == "macos" ]]; then
             python_bin="$(python3 -B -c 'import sys; print(sys.executable)')"
+            runner_uid="$(id -u)"
             python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
-              sudo -n --preserve-env=DEVLANE_DECRYPT_KEY "$python_bin" -B kit/devlane/sandbox_macos.py decrypt \
+              sudo -n --preserve-env=DEVLANE_DECRYPT_KEY "$python_bin" -B kit/devlane/control_python.py \
+                --target "$RUN_ROOT/control-python-deps" --platform macos --owner-uid "$runner_uid" \
+                run kit/devlane/sandbox_macos.py decrypt \
                 --state-dir "$RUN_ROOT/state" --context "$RUN_ROOT/context.json" \
                 --bundle "$RUN_ROOT/bundle.enc" --projection "$RUN_ROOT/projection.json" \
                 --deadline-file "$RUN_ROOT/deadline.json"
@@ -1183,9 +1195,9 @@ jobs:
               --index-url https://pypi.org/simple --target $cryptoTarget --require-hashes `
               --only-binary=:all: --no-deps -r (Join-Path $env:CI_WORKSPACE 'kit\devlane\control-crypto-requirements.txt') *> $null
           if ($LASTEXITCODE -ne 0) { Refuse-Bootstrap 'crypto-dependency-install-failed' }
-          $env:PYTHONPATH = $cryptoTarget
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value ('PYTHONPATH=' + $cryptoTarget) -Encoding utf8
-          python -B -c 'import cffi, cryptography, pycparser; from cryptography.hazmat.primitives.ciphers.aead import AESGCM; assert (cffi.__version__, cryptography.__version__, pycparser.__version__) == ("2.1.1", "50.0.2", "3.12") and AESGCM is not None' *> $null
+          python -B kit/devlane/control_python.py --target $cryptoTarget --platform windows seal *> $null
+          if ($LASTEXITCODE -ne 0) { Refuse-Bootstrap 'crypto-dependency-verification-failed' }
+          python -B kit/devlane/control_python.py --target $cryptoTarget --platform windows check --require-key-absent *> $null
           if ($LASTEXITCODE -ne 0) { Refuse-Bootstrap 'crypto-dependency-verification-failed' }
           python -B kit/devlane/fetch.py context --output (Join-Path $runRoot 'context.json')
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -1362,7 +1374,7 @@ jobs:
           DEVLANE_DECRYPT_KEY: ${{ secrets.DEVLANE_DECRYPT_KEY }}
         run: |
           $ErrorActionPreference = 'Stop'
-          python -B kit/devlane/sandbox_windows.py decrypt --context (Join-Path $env:RUN_ROOT 'context.json') --bundle (Join-Path $env:RUN_ROOT 'bundle.enc') --source (Join-Path $env:RUN_ROOT 'workspace\source') --manifest (Join-Path $env:RUN_ROOT 'state\manifest.json')
+          python -B kit/devlane/control_python.py --target (Join-Path $env:RUN_ROOT 'control-python-deps') --platform windows run kit/devlane/sandbox_windows.py decrypt --context (Join-Path $env:RUN_ROOT 'context.json') --bundle (Join-Path $env:RUN_ROOT 'bundle.enc') --source (Join-Path $env:RUN_ROOT 'workspace\source') --manifest (Join-Path $env:RUN_ROOT 'state\manifest.json')
           if ($LASTEXITCODE -ne 0) { exit 1 }
       - name: Execute offline profile and filter public summary
         id: execute

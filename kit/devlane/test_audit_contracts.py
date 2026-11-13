@@ -510,6 +510,8 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             "kit/bootstrap/test_policy.py",
             "kit/bootstrap/test_public_tree.py",
             "kit/devlane/test_audit_contracts.py",
+            "kit/devlane/control_python.py",
+            "kit/devlane/test_control_python.py",
             "kit/bootstrap/check_candidate.py",
         )
         discovery_targets = (
@@ -885,6 +887,8 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                     "crypto-dependency-install-failed", "crypto-dependency-verification-failed",
                 )
             )
+        cases.append(("macos", "Fetch public control and validate dispatch",
+                      "devlane_bootstrap_refusal=crypto-unavailable", 1))
 
         for platform_name, failed_step, marker, exit_code in cases:
             with self.subTest(platform=platform_name, marker=marker):
@@ -1136,6 +1140,21 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         with self.assertRaises(audit.AuditRefusal):
             audit.validate_job_log_surface(log.replace(b"\x1b[36;1m", b"\x1b[31m", 1),
                                            audit.RUN_JOB, IDENTITY)
+
+    def test_unreviewed_pythonpath_is_rejected_from_macos_and_windows_job_environments(self):
+        platform_cases = (
+            ("macos", audit.MACOS_RUN_JOB, MACOS_TMP + "/devlane-12345/control-python-deps"),
+            ("windows", audit.WINDOWS_RUN_JOB, audit.WINDOWS_TEMP + r"\devlane-12345\control-python-deps"),
+        )
+        stamp = b"2026-11-10T12:00:00.1234567Z "
+        for platform_name, job_key, target in platform_cases:
+            identity = dict(IDENTITY, platform=platform_name)
+            log = _render_log(job_key, identity)
+            anchor = stamp + b"env:\n"
+            self.assertIn(anchor, log)
+            mutation = log.replace(anchor, anchor + stamp + b"  PYTHONPATH: " + target.encode("utf-8") + b"\n", 1)
+            with self.subTest(platform=platform_name), self.assertRaises(audit.AuditRefusal):
+                audit.validate_job_log_surface(mutation, job_key, identity)
 
     def test_real_encrypted_rehearsal_logs_and_two_job_graph_match_github_output(self):
         fixtures = Path(__file__).resolve().parent / "fixtures"
@@ -2456,7 +2475,7 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
             "crypto-dependency-install-failed", "crypto-dependency-verification-failed",
             "tool-file-type-invalid", "tool-owner-invalid", "tool-mode-invalid", "tool-symlink", "tool-path-resolve-mismatch",
             "tool-file-unavailable",
-            "developer-dir-unexpected", "clang-path-invalid", "tool-digest-mismatch",
+            "developer-dir-unexpected", "developer-dir-trust-invalid", "clang-path-invalid", "tool-digest-mismatch",
             "developer-clang-mismatch", "node-runtime-version-invalid", "npm-runtime-install-failed",
             "npm-runtime-version-invalid", "windows-node-runtime-invalid",
             "windows-npm-runtime-install-failed", "windows-npm-runtime-version-invalid",
@@ -2473,7 +2492,26 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
             self.assertIn("--no-deps", script)
             self.assertIn("--index-url https://pypi.org/simple", script)
             self.assertIn("control-python-deps", script)
-            self.assertIn("PYTHONPATH", script)
+            self.assertIn("control_python.py", script)
+            self.assertNotIn("PYTHONPATH", script)
+            platform_scripts = "\n".join(
+                line for step in workflow[job_key]["steps"] for line in step.get("run", [])
+            )
+            self.assertNotIn("PYTHONPATH", platform_scripts)
+            if platform_name == "macos":
+                self.assertIn("--require-key-absent", script)
+                self.assertIn("sudo -n", script)
+                self.assertIn("crypto_refuse crypto-unavailable", script)
+                root_check = script.index('sudo -n "$python_bin" -B kit/devlane/control_python.py')
+                self.assertIn(
+                    '--platform macos --owner-uid "$runner_uid" check --require-key-absent',
+                    script[root_check:],
+                )
+                decrypt = next(step for step in steps if step["name"] == "Decrypt authenticated bundle")
+                self.assertIn(
+                    'sudo -n --preserve-env=DEVLANE_DECRYPT_KEY "$python_bin" -B kit/devlane/control_python.py',
+                    "\n".join(decrypt["run"]),
+                )
             expected_python = "3.15" if platform_name == "macos" else "3.12"
             self.assertIn(("== \"" + expected_python + "\"") if platform_name == "macos"
                           else ("-ne '" + expected_python + "'"), script)
@@ -2488,6 +2526,10 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
             self.assertLess(node_setup_index, steps.index(preflight_step))
             self.assertIn("--global --prefix", preflight_script)
             self.assertIn("npm@11.19.1", preflight_script)
+            if platform_name == "macos":
+                install_index = preflight_script.index("npm install --global --prefix")
+                permissions_index = preflight_script.index('chmod -R a+rX,go-w "$npm_prefix"')
+                self.assertLess(install_index, permissions_index)
         windows_sandbox = (self.root / "kit/devlane/sandbox_windows.py").read_text(encoding="utf-8")
         self.assertIn('SAFE_ENVIRONMENT = frozenset((', windows_sandbox)
         safe_env = windows_sandbox.split('SAFE_ENVIRONMENT = frozenset((', 1)[1].split('))', 1)[0]

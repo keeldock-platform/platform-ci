@@ -30,6 +30,7 @@ import rust_tooling
 import rust_preparation_smoke
 import supervisor
 import sandbox_macos
+import control_python
 import test_e2e
 
 
@@ -632,14 +633,15 @@ class DeadlineTests(unittest.TestCase):
             ("devlane-encrypted.yml", "devlane-encrypted-run", "prepare.py"): 1,
             ("devlane-encrypted.yml", "devlane-encrypted-run", "rust_tooling.py"): 2,
             ("devlane-encrypted.yml", "devlane-encrypted-run", "supervisor.py"): 4,
-            ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "deadline.py"): 30,
+            ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "deadline.py"): 31,
             ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "fetch.py"): 4,
             ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "host_cleanup.py"): 1,
             ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "network_probe.py"): 1,
             ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "permit.py"): 3,
             ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "prepare.py"): 1,
             ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "rust_tooling.py"): 2,
-            ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "sandbox_macos.py"): 7,
+            ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "sandbox_macos.py"): 6,
+            ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "control_python.py"): 4,
             ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "supervisor.py"): 4,
             ("devlane-encrypted.yml", "devlane-encrypted-audit", "public_audit.py"): 1,
         })
@@ -823,6 +825,13 @@ class DeadlineTests(unittest.TestCase):
                     }[arguments[0]]
                     for option in required:
                         self._assert_required_argument(sandbox_macos.main, arguments, option)
+                elif script == "control_python.py":
+                    safe_arguments = [value.replace("$runner_uid)", "501").replace("$runner_uid", "501")
+                                      .replace("$crypto_target", "/tmp/control-python-deps")
+                                      .replace("$RUN_ROOT", "/tmp/devlane-12345") for value in arguments]
+                    for option in ("--target", "--platform"):
+                        self._assert_required_argument(control_python.main, safe_arguments, option)
+                    self.assertTrue(any(command in safe_arguments for command in ("seal", "check", "run")))
                 elif script == "public_audit.py":
                     self.assertEqual(arguments, [])
                     self.assertEqual(public_audit.main.__code__.co_argcount, 0)

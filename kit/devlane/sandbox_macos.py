@@ -68,7 +68,8 @@ MACOS_PREFLIGHT_REFUSAL_CODES = frozenset((
     "node-runtime-version-invalid", "npm-runtime-install-failed", "npm-runtime-version-invalid",
     "tool-file-type-invalid", "tool-owner-invalid", "tool-mode-invalid", "tool-symlink", "tool-path-resolve-mismatch",
     "tool-file-unavailable",
-    "developer-dir-unexpected", "clang-path-invalid", "tool-digest-mismatch", "developer-clang-mismatch",
+    "developer-dir-unexpected", "developer-dir-trust-invalid", "clang-path-invalid",
+    "tool-digest-mismatch", "developer-clang-mismatch",
     "tool-version-unavailable", "supervisor-operation-failed", "raw-record-size",
 ))
 
@@ -77,7 +78,7 @@ MACOS_ROOT_IDENTITY_REFUSAL_CODES = frozenset(
 ) | frozenset(("state-directory-permissions", "dispatch-context-invalid",
                "tool-file-type-invalid", "tool-owner-invalid", "tool-mode-invalid", "tool-symlink", "tool-path-resolve-mismatch",
                "tool-file-unavailable",
-               "developer-dir-unexpected", "clang-path-invalid", "tool-digest-mismatch",
+               "developer-dir-unexpected", "developer-dir-trust-invalid", "clang-path-invalid",
                "developer-clang-mismatch",
                "tool-version-unavailable", "node-toolchain-missing", "node-toolchain-version",
                "npm-toolchain-version", "supervisor-operation-failed", "raw-record-size"))
@@ -355,12 +356,103 @@ def _find_node_tools():
         npm_root = npm_launcher.parent.parent if npm_launcher.parent.name == "bin" else npm_launcher.parent
         npm_entry = npm_root / "lib" / "node_modules" / "npm" / "bin" / "npm-cli.js"
     npm_cli = _trusted_file(npm_entry)
+    _trusted_worker_readonly_tree(npm_entry.parents[4])
     version_env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
     if _command_output((str(node), "--version"), env=version_env) != "v24.22.1":
         _refuse("node-toolchain-version")
     if _command_output((str(node), str(npm_cli), "--version"), env=version_env) != "11.19.1":
         _refuse("npm-toolchain-version")
     return node, npm_cli
+
+
+def _trusted_worker_readonly_tree(root):
+    """Require the hosted npm prefix to be traversable but not worker-writable."""
+    root = Path(root)
+    owners = {0, os.getuid()}
+    try:
+        parent = root.parent.lstat()
+        if (not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode)
+                or parent.st_uid not in owners or parent.st_mode & 0o022):
+            _refuse("tool-mode-invalid")
+        root_info = root.lstat()
+        if (not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode)
+                or root_info.st_uid not in owners or root_info.st_mode & 0o022
+                or root_info.st_mode & 0o005 != 0o005):
+            _refuse("tool-mode-invalid")
+        pending = [root]
+        while pending:
+            directory = pending.pop()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    info = entry.stat(follow_symlinks=False)
+                    if stat.S_ISLNK(info.st_mode):
+                        resolved = path.resolve(strict=True)
+                        if not resolved.is_relative_to(root):
+                            _refuse("tool-path-resolve-mismatch")
+                        target = resolved.lstat()
+                        if (target.st_uid not in owners or target.st_mode & 0o022
+                                or not stat.S_ISREG(target.st_mode) or target.st_mode & 0o004 != 0o004):
+                            _refuse("tool-mode-invalid")
+                        continue
+                    if info.st_uid not in owners or info.st_mode & 0o022:
+                        _refuse("tool-mode-invalid")
+                    if stat.S_ISDIR(info.st_mode):
+                        if info.st_mode & 0o005 != 0o005:
+                            _refuse("tool-mode-invalid")
+                        pending.append(path)
+                    elif stat.S_ISREG(info.st_mode):
+                        if info.st_mode & 0o004 != 0o004:
+                            _refuse("tool-mode-invalid")
+                    else:
+                        _refuse("tool-file-type-invalid")
+    except Refusal:
+        raise
+    except OSError:
+        _refuse("tool-file-unavailable")
+
+
+def _trusted_developer_directory(path, anchor):
+    env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"}
+    current = Path(path)
+    anchor = Path(anchor)
+    directories = []
+    while True:
+        directories.append(current)
+        if current == anchor:
+            break
+        parent = current.parent
+        if parent == current or not current.is_relative_to(anchor):
+            _refuse("developer-dir-trust-invalid")
+        current = parent
+    write_rights = frozenset((
+        "add_file", "add_subdirectory", "append", "chown", "delete", "delete_child",
+        "write", "writeattr", "writeextattr", "writesecurity",
+    ))
+    for directory in directories:
+        try:
+            metadata = directory.lstat()
+            if (not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+                    or metadata.st_uid != 0 or metadata.st_mode & 0o022):
+                _refuse("developer-dir-trust-invalid")
+            output = _command_output(("/bin/ls", "-lde", str(directory)), env=env, maximum=16384)
+        except Refusal:
+            _refuse("developer-dir-trust-invalid")
+        except OSError:
+            _refuse("developer-dir-trust-invalid")
+        lines = output.splitlines()
+        if not lines or not lines[0].endswith(str(directory)):
+            _refuse("developer-dir-trust-invalid")
+        for line in lines[1:]:
+            if not line.strip():
+                continue
+            match = re.fullmatch(r"\s*[0-9]+:\s+.*?\s+(allow|deny)\s+(.+)", line)
+            if match is None:
+                _refuse("developer-dir-trust-invalid")
+            if match.group(1) == "allow":
+                rights = {part.strip().lower() for part in match.group(2).split(",")}
+                if rights & write_rights:
+                    _refuse("developer-dir-trust-invalid")
 
 
 def _validate_clt():
@@ -375,6 +467,8 @@ def _validate_clt():
              and re.fullmatch(r"/Applications/Xcode(?:_[A-Za-z0-9.]+)?\.app/Contents/Developer", developer) is None)
             or not developer_path.is_dir()):
         _refuse("developer-dir-unexpected")
+    anchor = Path("/Library") if developer == "/Library/Developer/CommandLineTools" else Path("/Applications")
+    _trusted_developer_directory(developer_path, anchor)
     clang_name = _command_output(("/usr/bin/xcrun", "--find", "clang"), env={**env, "DEVELOPER_DIR": developer})
     try:
         clang_path = Path(clang_name).resolve(strict=True)
@@ -474,6 +568,13 @@ def preparation_profile_text(*, project, prepared, cache, home, temporary, node,
         "(allow file-map-executable (subpath " + _quote(project) + ") (subpath " + _quote(prepared) + "))",
     ))
     return "\n".join(lines) + "\n"
+
+
+def _npm_preparation_command(ident):
+    return (
+        ident["node"], ident["npm_cli"], "ci", "--ignore-scripts", "--include=dev",
+        "--include=optional", "--no-audit", "--no-fund",
+    )
 
 
 def _run_preparation_process(argv, *, ident, profile, cwd, env, output, timeout):
@@ -604,8 +705,7 @@ def _prepare(state, projection_path, output_path, profile, control_sha, deadline
     timeout = min(3600, deadline_budget.remaining(deadline_file))
     with log.open("xb") as output_log:
         code = _run_preparation_process(
-            (ident["node"], ident["npm_cli"], "ci", "--ignore-scripts", "--include=dev",
-             "--include=optional", "--no-audit", "--no-fund"),
+            _npm_preparation_command(ident),
             ident=ident, profile=profile_path, cwd=project, env=env, output=output_log, timeout=timeout,
         )
     if log.stat().st_size > MAX_LOG_BYTES or code != 0:
