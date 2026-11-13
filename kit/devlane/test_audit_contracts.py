@@ -601,6 +601,27 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed "
                 "disposition=run-failed-at-decrypt",
             )
+        failure_surface = audit.validate_job_log_surface(failure_log, audit.RUN_JOB, IDENTITY, completed=True)
+        audit.validate_job_log_metadata_binding(failure_surface, run_job, IDENTITY)
+        successful_run_job = next(job for job in _encrypted_jobs() if job["name"] == audit.RUN_JOB)
+        with self.assertRaises(audit.AuditRefusal):
+            audit.validate_job_log_metadata_binding(failure_surface, successful_run_job, IDENTITY)
+        success_surface = audit.validate_job_log_surface(
+            _render_real_runner_encrypted_log(IDENTITY), audit.RUN_JOB, IDENTITY, completed=True,
+        )
+        with self.assertRaises(audit.AuditRefusal):
+            audit.validate_job_log_metadata_binding(success_surface, run_job, IDENTITY)
+        for mutation in ("cleanup", "downstream", "failed-step"):
+            changed_job = copy.deepcopy(run_job)
+            changed_steps = {step["name"]: step for step in changed_job["steps"]}
+            if mutation == "cleanup":
+                changed_steps["Shred runner-local workspace"]["conclusion"] = "failure"
+            elif mutation == "downstream":
+                changed_steps["Execute offline profile and filter public summary"]["conclusion"] = "success"
+            else:
+                changed_steps["Decrypt authenticated bundle"]["conclusion"] = "success"
+            with self.subTest(mutation=mutation), self.assertRaises(audit.AuditRefusal):
+                audit.validate_job_log_metadata_binding(failure_surface, changed_job, IDENTITY)
 
     def test_public_audit_refusal_prints_only_a_fixed_code(self):
         output = io.StringIO()
@@ -631,6 +652,14 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
              "devlane_macos_preflight_refusal=macos-user-attribute-set", 2,
              "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed "
              "disposition=run-failed-at-macos-preflight"),
+            ("linux", "Fetch public control and validate dispatch",
+             "devlane_bootstrap_refusal=bootstrap-command-failed", 1,
+             "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed "
+             "disposition=run-failed-at-bootstrap"),
+            ("macos", "Fetch public control and validate dispatch",
+             "devlane_bootstrap_refusal=bootstrap-command-failed", 1,
+             "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed "
+             "disposition=run-failed-at-bootstrap"),
             ("windows", "Fetch public control and validate dispatch",
              "devlane_deadline_refusal=deadline-start-invalid", 1,
              "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed "
@@ -668,6 +697,7 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 surface = audit.validate_job_log_surface(logs, audit.PLATFORM_RUN_JOBS[platform_name], identity,
                                                           completed=True)
                 self.assertEqual(surface["early_failure"], failed_step)
+                audit.validate_job_log_metadata_binding(surface, run_job, identity)
                 self.assertFalse(audit.validate_dispatch_marker(logs, identity, allow_missing=True))
                 with self.assertRaises(audit.AuditRefusal):
                     audit.validate_job_log_surface(
@@ -676,6 +706,10 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                     )
 
                 class API:
+                    def __init__(self, candidate_jobs=None, candidate_log=None):
+                        self.jobs = jobs if candidate_jobs is None else candidate_jobs
+                        self.log = logs if candidate_log is None else candidate_log
+
                     def json(self, endpoint):
                         if endpoint.endswith("/actions/runs/" + identity["run_id"]):
                             repository = {"full_name": audit.REPOSITORY, "id": audit.REPOSITORY_ID}
@@ -687,14 +721,14 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                                 "repository": repository, "head_repository": repository,
                             }, {})
                         if "/jobs?" in endpoint:
-                            return ({"total_count": 4, "jobs": jobs}, {})
+                            return ({"total_count": 4, "jobs": self.jobs}, {})
                         if "/artifacts?" in endpoint:
                             return ({"total_count": 0, "artifacts": []}, {})
                         return ({}, {})
 
                     def log_text(self, identifier):
                         self.assert_run_id = identifier
-                        return logs
+                        return self.log
 
                 permit_key = "devlane-permit-v1-" + identity["bundle_id"]
                 control_key = "devlane-control-v1-" + identity["control_run_id"]
@@ -704,6 +738,8 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                         patch.object(audit, "validate_check_output"), \
                         patch.object(audit, "_read_annotations", return_value=[]):
                     self.assertEqual(audit.run_audit(API(), identity), outcome)
+                    with self.assertRaises(audit.AuditRefusal):
+                        audit.run_audit(API(_encrypted_jobs(platform=platform_name), logs), identity)
                 terminal_jobs = copy.deepcopy(jobs)
                 terminal_audit = next(job for job in terminal_jobs if job["name"] == audit.AUDIT_JOB)
                 terminal_audit["status"] = "completed"
@@ -714,6 +750,91 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                     terminal_jobs, identity, "core-node",
                 )
                 self.assertTrue(audit_passed)
+                for mutation in ("cleanup", "downstream", "failed-step"):
+                    changed = copy.deepcopy(jobs)
+                    changed_run = next(job for job in changed
+                                       if job["name"] == audit.PLATFORM_RUN_JOBS[platform_name])
+                    changed_steps = {step["name"]: step for step in changed_run["steps"]}
+                    if mutation == "cleanup":
+                        changed_steps["Shred runner-local workspace"]["conclusion"] = "failure"
+                    elif mutation == "downstream":
+                        changed_steps["Decrypt authenticated bundle"]["conclusion"] = "success"
+                    else:
+                        changed_steps[failed_step]["conclusion"] = "success"
+                    with self.subTest(platform=platform_name, mutation=mutation), \
+                            self.assertRaises(audit.AuditRefusal):
+                        audit.validate_job_log_metadata_binding(surface, changed_run, identity)
+
+    def test_bootstrap_refusal_vocabulary_is_fixed_and_step_bound(self):
+        identity = dict(IDENTITY, platform="linux")
+        valid = _render_real_runner_encrypted_log(
+            identity,
+            early_failure={
+                "step": "Fetch public control and validate dispatch",
+                "marker": "devlane_bootstrap_refusal=bootstrap-command-failed", "exit_code": 1,
+            },
+        )
+        result = audit.validate_job_log_surface(valid, audit.RUN_JOB, identity, completed=True)
+        self.assertEqual(result["early_failure"], "Fetch public control and validate dispatch")
+        for changed in (
+            valid.replace(b"devlane_bootstrap_refusal=bootstrap-command-failed",
+                          b"devlane_bootstrap_refusal=" + b"a" * 64, 1),
+            valid.replace(b"devlane_bootstrap_refusal=bootstrap-command-failed",
+                          b"devlane_bootstrap_refusal=private-path", 1),
+        ):
+            with self.subTest(marker=changed[:180]), self.assertRaises(audit.AuditRefusal):
+                audit.validate_job_log_surface(changed, audit.RUN_JOB, identity, completed=True)
+
+        after_decrypt = _render_real_runner_encrypted_log(IDENTITY).replace(
+            b"authenticated_decryption=pass\n",
+            b"authenticated_decryption=pass\ndevlane_bootstrap_refusal=" + b"a" * 64 + b"\n", 1,
+        )
+        with self.assertRaises(audit.AuditRefusal):
+            audit.validate_job_log_surface(after_decrypt, audit.RUN_JOB, IDENTITY, completed=True)
+
+        windows_identity = dict(IDENTITY, platform="windows")
+        windows_wrong_emitter = _render_real_runner_encrypted_log(
+            windows_identity,
+            early_failure={
+                "step": "Fetch public control and validate dispatch",
+                "marker": "devlane_bootstrap_refusal=bootstrap-command-failed", "exit_code": 1,
+            },
+        )
+        with self.assertRaises(audit.AuditRefusal):
+            audit.validate_job_log_surface(
+                windows_wrong_emitter, audit.WINDOWS_RUN_JOB, windows_identity, completed=True,
+            )
+
+    def test_terminal_public_surface_rejects_success_graph_with_bootstrap_failure_log(self):
+        identity = dict(IDENTITY, platform="windows")
+        jobs = _encrypted_jobs(platform="windows")
+        terminal_audit = next(job for job in jobs if job["name"] == audit.AUDIT_JOB)
+        terminal_audit["status"] = "completed"
+        terminal_audit["conclusion"] = "success"
+        for step in terminal_audit["steps"]:
+            step.update({"status": "completed", "conclusion": "success"})
+        failed_log = _render_real_runner_encrypted_log(
+            identity,
+            early_failure={
+                "step": "Fetch public control and validate dispatch",
+                "marker": "devlane_deadline_refusal=deadline-start-invalid", "exit_code": 1,
+            },
+        )
+        audit_log = _render_real_runner_encrypted_log(identity, job_key=audit.AUDIT_JOB)
+        by_name = {job["name"]: job for job in jobs}
+        logs = {by_name[audit.WINDOWS_RUN_JOB]["id"]: failed_log,
+                by_name[audit.AUDIT_JOB]["id"]: audit_log}
+
+        class API:
+            def log_text(self, identifier):
+                return logs[identifier]
+
+            def json(self, endpoint):
+                return ({}, {})
+
+        with patch.object(audit, "_read_annotations", return_value=[]), \
+                patch.object(audit, "validate_check_output"), self.assertRaises(audit.AuditRefusal):
+            audit.validate_final_public_surfaces(API(), jobs, identity, "core-node")
 
     def test_desktop_contract_runs_tauri_dependencies_and_pinned_rust_setup(self):
         identity = dict(IDENTITY, profile="desktop")
@@ -1658,7 +1779,12 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             self.assertTrue(grammar.step_output_ok(
                 "Probe isolation before decryption", "network_probe_refusal=" + code, {},
             ))
-            self.assertFalse(audit.REFUSAL_LINE.fullmatch("network_probe_refusal=" + code))
+            self.assertFalse(grammar.refusal_line_ok(
+                "Probe isolation before decryption", "network_probe_refusal=" + code,
+            ))
+            self.assertFalse(grammar.step_output_ok(
+                "Execute offline profile and filter public summary", supervisor_line, {},
+            ))
             self.assertFalse(grammar.step_output_ok("Prepare hosted Linux isolation state",
                                                     "network_probe_refusal=" + code, {}))
         valid = (
@@ -1677,7 +1803,9 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 self.assertFalse(diagnostic_contract.public_preparation_diagnostic(invalid))
                 self.assertFalse(grammar.step_output_ok("Probe isolation before decryption", invalid, {}))
-        self.assertFalse(audit.REFUSAL_LINE.fullmatch("network_probe_refusal=private-path"))
+        self.assertFalse(grammar.refusal_line_ok(
+            "Probe isolation before decryption", "network_probe_refusal=private-path",
+        ))
 
         structure_refusal = "network-structure-invalid:netlink-message-port-id"
         self.assertTrue(grammar.step_output_ok(
