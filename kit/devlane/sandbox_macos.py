@@ -902,28 +902,8 @@ def _validate_profile(state, worker):
         _refuse("profile-config-invalid")
 
 
-def _deny_probe(state, worker, ident):
-    root = state.parent
-    path = root / SBPL_FILE
-    fake_user = chr(47) + "Users" + chr(47) + "devlane-probe-" + ident["run_id"]
-    fake_keychain = fake_user + "/Library/Keychains/devlane-probe-" + ident["run_id"] + ".keychain-db"
-    fake_folders = (chr(47) + "private" + chr(47) + "var" + chr(47) + "folders/devlane-probe-"
-                    + ident["run_id"] + "/T/probe-file")
-    outside_dir = root / "outside-canary-dir"
-    outside = outside_dir / "outside-canary"
-    detached = Path(worker["scratch"]) / "detached-probe-marker"
-    raw_canary = Path(worker["scratch"]) / "raw" / "probe.log"
-    if any(item.exists() or item.is_symlink() for item in (outside_dir, detached, raw_canary)):
-        _refuse("positive-control-failed")
-    outside_dir.mkdir(mode=0o700)
-    outside.write_bytes(b"outside-canary")
-    raw_canary.write_bytes(b"probe-log-readable")
-    os.chown(outside_dir, worker["worker_uid"], worker["worker_gid"])
-    os.chown(outside, worker["worker_uid"], worker["worker_gid"])
-    os.chmod(outside_dir, 0o700)
-    os.chmod(outside, 0o600)
-    os.chmod(raw_canary, 0o444)
-    script = (
+def _deny_probe_script():
+    return (
         "const fs=require('node:fs');const net=require('node:net');const dgram=require('node:dgram');"
         "const child=require('node:child_process');"
         "const [scratch,outside,fakeUser,fakeKeychain,fakeFolders,detached,rawLog]=process.argv.slice(1);"
@@ -953,8 +933,32 @@ def _deny_probe(state, worker, ident):
         "Promise.all([tcp('192.0.2.1',4),tcp('2001:db8::1',6),tcp('127.0.0.1',4),"
         "udp('udp4','192.0.2.1'),udp('udp6','2001:db8::1')]).then(values=>{"
         "[result.ipv4_network,result.ipv6_network,result.loopback_network,result.udp4_network,result.udp6_network]=values;"
-        "process.stdout.write('KD-SBPL:'+JSON.stringify(result)+'\n');});"
+        "process.stdout.write('KD-SBPL:'+JSON.stringify(result)+'\\n');});"
     )
+
+
+def _deny_probe(state, worker, ident):
+    root = state.parent
+    path = root / SBPL_FILE
+    fake_user = chr(47) + "Users" + chr(47) + "devlane-probe-" + ident["run_id"]
+    fake_keychain = fake_user + "/Library/Keychains/devlane-probe-" + ident["run_id"] + ".keychain-db"
+    fake_folders = (chr(47) + "private" + chr(47) + "var" + chr(47) + "folders/devlane-probe-"
+                    + ident["run_id"] + "/T/probe-file")
+    outside_dir = root / "outside-canary-dir"
+    outside = outside_dir / "outside-canary"
+    detached = Path(worker["scratch"]) / "detached-probe-marker"
+    raw_canary = Path(worker["scratch"]) / "raw" / "probe.log"
+    if any(item.exists() or item.is_symlink() for item in (outside_dir, detached, raw_canary)):
+        _refuse("positive-control-failed")
+    outside_dir.mkdir(mode=0o700)
+    outside.write_bytes(b"outside-canary")
+    raw_canary.write_bytes(b"probe-log-readable")
+    os.chown(outside_dir, worker["worker_uid"], worker["worker_gid"])
+    os.chown(outside, worker["worker_uid"], worker["worker_gid"])
+    os.chmod(outside_dir, 0o700)
+    os.chmod(outside, 0o600)
+    os.chmod(raw_canary, 0o444)
+    script = _deny_probe_script()
     command = ("/usr/bin/sandbox-exec", "-f", str(path), worker["node"], "-e", script,
                worker["scratch"], str(outside), fake_user, fake_keychain, fake_folders,
                str(detached), str(raw_canary))
@@ -1051,9 +1055,10 @@ def _probe(state):
 
 def _expected_envelope(context):
     return {
-        "format": "kd-public-devlane-aesgcm-v1", "repository_id": context["repository_id"],
+        "format": "kd-public-devlane-aesgcm-v2", "repository_id": context["repository_id"],
         "control_sha": context["control_sha"], "workflow_path": fetch.WORKFLOW_PATH,
-        "profile": context["profile"], "wave_id": context["wave_id"], "bundle_id": context["bundle_id"],
+        "platform": context["platform"], "profile": context["profile"],
+        "wave_id": context["wave_id"], "bundle_id": context["bundle_id"],
         "fetch_sha256": context["projection_sha256"], "expires": context["expires"],
     }
 

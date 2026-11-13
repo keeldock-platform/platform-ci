@@ -34,6 +34,17 @@ def _hosted_profile_probe_available():
 
 
 class MacProfileTests(unittest.TestCase):
+    @unittest.skipUnless(NODE, "Node.js is unavailable")
+    def test_deny_probe_javascript_passes_node_syntax_check(self):
+        with tempfile.TemporaryDirectory(prefix="devlane-node-check-") as temporary:
+            script = Path(temporary) / "deny-probe.js"
+            script.write_text(sandbox._deny_probe_script(), encoding="utf-8")
+            result = subprocess.run(
+                [NODE, "--check", str(script)], stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_profile_is_deny_default_and_has_required_boundary_rules(self):
         text = sandbox.profile_text(
             workspace="/tmp/devlane-workspace", prepared="/tmp/devlane-prepared",
