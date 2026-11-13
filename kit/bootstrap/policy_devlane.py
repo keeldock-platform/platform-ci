@@ -2,7 +2,7 @@
 
 WORKFLOW_TEMPLATES = {}
 WORKFLOW_SHA256 = {
-    "devlane-encrypted": "8727230496f9e8dc4eb3553636b8eb1483e9bfa0c8ccf6639bd33410f2aacca3",
+    "devlane-encrypted": "da3f79f3c7af6d75e62936925c1e1a16caf5679de0f1032327f16a7551cfe81a",
     "devlane-synthetic": "9a0e52bcad34b144e8a507af24f35c10c8408f5f85488c9f24217a057a667e13",
 }
 CANDIDATE_WORKFLOWS = (
