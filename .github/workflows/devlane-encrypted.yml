@@ -1202,10 +1202,6 @@ jobs:
         timeout-minutes: 180
         run: |
           $ErrorActionPreference = 'Stop'
-          $runRoot = Join-Path $env:RUNNER_TEMP ('devlane-' + $env:CI_RUN_ID)
-          if (Test-Path -LiteralPath $runRoot) { exit 1 }
-          New-Item -ItemType Directory -Path $runRoot | Out-Null
-          $runnerSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
           function Protect-PrivateDirectory([string]$Path, [Security.Principal.SecurityIdentifier]$OwnerSid) {
             $security = [Security.AccessControl.DirectorySecurity]::new()
             $security.SetAccessRuleProtection($true, $false)
@@ -1220,9 +1216,25 @@ jobs:
               )
               [void]$security.AddAccessRule($rule)
             }
-            Set-Acl -LiteralPath $Path -AclObject $security
+            Set-Acl -LiteralPath $Path -AclObject $security -ErrorAction Stop
           }
-          Protect-PrivateDirectory $runRoot $runnerSid
+          try {
+            $runRoot = Join-Path -Path $env:RUNNER_TEMP -ChildPath ('devlane-' + $env:CI_RUN_ID) -ErrorAction Stop
+            if (Test-Path -LiteralPath $runRoot -ErrorAction Stop) { exit 1 }
+            New-Item -ItemType Directory -Path $runRoot -ErrorAction Stop | Out-Null
+          } catch {
+            Write-Output 'devlane_crypto_refusal=crypto-target-invalid'
+            Write-Output 'devlane_deadline_refusal=crypto-dependency-seal-failed'
+            exit 1
+          }
+          try {
+            $runnerSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+            Protect-PrivateDirectory $runRoot $runnerSid
+          } catch {
+            Write-Output 'devlane_crypto_refusal=crypto-acl-output-invalid'
+            Write-Output 'devlane_deadline_refusal=crypto-dependency-seal-failed'
+            exit 1
+          }
           $env:RUN_ROOT = $runRoot
           Add-Content -LiteralPath $env:GITHUB_ENV -Value ('RUN_ROOT=' + $runRoot) -Encoding utf8
           $started = Join-Path $runRoot 'deadline-start'
@@ -1280,9 +1292,19 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $pythonVersion.Trim() -ne '3.12') {
             Refuse-Bootstrap 'crypto-python-version-invalid'
           }
-          $cryptoTarget = Join-Path $runRoot 'control-python-deps'
-          New-Item -ItemType Directory -Path $cryptoTarget | Out-Null
-          Protect-PrivateDirectory $cryptoTarget $runnerSid
+          try {
+            $cryptoTarget = Join-Path -Path $runRoot -ChildPath 'control-python-deps' -ErrorAction Stop
+            New-Item -ItemType Directory -Path $cryptoTarget -ErrorAction Stop | Out-Null
+          } catch {
+            Write-Output 'devlane_crypto_refusal=crypto-target-invalid'
+            Refuse-Bootstrap 'crypto-dependency-seal-failed'
+          }
+          try {
+            Protect-PrivateDirectory $cryptoTarget $runnerSid
+          } catch {
+            Write-Output 'devlane_crypto_refusal=crypto-acl-output-invalid'
+            Refuse-Bootstrap 'crypto-dependency-seal-failed'
+          }
           python -B kit/devlane/deadline.py run --file (Join-Path $runRoot 'deadline.json') -- `
             python -B -m pip install --quiet --disable-pip-version-check --no-input --no-cache-dir `
               --index-url https://pypi.org/simple --target $cryptoTarget --require-hashes `

@@ -246,6 +246,11 @@ MACOS_EXECUTE_REFUSAL_CODES = refusal_codes.MACOS_EXECUTE_REFUSAL_CODES
 MACOS_CLEANUP_REFUSAL_CODES = refusal_codes.MACOS_CLEANUP_REFUSAL_CODES
 MACOS_ROOT_PF_CLEANUP_REFUSAL_CODES = refusal_codes.MACOS_ROOT_PF_CLEANUP_REFUSAL_CODES
 MACOS_SUPERVISOR_START_REFUSAL_CODES = refusal_codes.MACOS_SUPERVISOR_START_REFUSAL_CODES
+MACOS_DIAGNOSED_FAILURE_DISPOSITIONS = {
+    MACOS_PREPARE_STEP: "macos-prepare",
+    MACOS_PROBE_STEP: "macos-probe",
+    MACOS_EXECUTE_STEP: "macos-execute",
+}
 MACOS_OPERATION_STEP_REFUSALS = {
     MACOS_PREPARE_STEP: MACOS_PREPARE_REFUSAL_CODES,
     MACOS_SUPERVISOR_START_STEP: MACOS_SUPERVISOR_START_REFUSAL_CODES,
@@ -262,9 +267,6 @@ EARLY_FAILURE_STEP_IDS = {
     "Prepare hosted Windows isolation state": "windows-preflight",
     "Fetch ciphertext and sanitized dependency projection": "asset-fetch",
     MACOS_SUPERVISOR_START_STEP: "macos-supervisor-start",
-    MACOS_PREPARE_STEP: "macos-prepare",
-    MACOS_PROBE_STEP: "macos-probe",
-    MACOS_EXECUTE_STEP: "macos-execute",
 }
 AUDIT_OUTCOME_LINES = frozenset((
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed",
@@ -724,7 +726,8 @@ class _Grammar:
         """Fixed output lines, each bound to the step that is allowed to print it."""
         step = next((item for item in self.steps if item["name"] == step_name), None)
         uses = (step or {}).get("uses") or ""
-        if line.startswith("devlane_supervisor_refusal=") and self.job_runner == "macos-15":
+        if (line.startswith("devlane_supervisor_refusal=") and self.job_runner == "macos-15"
+                and step_name in MACOS_OPERATION_STEP_REFUSALS):
             code = line[len("devlane_supervisor_refusal="):]
             allowed_codes = MACOS_OPERATION_STEP_REFUSALS.get(step_name)
             if allowed_codes is None or code not in allowed_codes:
@@ -2152,7 +2155,7 @@ def validate_dispatch_marker(log, identity, *, allow_missing=False):
     return True
 
 
-def _audit_outcome_line(jobs, identity):
+def _audit_outcome_line(jobs, identity, diagnosed_failure=None):
     active_name = (RUN_JOB if _legacy_encrypted_workflow_path(identity)
                    else PLATFORM_RUN_JOBS[identity.get("platform", "linux")])
     run_job = next((job for job in jobs if type(job) is dict and job.get("name") == active_name), None)
@@ -2164,7 +2167,13 @@ def _audit_outcome_line(jobs, identity):
     steps = {step.get("name"): step for step in _steps(run_job)}
     failed = next((name for name, step in steps.items()
                    if step.get("status") == "completed" and step.get("conclusion") == "failure"), None)
-    disposition = EARLY_FAILURE_STEP_IDS.get(failed)
+    if diagnosed_failure is not None:
+        if (identity.get("platform") != "macos" or diagnosed_failure != failed
+                or diagnosed_failure not in MACOS_DIAGNOSED_FAILURE_DISPOSITIONS):
+            _refuse()
+        disposition = MACOS_DIAGNOSED_FAILURE_DISPOSITIONS[diagnosed_failure]
+    else:
+        disposition = EARLY_FAILURE_STEP_IDS.get(failed)
     if disposition is not None:
         suffix = "at-" + disposition
     elif failed == "Probe isolation before decryption":
@@ -2205,7 +2214,7 @@ def validate_job_log_metadata_binding(surface, run_job, identity):
             allowed = (identity.get("platform") == "windows" and code in WINDOWS_PREFLIGHT_REFUSAL_CODES)
         elif early_failure == "Prepare hosted runner isolation state":
             allowed = (identity.get("platform") == "macos" and code in MACOS_PREFLIGHT_REFUSAL_CODES)
-        elif early_failure in (MACOS_PREPARE_STEP, MACOS_PROBE_STEP, MACOS_EXECUTE_STEP):
+        elif early_failure in MACOS_DIAGNOSED_FAILURE_DISPOSITIONS:
             allowed = (identity.get("platform") == "macos"
                        and code in MACOS_OPERATION_STEP_REFUSALS[early_failure]
                        and surface.get("early_failure_exit") == 2)
@@ -2236,8 +2245,10 @@ def validate_job_log_metadata_binding(surface, run_job, identity):
             downstream = step_by_name[name]
             if downstream.get("status") != "completed" or downstream.get("conclusion") != "skipped":
                 _refuse()
-        outcome = _audit_outcome_line([run_job], identity)
-        disposition = EARLY_FAILURE_STEP_IDS.get(early_failure)
+        diagnosed_failure = (early_failure if early_failure in MACOS_DIAGNOSED_FAILURE_DISPOSITIONS else None)
+        outcome = _audit_outcome_line([run_job], identity, diagnosed_failure=diagnosed_failure)
+        disposition = (MACOS_DIAGNOSED_FAILURE_DISPOSITIONS.get(early_failure)
+                       if diagnosed_failure is not None else EARLY_FAILURE_STEP_IDS.get(early_failure))
         expected_disposition = "disposition=run-failed-at-" + str(disposition)
         if (disposition is None or expected_disposition not in outcome
                 or outcome == "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed"):
@@ -2357,7 +2368,9 @@ def run_audit(api, identity):
         annotations = _read_annotations(api, "/repos/%s/check-runs/%d/annotations" % (REPOSITORY, check_id))
         if annotations:
             _refuse()
-    return _audit_outcome_line(list(jobs.values()), identity)
+    diagnosed_failure = (surface["early_failure"]
+                         if surface["early_failure"] in MACOS_DIAGNOSED_FAILURE_DISPOSITIONS else None)
+    return _audit_outcome_line(list(jobs.values()), identity, diagnosed_failure=diagnosed_failure)
 
 
 def validate_final_public_surfaces(api, jobs, identity, profile):
@@ -2408,6 +2421,7 @@ def validate_final_public_surfaces(api, jobs, identity, profile):
     if not audit_passed:
         _refuse()
     active_name = PLATFORM_RUN_JOBS[identity.get("platform", "linux")]
+    diagnosed_failure = None
     for job_name in (active_name, AUDIT_JOB):
         job = validated[job_name]
         if job.get("status") != "completed" or job["id"] not in collected:
@@ -2417,10 +2431,12 @@ def validate_final_public_surfaces(api, jobs, identity, profile):
         surface_result = validate_job_log_surface(log, job_name, identity, completed=True)
         if job_name == active_name:
             validate_job_log_metadata_binding(surface_result, job, identity)
+            if surface_result["early_failure"] in MACOS_DIAGNOSED_FAILURE_DISPOSITIONS:
+                diagnosed_failure = surface_result["early_failure"]
             public_records = surface_result["records"]
             validate_dispatch_marker(log, identity, allow_missing=surface_result["early_failure"] is not None)
         elif surface_result.get("counts", {}).get("devlane_audit_outcome_line") != _audit_outcome_line(
-                list(validated.values()), identity):
+                list(validated.values()), identity, diagnosed_failure=diagnosed_failure):
             _refuse()
         check_id = int(job["check_run_url"].rsplit("/", 1)[1])
         validate_check_output(surface.get("check"), job, identity, completed=True)
