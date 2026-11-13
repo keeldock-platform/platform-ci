@@ -11,30 +11,35 @@ from unittest import mock
 import control_python
 
 
-@unittest.skipUnless(hasattr(os, "getuid") and os.getuid() > 0, "requires an unprivileged local test owner")
-class ControlPythonTreeTests(unittest.TestCase):
-    def _tree(self, parent):
-        parent = parent.resolve(strict=True)
-        root = parent / "control-python-deps"
-        files = {
-            "cffi/__init__.py": b'__version__ = "2.1.1"\n',
-            "cryptography/__init__.py": b'__version__ = "50.0.2"\n',
-            "cryptography/hazmat/__init__.py": b"",
-            "cryptography/hazmat/primitives/__init__.py": b"",
-            "cryptography/hazmat/primitives/ciphers/__init__.py": b"",
-            "cryptography/hazmat/primitives/ciphers/aead.py": b"class AESGCM: pass\n",
-            "pycparser/__init__.py": b'__version__ = "3.12"\n',
-        }
-        for relative, payload in files.items():
-            destination = root / relative
-            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
-            destination.write_bytes(payload)
+def _control_tree(parent, *, posix_modes):
+    parent = parent.resolve(strict=True)
+    root = parent / "control-python-deps"
+    files = {
+        "cffi/__init__.py": b'__version__ = "2.1.1"\n',
+        "cryptography/__init__.py": b'__version__ = "50.0.2"\n',
+        "cryptography/hazmat/__init__.py": b"",
+        "cryptography/hazmat/primitives/__init__.py": b"",
+        "cryptography/hazmat/primitives/ciphers/__init__.py": b"",
+        "cryptography/hazmat/primitives/ciphers/aead.py": b"class AESGCM: pass\n",
+        "pycparser/__init__.py": b'__version__ = "3.12"\n',
+    }
+    for relative, payload in files.items():
+        destination = root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+        destination.write_bytes(payload)
+    if posix_modes:
         for directory in (root, *[path for path in root.rglob("*") if path.is_dir()]):
             os.chmod(directory, 0o755)
         for path in root.rglob("*"):
             if path.is_file():
                 os.chmod(path, 0o644)
-        return root
+    return root
+
+
+@unittest.skipUnless(hasattr(os, "getuid") and os.getuid() > 0, "requires an unprivileged local test owner")
+class ControlPythonTreeTests(unittest.TestCase):
+    def _tree(self, parent):
+        return _control_tree(parent, posix_modes=True)
 
     def test_seal_and_validate_bind_every_file_digest(self):
         with tempfile.TemporaryDirectory(prefix="control-python-") as temporary:
@@ -67,66 +72,6 @@ class ControlPythonTreeTests(unittest.TestCase):
             (root / "cryptography" / "linked.py").symlink_to(root / "cryptography" / "__init__.py")
             with self.assertRaisesRegex(control_python.CryptoRefusal, "crypto-unavailable"):
                 control_python.seal(root, "macos", os.getuid())
-
-    def test_windows_owner_change_invalidates_sealed_tree(self):
-        with tempfile.TemporaryDirectory(prefix="control-python-") as temporary:
-            root = self._tree(Path(temporary))
-            with mock.patch.object(control_python, "_powershell_acl_owner", return_value="S-1-5-21-100"):
-                control_python.seal(root, "windows")
-            with mock.patch.object(control_python, "_powershell_acl_owner", return_value="S-1-5-21-200"):
-                with self.assertRaisesRegex(control_python.CryptoRefusal, "crypto-unavailable"):
-                    control_python.validate(root, "windows")
-
-    def test_windows_tree_seals_native_extension_record_and_bytecode_files(self):
-        with tempfile.TemporaryDirectory(prefix="control-python-windows-") as temporary:
-            parent = Path(temporary).resolve(strict=True)
-            root = parent / "control-python-deps"
-            files = {
-                "cryptography/__init__.py": b'__version__ = "50.0.2"\n',
-                "cryptography/_rust.abi3.pyd": b"native-extension-fixture",
-                "cryptography-50.0.2.dist-info/RECORD": b"cryptography/_rust.abi3.pyd,,\n",
-                "cryptography/__pycache__/fixture.pyc": b"bytecode-fixture",
-            }
-            for relative, payload in files.items():
-                destination = root / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(payload)
-            with mock.patch.object(control_python, "_powershell_acl_owner", return_value="S-1-5-21-100"):
-                control_python.seal(root, "windows")
-                control_python.validate(root, "windows")
-            manifest = control_python._read_manifest(root, "windows", "S-1-5-21-100")
-            self.assertEqual(
-                [row["path"] for row in manifest["files"]],
-                sorted(files),
-            )
-            self.assertIn("cryptography/_rust.abi3.pyd", [row["path"] for row in manifest["files"]])
-            self.assertIn("cryptography-50.0.2.dist-info/RECORD", [row["path"] for row in manifest["files"]])
-            self.assertIn("cryptography/__pycache__/fixture.pyc", [row["path"] for row in manifest["files"]])
-
-            extension = root / "cryptography" / "_rust.abi3.pyd"
-            extension.chmod(0o644)
-            extension.write_bytes(b"changed extension")
-            with mock.patch.object(control_python, "_powershell_acl_owner", return_value="S-1-5-21-100"), \
-                    self.assertRaisesRegex(control_python.CryptoRefusal, "crypto-unavailable") as caught:
-                control_python.validate(root, "windows")
-            self.assertEqual(caught.exception.reason, "crypto-tree-mismatch")
-
-    def test_seal_and_check_print_only_fixed_subreason_codes(self):
-        output = io.StringIO()
-        with mock.patch.object(control_python, "seal", side_effect=control_python.CryptoRefusal("crypto-acl-invalid")), \
-                mock.patch("sys.stderr", output):
-            self.assertEqual(control_python.main([
-                "--target", "/tmp/control-python-deps", "--platform", "windows", "seal",
-            ]), 2)
-        self.assertEqual(output.getvalue(), "devlane_crypto_refusal=crypto-acl-invalid\n")
-
-        output = io.StringIO()
-        with mock.patch.object(control_python, "validate", side_effect=control_python.CryptoRefusal("private-path")), \
-                mock.patch("sys.stderr", output):
-            self.assertEqual(control_python.main([
-                "--target", "/tmp/control-python-deps", "--platform", "windows", "check",
-            ]), 2)
-        self.assertEqual(output.getvalue(), "devlane_crypto_refusal=crypto-control-invalid\n")
 
     def test_predecrypt_check_imports_pinned_crypto_before_key_is_available(self):
         with tempfile.TemporaryDirectory(prefix="control-python-") as temporary:
@@ -196,6 +141,65 @@ class ControlPythonTreeTests(unittest.TestCase):
                         if any(name == package or name.startswith(package + ".") for package in package_names):
                             sys.modules.pop(name, None)
                     sys.modules.update(saved_modules)
+
+
+class ControlPythonWindowsTests(unittest.TestCase):
+    def test_windows_owner_change_invalidates_sealed_tree(self):
+        with tempfile.TemporaryDirectory(prefix="control-python-windows-owner-") as temporary:
+            root = _control_tree(Path(temporary), posix_modes=False)
+            with mock.patch.object(control_python, "_powershell_acl_owner", return_value="S-1-5-21-100"):
+                control_python.seal(root, "windows")
+            with mock.patch.object(control_python, "_powershell_acl_owner", return_value="S-1-5-21-200"):
+                with self.assertRaisesRegex(control_python.CryptoRefusal, "crypto-unavailable"):
+                    control_python.validate(root, "windows")
+
+    def test_windows_tree_seals_native_extension_record_and_bytecode_files(self):
+        with tempfile.TemporaryDirectory(prefix="control-python-windows-") as temporary:
+            parent = Path(temporary).resolve(strict=True)
+            root = parent / "control-python-deps"
+            files = {
+                "cryptography/__init__.py": b'__version__ = "50.0.2"\n',
+                "cryptography/_rust.abi3.pyd": b"native-extension-fixture",
+                "cryptography-50.0.2.dist-info/RECORD": b"cryptography/_rust.abi3.pyd,,\n",
+                "cryptography/__pycache__/fixture.pyc": b"bytecode-fixture",
+            }
+            for relative, payload in files.items():
+                destination = root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(payload)
+            with mock.patch.object(control_python, "_powershell_acl_owner", return_value="S-1-5-21-100"):
+                control_python.seal(root, "windows")
+                control_python.validate(root, "windows")
+            manifest = control_python._read_manifest(root, "windows", "S-1-5-21-100")
+            self.assertEqual([row["path"] for row in manifest["files"]], sorted(files))
+            self.assertIn("cryptography/_rust.abi3.pyd", [row["path"] for row in manifest["files"]])
+            self.assertIn("cryptography-50.0.2.dist-info/RECORD", [row["path"] for row in manifest["files"]])
+            self.assertIn("cryptography/__pycache__/fixture.pyc", [row["path"] for row in manifest["files"]])
+
+            (root / "cryptography" / "_rust.abi3.pyd").write_bytes(b"changed extension")
+            with mock.patch.object(control_python, "_powershell_acl_owner", return_value="S-1-5-21-100"), \
+                    self.assertRaisesRegex(control_python.CryptoRefusal, "crypto-unavailable") as caught:
+                control_python.validate(root, "windows")
+            self.assertEqual(caught.exception.reason, "crypto-tree-mismatch")
+
+
+class ControlPythonPortableTests(unittest.TestCase):
+    def test_seal_and_check_print_only_fixed_subreason_codes(self):
+        output = io.StringIO()
+        with mock.patch.object(control_python, "seal", side_effect=control_python.CryptoRefusal("crypto-acl-invalid")), \
+                mock.patch("sys.stderr", output):
+            self.assertEqual(control_python.main([
+                "--target", "/tmp/control-python-deps", "--platform", "windows", "seal",
+            ]), 2)
+        self.assertEqual(output.getvalue(), "devlane_crypto_refusal=crypto-acl-invalid\n")
+
+        output = io.StringIO()
+        with mock.patch.object(control_python, "validate", side_effect=control_python.CryptoRefusal("private-path")), \
+                mock.patch("sys.stderr", output):
+            self.assertEqual(control_python.main([
+                "--target", "/tmp/control-python-deps", "--platform", "windows", "check",
+            ]), 2)
+        self.assertEqual(output.getvalue(), "devlane_crypto_refusal=crypto-control-invalid\n")
 
 
 if __name__ == "__main__":

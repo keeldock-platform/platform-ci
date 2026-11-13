@@ -905,6 +905,8 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                         step["conclusion"] = "success"
                     elif step["name"] == "Install pinned Rust toolchain":
                         step["conclusion"] = "skipped"
+                    elif step["name"] == "Install Tauri Linux build dependencies" and platform_name != "linux":
+                        step["conclusion"] = "skipped"
                     elif index < failed_index:
                         step["conclusion"] = "success"
                     elif index == failed_index:
@@ -930,7 +932,9 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 )
                 self.assertEqual(surface["early_failure"], failed_step)
                 self.assertEqual(surface["early_failure_code"], marker.split("=", 1)[1])
+                audit.validate_job_contract(jobs, identity, "core-node")
                 audit.validate_job_log_metadata_binding(surface, run_job, identity)
+                audit.validate_dispatch_marker(log, identity, allow_missing=surface["early_failure"] is not None)
                 with self.assertRaises(audit.AuditRefusal):
                     audit.validate_job_log_surface(
                         log.replace(marker.encode("ascii"), b"devlane_bootstrap_refusal=private-path", 1),
@@ -2223,25 +2227,213 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             "Fetch public control and validate dispatch", "devlane_crypto_refusal=private-path", {},
         ))
 
-    def test_bootstrap_crypto_subreason_is_bound_to_a_fixed_reason_and_failure(self):
+    def test_crypto_bootstrap_additions_are_platform_and_step_scoped(self):
+        new_codes = frozenset((
+            "crypto-python-version-invalid", "crypto-dependency-seal-failed",
+            "crypto-dependency-check-failed", "crypto-dependency-privileged-check-failed",
+        ))
+        allowed_bootstrap = {
+            "linux": frozenset(),
+            "macos": new_codes,
+            "windows": new_codes - {"crypto-dependency-privileged-check-failed"},
+        }
+        root = Path(__file__).resolve().parents[2]
+        for platform_name in ("linux", "macos", "windows"):
+            job_name = audit.PLATFORM_RUN_JOBS[platform_name]
+            identity = dict(IDENTITY, platform=platform_name)
+            grammar = audit._Grammar(
+                root / ".github/workflows/devlane-encrypted.yml", job_name, identity, "encrypted",
+            )
+            bootstrap_prefix = "devlane_deadline_refusal=" if platform_name == "windows" else "devlane_bootstrap_refusal="
+            for code in sorted(new_codes):
+                bootstrap_line = bootstrap_prefix + code
+                execution_line = "devlane_supervisor_refusal=" + code
+                for step in grammar.steps:
+                    step_name = step["name"]
+                    counts = {}
+                    accepted = grammar.step_output_ok(step_name, bootstrap_line, counts)
+                    expected = (platform_name in ("macos", "windows")
+                                and step_name == "Fetch public control and validate dispatch"
+                                and code in allowed_bootstrap[platform_name])
+                    self.assertEqual(accepted, expected, (platform_name, step_name, code, "bootstrap"))
+                    self.assertFalse(
+                        grammar.refusal_line_ok(step_name, execution_line),
+                        (platform_name, step_name, code, "execution"),
+                    )
+            for code in sorted(refusal_codes.CRYPTO_CONTROL_REFUSAL_CODES):
+                crypto_line = "devlane_crypto_refusal=" + code
+                for step in grammar.steps:
+                    step_name = step["name"]
+                    accepted = grammar.step_output_ok(step_name, crypto_line, {})
+                    expected = (platform_name in ("macos", "windows")
+                                and step_name == "Fetch public control and validate dispatch")
+                    self.assertEqual(accepted, expected, (platform_name, step_name, code, "crypto-reason"))
+
+    def test_macos_startup_refusals_pass_the_complete_log_and_metadata_contract(self):
+        new_start_codes = sorted(audit.MACOS_SUPERVISOR_START_REFUSAL_CODES)
         identity = dict(IDENTITY, platform="macos")
-        marker = b"devlane_bootstrap_refusal=crypto-dependency-check-failed"
-        log = _render_real_runner_encrypted_log(
-            identity,
-            early_failure={
-                "step": "Fetch public control and validate dispatch",
-                "marker": marker.decode("ascii"), "exit_code": 1,
-            },
-        ).replace(marker, b"devlane_crypto_refusal=crypto-import-invalid\n" + marker, 1)
-        result = audit.validate_job_log_surface(log, audit.MACOS_RUN_JOB, identity, completed=True)
-        self.assertEqual(result["crypto_refusal_reason"], "crypto-import-invalid")
-        for invalid in (
-            log.replace(b"crypto-import-invalid", b"private-path", 1),
-            log.replace(b"crypto-dependency-check-failed", b"crypto-dependency-seal-failed", 1),
-            log.replace(b"devlane_crypto_refusal=crypto-import-invalid\n", b"", 1),
+        failed_step = audit.MACOS_SUPERVISOR_START_STEP
+        expected_outcome = (
+            "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed "
+            "disposition=run-failed-at-macos-supervisor-start"
+        )
+        for code in new_start_codes:
+            with self.subTest(code=code):
+                jobs = _encrypted_jobs(platform="macos")
+                run_job = next(job for job in jobs if job["name"] == audit.MACOS_RUN_JOB)
+                run_job["conclusion"] = "failure"
+                names = [step["name"] for step in run_job["steps"]]
+                failed_index = names.index(failed_step)
+                for index, step in enumerate(run_job["steps"]):
+                    if step["name"] == "Shred runner-local workspace":
+                        step["conclusion"] = "success"
+                    elif step["name"] == "Install pinned Rust toolchain":
+                        step["conclusion"] = "skipped"
+                    elif step["name"] == "Install Tauri Linux build dependencies":
+                        step["conclusion"] = "skipped"
+                    elif index < failed_index:
+                        step["conclusion"] = "success"
+                    elif index == failed_index:
+                        step["conclusion"] = "failure"
+                    else:
+                        step["conclusion"] = "skipped"
+                log = _render_real_runner_encrypted_log(
+                    identity, early_failure={
+                        "step": failed_step,
+                        "marker": "devlane_supervisor_refusal=" + code,
+                        "exit_code": 2,
+                    },
+                )
+                surface = audit.validate_job_log_surface(log, audit.MACOS_RUN_JOB, identity, completed=True)
+                self.assertEqual(surface["early_failure"], failed_step)
+                self.assertEqual(surface["early_failure_code"], code)
+                self.assertEqual(surface["early_failure_exit"], 2)
+                audit.validate_job_contract(jobs, identity, "core-node")
+                audit.validate_job_log_metadata_binding(surface, run_job, identity)
+                audit.validate_dispatch_marker(log, identity, allow_missing=False)
+                self.assertEqual(audit._audit_outcome_line(jobs, identity), expected_outcome)
+
+                wrong_exit = _render_real_runner_encrypted_log(
+                    identity, early_failure={
+                        "step": failed_step,
+                        "marker": "devlane_supervisor_refusal=" + code,
+                        "exit_code": 1,
+                    },
+                )
+                with self.assertRaises(audit.AuditRefusal) as caught:
+                    audit.validate_job_log_surface(wrong_exit, audit.MACOS_RUN_JOB, identity, completed=True)
+                self.assertEqual(caught.exception.reason, "job-log-surface")
+
+                changed = copy.deepcopy(jobs)
+                changed_run = next(job for job in changed if job["name"] == audit.MACOS_RUN_JOB)
+                changed_steps = {step["name"]: step for step in changed_run["steps"]}
+                changed_steps["Probe isolation before decryption"]["conclusion"] = "success"
+                with self.assertRaises(audit.AuditRefusal) as caught:
+                    audit.validate_job_contract(changed, identity, "core-node")
+                self.assertEqual(caught.exception.reason, "job-contract")
+
+                changed = copy.deepcopy(run_job)
+                changed_steps = {step["name"]: step for step in changed["steps"]}
+                changed_steps["Shred runner-local workspace"]["conclusion"] = "failure"
+                with self.assertRaises(audit.AuditRefusal) as caught:
+                    audit.validate_job_log_metadata_binding(surface, changed, identity)
+                self.assertEqual(caught.exception.reason, "step-metadata-binding")
+
+    def test_new_audit_contract_reasons_are_fixed_and_accepted_by_the_log_grammar(self):
+        root = Path(__file__).resolve().parents[2]
+        grammar = audit._Grammar(
+            root / ".github/workflows/devlane-encrypted.yml", audit.AUDIT_JOB, IDENTITY, "encrypted",
+        )
+        self.assertEqual(audit.AUDIT_SUBREASONS, frozenset(audit.AUDIT_REASON_BY_CHECK.values()) |
+                         frozenset(("audit-internal-check",)))
+        for reason in sorted(audit.AUDIT_SUBREASONS):
+            line = "devlane_audit=refused code=audit-contract reason=" + reason
+            self.assertTrue(grammar.step_output_ok(
+                "Audit exact four-job graph and public surfaces", line, {},
+            ))
+        for line in (
+            "devlane_audit=refused code=audit-contract reason=private-path",
+            "devlane_audit=refused code=audit-contract",
         ):
-            with self.subTest(invalid=invalid[-180:]), self.assertRaises(audit.AuditRefusal):
-                audit.validate_job_log_surface(invalid, audit.MACOS_RUN_JOB, identity, completed=True)
+            self.assertFalse(grammar.step_output_ok(
+                "Audit exact four-job graph and public surfaces", line, {},
+            ))
+
+    def test_bootstrap_crypto_subreason_is_bound_to_a_fixed_reason_and_failure(self):
+        phases = (
+            ("crypto-dependency-seal-failed", audit.CRYPTO_SEAL_REFUSAL_CODES),
+            ("crypto-dependency-check-failed", audit.CRYPTO_CHECK_REFUSAL_CODES),
+        )
+        cases = [(platform, code, reason)
+                 for platform in ("macos", "windows")
+                 for code, reasons in phases for reason in sorted(reasons)]
+        cases.extend(("macos", "crypto-dependency-privileged-check-failed", reason)
+                     for reason in sorted(audit.CRYPTO_CHECK_REFUSAL_CODES))
+        for platform, bootstrap_code, reason in cases:
+            with self.subTest(platform=platform, bootstrap_code=bootstrap_code, reason=reason):
+                identity = dict(IDENTITY, platform=platform)
+                prefix = "devlane_bootstrap_refusal=" if platform == "macos" else "devlane_deadline_refusal="
+                marker = (prefix + bootstrap_code).encode("ascii")
+                log = _render_real_runner_encrypted_log(
+                    identity,
+                    early_failure={
+                        "step": "Fetch public control and validate dispatch",
+                        "marker": marker.decode("ascii"), "exit_code": 1,
+                    },
+                ).replace(
+                    marker,
+                    ("devlane_crypto_refusal=" + reason + "\n").encode("ascii") + marker,
+                    1,
+                )
+                jobs = _encrypted_jobs(platform=platform)
+                run_job = next(job for job in jobs if job["name"] == audit.PLATFORM_RUN_JOBS[platform])
+                run_job["conclusion"] = "failure"
+                steps = run_job["steps"]
+                failed_index = next(index for index, step in enumerate(steps)
+                                    if step["name"] == "Fetch public control and validate dispatch")
+                for index, step in enumerate(steps):
+                    if step["name"] == "Shred runner-local workspace":
+                        step["conclusion"] = "success"
+                    elif step["name"] == "Install pinned Rust toolchain":
+                        step["conclusion"] = "skipped"
+                    elif index < failed_index:
+                        step["conclusion"] = "success"
+                    elif index == failed_index:
+                        step["conclusion"] = "failure"
+                    else:
+                        step["conclusion"] = "skipped"
+
+                surface = audit.validate_job_log_surface(log, audit.PLATFORM_RUN_JOBS[platform], identity,
+                                                         completed=True)
+                self.assertEqual(surface["crypto_refusal_reason"], reason)
+                audit.validate_job_contract(jobs, identity, "core-node")
+                audit.validate_job_log_metadata_binding(surface, run_job, identity)
+                audit.validate_dispatch_marker(log, identity, allow_missing=True)
+
+                rejected_reasons = ["crypto-script-invalid", "private-path"]
+                if bootstrap_code == "crypto-dependency-seal-failed":
+                    rejected_reasons.append("crypto-import-invalid")
+                else:
+                    rejected_reasons.append("crypto-seal-write-failed")
+                for invalid_reason in rejected_reasons:
+                    invalid = log.replace(
+                        ("devlane_crypto_refusal=" + reason).encode("ascii"),
+                        ("devlane_crypto_refusal=" + invalid_reason).encode("ascii"),
+                        1,
+                    )
+                    with self.subTest(platform=platform, bootstrap_code=bootstrap_code,
+                                      reason=reason, invalid_reason=invalid_reason), \
+                            self.assertRaises(audit.AuditRefusal):
+                        audit.validate_job_log_surface(
+                            invalid, audit.PLATFORM_RUN_JOBS[platform], identity, completed=True,
+                        )
+                without_reason = log.replace(
+                    ("devlane_crypto_refusal=" + reason + "\n").encode("ascii"), b"", 1,
+                )
+                with self.assertRaises(audit.AuditRefusal):
+                    audit.validate_job_log_surface(
+                        without_reason, audit.PLATFORM_RUN_JOBS[platform], identity, completed=True,
+                    )
 
     def test_audit_refusal_reason_identifies_the_contract_check(self):
         job = {"name": "audit", "status": "completed", "conclusion": "success"}
@@ -2683,8 +2875,6 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
         self.assertEqual(requirements.count("--hash=sha256:"), 5)
         for code in (
             "crypto-dependency-install-failed", "crypto-dependency-verification-failed",
-            "crypto-python-version-invalid", "crypto-dependency-seal-failed",
-            "crypto-dependency-check-failed", "crypto-dependency-privileged-check-failed",
             "tool-file-type-invalid", "tool-owner-invalid", "tool-mode-invalid", "tool-symlink", "tool-path-resolve-mismatch",
             "tool-file-unavailable",
             "developer-dir-unexpected", "developer-dir-trust-invalid", "clang-path-invalid", "tool-digest-mismatch",
@@ -2693,6 +2883,19 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
             "windows-npm-runtime-install-failed", "windows-npm-runtime-version-invalid",
         ):
             self.assertIn(code, refusal_codes.REFUSAL_CODES)
+        bootstrap_only = frozenset((
+            "crypto-python-version-invalid", "crypto-dependency-seal-failed",
+            "crypto-dependency-check-failed", "crypto-dependency-privileged-check-failed",
+        ))
+        self.assertTrue(bootstrap_only.isdisjoint(refusal_codes.REFUSAL_CODES))
+        self.assertEqual(
+            audit.MACOS_BOOTSTRAP_REFUSAL_CODES & bootstrap_only,
+            bootstrap_only,
+        )
+        self.assertEqual(
+            audit.WINDOWS_BOOTSTRAP_REFUSAL_CODES & bootstrap_only,
+            bootstrap_only - {"crypto-dependency-privileged-check-failed"},
+        )
         for job_key, platform_name in ((audit.MACOS_RUN_JOB, "macos"),
                                        (audit.WINDOWS_RUN_JOB, "windows")):
             steps = workflow[job_key]["steps"]
@@ -2751,6 +2954,60 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
         mac_sandbox = (self.root / "kit/devlane/sandbox_macos.py").read_text(encoding="utf-8")
         clean_env = mac_sandbox.split("def _clean_env(", 1)[1].split("\n\ndef ", 1)[0]
         self.assertNotIn('"PYTHONPATH"', clean_env)
+
+    def test_bootstrap_crypto_reason_filters_match_only_exact_allowlist_literals(self):
+        workflow = audit.parse_workflow(self.root / ".github/workflows/devlane-encrypted.yml")
+        mac_step = next(step for step in workflow[audit.MACOS_RUN_JOB]["steps"]
+                        if step["name"] == "Fetch public control and validate dispatch")
+        win_step = next(step for step in workflow[audit.WINDOWS_RUN_JOB]["steps"]
+                        if step["name"] == "Fetch public control and validate dispatch")
+        mac_script = "\n".join(mac_step["run"])
+        win_script = "\n".join(win_step["run"])
+
+        bash_function = re.search(r"(?ms)^\s*crypto_print_reason\(\) \{\n(.*?)^\s*\}", mac_script)
+        self.assertIsNotNone(bash_function)
+        bash_callable = "crypto_print_reason() {\n" + bash_function.group(1) + "}\ncrypto_print_reason \"$1\"\n"
+        canonical = "devlane_crypto_refusal=crypto-acl-invalid"
+        bash_allowed = sorted(refusal_codes.CRYPTO_CONTROL_REFUSAL_CODES)
+        for code in bash_allowed:
+            candidate = "devlane_crypto_refusal=" + code
+            result = subprocess.run(
+                ["bash", "-c", bash_callable, "crypto-reason-test", candidate],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, candidate + "\n")
+        malformed = (
+            canonical.replace("crypto-acl-invalid", "Crypto-acl-invalid"),
+            canonical + " ", canonical + "\r", "prefix-" + canonical, canonical + "-suffix",
+            "prefix\n" + canonical + "\nsuffix",
+        )
+        for candidate in malformed:
+            result = subprocess.run(
+                ["bash", "-c", bash_callable, "crypto-reason-test", candidate],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "devlane_crypto_refusal=crypto-control-invalid\n")
+            self.assertNotIn(candidate, result.stderr)
+
+        powershell_filter = win_script.split("function Write-Crypto-Reason", 1)[1].split("$pythonVersion =", 1)[0]
+        self.assertIn("[System.StringComparison]::Ordinal", powershell_filter)
+        self.assertIn("Write-Output $allowedLine", powershell_filter)
+        self.assertNotIn("-contains $line", powershell_filter)
+        self.assertNotIn("Write-Output $line", powershell_filter)
+        allowed_match = re.search(r"\$allowed = @\((.*?)\n\s*\)", powershell_filter, re.S)
+        self.assertIsNotNone(allowed_match)
+        powershell_allowed = re.findall(r"'([^']+)'", allowed_match.group(1))
+        self.assertEqual(
+            frozenset(item.removeprefix("devlane_crypto_refusal=") for item in powershell_allowed),
+            refusal_codes.CRYPTO_CONTROL_REFUSAL_CODES,
+        )
+        for candidate in malformed:
+            matched_literal = next((item for item in powershell_allowed if candidate == item), None)
+            self.assertIsNone(matched_literal)
+        matched_literal = next(item for item in powershell_allowed if item == canonical)
+        self.assertEqual(matched_literal, canonical)
 
     def test_windows_deadline_starts_before_manual_checkout_and_wer_dumps_are_disabled(self):
         encrypted = self._workflow("devlane-encrypted.yml")

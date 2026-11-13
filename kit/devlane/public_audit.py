@@ -235,11 +235,13 @@ WINDOWS_PREFLIGHT_REFUSAL_CODES = frozenset((
     "windows-npm-runtime-version-invalid",
 ))
 MACOS_PREFLIGHT_REFUSAL_CODES = refusal_codes.MACOS_PREFLIGHT_REFUSAL_CODES
+MACOS_SUPERVISOR_START_STEP = "Cut network and start the isolated supervisor"
 EARLY_FAILURE_STEP_IDS = {
     "Fetch public control and validate dispatch": "bootstrap",
     "Prepare hosted runner isolation state": "macos-preflight",
     "Prepare hosted Windows isolation state": "windows-preflight",
     "Fetch ciphertext and sanitized dependency projection": "asset-fetch",
+    MACOS_SUPERVISOR_START_STEP: "macos-supervisor-start",
 }
 AUDIT_OUTCOME_LINES = frozenset((
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed",
@@ -247,6 +249,7 @@ AUDIT_OUTCOME_LINES = frozenset((
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-macos-preflight",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-windows-preflight",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-asset-fetch",
+    "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-macos-supervisor-start",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-probe",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-decrypt",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-during-execution",
@@ -665,7 +668,8 @@ class _Grammar:
         if prefix == "dependency_preparation_refusal":
             return step_name == "Prepare dependencies before the cut" and code == "runner-unknown"
         if prefix == "devlane_crypto_refusal":
-            return (step_name == "Fetch public control and validate dispatch"
+            return (self.job_runner in ("macos-15", "windows-2025")
+                    and step_name == "Fetch public control and validate dispatch"
                     and code in CRYPTO_CONTROL_REFUSAL_CODES)
         if prefix != "devlane_supervisor_refusal":
             return False
@@ -693,6 +697,15 @@ class _Grammar:
         """Fixed output lines, each bound to the step that is allowed to print it."""
         step = next((item for item in self.steps if item["name"] == step_name), None)
         uses = (step or {}).get("uses") or ""
+        if (line.startswith("devlane_supervisor_refusal=") and step_name == MACOS_SUPERVISOR_START_STEP
+                and self.job_runner == "macos-15"):
+            code = line[len("devlane_supervisor_refusal="):]
+            if code not in MACOS_SUPERVISOR_START_REFUSAL_CODES:
+                return False
+            public_counts["early_failure_marker"] = public_counts.get("early_failure_marker", 0) + 1
+            public_counts["early_failure_step"] = step_name
+            public_counts["early_failure_code"] = code
+            return public_counts["early_failure_marker"] == 1
         if uses.startswith("actions/cache/"):
             key = self.expected_cache_key(step)
             return key is not None and any(
@@ -714,7 +727,8 @@ class _Grammar:
             return public_counts["early_failure_marker"] == 1
         if line.startswith("devlane_crypto_refusal="):
             code = line[len("devlane_crypto_refusal="):]
-            if (step_name != "Fetch public control and validate dispatch"
+            if (self.job_runner not in ("macos-15", "windows-2025")
+                    or step_name != "Fetch public control and validate dispatch"
                     or code not in CRYPTO_CONTROL_REFUSAL_CODES):
                 return False
             public_counts["crypto_refusal_reason"] = public_counts.get("crypto_refusal_reason", 0) + 1
@@ -1682,11 +1696,13 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
             _refuse()
         if counts.get("early_failure_marker"):
             early_failure = counts.get("early_failure_step")
+            dispatch_bound_failure = early_failure in (
+                "Fetch ciphertext and sanitized dependency projection", MACOS_SUPERVISOR_START_STEP,
+            )
             if (counts.get("early_failure_marker") != 1 or counts.get("early_failure_exit") not in (1, 2)
                     or counts.get("early_failed_step") != early_failure
                     or ((counts.get("dispatch") != 1 or counts.get("permit") != 1)
-                        if early_failure == "Fetch ciphertext and sanitized dependency projection"
-                        else counts.get("dispatch") or counts.get("permit"))
+                        if dispatch_bound_failure else counts.get("dispatch") or counts.get("permit"))
                     or records
                     or counts.get("network_probe_refusal") or counts.get("network_probe_supervisor_refusal")
                     or counts.get("network_cut_probe=pass") or counts.get("authenticated_decryption=pass")
@@ -1694,6 +1710,11 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
                     or counts.get("decrypt_refusal_detail") or "Probe isolation before decryption" in seen_steps
                     or "Decrypt authenticated bundle" in seen_steps
                     or "Execute offline profile and filter public summary" in seen_steps):
+                _refuse()
+            if (early_failure == MACOS_SUPERVISOR_START_STEP
+                    and (identity.get("platform") != "macos"
+                         or counts.get("early_failure_code") not in MACOS_SUPERVISOR_START_REFUSAL_CODES
+                         or counts.get("early_failure_exit") != 2)):
                 _refuse()
         elif counts.get("dispatch") != 1 or counts.get("permit") != 1:
             _refuse()
@@ -1928,7 +1949,8 @@ def validate_job_contract(jobs, identity, profile):
         candidate = pre_probe_failures[0]
         platform_early_steps = {
             "linux": {"Fetch public control and validate dispatch"},
-            "macos": {"Fetch public control and validate dispatch", "Prepare hosted runner isolation state"},
+            "macos": {"Fetch public control and validate dispatch", "Prepare hosted runner isolation state",
+                      MACOS_SUPERVISOR_START_STEP},
             "windows": {"Fetch public control and validate dispatch", "Prepare hosted Windows isolation state"},
         }.get(platform, set())
         if candidate in platform_early_steps:
@@ -2134,6 +2156,10 @@ def validate_job_log_metadata_binding(surface, run_job, identity):
             allowed = (identity.get("platform") == "windows" and code in WINDOWS_PREFLIGHT_REFUSAL_CODES)
         elif early_failure == "Prepare hosted runner isolation state":
             allowed = (identity.get("platform") == "macos" and code in MACOS_PREFLIGHT_REFUSAL_CODES)
+        elif early_failure == MACOS_SUPERVISOR_START_STEP:
+            allowed = (identity.get("platform") == "macos"
+                       and code in MACOS_SUPERVISOR_START_REFUSAL_CODES
+                       and surface.get("early_failure_exit") == 2)
         elif early_failure == "Fetch ciphertext and sanitized dependency projection":
             allowed = (identity.get("platform") in PLATFORM_RUNNERS and code in FETCH_REFUSAL_CODES)
         else:

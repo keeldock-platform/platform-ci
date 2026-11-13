@@ -704,15 +704,19 @@ jobs:
           crypto_reason_file="$RUN_ROOT/control-crypto-refusal.txt"
           crypto_print_reason() {
             case "$1" in
-              devlane_crypto_refusal=crypto-target-invalid|devlane_crypto_refusal=crypto-acl-invalid|\
-              devlane_crypto_refusal=crypto-platform-invalid|devlane_crypto_refusal=crypto-metadata-invalid|\
-              devlane_crypto_refusal=crypto-file-invalid|devlane_crypto_refusal=crypto-tree-invalid|\
-              devlane_crypto_refusal=crypto-manifest-invalid|devlane_crypto_refusal=crypto-seal-write-failed|\
-              devlane_crypto_refusal=crypto-tree-mismatch|devlane_crypto_refusal=crypto-import-invalid|\
-              devlane_crypto_refusal=crypto-key-present|devlane_crypto_refusal=crypto-script-invalid|\
-              devlane_crypto_refusal=crypto-control-invalid)
-                printf '%s\n' "$1" >&2
-                ;;
+              devlane_crypto_refusal=crypto-target-invalid) printf 'devlane_crypto_refusal=crypto-target-invalid\n' >&2 ;;
+              devlane_crypto_refusal=crypto-acl-invalid) printf 'devlane_crypto_refusal=crypto-acl-invalid\n' >&2 ;;
+              devlane_crypto_refusal=crypto-platform-invalid) printf 'devlane_crypto_refusal=crypto-platform-invalid\n' >&2 ;;
+              devlane_crypto_refusal=crypto-metadata-invalid) printf 'devlane_crypto_refusal=crypto-metadata-invalid\n' >&2 ;;
+              devlane_crypto_refusal=crypto-file-invalid) printf 'devlane_crypto_refusal=crypto-file-invalid\n' >&2 ;;
+              devlane_crypto_refusal=crypto-tree-invalid) printf 'devlane_crypto_refusal=crypto-tree-invalid\n' >&2 ;;
+              devlane_crypto_refusal=crypto-manifest-invalid) printf 'devlane_crypto_refusal=crypto-manifest-invalid\n' >&2 ;;
+              devlane_crypto_refusal=crypto-seal-write-failed) printf 'devlane_crypto_refusal=crypto-seal-write-failed\n' >&2 ;;
+              devlane_crypto_refusal=crypto-tree-mismatch) printf 'devlane_crypto_refusal=crypto-tree-mismatch\n' >&2 ;;
+              devlane_crypto_refusal=crypto-import-invalid) printf 'devlane_crypto_refusal=crypto-import-invalid\n' >&2 ;;
+              devlane_crypto_refusal=crypto-key-present) printf 'devlane_crypto_refusal=crypto-key-present\n' >&2 ;;
+              devlane_crypto_refusal=crypto-script-invalid) printf 'devlane_crypto_refusal=crypto-script-invalid\n' >&2 ;;
+              devlane_crypto_refusal=crypto-control-invalid) printf 'devlane_crypto_refusal=crypto-control-invalid\n' >&2 ;;
               *)
                 printf 'devlane_crypto_refusal=crypto-control-invalid\n' >&2
                 ;;
@@ -1236,7 +1240,12 @@ jobs:
             )
             foreach ($item in $Output) {
               $line = [string]$item
-              if ($allowed -contains $line) { Write-Output $line; return }
+              foreach ($allowedLine in $allowed) {
+                if ([string]::Equals($line, $allowedLine, [System.StringComparison]::Ordinal)) {
+                  Write-Output $allowedLine
+                  return
+                }
+              }
             }
             Write-Output 'devlane_crypto_refusal=crypto-control-invalid'
           }
