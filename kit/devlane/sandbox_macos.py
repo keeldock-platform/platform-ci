@@ -52,6 +52,25 @@ DECRYPT_REFUSAL_CODES = frozenset((
     "request-invalid", "truncated",
 ))
 
+MACOS_PREFLIGHT_REFUSAL_CODES = frozenset((
+    "macos-preflight-internal", "macos-root-identity-internal", "macos-preflight-host-identity", "macos-preflight-node-tools",
+    "macos-preflight-command-line-tools", "macos-preflight-platform-policy",
+    "macos-preflight-temp-permissions", "macos-preflight-root-helper", "macos-preflight-state-record",
+    "macos-run-root-missing", "macos-state-directory-create", "macos-python3-unavailable",
+    "macos-user-list", "macos-user-name-conflict", "macos-user-id-exhausted", "macos-user-create",
+    "macos-user-attribute-set", "macos-worker-home-create", "macos-worker-home-permissions",
+    "macos-user-verify", "macos-cleanup-intent-write", "macos-identity-record-write",
+    "macos-runner-required", "profile-unknown", "dispatch-context-invalid", "state-directory-permissions",
+    "node-toolchain-missing", "node-toolchain-version", "npm-toolchain-version", "tool-path-invalid",
+    "tool-version-unavailable", "supervisor-operation-failed", "raw-record-size",
+))
+
+MACOS_ROOT_IDENTITY_REFUSAL_CODES = frozenset(
+    code for code in MACOS_PREFLIGHT_REFUSAL_CODES if code.startswith("macos-")
+) | frozenset(("state-directory-permissions", "dispatch-context-invalid", "tool-path-invalid",
+               "tool-version-unavailable", "node-toolchain-missing", "node-toolchain-version",
+               "npm-toolchain-version", "supervisor-operation-failed", "raw-record-size"))
+
 
 class Refusal(ValueError):
     def __init__(self, code="supervisor-failed", decrypt_refusal=None):
@@ -231,14 +250,22 @@ def _run_root_helper(operation, arguments, *, preserve=()):
     for name, value in arguments.items():
         command.extend(("--" + name.replace("_", "-"), str(value)))
     result = subprocess.run(
-        command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         env={"PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"), "LC_ALL": "C",
              "ImageOS": os.environ.get("ImageOS", ""), "ImageVersion": os.environ.get("ImageVersion", ""),
              **({"DEVLANE_DECRYPT_KEY": os.environ.get("DEVLANE_DECRYPT_KEY", "")} if preserve else {})},
         timeout=120, check=False,
     )
     if result.returncode != 0:
-        _refuse("supervisor-operation-failed")
+        try:
+            lines = result.stderr.decode("ascii", "strict").splitlines()
+        except UnicodeDecodeError:
+            lines = []
+        if len(lines) == 1 and lines[0].startswith("devlane_macos_root_refusal="):
+            code = lines[0].removeprefix("devlane_macos_root_refusal=")
+            if code in MACOS_ROOT_IDENTITY_REFUSAL_CODES:
+                _refuse(code)
+        _refuse("macos-preflight-root-helper")
     return result.stdout
 
 
@@ -342,22 +369,49 @@ def _host_preflight(state, workspace, profile, run_id):
     runner_uid = root.stat().st_uid
     if runner_uid == 0 or runner_uid != os.getuid():
         _refuse("dispatch-context-invalid")
-    node, npm_cli = _find_node_tools()
-    developer, clang = _validate_clt()
-    host = boundary_guard.check_platform()
-    state.parent.chmod(0o711)
-    _run_root_helper("root-identity", {
-        "state_dir": state, "workspace": root, "run_id": run_id, "runner_uid": runner_uid,
-        "node": node, "npm_cli": npm_cli, "node_sha256": _sha256_file(node),
-        "npm_sha256": _sha256_file(npm_cli), "developer_directory": developer, "clang": clang,
-        "image_os": host.image_os, "image_version": host.image_version,
-        "product_version": host.product_version, "architecture": host.architecture,
-    })
+    try:
+        node, npm_cli = _find_node_tools()
+    except Refusal:
+        raise
+    except Exception:
+        _refuse("macos-preflight-node-tools")
+    try:
+        developer, clang = _validate_clt()
+    except Refusal:
+        raise
+    except Exception:
+        _refuse("macos-preflight-command-line-tools")
+    try:
+        host = boundary_guard.check_platform()
+    except boundary_guard.GuardError as error:
+        _refuse("macos-runner-required" if error.reason == "platform_unapproved"
+                else "macos-preflight-platform-policy")
+    except Exception:
+        _refuse("macos-preflight-platform-policy")
+    try:
+        state.parent.chmod(0o711)
+    except OSError:
+        _refuse("macos-preflight-temp-permissions")
+    try:
+        _run_root_helper("root-identity", {
+            "state_dir": state, "workspace": root, "run_id": run_id, "runner_uid": runner_uid,
+            "node": node, "npm_cli": npm_cli, "node_sha256": _sha256_file(node),
+            "npm_sha256": _sha256_file(npm_cli), "developer_directory": developer, "clang": clang,
+            "image_os": host.image_os, "image_version": host.image_version,
+            "product_version": host.product_version, "architecture": host.architecture,
+        })
+    except Refusal:
+        raise
+    except Exception:
+        _refuse("macos-preflight-root-helper")
     if not (state / IDENTITY_FILE).is_file():
-        _refuse("state-directory-permissions")
+        _refuse("macos-preflight-state-record")
     for name in ("preparation-home", "preparation-tmp"):
         path = state.parent / name
-        path.mkdir(mode=0o700, exist_ok=True)
+        try:
+            path.mkdir(mode=0o700, exist_ok=True)
+        except OSError:
+            _refuse("macos-preflight-temp-permissions")
     print("devlane_macos=preflight-ready")
 
 
@@ -743,7 +797,7 @@ def _probe_pf(state, ident):
         "print('KD-PF:' + ('pass' if tcp_blocked else 'fail'))\n"
     )
     env = {"PATH": "/usr/bin:/bin", "HOME": ident["home"], "TMPDIR": ident["home"], "LC_ALL": "C", "LANG": "C"}
-    code, stdout, stderr = _run(("/usr/bin/python3", "-I", "-S", "-B", "-c", script),
+    code, stdout, stderr = _run((sys.executable, "-I", "-S", "-B", "-c", script),
                                 env=env, user=ident["uid"], group=ident["gid"], timeout=10, capture_limit=4096)
     if code != 0 or stderr or stdout != b"KD-PF:pass\n":
         _refuse("firewall-unavailable")
@@ -751,6 +805,16 @@ def _probe_pf(state, ident):
     counters = guard.verify()
     if (counters is None or len(counters) != 4 or counters[0][1] == 0 or counters[1][1] == 0):
         _refuse("firewall-unavailable")
+
+
+def _directory_service(argv, refusal, *, timeout=10):
+    try:
+        result = boundary_guard._run_command(argv, timeout=timeout)
+    except boundary_guard.GuardError:
+        _refuse(refusal)
+    if result.returncode != 0 or result.stderr:
+        _refuse(refusal)
+    return result
 
 
 def _root_identity(args):
@@ -775,7 +839,7 @@ def _root_identity(args):
                 os.environ[name] = value
     if (host.image_os != args.image_os or host.image_version != args.image_version
             or host.product_version != args.product_version or host.architecture != args.architecture):
-        _refuse("macos-runner-required")
+        _refuse("macos-preflight-host-identity")
     runner_uid = int(args.runner_uid)
     node = _trusted_file(args.node, executable=True, owners=(0, runner_uid))
     npm_cli = _trusted_file(args.npm_cli, owners=(0, runner_uid))
@@ -790,28 +854,26 @@ def _root_identity(args):
     if developer != args.developer_directory or clang != args.clang:
         _refuse("tool-path-invalid")
     account = WORKER_NAME_PREFIX + run_id
-    listing = boundary_guard._run_command(("/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"), timeout=10)
-    if listing.returncode != 0 or listing.stderr:
-        _refuse("macos-identity-unavailable")
+    listing = _directory_service(("/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"), "macos-user-list")
     raw_ids = []
     names = set()
     try:
         for line in listing.stdout.decode("ascii", "strict").splitlines():
             fields = line.split()
             if len(fields) != 2:
-                _refuse("macos-identity-unavailable")
+                _refuse("macos-user-list")
             names.add(fields[0])
             parsed = boundary_guard._parse_darwin_uid(fields[1])
             if parsed is None:
-                _refuse("macos-identity-unavailable")
+                _refuse("macos-user-list")
             raw_ids.append(parsed[0])
     except UnicodeDecodeError:
-        _refuse("macos-identity-unavailable")
+        _refuse("macos-user-list")
     if account in names:
-        _refuse("macos-identity-unavailable")
+        _refuse("macos-user-name-conflict")
     uid = max((item for item in raw_ids if 500 <= item < 60000), default=500) + 1
     if uid >= 60000:
-        _refuse("macos-identity-unavailable")
+        _refuse("macos-user-id-exhausted")
     host_identity = {
         "product_version": host.product_version, "image_os": host.image_os,
         "image_version": host.image_version, "architecture": host.architecture,
@@ -821,29 +883,38 @@ def _root_identity(args):
         "schema": 1, "run_id": run_id, "runner_uid": runner_uid,
         "uid": uid, "gid": WORKER_GROUP, "account": account, "home": home,
     }
-    _write_json(state / CLEANUP_INTENT_FILE, intent, mode=0o644)
-    os.mkdir(home, 0o700)
-    result = boundary_guard._run_command(("/usr/bin/dscl", ".", "-create", "/Users/" + account), timeout=10)
-    if result.returncode != 0 or result.stderr:
-        _refuse("macos-identity-unavailable")
+    try:
+        _write_json(state / CLEANUP_INTENT_FILE, intent, mode=0o644)
+    except Refusal:
+        _refuse("macos-cleanup-intent-write")
+    try:
+        os.mkdir(home, 0o700)
+    except OSError:
+        _refuse("macos-worker-home-create")
+    _directory_service(("/usr/bin/dscl", ".", "-create", "/Users/" + account), "macos-user-create")
     for key, value in (("UniqueID", str(uid)), ("PrimaryGroupID", str(WORKER_GROUP)),
                        ("NFSHomeDirectory", home), ("UserShell", "/usr/bin/false"),
                        ("RealName", "Private Devlane Worker"), ("IsHidden", "1")):
-        result = boundary_guard._run_command(("/usr/bin/dscl", ".", "-create", "/Users/" + account, key, value), timeout=10)
-        if result.returncode != 0 or result.stderr:
-            _refuse("macos-identity-unavailable")
-    os.chown(home, uid, WORKER_GROUP)
-    os.chmod(home, 0o700)
-    actual_uid = boundary_guard._run_command(("/usr/bin/id", "-u", account), timeout=5)
-    if actual_uid.returncode != 0 or actual_uid.stderr or actual_uid.stdout != (str(uid) + "\n").encode("ascii"):
-        _refuse("macos-identity-unavailable")
-    _write_json(state / IDENTITY_FILE, {
-        "schema": 1, "run_id": run_id, "runner_uid": runner_uid, "uid": uid,
-        "gid": WORKER_GROUP, "account": account, "home": home, "node": args.node, "npm_cli": args.npm_cli,
-        "node_sha256": args.node_sha256, "npm_sha256": args.npm_sha256,
-        "developer_directory": args.developer_directory, "clang": args.clang,
-        "host_identity": host_identity,
-    }, mode=0o644)
+        _directory_service(("/usr/bin/dscl", ".", "-create", "/Users/" + account, key, value),
+                           "macos-user-attribute-set")
+    try:
+        os.chown(home, uid, WORKER_GROUP)
+        os.chmod(home, 0o700)
+    except OSError:
+        _refuse("macos-worker-home-permissions")
+    actual_uid = _directory_service(("/usr/bin/id", "-u", account), "macos-user-verify", timeout=5)
+    if actual_uid.stdout != (str(uid) + "\n").encode("ascii"):
+        _refuse("macos-user-verify")
+    try:
+        _write_json(state / IDENTITY_FILE, {
+            "schema": 1, "run_id": run_id, "runner_uid": runner_uid, "uid": uid,
+            "gid": WORKER_GROUP, "account": account, "home": home, "node": args.node, "npm_cli": args.npm_cli,
+            "node_sha256": args.node_sha256, "npm_sha256": args.npm_sha256,
+            "developer_directory": args.developer_directory, "clang": args.clang,
+            "host_identity": host_identity,
+        }, mode=0o644)
+    except Refusal:
+        _refuse("macos-identity-record-write")
     return 0
 
 
@@ -1758,6 +1829,14 @@ def main(argv=None):
             return _root_pf_cleanup(args)
         _refuse("control-operation-invalid")
     except Refusal as error:
+        if args.operation == "root-identity":
+            code = error.code if error.code in MACOS_ROOT_IDENTITY_REFUSAL_CODES else "macos-root-identity-internal"
+            print("devlane_macos_root_refusal=" + code, file=sys.stderr)
+            return 2
+        if args.operation == "preflight":
+            code = error.code if error.code in MACOS_PREFLIGHT_REFUSAL_CODES else "macos-preflight-internal"
+            print("devlane_macos_preflight_refusal=" + code, file=sys.stderr)
+            return 2
         if args.operation == "decrypt":
             print("devlane_supervisor_refusal=" + error.code, file=sys.stderr)
             if error.decrypt_refusal in DECRYPT_REFUSAL_CODES:
@@ -1765,7 +1844,24 @@ def main(argv=None):
         else:
             print("devlane_supervisor_refusal=supervisor-failed", file=sys.stderr)
         return 2
+    except boundary_guard.GuardError as error:
+        if args.operation == "preflight":
+            code = ("macos-runner-required" if error.reason == "platform_unapproved"
+                    else "macos-preflight-platform-policy")
+            print("devlane_macos_preflight_refusal=" + code, file=sys.stderr)
+            return 2
+        if args.operation == "root-identity":
+            print("devlane_macos_root_refusal=macos-root-identity-internal", file=sys.stderr)
+            return 2
+        print("devlane_supervisor_refusal=supervisor-failed", file=sys.stderr)
+        return 2
     except Exception:
+        if args.operation == "root-identity":
+            print("devlane_macos_root_refusal=macos-root-identity-internal", file=sys.stderr)
+            return 2
+        if args.operation == "preflight":
+            print("devlane_macos_preflight_refusal=macos-preflight-internal", file=sys.stderr)
+            return 2
         print("devlane_supervisor_refusal=supervisor-failed", file=sys.stderr)
         return 2
 

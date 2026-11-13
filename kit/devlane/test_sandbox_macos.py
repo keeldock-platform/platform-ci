@@ -256,6 +256,32 @@ class MacProfileTests(unittest.TestCase):
 
 
 class MacRoundOneRegressionTests(unittest.TestCase):
+    def test_preflight_refusal_names_the_fixed_failed_directory_services_stage(self):
+        stderr = io.StringIO()
+        state = Path(PRIVATE_RUN + "/state")
+        arguments = ["preflight", "--state-dir", str(state), "--workspace", PRIVATE_RUN,
+                    "--profile", "core-node", "--run-id", "12345", "--control-sha", "a" * 40]
+        with mock.patch.object(sandbox, "_state_paths", return_value=(state, state.parent)), \
+                mock.patch.object(sandbox.boundary_guard, "check_platform", return_value=object()), \
+                mock.patch.object(sandbox, "_host_preflight", side_effect=sandbox.Refusal("macos-user-attribute-set")), \
+                mock.patch.dict(os.environ, {
+                    "CI_REPOSITORY": sandbox.fetch.REPOSITORY, "CI_EVENT_NAME": "workflow_dispatch",
+                    "CI_REF": "refs/heads/main", "CI_SHA": "a" * 40,
+                }), mock.patch("sys.stderr", stderr):
+            self.assertEqual(sandbox.main(arguments), 2)
+        self.assertEqual(stderr.getvalue(),
+                         "devlane_macos_preflight_refusal=macos-user-attribute-set\n")
+
+    def test_root_helper_forwards_only_fixed_directory_services_refusals(self):
+        result = mock.Mock(returncode=2, stdout=b"", stderr=b"devlane_macos_root_refusal=macos-user-create\n")
+        with mock.patch.object(sandbox.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(sandbox.Refusal, "macos-user-create"):
+                sandbox._run_root_helper("root-identity", {"state_dir": PRIVATE_RUN + "/state"})
+        result.stderr = (chr(47) + "Users/runner/work/_temp/private-host-detail\n").encode("ascii")
+        with mock.patch.object(sandbox.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(sandbox.Refusal, "macos-preflight-root-helper"):
+                sandbox._run_root_helper("root-identity", {"state_dir": PRIVATE_RUN + "/state"})
+
     def test_dependency_preparation_is_unprivileged_and_network_outbound_only(self):
         profile = sandbox.preparation_profile_text(
             project=PRIVATE_RUN + "/preparation-project", prepared=PRIVATE_RUN + "/prepared",
@@ -352,6 +378,11 @@ class MacRoundOneRegressionTests(unittest.TestCase):
             self.assertEqual(sandbox.main(arguments), 2)
         self.assertEqual(stderr.getvalue(),
                          "devlane_supervisor_refusal=decrypt-rejected\ndecrypt_refusal=auth-tag\n")
+
+    def test_macos_pf_probe_uses_the_selected_runner_python_not_the_system_python(self):
+        source = (sandbox.CONTROL_ROOT / "kit/devlane/sandbox_macos.py").read_text(encoding="utf-8")
+        self.assertIn('(sys.executable, "-I", "-S", "-B", "-c", script)', source)
+        self.assertNotIn("usr/bin/python3", source)
 
     def test_root_cleanup_attempts_plaintext_and_account_cleanup_after_firewall_error(self):
         with tempfile.TemporaryDirectory() as temporary:

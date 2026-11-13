@@ -22,7 +22,8 @@ class DeadlineRefusal(ValueError):
 
 def _read(path):
     path = Path(path)
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0)
+                         | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024:
@@ -71,7 +72,8 @@ def guard_action(path, step_timeout_seconds, margin_seconds=60, now=None):
 
 
 def _started_at(path):
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0)
+                         | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 64:
@@ -107,7 +109,8 @@ def create(path, budget_seconds, cleanup_reserve_seconds, job_seconds, now=None,
         "cleanup_reserve": cleanup_reserve_seconds,
         "job_seconds": job_seconds,
     }, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                         | getattr(os, "O_BINARY", 0), 0o600)
     with os.fdopen(descriptor, "wb") as output:
         output.write(payload)
         output.flush()
@@ -195,9 +198,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.operation == "mark-start":
-            descriptor = os.open(args.file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(descriptor, "w", encoding="ascii") as output:
-                output.write("%.17g\n" % time.monotonic())
+            descriptor = os.open(args.file, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                 | getattr(os, "O_BINARY", 0), 0o600)
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(("%.17g\n" % time.monotonic()).encode("ascii"))
                 output.flush()
                 os.fsync(output.fileno())
             return 0

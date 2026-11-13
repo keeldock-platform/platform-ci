@@ -158,6 +158,30 @@ def _assert_pid_gone(test, pid):
 
 
 class DeadlineTests(unittest.TestCase):
+    def test_windows_inline_start_writer_emits_a_marker_the_helper_accepts(self):
+        jobs = public_audit.parse_workflow(WORKFLOW_ROOT / ".github/workflows/devlane-encrypted.yml")
+        windows_job = jobs[public_audit.WINDOWS_RUN_JOB]
+        first_step = windows_job["steps"][0]
+        writer_line = next(line for line in first_step["run"]
+                           if line.startswith("python -B -c 'import os,sys,time; fd=os.open("))
+        writer = writer_line.split("python -B -c '", 1)[1].rsplit("' $started", 1)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            started = Path(temporary) / "deadline-start"
+            result = subprocess.run(
+                [sys.executable, "-B", "-c", writer, str(started)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+            raw = started.read_bytes()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertNotIn(b"\r", raw)
+            self.assertFalse(raw.startswith(b"\xef\xbb\xbf"))
+            start = deadline._started_at(started)
+            self.assertEqual(start, float(raw.decode("ascii").strip()))
+            payload = Path(temporary) / "deadline.json"
+            deadline.create(payload, 60, 30, 90, started_at_file=started)
+            self.assertEqual(deadline._read(payload)["work_deadline"], start + 60)
+
     def test_mark_start_binds_the_job_deadline_before_setup_elapsed(self):
         with tempfile.TemporaryDirectory() as temporary:
             started = Path(temporary) / "started"

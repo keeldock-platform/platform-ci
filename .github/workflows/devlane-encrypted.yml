@@ -708,7 +708,9 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$DEVLANE_PLATFORM" == "macos" ]]; then
-            mkdir -m 700 "$RUN_ROOT/state"
+            [[ -n "$RUN_ROOT" ]] || { printf 'devlane_macos_preflight_refusal=macos-run-root-missing\n' >&2; exit 1; }
+            mkdir -m 700 "$RUN_ROOT/state" || { printf 'devlane_macos_preflight_refusal=macos-state-directory-create\n' >&2; exit 1; }
+            command -v python3 >/dev/null 2>&1 || { printf 'devlane_macos_preflight_refusal=macos-python3-unavailable\n' >&2; exit 1; }
             python3 -B kit/devlane/sandbox_macos.py preflight \
               --state-dir "$RUN_ROOT/state" --workspace "$GITHUB_WORKSPACE" \
               --profile "$DEVLANE_PROFILE" --run-id "$CI_RUN_ID" --control-sha "$CI_SHA"
@@ -1128,7 +1130,7 @@ jobs:
               $env:CI_REF -ne 'refs/heads/main' -or $env:DEVLANE_PLATFORM -ne 'windows' -or
               $env:DEVLANE_PROFILE -ne 'core-node' -or $env:CI_RUN_ATTEMPT -ne '1' -or
               $env:CI_SHA -notmatch '^[a-f0-9]{40}$') { exit 1 }
-          python -B -c 'import os,sys,time; fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600); f=os.fdopen(fd,"w",encoding="ascii"); f.write("%.17g\n" % time.monotonic()); f.flush(); os.fsync(f.fileno()); f.close()' $started
+          python -B -c 'import os,sys,time; fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_BINARY",0),0o600); f=os.fdopen(fd,"wb"); f.write(("%.17g\n" % time.monotonic()).encode("ascii")); f.flush(); os.fsync(f.fileno()); f.close()' $started
           if ($LASTEXITCODE -ne 0) { exit 1 }
           git -C $env:CI_WORKSPACE init -q 2>$null
           if ($LASTEXITCODE -ne 0) { exit 1 }
