@@ -213,8 +213,41 @@ CRYPTO_SEAL_REFUSAL_CODES = CRYPTO_CONTROL_REFUSAL_CODES - frozenset((
     "crypto-tree-mismatch", "crypto-import-invalid", "crypto-key-present", "crypto-script-invalid",
 ))
 CRYPTO_CHECK_REFUSAL_CODES = CRYPTO_CONTROL_REFUSAL_CODES - frozenset((
-    "crypto-seal-write-failed", "crypto-script-invalid",
+    "crypto-acl-protection-failed", "crypto-seal-write-failed", "crypto-script-invalid",
 ))
+CRYPTO_BOOTSTRAP_TERMINAL_CODES = frozenset((
+    "crypto-dependency-seal-failed", "crypto-dependency-check-failed",
+    "crypto-dependency-privileged-check-failed",
+))
+
+
+def _crypto_reason_matches_bootstrap_code(surface, identity):
+    if type(surface) is not dict:
+        return False
+    code = surface.get("early_failure_code")
+    reason = surface.get("crypto_refusal_reason")
+    if code not in CRYPTO_BOOTSTRAP_TERMINAL_CODES:
+        return reason is None
+    if reason is None or surface.get("early_failure") != "Fetch public control and validate dispatch":
+        return False
+    platform = identity.get("platform", "linux")
+    if platform == "macos":
+        available = MACOS_CRYPTO_CONTROL_REFUSAL_CODES
+    elif platform == "windows":
+        available = CRYPTO_CONTROL_REFUSAL_CODES
+    else:
+        return False
+    if code == "crypto-dependency-seal-failed":
+        allowed = CRYPTO_SEAL_REFUSAL_CODES
+    elif code == "crypto-dependency-check-failed":
+        allowed = CRYPTO_CHECK_REFUSAL_CODES
+    elif code == "crypto-dependency-privileged-check-failed" and platform == "macos":
+        allowed = CRYPTO_CHECK_REFUSAL_CODES
+    else:
+        return False
+    return reason in allowed and reason in available
+
+
 AUDIT_SUBREASONS = frozenset((
     "workflow-parse", "workflow-graph", "summary-records", "hosted-log-preamble",
     "hosted-step-block", "hosted-log-canonicalization", "job-log-surface", "check-run-output",
@@ -2077,20 +2110,13 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         elif (counts.get("devlane_acceptance=pass") != 1 or counts.get("acceptance_refused")
               or counts.get("devlane_linux_probe=pass") != 1):
             _refuse()
-    if counts.get("crypto_refusal_reason"):
-        bootstrap_code = counts.get("early_failure_code")
-        reason = counts.get("crypto_refusal_reason_code")
-        allowed_crypto_reasons = (
-            CRYPTO_SEAL_REFUSAL_CODES if bootstrap_code == "crypto-dependency-seal-failed"
-            else CRYPTO_CHECK_REFUSAL_CODES
-            if bootstrap_code in ("crypto-dependency-check-failed", "crypto-dependency-privileged-check-failed")
-            else frozenset()
-        )
-        if counts.get("crypto_refusal_reason") != 1 or reason not in allowed_crypto_reasons:
-            _refuse()
-    elif counts.get("early_failure_code") in (
-            "crypto-dependency-seal-failed", "crypto-dependency-check-failed",
-            "crypto-dependency-privileged-check-failed"):
+    crypto_surface = {
+        "early_failure": early_failure,
+        "early_failure_code": counts.get("early_failure_code"),
+        "crypto_refusal_reason": counts.get("crypto_refusal_reason_code"),
+    }
+    if (counts.get("crypto_refusal_reason", 0) > 1
+            or not _crypto_reason_matches_bootstrap_code(crypto_surface, identity)):
         _refuse()
     failure_stage = None
     if early_failure is not None:
@@ -2158,8 +2184,10 @@ def _expected_step_names(profile, identity=None):
     return [step["name"] for step in jobs[PLATFORM_RUN_JOBS[platform]]["steps"]]
 
 
-def validate_job_contract(jobs, identity, profile):
+def validate_job_contract(jobs, identity, profile, *, surface=None):
     platform = identity.get("platform", "linux")
+    if surface is not None and not _crypto_reason_matches_bootstrap_code(surface, identity):
+        _refuse()
     legacy = _legacy_encrypted_workflow_path(identity) is not None
     if platform not in PLATFORM_RUN_JOBS or (platform == "windows" and profile != "core-node"):
         _refuse()
@@ -2439,7 +2467,8 @@ def _audit_outcome_line(jobs, identity, diagnosed_failure=None):
 
 def validate_job_log_metadata_binding(surface, run_job, identity):
     """Bind failure evidence in the active job log to its completed job and step metadata."""
-    if type(surface) is not dict or type(run_job) is not dict:
+    if (type(surface) is not dict or type(run_job) is not dict
+            or not _crypto_reason_matches_bootstrap_code(surface, identity)):
         _refuse()
     conclusion = run_job.get("conclusion")
     steps = _steps(run_job)
@@ -2593,6 +2622,7 @@ def run_audit(api, identity):
     run_job = jobs[active_name]
     log = api.log_text(run_job["id"])
     surface = validate_job_log_surface(log, active_name, identity, completed=True)
+    validate_job_contract(response["jobs"], identity, identity["profile"], surface=surface)
     validate_job_log_metadata_binding(surface, run_job, identity)
     validate_dispatch_marker(log, identity, allow_missing=surface["early_failure"] is not None)
     artifacts, _ = api.json(prefix + "/artifacts?per_page=100&page=1")

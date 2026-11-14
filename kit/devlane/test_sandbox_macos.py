@@ -641,6 +641,12 @@ class MacRoundOneRegressionTests(unittest.TestCase):
                     log.write_text(content, encoding="utf-8")
                     self.assertEqual(sandbox._npm_preparation_error_class(log), expected)
 
+    def test_npm_preparation_error_class_reads_only_the_log_limit_plus_one(self):
+        reader = mock.mock_open(read_data=b"npm error code EACCES\n")
+        with mock.patch.object(Path, "open", reader):
+            self.assertEqual(sandbox._npm_preparation_error_class("preparation.log"), "EACCES")
+        reader.return_value.read.assert_called_once_with(sandbox.MAX_LOG_BYTES + 1)
+
     def test_workload_build_environment_pins_the_clt_developer_directory(self):
         worker = {
             "node": "/opt/node/bin/node", "home": PRIVATE_RUN + "/worker-home",

@@ -2896,9 +2896,25 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 surface = audit.validate_job_log_surface(log, audit.PLATFORM_RUN_JOBS[platform], identity,
                                                          completed=True)
                 self.assertEqual(surface["crypto_refusal_reason"], reason)
-                audit.validate_job_contract(jobs, identity, "core-node")
+                audit.validate_job_contract(jobs, identity, "core-node", surface=surface)
                 audit.validate_job_log_metadata_binding(surface, run_job, identity)
                 audit.validate_dispatch_marker(log, identity, allow_missing=True)
+
+                if platform == "windows" and reason == "crypto-acl-protection-failed":
+                    changed_terminal = _replace_output_line(
+                        log,
+                        "devlane_deadline_refusal=crypto-dependency-seal-failed",
+                        "devlane_deadline_refusal=crypto-dependency-check-failed",
+                    )
+                    with self.assertRaises(audit.AuditRefusal):
+                        audit.validate_job_log_surface(
+                            changed_terminal, audit.PLATFORM_RUN_JOBS[platform], identity, completed=True,
+                        )
+                    changed_surface = dict(surface, early_failure_code="crypto-dependency-check-failed")
+                    with self.assertRaises(audit.AuditRefusal):
+                        audit.validate_job_contract(jobs, identity, "core-node", surface=changed_surface)
+                    with self.assertRaises(audit.AuditRefusal):
+                        audit.validate_job_log_metadata_binding(changed_surface, run_job, identity)
 
                 rejected_reasons = ["crypto-script-invalid", "private-path"]
                 if bootstrap_code == "crypto-dependency-seal-failed":
@@ -2923,6 +2939,15 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                     audit.validate_job_log_surface(
                         without_reason, audit.PLATFORM_RUN_JOBS[platform], identity, completed=True,
                     )
+
+    def test_windows_acl_reason_terminal_pairings_match_the_bootstrap_phases(self):
+        self.assertIn("crypto-acl-protection-failed", audit.CRYPTO_SEAL_REFUSAL_CODES)
+        self.assertNotIn("crypto-acl-protection-failed", audit.CRYPTO_CHECK_REFUSAL_CODES)
+        for reason in sorted(audit.WINDOWS_CRYPTO_ACL_REFUSAL_CODES - {
+                "crypto-acl-protection-failed"}):
+            with self.subTest(reason=reason):
+                self.assertIn(reason, audit.CRYPTO_SEAL_REFUSAL_CODES)
+                self.assertIn(reason, audit.CRYPTO_CHECK_REFUSAL_CODES)
 
     def test_audit_refusal_reason_identifies_the_contract_check(self):
         job = {"name": "audit", "status": "completed", "conclusion": "success"}

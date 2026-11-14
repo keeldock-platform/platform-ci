@@ -699,7 +699,8 @@ _NPM_PREPARATION_ERROR_CLASSES = frozenset((
 
 def _npm_preparation_error_class(log_path):
     try:
-        payload = Path(log_path).read_bytes()
+        with Path(log_path).open("rb") as stream:
+            payload = stream.read(MAX_LOG_BYTES + 1)
     except OSError:
         return "other"
     if len(payload) > MAX_LOG_BYTES:
