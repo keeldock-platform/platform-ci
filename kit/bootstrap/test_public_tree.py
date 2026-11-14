@@ -1076,6 +1076,7 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/rust_tooling.py',
             'kit/devlane/test_deadline.py',
             'kit/devlane/test_powershell_static.py',
+            'kit/devlane/test_powershell_live.py',
             'kit/devlane/test_network_probe.py',
             'kit/devlane/test_rust_matrix_runner.py',
             'kit/devlane/test_rust_public_audit.py',

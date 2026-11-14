@@ -191,6 +191,24 @@ MACOS_BOOTSTRAP_REFUSAL_CODES = frozenset((
     "crypto-dependency-privileged-check-failed",
 ))
 CRYPTO_CONTROL_REFUSAL_CODES = refusal_codes.CRYPTO_CONTROL_REFUSAL_CODES
+WINDOWS_CRYPTO_ACL_OUTPUT_REFUSAL_CODES = frozenset((
+    "crypto-acl-protection-failed", "crypto-acl-process-failed", "crypto-acl-exit-other",
+    "crypto-acl-stderr-nonempty", "crypto-acl-stdout-non-ascii", "crypto-acl-stdout-empty",
+    "crypto-acl-stdout-multiple-lines", "crypto-acl-stdout-not-sid",
+    "crypto-acl-stdout-bom-or-whitespace",
+)) | frozenset(
+    "crypto-acl-exit-" + str(code) for code in range(1, 16) if code not in (3, 4, 5, 6)
+)
+MACOS_CRYPTO_CONTROL_REFUSAL_CODES = CRYPTO_CONTROL_REFUSAL_CODES - WINDOWS_CRYPTO_ACL_OUTPUT_REFUSAL_CODES
+WINDOWS_CRYPTO_ACL_REFUSAL_CODES = frozenset((
+    "crypto-acl-powershell-unavailable", "crypto-acl-reparse-point", "crypto-acl-owner-unresolved",
+    "crypto-acl-owner-untrusted", "crypto-acl-writer-untrusted", "crypto-acl-protection-failed",
+    "crypto-acl-process-failed", "crypto-acl-exit-other", "crypto-acl-stderr-nonempty",
+    "crypto-acl-stdout-non-ascii", "crypto-acl-stdout-empty", "crypto-acl-stdout-multiple-lines",
+    "crypto-acl-stdout-not-sid", "crypto-acl-stdout-bom-or-whitespace",
+)) | frozenset(
+    "crypto-acl-exit-" + str(code) for code in range(1, 16) if code not in (3, 4, 5, 6)
+)
 CRYPTO_SEAL_REFUSAL_CODES = CRYPTO_CONTROL_REFUSAL_CODES - frozenset((
     "crypto-tree-mismatch", "crypto-import-invalid", "crypto-key-present", "crypto-script-invalid",
 ))
@@ -658,7 +676,7 @@ class _Grammar:
                 "devlane_crypto_refusal", "devlane_deadline_refusal", "devlane_bootstrap_refusal",
             ) for line in output_lines)
             initial_acl_refusal = (
-                output_lines.count("devlane_crypto_refusal=crypto-acl-output-invalid") == 1
+                output_lines.count("devlane_crypto_refusal=crypto-acl-protection-failed") == 1
                 and output_lines.count("devlane_deadline_refusal=crypto-dependency-seal-failed") == 1
             )
             if ((not has_refusal and not checkout_states)
@@ -668,9 +686,21 @@ class _Grammar:
                 structured = [line for line in output_lines if line.startswith((
                     "devlane_crypto_state=", "devlane_crypto_refusal=", "devlane_deadline_refusal=",
                 ))]
-                if structured != [after_state, "devlane_crypto_refusal=crypto-acl-output-invalid",
+                if structured != [after_state, "devlane_crypto_refusal=crypto-acl-protection-failed",
                                   "devlane_deadline_refusal=crypto-dependency-seal-failed"]:
                     _refuse()
+            elif "devlane_deadline_refusal=crypto-dependency-seal-failed" in output_lines:
+                acl_reasons = [line for line in output_lines if line.startswith("devlane_crypto_refusal=")
+                               and line.partition("=")[2] in WINDOWS_CRYPTO_ACL_REFUSAL_CODES]
+                if acl_reasons:
+                    structured = [line for line in output_lines if line.startswith((
+                        "devlane_crypto_state=", "devlane_crypto_refusal=", "devlane_deadline_refusal=",
+                    ))]
+                    if (len(acl_reasons) != 1 or structured != [
+                            after_state, checkout_state, acl_reasons[0],
+                            "devlane_deadline_refusal=crypto-dependency-seal-failed",
+                    ]):
+                        _refuse()
             return exports
         has_crypto_reason = any(line.startswith("devlane_crypto_refusal=") for line in output_lines)
         target_refusal = (
@@ -883,7 +913,8 @@ class _Grammar:
             code = line[len("devlane_crypto_refusal="):]
             if (self.job_runner not in ("macos-15", "windows-2025")
                     or step_name != "Fetch public control and validate dispatch"
-                    or code not in CRYPTO_CONTROL_REFUSAL_CODES):
+                    or (code not in CRYPTO_CONTROL_REFUSAL_CODES if self.job_runner == "windows-2025"
+                        else code not in MACOS_CRYPTO_CONTROL_REFUSAL_CODES)):
                 return False
             public_counts["crypto_refusal_reason"] = public_counts.get("crypto_refusal_reason", 0) + 1
             public_counts["crypto_refusal_reason_code"] = code
@@ -1580,6 +1611,11 @@ def _canonicalize_github_hosted_log(text, grammar, job_name, identity, workflow_
         matches = []
         for candidate_index in range(position + 1, len(grammar.steps)):
             step = grammar.steps[candidate_index]
+            if (step["name"] == "Install Tauri Linux build dependencies"
+                    and (grammar.job_runner != "ubuntu-24.04" or identity.get("profile") != "desktop")):
+                continue
+            if step["name"] == "Install pinned Rust toolchain" and identity.get("profile") != "desktop":
+                continue
             uses = step["uses"] or ""
             run = step["run"]
             if ((uses and uses == description)
@@ -1694,6 +1730,7 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         _refuse()
     for sequence in ANSI_SGR:
         log = log.replace(sequence, b"")
+    log = log.replace(b"\r\n", b"\n")
     if any(byte < 32 and byte != 10 or byte == 127 for byte in log) or b"\x1b" in log:
         _refuse()
     try:

@@ -1,5 +1,6 @@
 """Integrity checks for the isolated control-only Python dependency tree."""
 
+import base64
 import os
 import io
 from pathlib import Path
@@ -212,8 +213,30 @@ class ControlPythonPortableTests(unittest.TestCase):
         for exit_code, reason in expected.items():
             with self.subTest(exit_code=exit_code):
                 self.assertEqual(control_python._powershell_acl_exit_reason(exit_code), reason)
-        self.assertEqual(control_python._powershell_acl_exit_reason(0), "crypto-acl-output-invalid")
-        self.assertEqual(control_python._powershell_acl_exit_reason(7), "crypto-acl-output-invalid")
+        self.assertIsNone(control_python._powershell_acl_exit_reason(0))
+        self.assertEqual(control_python._powershell_acl_exit_reason(7), "crypto-acl-exit-7")
+        self.assertEqual(control_python._powershell_acl_exit_reason(16), "crypto-acl-exit-other")
+
+    def test_windows_acl_output_parser_accepts_only_one_sid_line_and_normalizes_bom_crlf(self):
+        self.assertEqual(
+            control_python._powershell_acl_stdout_sid(b"\xef\xbb\xbfS-1-5-21-100\r\n"),
+            "S-1-5-21-100",
+        )
+        self.assertEqual(control_python._powershell_acl_stdout_sid(b"S-1-5-21-100\n"), "S-1-5-21-100")
+        cases = (
+            (b"", "crypto-acl-stdout-empty"),
+            (b"\n", "crypto-acl-stdout-empty"),
+            (b"S-1-5-21-100\nextra\n", "crypto-acl-stdout-multiple-lines"),
+            (b"not-a-sid\n", "crypto-acl-stdout-not-sid"),
+            (b" S-1-5-21-100\n", "crypto-acl-stdout-bom-or-whitespace"),
+            (b"S-1-5-21-100\n\n", "crypto-acl-stdout-multiple-lines"),
+            (b"S-1-5-21-100\r", "crypto-acl-stdout-bom-or-whitespace"),
+            (b"S-1-5-21-100\xff\n", "crypto-acl-stdout-non-ascii"),
+        )
+        for payload, reason in cases:
+            with self.subTest(reason=reason, payload=payload), self.assertRaises(control_python.CryptoRefusal) as caught:
+                control_python._powershell_acl_stdout_sid(payload)
+            self.assertEqual(caught.exception.reason, reason)
 
     def test_windows_acl_command_output_failures_have_fixed_subreasons(self):
         with mock.patch.object(Path, "is_file", return_value=False):
@@ -226,10 +249,12 @@ class ControlPythonPortableTests(unittest.TestCase):
             (mock.Mock(returncode=4, stdout=b"", stderr=b""), "crypto-acl-owner-unresolved"),
             (mock.Mock(returncode=5, stdout=b"", stderr=b""), "crypto-acl-owner-untrusted"),
             (mock.Mock(returncode=6, stdout=b"", stderr=b""), "crypto-acl-writer-untrusted"),
-            (mock.Mock(returncode=0, stdout=b"not-a-sid\n", stderr=b""), "crypto-acl-output-invalid"),
-            (mock.Mock(returncode=0, stdout=b"S-1-5-21-100\nextra\n", stderr=b""), "crypto-acl-output-invalid"),
-            (mock.Mock(returncode=0, stdout=b"S-1-5-21-100\n", stderr=b"warning\n"), "crypto-acl-output-invalid"),
-            (mock.Mock(returncode=7, stdout=b"", stderr=b""), "crypto-acl-output-invalid"),
+            (mock.Mock(returncode=0, stdout=b"not-a-sid\n", stderr=b""), "crypto-acl-stdout-not-sid"),
+            (mock.Mock(returncode=0, stdout=b"S-1-5-21-100\nextra\n", stderr=b""), "crypto-acl-stdout-multiple-lines"),
+            (mock.Mock(returncode=0, stdout=b"S-1-5-21-100\n", stderr=b"warning\n"), "crypto-acl-stderr-nonempty"),
+            (mock.Mock(returncode=0, stdout=b"\xff", stderr=b""), "crypto-acl-stdout-non-ascii"),
+            (mock.Mock(returncode=7, stdout=b"", stderr=b""), "crypto-acl-exit-7"),
+            (mock.Mock(returncode=28, stdout=b"", stderr=b""), "crypto-acl-exit-other"),
         ):
             with self.subTest(reason=reason, returncode=result.returncode), \
                     mock.patch.object(Path, "is_file", return_value=True), \
@@ -237,6 +262,13 @@ class ControlPythonPortableTests(unittest.TestCase):
                     self.assertRaises(control_python.CryptoRefusal) as caught:
                 control_python._powershell_acl_owner(Path("D:/run/control-python-deps"))
             self.assertEqual(caught.exception.reason, reason)
+
+    def test_windows_acl_powershell_command_is_quiet_and_text_formatted(self):
+        command = control_python._powershell_acl_command(Path("D:/run/control-python-deps"), Path("pwsh.exe"))
+        self.assertEqual(command[1:7], ["-NoLogo", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-EncodedCommand"])
+        script = base64.b64decode(command[-1]).decode("utf-16le")
+        self.assertIn("$ProgressPreference = 'SilentlyContinue'", script)
+        self.assertEqual(script.count("[Console]::Out.WriteLine($ownerSid)"), 1)
 
     def test_windows_crypto_acl_bootstrap_is_protected_before_install(self):
         root = Path(__file__).resolve().parents[2]

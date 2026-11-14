@@ -35,7 +35,13 @@ _POWERSHELL_ACL_EXIT_REASONS = {
 
 
 def _powershell_acl_exit_reason(exit_code):
-    return _POWERSHELL_ACL_EXIT_REASONS.get(exit_code, "crypto-acl-output-invalid")
+    if exit_code == 0:
+        return None
+    if exit_code in _POWERSHELL_ACL_EXIT_REASONS:
+        return _POWERSHELL_ACL_EXIT_REASONS[exit_code]
+    if type(exit_code) is int and 1 <= exit_code <= 15:
+        return "crypto-acl-exit-" + str(exit_code)
+    return "crypto-acl-exit-other"
 
 
 class CryptoRefusal(ValueError):
@@ -70,17 +76,11 @@ def _canonical_root(value):
         _refuse("crypto-target-invalid")
 
 
-def _powershell_acl_owner(root):
-    """Return the current Windows SID after checking the control tree ACLs."""
-    powershell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / (
-        "System32/WindowsPowerShell/v1.0/powershell.exe"
-    )
-    try:
-        if not powershell.is_file():
-            _refuse("crypto-acl-powershell-unavailable")
-        encoded_root = base64.b64encode(str(root).encode("utf-8")).decode("ascii")
-        script = r'''
+def _powershell_acl_script(root):
+    encoded_root = base64.b64encode(str(root).encode("utf-8")).decode("ascii")
+    return r'''
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 $root = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__ROOT__'))
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $ownerSid = $identity.User.Value
@@ -98,7 +98,8 @@ foreach ($item in $items) {
     try { $itemOwner = ([Security.Principal.NTAccount]$acl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value }
     catch { exit 4 }
     if ($trustedOwners -notcontains $itemOwner) { exit 5 }
-    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+    $rules = $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
+    foreach ($rule in $rules) {
         if (($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
         if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
         $sid = $rule.IdentityReference.Value
@@ -108,9 +109,59 @@ foreach ($item in $items) {
 }
 [Console]::Out.WriteLine($ownerSid)
 '''.replace("__ROOT__", encoded_root)
-        encoded_script = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+
+
+def _powershell_acl_command(root, powershell=None):
+    if powershell is None:
+        powershell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / (
+            "System32/WindowsPowerShell/v1.0/powershell.exe"
+        )
+    encoded_script = base64.b64encode(_powershell_acl_script(root).encode("utf-16le")).decode("ascii")
+    return [str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text",
+            "-EncodedCommand", encoded_script]
+
+
+def _powershell_acl_stdout_sid(payload):
+    if type(payload) is not bytes:
+        _refuse("crypto-acl-stdout-non-ascii")
+    if payload.startswith(b"\xef\xbb\xbf"):
+        payload = payload[3:]
+    if b"\xef\xbb\xbf" in payload:
+        _refuse("crypto-acl-stdout-bom-or-whitespace")
+    try:
+        payload.decode("ascii", "strict")
+    except UnicodeError:
+        _refuse("crypto-acl-stdout-non-ascii")
+    if not payload:
+        _refuse("crypto-acl-stdout-empty")
+    normalized = payload.replace(b"\r\n", b"\n")
+    if b"\r" in normalized:
+        _refuse("crypto-acl-stdout-bom-or-whitespace")
+    lines = normalized.split(b"\n")
+    if lines[-1] == b"":
+        lines.pop()
+    if not lines or not lines[0]:
+        _refuse("crypto-acl-stdout-empty")
+    if len(lines) != 1:
+        _refuse("crypto-acl-stdout-multiple-lines")
+    line = lines[0]
+    if any(byte in b" \t\v\f" for byte in line):
+        _refuse("crypto-acl-stdout-bom-or-whitespace")
+    if re.fullmatch(rb"S-1-(?:[0-9]+-)*[0-9]+", line) is None:
+        _refuse("crypto-acl-stdout-not-sid")
+    return line.decode("ascii")
+
+
+def _powershell_acl_owner(root):
+    """Return the current Windows SID after checking the control tree ACLs."""
+    powershell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / (
+        "System32/WindowsPowerShell/v1.0/powershell.exe"
+    )
+    try:
+        if not powershell.is_file():
+            _refuse("crypto-acl-powershell-unavailable")
         result = subprocess.run(
-            [str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded_script],
+            _powershell_acl_command(root, powershell),
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=30, check=False,
         )
@@ -119,19 +170,12 @@ foreach ($item in $items) {
     except OSError:
         _refuse("crypto-acl-powershell-unavailable")
     except (subprocess.SubprocessError, UnicodeError, ValueError):
-        _refuse("crypto-acl-output-invalid")
-    if result.returncode in _POWERSHELL_ACL_EXIT_REASONS:
+        _refuse("crypto-acl-process-failed")
+    if result.returncode != 0:
         _refuse(_powershell_acl_exit_reason(result.returncode))
-    try:
-        output = result.stdout.decode("ascii", "strict")
-    except UnicodeError:
-        _refuse("crypto-acl-output-invalid")
-    if result.returncode != 0 or result.stderr:
-        _refuse("crypto-acl-output-invalid")
-    match = re.fullmatch(r"(S-1-(?:[0-9]+-)*[0-9]+)\r?\n?", output)
-    if match is None:
-        _refuse("crypto-acl-output-invalid")
-    return match.group(1)
+    if result.stderr:
+        _refuse("crypto-acl-stderr-nonempty")
+    return _powershell_acl_stdout_sid(result.stdout)
 
 
 def _expected_owner(platform_name, owner_uid=None):

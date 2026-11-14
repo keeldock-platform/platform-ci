@@ -113,12 +113,15 @@ REFUSAL_CODES = frozenset((
 CRYPTO_CONTROL_REFUSAL_CODES = frozenset((
     "crypto-target-invalid", "crypto-acl-powershell-unavailable", "crypto-acl-reparse-point",
     "crypto-acl-owner-unresolved", "crypto-acl-owner-untrusted", "crypto-acl-writer-untrusted",
-    "crypto-acl-output-invalid", "crypto-platform-invalid",
+    "crypto-acl-protection-failed", "crypto-acl-process-failed", "crypto-acl-exit-other",
+    "crypto-acl-stderr-nonempty", "crypto-acl-stdout-non-ascii", "crypto-acl-stdout-empty",
+    "crypto-acl-stdout-multiple-lines", "crypto-acl-stdout-not-sid",
+    "crypto-acl-stdout-bom-or-whitespace", "crypto-platform-invalid",
     "crypto-metadata-invalid", "crypto-file-invalid", "crypto-tree-invalid",
     "crypto-manifest-invalid", "crypto-seal-write-failed", "crypto-tree-mismatch",
     "crypto-import-invalid", "crypto-key-present", "crypto-script-invalid",
     "crypto-control-invalid",
-))
+)) | frozenset("crypto-acl-exit-" + str(code) for code in range(1, 16) if code not in (3, 4, 5, 6))
 MACOS_SUPERVISOR_START_REFUSAL_CODES = frozenset((
     "macos-root-required", "dispatch-context-invalid", "input-unavailable", "input-size",
     "projection-invalid", "positive-control-failed", "tool-version-mismatch",
@@ -133,7 +136,8 @@ MACOS_OPERATION_RAW_REFUSALS = {
         "profile-unknown", "deadline-file-invalid", "total-deadline-exhausted", "projection-invalid",
         "prepare-run-root-invalid", "prepared-output-invalid", "prepared-output-path-invalid",
         "prepared-output-exists", "preparation-path-invalid", "profile-config-invalid",
-        "dependency-preparation-refused", "process-cleanup-incomplete", "prepared-file-count",
+        "process-start-failed", "process-wait-failed", "log-too-large", "playwright-failed",
+        "process-cleanup-incomplete", "prepared-file-count",
         "prepared-link-invalid", "prepared-tree-size", "prepared-member-type", "prepared-input-invalid",
         "cleanup-incomplete",
     )),
@@ -164,6 +168,13 @@ MACOS_OPERATION_RAW_REFUSALS = {
         "firewall-unavailable",
     )),
 }
+MACOS_NPM_PREPARATION_ERROR_CLASSES = frozenset((
+    "EPERM", "EACCES", "ENOTFOUND", "ECONNREFUSED", "E403", "E404", "EINTEGRITY", "ENOENT",
+    "sandbox-deny", "other",
+))
+MACOS_OPERATION_RAW_REFUSALS["prepare"] |= frozenset(
+    "npm-failed-" + error_class for error_class in MACOS_NPM_PREPARATION_ERROR_CLASSES
+)
 _MACOS_OPERATION_ALIASES = {
     "macos-root-required": "root-required", "prepare-run-root-invalid": "run-root-invalid",
     "prepared-output-invalid": "output-invalid", "prepared-output-path-invalid": "output-path-invalid",

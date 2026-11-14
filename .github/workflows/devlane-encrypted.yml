@@ -710,7 +710,6 @@ jobs:
               devlane_crypto_refusal=crypto-acl-owner-unresolved) printf 'devlane_crypto_refusal=crypto-acl-owner-unresolved\n' >&2 ;;
               devlane_crypto_refusal=crypto-acl-owner-untrusted) printf 'devlane_crypto_refusal=crypto-acl-owner-untrusted\n' >&2 ;;
               devlane_crypto_refusal=crypto-acl-writer-untrusted) printf 'devlane_crypto_refusal=crypto-acl-writer-untrusted\n' >&2 ;;
-              devlane_crypto_refusal=crypto-acl-output-invalid) printf 'devlane_crypto_refusal=crypto-acl-output-invalid\n' >&2 ;;
               devlane_crypto_refusal=crypto-platform-invalid) printf 'devlane_crypto_refusal=crypto-platform-invalid\n' >&2 ;;
               devlane_crypto_refusal=crypto-metadata-invalid) printf 'devlane_crypto_refusal=crypto-metadata-invalid\n' >&2 ;;
               devlane_crypto_refusal=crypto-file-invalid) printf 'devlane_crypto_refusal=crypto-file-invalid\n' >&2 ;;
@@ -1263,7 +1262,7 @@ jobs:
             $runnerSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
             Protect-PrivateDirectory $runRoot $runnerSid
           } catch {
-            Write-Output 'devlane_crypto_refusal=crypto-acl-output-invalid'
+            Write-Output 'devlane_crypto_refusal=crypto-acl-protection-failed'
             Write-Output 'devlane_deadline_refusal=crypto-dependency-seal-failed'
             exit 1
           }
@@ -1302,7 +1301,17 @@ jobs:
               'devlane_crypto_refusal=crypto-acl-powershell-unavailable',
               'devlane_crypto_refusal=crypto-acl-reparse-point', 'devlane_crypto_refusal=crypto-acl-owner-unresolved',
               'devlane_crypto_refusal=crypto-acl-owner-untrusted', 'devlane_crypto_refusal=crypto-acl-writer-untrusted',
-              'devlane_crypto_refusal=crypto-acl-output-invalid',
+              'devlane_crypto_refusal=crypto-acl-protection-failed', 'devlane_crypto_refusal=crypto-acl-process-failed',
+              'devlane_crypto_refusal=crypto-acl-exit-other', 'devlane_crypto_refusal=crypto-acl-stderr-nonempty',
+              'devlane_crypto_refusal=crypto-acl-stdout-non-ascii', 'devlane_crypto_refusal=crypto-acl-stdout-empty',
+              'devlane_crypto_refusal=crypto-acl-stdout-multiple-lines', 'devlane_crypto_refusal=crypto-acl-stdout-not-sid',
+              'devlane_crypto_refusal=crypto-acl-stdout-bom-or-whitespace',
+              'devlane_crypto_refusal=crypto-acl-exit-1', 'devlane_crypto_refusal=crypto-acl-exit-2',
+              'devlane_crypto_refusal=crypto-acl-exit-7', 'devlane_crypto_refusal=crypto-acl-exit-8',
+              'devlane_crypto_refusal=crypto-acl-exit-9', 'devlane_crypto_refusal=crypto-acl-exit-10',
+              'devlane_crypto_refusal=crypto-acl-exit-11', 'devlane_crypto_refusal=crypto-acl-exit-12',
+              'devlane_crypto_refusal=crypto-acl-exit-13', 'devlane_crypto_refusal=crypto-acl-exit-14',
+              'devlane_crypto_refusal=crypto-acl-exit-15',
               'devlane_crypto_refusal=crypto-platform-invalid', 'devlane_crypto_refusal=crypto-metadata-invalid',
               'devlane_crypto_refusal=crypto-file-invalid', 'devlane_crypto_refusal=crypto-tree-invalid',
               'devlane_crypto_refusal=crypto-manifest-invalid', 'devlane_crypto_refusal=crypto-seal-write-failed',
@@ -1335,7 +1344,7 @@ jobs:
           try {
             Protect-PrivateDirectory $cryptoTarget $runnerSid
           } catch {
-            Write-Output 'devlane_crypto_refusal=crypto-acl-output-invalid'
+            Write-Output 'devlane_crypto_refusal=crypto-acl-protection-failed'
             Refuse-Bootstrap 'crypto-dependency-seal-failed'
           }
           python -B kit/devlane/deadline.py run --file (Join-Path $runRoot 'deadline.json') -- `

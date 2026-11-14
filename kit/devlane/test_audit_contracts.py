@@ -79,7 +79,11 @@ def _omit_step_run_group(log, identity, job_name, step_name):
     grammar = audit._Grammar(
         ".github/workflows/devlane-encrypted.yml", job_name, identity, "encrypted",
     )
-    runnable_steps = [step for step in grammar.steps if step["name"] != "Install pinned Rust toolchain"]
+    runnable_steps = [step for step in grammar.steps if not (
+        step["name"] == "Install pinned Rust toolchain" and identity.get("profile") != "desktop"
+        or step["name"] == "Install Tauri Linux build dependencies"
+        and (identity.get("platform") != "linux" or identity.get("profile") != "desktop")
+    )]
     target_index = next(index for index, step in enumerate(runnable_steps) if step["name"] == step_name)
     lines = log.splitlines(keepends=True)
     starts = [index for index, line in enumerate(lines)
@@ -447,7 +451,10 @@ def _render_real_runner_encrypted_log(identity, job_key=None, early_failure=None
     failure_seen = False
     runtime_env_names = set()
     for step_index, step in enumerate(grammar.steps):
-        if step["name"] == "Install pinned Rust toolchain":
+        if step["name"] == "Install pinned Rust toolchain" and identity.get("profile") != "desktop":
+            continue
+        if (step["name"] == "Install Tauri Linux build dependencies"
+                and (platform_runner != "ubuntu-24.04" or identity.get("profile") != "desktop")):
             continue
         if failure_seen and step["name"] != "Shred runner-local workspace":
             continue
@@ -736,10 +743,11 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             index for index, step in enumerate(grammar.steps)
             if step["name"] == "Execute offline profile and filter public summary"
         )
-        execute_group_index = sum(
-            step["name"] != "Install pinned Rust toolchain"
-            for step in grammar.steps[:execute_position]
-        )
+        execute_group_index = sum(not (
+            step["name"] == "Install pinned Rust toolchain" and IDENTITY.get("profile") != "desktop"
+            or step["name"] == "Install Tauri Linux build dependencies"
+            and (IDENTITY.get("platform") != "linux" or IDENTITY.get("profile") != "desktop")
+        ) for step in grammar.steps[:execute_position])
         group_index = 0
         for line in failure_log.splitlines(keepends=True):
             normalized = audit.TIME_PREFIX.sub("", line.decode("utf-8"), count=1).rstrip("\r\n")
@@ -854,7 +862,7 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             (
                 "initial-acl",
                 ["devlane_crypto_state=run-root-exported",
-                 "devlane_crypto_refusal=crypto-acl-output-invalid",
+                 "devlane_crypto_refusal=crypto-acl-protection-failed",
                  "devlane_deadline_refusal=crypto-dependency-seal-failed"],
                 _windows_precheckout_cleanup_outputs(),
                 True,
@@ -863,6 +871,14 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 "later-target",
                 ["devlane_crypto_state=run-root-exported", "devlane_crypto_state=checkout-complete",
                  "devlane_crypto_refusal=crypto-target-invalid",
+                 "devlane_deadline_refusal=crypto-dependency-seal-failed"],
+                _windows_real_shred_cleanup_outputs(),
+                True,
+            ),
+            (
+                "later-acl",
+                ["devlane_crypto_state=run-root-exported", "devlane_crypto_state=checkout-complete",
+                 "devlane_crypto_refusal=crypto-acl-stdout-bom-or-whitespace",
                  "devlane_deadline_refusal=crypto-dependency-seal-failed"],
                 _windows_real_shred_cleanup_outputs(),
                 True,
@@ -942,7 +958,7 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                         audit.validate_job_log_surface(
                             fabricated_shred, audit.PLATFORM_RUN_JOBS["windows"], identity, completed=True,
                         )
-                if name in ("later-target", "later-seal"):
+                if name in ("later-target", "later-acl", "later-seal"):
                     self.assertIn(b"windows_runner_shred=confirmed files=1 bytes=8 reparse=0", log)
                 surface = audit.validate_job_log_surface(
                     log, audit.PLATFORM_RUN_JOBS["windows"], identity, completed=True,
@@ -953,6 +969,30 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 audit.validate_job_contract(jobs, identity, "core-node")
                 audit.validate_job_log_metadata_binding(surface, run_job, identity)
                 self.assertFalse(audit.validate_dispatch_marker(log, identity, allow_missing=True))
+                if name == "later-acl":
+                    missing_checkout = log.replace(
+                        b"devlane_crypto_state=checkout-complete\n", b"", 1,
+                    )
+                    with self.assertRaises(audit.AuditRefusal):
+                        audit.validate_job_log_surface(
+                            missing_checkout, audit.WINDOWS_RUN_JOB, identity, completed=True,
+                        )
+                    wrong_step = audit._Grammar(
+                        ".github/workflows/devlane-encrypted.yml", audit.WINDOWS_RUN_JOB,
+                        identity, "encrypted",
+                    )
+                    self.assertFalse(wrong_step.step_output_ok(
+                        "Prepare hosted Windows isolation state",
+                        "devlane_crypto_refusal=crypto-acl-stdout-bom-or-whitespace", {},
+                    ))
+                    linux_identity = dict(IDENTITY, platform="linux")
+                    linux = audit._Grammar(
+                        ".github/workflows/devlane-encrypted.yml", audit.RUN_JOB,
+                        linux_identity, "encrypted",
+                    )
+                    self.assertFalse(linux.step_output_ok(
+                        failed_step, "devlane_crypto_refusal=crypto-acl-stdout-bom-or-whitespace", {},
+                    ))
 
     def test_macos_and_windows_early_failures_are_audited_with_fixed_dispositions(self):
         scenarios = (
@@ -1758,6 +1798,8 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         result = audit.validate_job_log_surface(log, audit.WINDOWS_RUN_JOB, identity, completed=True)
         self.assertEqual(result["records"], [])
         self.assertIn(b"tar.exe", log)
+        audit.validate_job_log_surface(log.replace(b"\n", b"\r\n"), audit.WINDOWS_RUN_JOB,
+                                       identity, completed=True)
         audit_log = _render_real_runner_encrypted_log(identity, job_key=audit.AUDIT_JOB)
         audit.validate_job_log_surface(audit_log, audit.AUDIT_JOB, identity, completed=True)
         for changed in (
@@ -2483,8 +2525,11 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 for step in grammar.steps:
                     step_name = step["name"]
                     accepted = grammar.step_output_ok(step_name, crypto_line, {})
+                    accepted_codes = (audit.MACOS_CRYPTO_CONTROL_REFUSAL_CODES if platform_name == "macos"
+                                      else refusal_codes.CRYPTO_CONTROL_REFUSAL_CODES)
                     expected = (platform_name in ("macos", "windows")
-                                and step_name == "Fetch public control and validate dispatch")
+                                and step_name == "Fetch public control and validate dispatch"
+                                and code in accepted_codes)
                     self.assertEqual(accepted, expected, (platform_name, step_name, code, "crypto-reason"))
 
     def test_macos_startup_refusals_pass_the_complete_log_and_metadata_contract(self):
@@ -2810,9 +2855,13 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         )
         cases = [(platform, code, reason)
                  for platform in ("macos", "windows")
-                 for code, reasons in phases for reason in sorted(reasons)]
+                 for code, reasons in phases
+                 for reason in sorted(reasons & (audit.MACOS_CRYPTO_CONTROL_REFUSAL_CODES
+                                                  if platform == "macos"
+                                                  else audit.CRYPTO_CONTROL_REFUSAL_CODES))]
         cases.extend(("macos", "crypto-dependency-privileged-check-failed", reason)
-                     for reason in sorted(audit.CRYPTO_CHECK_REFUSAL_CODES))
+                     for reason in sorted(audit.CRYPTO_CHECK_REFUSAL_CODES
+                                          & audit.MACOS_CRYPTO_CONTROL_REFUSAL_CODES))
         for platform, bootstrap_code, reason in cases:
             with self.subTest(platform=platform, bootstrap_code=bootstrap_code, reason=reason):
                 identity = dict(IDENTITY, platform=platform)
@@ -3408,7 +3457,7 @@ class WorkflowStaticAcceptanceTests(unittest.TestCase):
         self.assertIsNotNone(bash_function)
         bash_callable = "crypto_print_reason() {\n" + bash_function.group(1) + "}\ncrypto_print_reason \"$1\"\n"
         canonical = "devlane_crypto_refusal=crypto-acl-owner-untrusted"
-        bash_allowed = sorted(refusal_codes.CRYPTO_CONTROL_REFUSAL_CODES)
+        bash_allowed = sorted(audit.MACOS_CRYPTO_CONTROL_REFUSAL_CODES)
         run_bash = sys.platform != "win32"
         for code in bash_allowed if run_bash else ():
             candidate = "devlane_crypto_refusal=" + code

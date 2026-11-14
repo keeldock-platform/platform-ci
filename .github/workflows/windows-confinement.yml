@@ -47,6 +47,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           python -B kit/confinement/test_windows_confinement.py
           if ($LASTEXITCODE -ne 0) { exit 1 }
+          python -B kit/devlane/test_powershell_live.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           python -B kit/bootstrap/check_candidate.py --root $env:CI_WORKSPACE --pool platform --sha $env:CI_SHA
           if ($LASTEXITCODE -ne 0) { exit 1 }
   windows-native-synthetic:

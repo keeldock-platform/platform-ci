@@ -243,7 +243,7 @@ class PowerShellStaticTests(unittest.TestCase):
             [
                 ["Write-Output 'devlane_crypto_refusal=crypto-target-invalid'",
                  "Refuse-Bootstrap 'crypto-dependency-seal-failed'"],
-                ["Write-Output 'devlane_crypto_refusal=crypto-acl-output-invalid'",
+                ["Write-Output 'devlane_crypto_refusal=crypto-acl-protection-failed'",
                  "Refuse-Bootstrap 'crypto-dependency-seal-failed'"],
             ],
         )
@@ -290,7 +290,7 @@ class PowerShellStaticTests(unittest.TestCase):
             ),
         )
         for line in re.findall(r"Write-Output\s+([^\r\n]+)", protect_block):
-            self.assertRegex(line, r"^'devlane_(?:crypto_state=run-root-not-exported|crypto_state=run-root-exported|crypto_refusal=crypto-(?:target-invalid|acl-output-invalid)|deadline_refusal=crypto-dependency-seal-failed|refusal=windows-runner-failed)'\s*\}?$")
+            self.assertRegex(line, r"^'devlane_(?:crypto_state=run-root-not-exported|crypto_state=run-root-exported|crypto_refusal=crypto-(?:target-invalid|acl-protection-failed)|deadline_refusal=crypto-dependency-seal-failed|refusal=windows-runner-failed)'\s*\}?$")
         self.assertNotRegex(protect_block, r"(?i)\$_|\$PSItem|Write-Error|Write-Host|throw\b")
         self.assertRegex(
             protect_block,

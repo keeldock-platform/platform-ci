@@ -691,6 +691,28 @@ def _npm_preparation_command(ident):
     )
 
 
+_NPM_PREPARATION_ERROR_CLASSES = frozenset((
+    "EPERM", "EACCES", "ENOTFOUND", "ECONNREFUSED", "E403", "E404", "EINTEGRITY", "ENOENT",
+    "sandbox-deny", "other",
+))
+
+
+def _npm_preparation_error_class(log_path):
+    try:
+        payload = Path(log_path).read_bytes()
+    except OSError:
+        return "other"
+    if len(payload) > MAX_LOG_BYTES:
+        return "other"
+    text = payload.decode("utf-8", "replace")
+    if re.search(r"(?:Sandbox:|sandbox-exec:).*\bdeny\b", text, re.IGNORECASE):
+        return "sandbox-deny"
+    for match in re.finditer(r"npm (?:error|ERR!) code ([A-Z][A-Z0-9]+)", text):
+        if match.group(1) in _NPM_PREPARATION_ERROR_CLASSES:
+            return match.group(1)
+    return "other"
+
+
 def _run_preparation_process(argv, *, ident, profile, cwd, env, output, timeout):
     command = ["/usr/bin/sandbox-exec", "-f", str(profile), *map(str, argv)]
     process = None
@@ -700,24 +722,34 @@ def _run_preparation_process(argv, *, ident, profile, cwd, env, output, timeout)
             env=env, close_fds=True, start_new_session=True,
             user=ident["uid"], group=ident["gid"], extra_groups=(), preexec_fn=_worker_limits,
         )
+    except (OSError, subprocess.SubprocessError, TypeError):
+        _refuse("process-start-failed")
+    try:
         process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        if process is not None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=2)
+        except (OSError, subprocess.SubprocessError):
             try:
-                os.killpg(process.pid, signal.SIGTERM)
-                process.wait(timeout=2)
-            except (OSError, subprocess.TimeoutExpired):
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    _refuse("process-cleanup-incomplete")
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=3)
+            except (OSError, subprocess.SubprocessError):
+                _refuse("process-cleanup-incomplete")
         _refuse("total-deadline-exhausted")
     except (OSError, subprocess.SubprocessError, TypeError):
-        _refuse("dependency-preparation-refused")
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            _refuse("process-cleanup-incomplete")
+        _refuse("process-wait-failed")
     _terminate_worker_processes(ident["uid"])
     return process.returncode
 
@@ -816,8 +848,10 @@ def _prepare(state, projection_path, output_path, profile, control_sha, deadline
             _npm_preparation_command(ident),
             ident=ident, profile=profile_path, cwd=project, env=env, output=output_log, timeout=timeout,
         )
-    if log.stat().st_size > MAX_LOG_BYTES or code != 0:
-        _refuse("dependency-preparation-refused")
+    if log.stat().st_size > MAX_LOG_BYTES:
+        _refuse("log-too-large")
+    if code != 0:
+        _refuse("npm-failed-" + _npm_preparation_error_class(log))
     if projection["playwright"]:
         candidates = (
             project / "node_modules" / "playwright" / "cli.js",
@@ -832,8 +866,10 @@ def _prepare(state, projection_path, output_path, profile, control_sha, deadline
                 ident=ident, profile=profile_path, cwd=project, env=env, output=output_log,
                 timeout=min(1800, deadline_budget.remaining(deadline_file)),
             )
-        if code != 0 or log.stat().st_size > MAX_LOG_BYTES:
-            _refuse("dependency-preparation-refused")
+        if log.stat().st_size > MAX_LOG_BYTES:
+            _refuse("log-too-large")
+        if code != 0:
+            _refuse("playwright-failed")
         if not (prepared / "ms-playwright").is_dir():
             _refuse("prepared-input-invalid")
     source_modules = project / "node_modules"

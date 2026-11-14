@@ -120,6 +120,7 @@ class WindowsConfinementWorkflowTests(unittest.TestCase):
         self.assertIn("if ($bad -ne 0) { exit 1 }", parser_step)
         self.assertNotIn("foreach ($name in @('windows_confinement.ps1'))", parser_step)
         self.assertIn("test_windows_confinement.py", workflow)
+        self.assertIn("test_powershell_live.py", workflow)
         self.assertNotIn("promotion-check-reuse", workflow)
         diagnostic = WINDOWS_CONFINEMENT_DIAGNOSTIC_WORKFLOW.read_text(encoding="utf-8")
         self.assertTrue(validate_workflow_text(diagnostic, "platform", "windows-confinement-diagnostic"))

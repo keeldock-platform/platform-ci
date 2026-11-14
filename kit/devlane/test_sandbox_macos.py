@@ -618,6 +618,29 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         self.assertEqual(spawn.call_args.kwargs["group"], sandbox.WORKER_GROUP)
         self.assertEqual(spawn.call_args.kwargs["extra_groups"], ())
 
+    def test_preparation_start_and_npm_failures_have_fixed_codes(self):
+        with mock.patch.object(sandbox.subprocess, "Popen", side_effect=PermissionError(1, "denied")):
+            with self.assertRaises(sandbox.Refusal) as caught:
+                sandbox._run_preparation_process(
+                    ("node", "npm-cli.js", "ci"),
+                    ident={"uid": 544, "gid": sandbox.WORKER_GROUP}, profile=PRIVATE_RUN + "/prep.sb",
+                    cwd=PRIVATE_RUN, env={"PATH": "/usr/bin:/bin"}, output=io.BytesIO(), timeout=20,
+                )
+        self.assertEqual(caught.exception.code, "process-start-failed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "preparation.log"
+            cases = (
+                ("npm error code ENOTFOUND\n", "ENOTFOUND"),
+                ("npm ERR! code EACCES\n", "EACCES"),
+                ("Sandbox: node deny(1) file-write-data /tmp/package\n", "sandbox-deny"),
+                ("npm error code EAI_AGAIN\n", "other"),
+            )
+            for content, expected in cases:
+                with self.subTest(expected=expected):
+                    log.write_text(content, encoding="utf-8")
+                    self.assertEqual(sandbox._npm_preparation_error_class(log), expected)
+
     def test_workload_build_environment_pins_the_clt_developer_directory(self):
         worker = {
             "node": "/opt/node/bin/node", "home": PRIVATE_RUN + "/worker-home",
