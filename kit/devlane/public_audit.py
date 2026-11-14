@@ -1647,7 +1647,8 @@ def _canonicalize_github_hosted_log(text, grammar, job_name, identity, workflow_
             if (step["name"] == "Install Tauri Linux build dependencies"
                     and (grammar.job_runner != "ubuntu-24.04" or identity.get("profile") != "desktop")):
                 continue
-            if step["name"] == "Install pinned Rust toolchain" and identity.get("profile") != "desktop":
+            if (step["name"] == "Install pinned Rust toolchain"
+                    and identity.get("profile") not in (*RUST_PROFILES, "desktop")):
                 continue
             uses = step["uses"] or ""
             run = step["run"]
@@ -1763,7 +1764,6 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         _refuse()
     for sequence in ANSI_SGR:
         log = log.replace(sequence, b"")
-    log = log.replace(b"\r\n", b"\n")
     if any(byte < 32 and byte != 10 or byte == 127 for byte in log) or b"\x1b" in log:
         _refuse()
     try:
@@ -2432,6 +2432,12 @@ def validate_dispatch_marker(log, identity, *, allow_missing=False):
     return True
 
 
+def _normalize_audit_log(log):
+    if type(log) is not bytes or len(log) > MAX_LOG_BYTES:
+        _refuse()
+    return log.replace(b"\r\n", b"\n")
+
+
 def _audit_outcome_line(jobs, identity, diagnosed_failure=None):
     active_name = (RUN_JOB if _legacy_encrypted_workflow_path(identity)
                    else PLATFORM_RUN_JOBS[identity.get("platform", "linux")])
@@ -2620,7 +2626,7 @@ def run_audit(api, identity):
     active_name = (RUN_JOB if expected_count == 2
                    else PLATFORM_RUN_JOBS[identity.get("platform", "linux")])
     run_job = jobs[active_name]
-    log = api.log_text(run_job["id"])
+    log = _normalize_audit_log(api.log_text(run_job["id"]))
     surface = validate_job_log_surface(log, active_name, identity, completed=True)
     validate_job_contract(response["jobs"], identity, identity["profile"], surface=surface)
     validate_job_log_metadata_binding(surface, run_job, identity)
@@ -2670,7 +2676,7 @@ def validate_final_public_surfaces(api, jobs, identity, profile):
             continue
         surface = {}
         try:
-            surface["log"] = api.log_text(identifier)
+            surface["log"] = _normalize_audit_log(api.log_text(identifier))
         except Exception:
             collection_failed = True
         url = job.get("check_run_url")

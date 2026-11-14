@@ -80,7 +80,8 @@ def _omit_step_run_group(log, identity, job_name, step_name):
         ".github/workflows/devlane-encrypted.yml", job_name, identity, "encrypted",
     )
     runnable_steps = [step for step in grammar.steps if not (
-        step["name"] == "Install pinned Rust toolchain" and identity.get("profile") != "desktop"
+        step["name"] == "Install pinned Rust toolchain"
+        and identity.get("profile") not in (*audit.RUST_PROFILES, "desktop")
         or step["name"] == "Install Tauri Linux build dependencies"
         and (identity.get("platform") != "linux" or identity.get("profile") != "desktop")
     )]
@@ -322,7 +323,7 @@ def _render_log(job_key, identity=None, *, records=(), kind="encrypted", skip=("
              "Getting action download info", "Complete job name: " + job_key,
              MARK + "[section]Finishing: Set up job"]
     skipped = set(skip)
-    if identity["profile"] == "desktop":
+    if identity["profile"] in (*audit.RUST_PROFILES, "desktop"):
         skipped.discard("Install pinned Rust toolchain")
     else:
         skipped.add("Install Tauri Linux build dependencies")
@@ -451,7 +452,8 @@ def _render_real_runner_encrypted_log(identity, job_key=None, early_failure=None
     failure_seen = False
     runtime_env_names = set()
     for step_index, step in enumerate(grammar.steps):
-        if step["name"] == "Install pinned Rust toolchain" and identity.get("profile") != "desktop":
+        if (step["name"] == "Install pinned Rust toolchain"
+                and identity.get("profile") not in (*audit.RUST_PROFILES, "desktop")):
             continue
         if (step["name"] == "Install Tauri Linux build dependencies"
                 and (platform_runner != "ubuntu-24.04" or identity.get("profile") != "desktop")):
@@ -521,6 +523,41 @@ def _record(**fields):
     return json.dumps(fields, sort_keys=True, separators=(",", ":"))
 
 
+def _run_audit_with_log(identity, jobs, log):
+    active_job = next(job for job in jobs if job["name"] == audit.PLATFORM_RUN_JOBS[identity["platform"]])
+
+    class API:
+        def json(self, endpoint):
+            if endpoint.endswith("/actions/runs/" + identity["run_id"]):
+                repository = {"full_name": audit.REPOSITORY, "id": audit.REPOSITORY_ID}
+                return ({
+                    "id": int(identity["run_id"]), "path": audit.WORKFLOW_PATH,
+                    "event": "workflow_dispatch", "head_branch": "main",
+                    "head_sha": identity["control_sha"], "run_attempt": 1,
+                    "status": "in_progress", "conclusion": None,
+                    "repository": repository, "head_repository": repository,
+                }, {})
+            if "/jobs?" in endpoint:
+                return ({"total_count": len(jobs), "jobs": jobs}, {})
+            if "/artifacts?" in endpoint:
+                return ({"total_count": 0, "artifacts": []}, {})
+            return ({}, {})
+
+        def log_text(self, identifier):
+            if identifier != active_job["id"]:
+                raise AssertionError("unexpected-run-job")
+            return log
+
+    permit_key = "devlane-permit-v1-" + identity["bundle_id"]
+    control_key = "devlane-control-v1-" + identity["control_run_id"]
+    with patch.object(audit, "_fetch_cache_entries", return_value=[
+            {"key": permit_key, "size_in_bytes": 1}, {"key": control_key, "size_in_bytes": 1}]), \
+            patch.object(audit, "cache_inventory_digest", return_value=identity["cache_baseline_sha256"]), \
+            patch.object(audit, "validate_check_output"), \
+            patch.object(audit, "_read_annotations", return_value=[]):
+        return audit.run_audit(API(), identity)
+
+
 def _encrypted_jobs(profile="core-node", platform="linux"):
     identity = dict(IDENTITY, profile=profile, platform=platform)
     names = audit._expected_step_names(profile, identity)
@@ -528,7 +565,8 @@ def _encrypted_jobs(profile="core-node", platform="linux"):
     for name in names:
         conclusion = "success"
         if ((name == "Install pinned Rust toolchain" and profile == "core-node")
-                or (name == "Install Tauri Linux build dependencies" and profile != "desktop")):
+                or (name == "Install Tauri Linux build dependencies"
+                    and (profile != "desktop" or platform != "linux"))):
             conclusion = "skipped"
         steps.append({"name": name, "status": "completed", "conclusion": conclusion})
     active_name = audit.PLATFORM_RUN_JOBS[platform]
@@ -744,7 +782,8 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             if step["name"] == "Execute offline profile and filter public summary"
         )
         execute_group_index = sum(not (
-            step["name"] == "Install pinned Rust toolchain" and IDENTITY.get("profile") != "desktop"
+            step["name"] == "Install pinned Rust toolchain"
+            and IDENTITY.get("profile") not in (*audit.RUST_PROFILES, "desktop")
             or step["name"] == "Install Tauri Linux build dependencies"
             and (IDENTITY.get("platform") != "linux" or IDENTITY.get("profile") != "desktop")
         ) for step in grammar.steps[:execute_position])
@@ -844,6 +883,75 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         jobs = _encrypted_jobs()
         result = audit.validate_job_contract(jobs, IDENTITY, "core-node")
         self.assertEqual(set(result), set(audit.EXECUTION_JOBS) | {audit.AUDIT_JOB})
+
+    def test_run_audit_accepts_success_for_every_supported_platform_profile(self):
+        matrix = (
+            ("linux", audit.ENCRYPTED_PROFILES),
+            ("macos", audit.ENCRYPTED_PROFILES),
+            ("windows", ("core-node",)),
+        )
+        expected = "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed"
+        for platform, profiles in matrix:
+            for profile in profiles:
+                identity = dict(IDENTITY, platform=platform, profile=profile)
+                jobs = _encrypted_jobs(profile, platform)
+                log = _render_real_runner_encrypted_log(identity)
+                with self.subTest(platform=platform, profile=profile):
+                    if profile in audit.RUST_PROFILES:
+                        self.assertIn(b"rust_offline_tools=prepared", log)
+                    self.assertEqual(_run_audit_with_log(identity, jobs, log), expected)
+
+    def test_run_audit_normalizes_windows_success_and_seal_failure_logs(self):
+        identity = dict(IDENTITY, platform="windows", profile="core-node")
+        expected_success = "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed"
+        success_jobs = _encrypted_jobs("core-node", "windows")
+        success_log = _render_real_runner_encrypted_log(identity)
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(path="success", newline=newline):
+                self.assertEqual(_run_audit_with_log(
+                    identity, success_jobs, success_log.replace(b"\n", newline),
+                ), expected_success)
+
+        failure_jobs = _encrypted_jobs("core-node", "windows")
+        run_job = next(job for job in failure_jobs if job["name"] == audit.WINDOWS_RUN_JOB)
+        run_job["conclusion"] = "failure"
+        failure_step = "Fetch public control and validate dispatch"
+        failed_index = next(index for index, step in enumerate(run_job["steps"])
+                            if step["name"] == failure_step)
+        for index, step in enumerate(run_job["steps"]):
+            if step["name"] == "Shred runner-local workspace":
+                step["conclusion"] = "success"
+            elif index == failed_index:
+                step["conclusion"] = "failure"
+            else:
+                step["conclusion"] = "skipped"
+        failure_log = _render_real_runner_encrypted_log(
+            identity,
+            early_failure={
+                "step": failure_step,
+                "marker": "devlane_deadline_refusal=crypto-dependency-seal-failed",
+                "outputs": [
+                    "devlane_crypto_state=run-root-exported",
+                    "devlane_crypto_state=checkout-complete",
+                    "devlane_crypto_refusal=crypto-seal-write-failed",
+                    "devlane_deadline_refusal=crypto-dependency-seal-failed",
+                ],
+                "exit_code": 1,
+            },
+        )
+        expected_failure = (
+            "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed "
+            "disposition=run-failed-at-bootstrap"
+        )
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(path="seal-failure", newline=newline):
+                self.assertEqual(_run_audit_with_log(
+                    identity, failure_jobs, failure_log.replace(b"\n", newline),
+                ), expected_failure)
+
+        invalid_control = success_log.replace(b"Complete job name", b"Complete\x01 job name", 1)
+        with self.assertRaises(audit.AuditRefusal):
+            _run_audit_with_log(identity, success_jobs, invalid_control)
 
     def test_windows_crypto_refusals_use_exact_export_checkout_and_cleanup_states(self):
         identity = dict(IDENTITY, platform="windows")
@@ -1798,8 +1906,10 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         result = audit.validate_job_log_surface(log, audit.WINDOWS_RUN_JOB, identity, completed=True)
         self.assertEqual(result["records"], [])
         self.assertIn(b"tar.exe", log)
-        audit.validate_job_log_surface(log.replace(b"\n", b"\r\n"), audit.WINDOWS_RUN_JOB,
-                                       identity, completed=True)
+        audit.validate_job_log_surface(
+            audit._normalize_audit_log(log.replace(b"\n", b"\r\n")),
+            audit.WINDOWS_RUN_JOB, identity, completed=True,
+        )
         audit_log = _render_real_runner_encrypted_log(identity, job_key=audit.AUDIT_JOB)
         audit.validate_job_log_surface(audit_log, audit.AUDIT_JOB, identity, completed=True)
         for changed in (
