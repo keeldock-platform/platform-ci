@@ -4,6 +4,7 @@ import json
 import contextlib
 import io
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -144,6 +145,73 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "windows-prepare-powershell-nonzero")
         self.assertEqual(caught.exception.reason, "sharing-violation")
         output.assert_called_once_with("windows_prepare_cleanup_reason=sharing-violation", flush=True)
+
+    def test_prepare_refusal_is_emitted_before_cleanup_refusal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projection = root / "projection.json"
+            projection.write_text("{}", encoding="ascii")
+            state = root / "runner" / "state.json"
+            output = io.StringIO()
+
+            def fail_cleanup(*_args, **_kwargs):
+                print("windows_prepare_cleanup_reason=access-denied", flush=True)
+                raise windows.WindowsBoundaryRefusal(
+                    "windows-prepare-powershell-nonzero", reason="access-denied",
+                )
+
+            with mock.patch.object(windows.sys, "platform", "win32"), \
+                    mock.patch.object(windows.fetch, "validate_projection", return_value={
+                        "npm_package": {}, "npm_lock": {}, "playwright": [],
+                    }), \
+                    mock.patch.object(windows, "_npm_tools", return_value=(Path("node.exe"), Path("npm-cli.js"))), \
+                    mock.patch.object(windows, "create_profile"), \
+                    mock.patch.object(windows, "_deadline_remaining", return_value=100), \
+                    mock.patch.object(windows, "_native_run", return_value={"status": "fail"}), \
+                    mock.patch.object(windows, "_npm_preparation_error_class", return_value="ENOTFOUND"), \
+                    mock.patch.object(windows, "delete_profile", side_effect=fail_cleanup), \
+                    contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                result = windows.main([
+                    "prepare", "--projection", str(projection), "--output", str(root / "output"),
+                    "--deadline", str(root / "deadline"), "--state", str(state),
+                ])
+
+        text = output.getvalue()
+        first = "devlane_refusal=windows-prepare-npm-failed-ENOTFOUND"
+        cleanup = "devlane_refusal=windows-prepare-profile-cleanup-failed"
+        self.assertEqual(result, 1)
+        self.assertLess(text.index(first), text.index(cleanup))
+        self.assertEqual(text.count("devlane_refusal="), 2)
+        self.assertIn("windows_prepare_cleanup_reason=access-denied", text)
+
+    def test_large_node_modules_cleanup_uses_a_fixed_number_of_child_processes(self):
+        script = Path(windows.__file__).with_name("sandbox_windows.ps1").read_text(encoding="utf-8")
+        body = script.split("function Restore-RunnerAccessTree", 1)[1].split(
+            "function Clear-AppContainerStorage", 1,
+        )[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "node_modules"
+            started = time.perf_counter()
+            for package in range(200):
+                package_root = root / ("package-%03d" % package) / "lib"
+                package_root.mkdir(parents=True)
+                for entry in range(100):
+                    (package_root / ("module-%03d.js" % entry)).touch()
+            generation_seconds = time.perf_counter() - started
+            item_count = sum(1 for _ in root.rglob("*")) + 1
+            self.assertGreaterEqual(item_count, 20000)
+            self.assertLessEqual(item_count, 250000)
+            self.assertGreater(generation_seconds, 0)
+
+        self.assertEqual(body.count("& $takeown"), 1)
+        self.assertEqual(body.count("& $icacls"), 2)
+        self.assertIn("while ($pending.Count -gt 0)", body)
+        self.assertLess(body.index("while ($pending.Count -gt 0)"), body.index("& $takeown"))
+        self.assertIn("'/R'", body)
+        self.assertIn("'/T'", body)
+        scan = body[:body.index("& $takeown")]
+        self.assertNotIn("& $takeown", scan)
+        self.assertNotIn("& $icacls", scan)
 
     def test_shred_failure_prints_a_fixed_failed_cleanup_receipt(self):
         output = io.StringIO()

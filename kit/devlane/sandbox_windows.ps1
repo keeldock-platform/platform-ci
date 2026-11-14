@@ -157,24 +157,25 @@ try {
             $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
             $pending = [Collections.Generic.Stack[string]]::new()
             $pending.Push($Root)
-            $visited = [Collections.Generic.List[string]]::new()
+            $entryCount = 1
             while ($pending.Count -gt 0) {
                 $path = $pending.Pop()
-                if ($visited.Count -ge 250000) { throw }
                 $item = Get-Item -LiteralPath $path -Force
                 if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw }
-                & $takeown '/F' $path '/A' *> $null
-                if ($LASTEXITCODE -ne 0) { $script:cleanupReason = 'other'; throw }
-                & $icacls $path '/reset' '/C' '/Q' *> $null
-                if ($LASTEXITCODE -ne 0) { $script:cleanupReason = 'other'; throw }
-                $grant = if ($item.PSIsContainer) { '*S-1-5-32-544:(OI)(CI)F' } else { '*S-1-5-32-544:F' }
-                & $icacls $path '/grant:r' $grant '/C' '/Q' *> $null
-                if ($LASTEXITCODE -ne 0) { $script:cleanupReason = 'other'; throw }
-                $visited.Add($path)
                 if ($item.PSIsContainer) {
-                    foreach ($entry in Get-ChildItem -LiteralPath $path -Force) { $pending.Push($entry.FullName) }
+                    foreach ($entry in Get-ChildItem -LiteralPath $path -Force) {
+                        $entryCount++
+                        if ($entryCount -gt 250000) { throw }
+                        $pending.Push($entry.FullName)
+                    }
                 }
             }
+            & $takeown '/F' $Root '/A' '/R' '/D' 'Y' *> $null
+            if ($LASTEXITCODE -ne 0) { $script:cleanupReason = 'other'; throw }
+            & $icacls $Root '/reset' '/T' '/C' '/Q' *> $null
+            if ($LASTEXITCODE -ne 0) { $script:cleanupReason = 'other'; throw }
+            & $icacls $Root '/grant:r' '*S-1-5-32-544:(OI)(CI)F' '/C' '/Q' *> $null
+            if ($LASTEXITCODE -ne 0) { $script:cleanupReason = 'other'; throw }
         }
         function Clear-AppContainerStorage([string]$PackageSid, [string]$ProfileName) {
             $actual = [IO.Path]::GetFullPath([KeelDock.Platform.DevLaneWindows.Boundary]::GetProfileFolderPath($PackageSid))

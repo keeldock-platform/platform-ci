@@ -3227,12 +3227,13 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             identity,
             early_failure={
                 "step": audit.WINDOWS_PREPARE_STEP,
-                "marker": "devlane_refusal=windows-prepare-profile-cleanup-failed",
+                "marker": "devlane_refusal=windows-prepare-npm-failed-ENOTFOUND",
                 "exit_code": 1,
                 "outputs": [
-                    "windows_prepare_stage=none", "windows_prepare_job=empty",
-                    "windows_prepare_stage=npm-ci", "windows_prepare_job=empty",
-                    "windows_prepare_stage=playwright", "windows_prepare_stage=done",
+                    "windows_prepare_stage=none", "windows_prepare_stage_start=npm-ci",
+                    "windows_prepare_job=empty",
+                    "devlane_refusal=windows-prepare-npm-failed-ENOTFOUND",
+                    "windows_prepare_stage_start=profile-cleanup",
                     "windows_prepare_cleanup_reason=sharing-violation",
                     "devlane_refusal=windows-prepare-profile-cleanup-failed",
                 ],
@@ -3249,7 +3250,8 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             log, audit.PLATFORM_RUN_JOBS["windows"], identity, completed=True,
         )
         self.assertEqual(surface["early_failure"], audit.WINDOWS_PREPARE_STEP)
-        self.assertEqual(surface["early_failure_code"], "windows-prepare-profile-cleanup-failed")
+        self.assertEqual(surface["early_failure_code"], "windows-prepare-npm-failed-ENOTFOUND")
+        self.assertTrue(surface["prepare_cleanup_refusal"])
         self.assertEqual(surface["cleanup_failure_code"], cleanup_code)
         self.assertEqual(surface["cleanup_failure_reason"], "sharing-violation")
         audit.validate_dispatch_marker(log, identity, allow_missing=False)
@@ -3261,6 +3263,64 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         )
         self.assertEqual(audit._audit_outcome_line(jobs, identity), expected_outcome)
         self.assertEqual(_run_audit_with_log(identity, jobs, log), expected_outcome)
+
+        prepare_and_cleanup_log = _render_real_runner_encrypted_log(
+            identity,
+            early_failure={
+                "step": audit.WINDOWS_PREPARE_STEP,
+                "marker": "devlane_refusal=windows-prepare-npm-failed-ENOTFOUND",
+                "exit_code": 1,
+                "outputs": [
+                    "windows_prepare_stage=none", "windows_prepare_stage_start=npm-ci",
+                    "windows_prepare_job=empty", "devlane_refusal=windows-prepare-npm-failed-ENOTFOUND",
+                    "windows_prepare_stage_start=profile-cleanup",
+                    "windows_prepare_cleanup_reason=access-denied",
+                    "devlane_refusal=windows-prepare-profile-cleanup-failed",
+                ],
+                "cleanup_outputs": [
+                    "windows_sandbox_cleanup=confirmed firewall=removed profile=deleted",
+                    "windows_runner_shred=confirmed files=1 bytes=2 reparse=0",
+                    "cleanup_receipt=confirmed",
+                    "devlane_job=completed public_output=filtered cleanup=confirmed",
+                ],
+            },
+        )
+        prepare_and_cleanup_surface = audit.validate_job_log_surface(
+            prepare_and_cleanup_log, audit.PLATFORM_RUN_JOBS["windows"], identity, completed=True,
+        )
+        self.assertEqual(
+            prepare_and_cleanup_surface["early_failure_code"], "windows-prepare-npm-failed-ENOTFOUND",
+        )
+        self.assertTrue(prepare_and_cleanup_surface["prepare_cleanup_refusal"])
+        self.assertEqual(prepare_and_cleanup_surface["cleanup_failure_code"], None)
+
+        cleanup_only_log = _render_real_runner_encrypted_log(
+            identity,
+            early_failure={
+                "step": audit.WINDOWS_PREPARE_STEP,
+                "marker": "devlane_refusal=windows-prepare-profile-cleanup-failed",
+                "exit_code": 1,
+                "outputs": [
+                    "windows_prepare_stage=none", "windows_prepare_stage_start=npm-ci",
+                    "windows_prepare_job=empty", "windows_prepare_stage=npm-ci",
+                    "windows_prepare_stage_start=playwright", "windows_prepare_stage=playwright",
+                    "windows_prepare_stage=done", "windows_prepare_stage_start=profile-cleanup",
+                    "windows_prepare_cleanup_reason=sharing-violation",
+                    "devlane_refusal=windows-prepare-profile-cleanup-failed",
+                ],
+                "cleanup_outputs": [
+                    "windows_sandbox_cleanup=confirmed firewall=removed profile=deleted",
+                    "windows_runner_shred=confirmed files=1 bytes=2 reparse=0",
+                    "cleanup_receipt=confirmed",
+                    "devlane_job=completed public_output=filtered cleanup=confirmed",
+                ],
+            },
+        )
+        cleanup_only_surface = audit.validate_job_log_surface(
+            cleanup_only_log, audit.PLATFORM_RUN_JOBS["windows"], identity, completed=True,
+        )
+        self.assertEqual(cleanup_only_surface["early_failure_code"], "windows-prepare-profile-cleanup-failed")
+        self.assertFalse(cleanup_only_surface["prepare_cleanup_refusal"])
 
         changed = copy.deepcopy(jobs)
         changed_run = next(job for job in changed if job["name"] == audit.PLATFORM_RUN_JOBS["windows"])

@@ -383,13 +383,21 @@ class PowerShellStaticTests(unittest.TestCase):
         self.assertIn("function Clear-AppContainerStorage", script)
         self.assertIn("GetProfileFolderPath($PackageSid)", script)
         self.assertIn("[StringComparison]::OrdinalIgnoreCase", script)
-        self.assertIn("'/F' $path '/A'", script)
-        self.assertIn("$path '/reset' '/C' '/Q'", script)
-        self.assertIn("'*S-1-5-32-544:(OI)(CI)F'", script)
         self.assertIn("[IO.FileAttributes]::ReparsePoint", script)
+        restore = script.split("function Restore-RunnerAccessTree", 1)[1].split(
+            "function Clear-AppContainerStorage", 1,
+        )[0]
+        self.assertIn("'/F' $Root '/A' '/R' '/D' 'Y'", restore)
+        self.assertIn("$Root '/reset' '/T' '/C' '/Q'", restore)
+        self.assertIn("$Root '/grant:r' '*S-1-5-32-544:(OI)(CI)F'", restore)
+        self.assertIn("$entryCount -gt 250000", restore)
+        self.assertLess(restore.index("while ($pending.Count -gt 0)"), restore.index("& $takeown"))
+        scan = restore[:restore.index("& $takeown")]
+        self.assertNotIn("& $takeown", scan)
+        self.assertNotIn("& $icacls", scan)
         cleanup = script.split("if ($Mode -eq 'delete') {", 1)[1].split("\n    throw\n} catch {", 1)[0]
         self.assertLess(cleanup.index("Clear-AppContainerStorage"), cleanup.index("DeleteProfile"))
-        self.assertNotIn("'/T'", cleanup)
+        self.assertIn("'/T'", cleanup)
         self.assertIn("Restore-RunnerAccessTree $fullPath", cleanup)
         self.assertIn("windows_cleanup_reason=", script)
 

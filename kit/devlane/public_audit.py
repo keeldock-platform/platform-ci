@@ -1444,6 +1444,14 @@ class _Grammar:
             code = line[len("devlane_refusal="):]
             if self.job_runner != "windows-2025" or code not in WINDOWS_PREPARE_REFUSAL_CODES:
                 return False
+            if (public_counts.get("early_failure_marker") == 1
+                    and public_counts.get("early_failure_step") == WINDOWS_PREPARE_STEP
+                    and public_counts.get("early_failure_code") != "windows-prepare-profile-cleanup-failed"
+                    and code == "windows-prepare-profile-cleanup-failed"
+                    and public_counts.get("windows_prepare_cleanup_reason") == 1
+                    and public_counts.get("windows_prepare_cleanup_refusal", 0) == 0):
+                public_counts["windows_prepare_cleanup_refusal"] = 1
+                return True
             public_counts["early_failure_marker"] = public_counts.get("early_failure_marker", 0) + 1
             public_counts["early_failure_step"] = step_name
             public_counts["early_failure_code"] = code
@@ -2286,8 +2294,18 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
                 _refuse()
         cleanup_line = "cleanup_receipt=confirmed"
         cleanup_failure_receipts = counts.get("cleanup_receipt_failed", 0)
+        prepare_cleanup_refusal = counts.get("windows_prepare_cleanup_refusal", 0)
         if cleanup_failure_receipts:
             failure_code = counts.get("cleanup_failure_code")
+            prepare_cleanup_failure_ok = (
+                counts.get("early_failure_code") == "windows-prepare-profile-cleanup-failed"
+                and prepare_cleanup_refusal == 0
+                and counts.get("windows_prepare_stage_done") == 1
+            ) or (
+                counts.get("early_failure_code") != "windows-prepare-profile-cleanup-failed"
+                and prepare_cleanup_refusal == 1
+                and counts.get("windows_prepare_cleanup_reason") == 1
+            )
             if (not windows_job or counts.get(cleanup_line) or cleanup_failure_receipts != 1
                     or counts.get("cleanup_failure_completion") != 1
                     or counts.get("cleanup_failure_refusal") != 1
@@ -2296,8 +2314,7 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
                     or counts.get("windows_cleanup_reason") != 1
                     or counts.get("windows_cleanup_reason_value") != counts.get("cleanup_receipt_failed_reason")
                     or counts.get("early_failure_step") != WINDOWS_PREPARE_STEP
-                    or counts.get("early_failure_code") != "windows-prepare-profile-cleanup-failed"
-                    or counts.get("windows_prepare_stage_done") != 1
+                    or not prepare_cleanup_failure_ok
                     or (completed and counts.get("devlane_job=completed public_output=filtered cleanup=confirmed"))):
                 _refuse()
         elif (counts.get(cleanup_line) != 1 or counts.get("cleanup_failure_refusal")
@@ -2308,7 +2325,13 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         if (counts.get("windows_prepare_cleanup_reason", 0) > 1
                 or (counts.get("windows_prepare_cleanup_reason")
                     and (counts.get("early_failure_step") != WINDOWS_PREPARE_STEP
-                         or counts.get("early_failure_code") != "windows-prepare-profile-cleanup-failed"))):
+                         or (counts.get("early_failure_code") != "windows-prepare-profile-cleanup-failed"
+                             and prepare_cleanup_refusal != 1)))
+                or prepare_cleanup_refusal > 1
+                or (prepare_cleanup_refusal
+                    and (counts.get("early_failure_step") != WINDOWS_PREPARE_STEP
+                         or counts.get("early_failure_code") == "windows-prepare-profile-cleanup-failed"
+                         or counts.get("windows_prepare_cleanup_reason") != 1))):
             _refuse()
         if windows_job:
             cleanup_modes = {
@@ -2384,6 +2407,7 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
     return {"records": [record.encode("ascii") for record in records], "early_failure": early_failure,
             "early_failure_code": counts.get("early_failure_code"),
             "early_failure_exit": counts.get("early_failure_exit"), "failure_stage": failure_stage,
+            "prepare_cleanup_refusal": bool(counts.get("windows_prepare_cleanup_refusal")),
             "cleanup_failure_code": counts.get("cleanup_failure_code"),
             "cleanup_failure_reason": counts.get("cleanup_receipt_failed_reason"),
             "crypto_refusal_reason": counts.get("crypto_refusal_reason_code"),
@@ -2816,7 +2840,8 @@ def validate_job_log_metadata_binding(surface, run_job, identity):
         expected_failed = [early_failure]
         if cleanup_failure is not None:
             if (early_failure != WINDOWS_PREPARE_STEP or identity.get("platform") != "windows"
-                    or code != "windows-prepare-profile-cleanup-failed"
+                    or (code != "windows-prepare-profile-cleanup-failed"
+                        and not surface.get("prepare_cleanup_refusal"))
                     or cleanup_failure not in WINDOWS_SHRED_REFUSAL_CODES
                     or not cleanup_failure.startswith("windows-cleanup-shred-")
                     or cleanup_reason not in WINDOWS_CLEANUP_REASON_CLASSES

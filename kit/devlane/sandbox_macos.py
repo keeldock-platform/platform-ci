@@ -845,8 +845,8 @@ def _collect_macos_sandbox_denials(pid, emitted):
         return
     try:
         result = subprocess.run(
-            ("/usr/bin/log", "show", "--last", "2m", "--style", "compact", "--process", str(pid),
-             "--predicate", 'sender == "Sandbox"'),
+            ("/usr/bin/log", "show", "--last", "2m", "--style", "compact", "--predicate",
+             '(processIdentifier == 0 OR sender == "Sandbox") AND eventMessage CONTAINS[c] "Sandbox:"'),
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             timeout=5, check=False, close_fds=True,
         )
@@ -855,13 +855,22 @@ def _collect_macos_sandbox_denials(pid, emitted):
     if result.returncode != 0 or len(result.stdout) > 1024 * 1024:
         return
     for raw_line in result.stdout.decode("utf-8", "replace").splitlines():
-        match = re.search(r"deny\([0-9]+\)\s+([a-z][a-z0-9*-]*)\s+(.+)$", raw_line)
+        match = re.search(
+            r"Sandbox:\s+[^\s()]+\(([0-9]+)\)\s+deny\([0-9]+\)\s+([a-z][a-z0-9*-]*)\s+(.+)$",
+            raw_line,
+        )
         if match is None:
             continue
-        operation = match.group(1)
+        try:
+            target_pid = int(match.group(1))
+        except (ValueError, OverflowError):
+            continue
+        if target_pid != pid:
+            continue
+        operation = match.group(2)
         if operation not in MACOS_DNS_DENIAL_OPERATIONS:
             continue
-        target = _macos_dns_denial_target(operation, match.group(2))
+        target = _macos_dns_denial_target(operation, match.group(3))
         line = "macos_sandbox_denial op=" + operation + " target=" + target
         if line in emitted:
             continue

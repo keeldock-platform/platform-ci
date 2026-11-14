@@ -717,6 +717,7 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         private_root = chr(47) + "private"
         raw = (
             b"Sandbox: node(451) deny(1) mach-lookup com.apple.SystemConfiguration.configd\n"
+            b"Sandbox: node(452) deny(1) mach-lookup com.apple.private.unrelated\n"
             + ("Sandbox: node(451) deny(1) file-read-data " + private_root + "/etc/resolv.conf\n").encode()
             + ("Sandbox: node(451) deny(1) network-outbound " + private_root + "/var/run/mDNSResponder\n").encode()
             + b"Sandbox: node(451) deny(1) mach-lookup com.apple.private.secret\n"
@@ -735,7 +736,11 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         self.assertTrue(all(b"/private" not in call.args[0].encode("ascii")
                             for call in output.call_args_list))
         self.assertEqual(run.call_args.args[0][0:3], ("/usr/bin/log", "show", "--last"))
-        self.assertIn("451", run.call_args.args[0])
+        self.assertNotIn("--process", run.call_args.args[0])
+        self.assertIn(
+            '(processIdentifier == 0 OR sender == "Sandbox") AND eventMessage CONTAINS[c] "Sandbox:"',
+            run.call_args.args[0],
+        )
 
     def test_preparation_start_and_npm_failures_have_fixed_codes(self):
         with mock.patch.object(sandbox.subprocess, "Popen", side_effect=PermissionError(1, "denied")):

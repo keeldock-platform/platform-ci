@@ -66,6 +66,13 @@ def _refuse(code="windows-boundary", reason="other"):
     raise WindowsBoundaryRefusal(code, reason)
 
 
+def _emit_windows_prepare_refusal(error):
+    code = (error.code if error.code in refusal_codes.WINDOWS_PREPARE_REFUSAL_CODES
+            else "windows-prepare-internal")
+    print("devlane_refusal=" + code, file=sys.stderr, flush=True)
+    error._prepare_refusal_emitted = True
+
+
 def _windows_cleanup_error_reason(error):
     winerror = getattr(error, "winerror", None)
     error_number = getattr(error, "errno", None)
@@ -550,7 +557,9 @@ def _run_powershell(mode, state_path, request_path=None, timeout=MAX_CHILD_SECON
                 marker = ("windows_prepare_cleanup_reason=" if failure_prefix == "windows-prepare"
                           else "windows_profile_cleanup_reason=")
                 print(marker + reason, flush=True)
-                _refuse((failure_prefix or "windows") + "-powershell-nonzero", reason=reason)
+                error = WindowsBoundaryRefusal((failure_prefix or "windows") + "-powershell-nonzero", reason=reason)
+                error._cleanup_reason_emitted = True
+                raise error
         _refuse((failure_prefix or "windows") + "-powershell-nonzero")
     try:
         return result.stdout.decode("utf-8", "strict").strip()
@@ -801,83 +810,95 @@ def prepare_dependencies(projection_path, output_root, deadline_file, state_path
     ]
     runner_root = Path(state_path).resolve().parents[1]
     created_profile = False
+    prepare_failure = None
+    cleanup_failure = None
     try:
-        print("windows_prepare_stage_start=profile-create", flush=True)
         try:
-            create_profile(state_path, failure_prefix="windows-prepare", monitor_stage="profile-create")
-        except WindowsBoundaryRefusal as error:
-            if error.code not in (
-                    "windows-prepare-powershell-start-failed", "windows-prepare-powershell-timeout",
-                    "windows-prepare-powershell-nonzero"):
-                _refuse("windows-prepare-profile-create-failed")
-            raise
-        created_profile = True
-        print("windows_prepare_stage=none", flush=True)
-        remaining = max(1, int(_deadline_remaining(deadline_file)))
-        request = {
-            "executable": str(node), "arguments": [str(npm_cli), *NPM_INSTALL_ARGUMENTS],
-            "working_directory": str(project), "environment": environment, "access_root": str(runner_root),
-            "read_paths": [str(system_root / "System32"), str(node.parent), str(project), str(npm_cli)],
-            "write_paths": [str(project), str(cache), str(browser_root)],
-            "timeout_milliseconds": min(3_600_000, max(1000, int(remaining * 1000))), "internet_client": True,
-        }
-        print("windows_prepare_stage_start=npm-ci", flush=True)
-        result = _native_run(
-            state_path, request, runner_root, failure_prefix="windows-prepare", monitor_stage="npm-ci",
-        )
-        print("windows_prepare_job=empty", flush=True)
-        if result["status"] == "process-start-failed":
-            _refuse("windows-prepare-npm-process-start-failed")
-        if result["status"] == "timeout":
-            limit = "npm-child" if request["timeout_milliseconds"] == 3_600_000 else "work-deadline"
-            print("windows_prepare_timeout limit=" + limit + " seconds="
-                  + str((request["timeout_milliseconds"] + 999) // 1000), flush=True)
-            _refuse("windows-prepare-npm-child-timeout-3600s" if request["timeout_milliseconds"] == 3_600_000
-                    else "windows-prepare-npm-work-deadline")
-        if result["status"] == "fail":
-            _refuse("windows-prepare-npm-failed-" + _npm_preparation_error_class(cache / "_logs"))
-        print("windows_prepare_stage=npm-ci", flush=True)
-        if projection["playwright"]:
-            candidates = (
-                project / "node_modules" / "playwright" / "cli.js",
-                project / "node_modules" / "@playwright" / "test" / "cli.js",
-            )
-            cli = next((item for item in candidates if item.is_file() and not item.is_symlink()), None)
-            if cli is None:
-                _refuse("windows-prepare-playwright-cli-missing")
+            print("windows_prepare_stage_start=profile-create", flush=True)
+            try:
+                create_profile(state_path, failure_prefix="windows-prepare", monitor_stage="profile-create")
+            except WindowsBoundaryRefusal as error:
+                if error.code not in (
+                        "windows-prepare-powershell-start-failed", "windows-prepare-powershell-timeout",
+                        "windows-prepare-powershell-nonzero"):
+                    _refuse("windows-prepare-profile-create-failed")
+                raise
+            created_profile = True
+            print("windows_prepare_stage=none", flush=True)
             remaining = max(1, int(_deadline_remaining(deadline_file)))
-            request.update({
-                "arguments": [str(cli), "install", *projection["playwright"]],
-                "working_directory": str(project),
-                "timeout_milliseconds": min(1_800_000, max(1000, int(remaining * 1000))),
-            })
-            print("windows_prepare_stage_start=playwright", flush=True)
+            request = {
+                "executable": str(node), "arguments": [str(npm_cli), *NPM_INSTALL_ARGUMENTS],
+                "working_directory": str(project), "environment": environment, "access_root": str(runner_root),
+                "read_paths": [str(system_root / "System32"), str(node.parent), str(project), str(npm_cli)],
+                "write_paths": [str(project), str(cache), str(browser_root)],
+                "timeout_milliseconds": min(3_600_000, max(1000, int(remaining * 1000))), "internet_client": True,
+            }
+            print("windows_prepare_stage_start=npm-ci", flush=True)
             result = _native_run(
-                state_path, request, runner_root, failure_prefix="windows-prepare", monitor_stage="playwright",
+                state_path, request, runner_root, failure_prefix="windows-prepare", monitor_stage="npm-ci",
             )
             print("windows_prepare_job=empty", flush=True)
             if result["status"] == "process-start-failed":
-                _refuse("windows-prepare-playwright-process-start-failed")
+                _refuse("windows-prepare-npm-process-start-failed")
             if result["status"] == "timeout":
-                limit = "playwright-child" if request["timeout_milliseconds"] == 1_800_000 else "work-deadline"
+                limit = "npm-child" if request["timeout_milliseconds"] == 3_600_000 else "work-deadline"
                 print("windows_prepare_timeout limit=" + limit + " seconds="
                       + str((request["timeout_milliseconds"] + 999) // 1000), flush=True)
-                _refuse("windows-prepare-playwright-child-timeout-1800s"
-                        if request["timeout_milliseconds"] == 1_800_000
-                        else "windows-prepare-playwright-work-deadline")
+                _refuse("windows-prepare-npm-child-timeout-3600s" if request["timeout_milliseconds"] == 3_600_000
+                        else "windows-prepare-npm-work-deadline")
             if result["status"] == "fail":
-                _refuse("windows-prepare-playwright-failed-other")
-            print("windows_prepare_stage=playwright", flush=True)
-        print("windows_prepare_stage=done", flush=True)
-    except (OSError, subprocess.SubprocessError):
-        _refuse("windows-prepare-internal")
+                _refuse("windows-prepare-npm-failed-" + _npm_preparation_error_class(cache / "_logs"))
+            print("windows_prepare_stage=npm-ci", flush=True)
+            if projection["playwright"]:
+                candidates = (
+                    project / "node_modules" / "playwright" / "cli.js",
+                    project / "node_modules" / "@playwright" / "test" / "cli.js",
+                )
+                cli = next((item for item in candidates if item.is_file() and not item.is_symlink()), None)
+                if cli is None:
+                    _refuse("windows-prepare-playwright-cli-missing")
+                remaining = max(1, int(_deadline_remaining(deadline_file)))
+                request.update({
+                    "arguments": [str(cli), "install", *projection["playwright"]],
+                    "working_directory": str(project),
+                    "timeout_milliseconds": min(1_800_000, max(1000, int(remaining * 1000))),
+                })
+                print("windows_prepare_stage_start=playwright", flush=True)
+                result = _native_run(
+                    state_path, request, runner_root, failure_prefix="windows-prepare", monitor_stage="playwright",
+                )
+                print("windows_prepare_job=empty", flush=True)
+                if result["status"] == "process-start-failed":
+                    _refuse("windows-prepare-playwright-process-start-failed")
+                if result["status"] == "timeout":
+                    limit = "playwright-child" if request["timeout_milliseconds"] == 1_800_000 else "work-deadline"
+                    print("windows_prepare_timeout limit=" + limit + " seconds="
+                          + str((request["timeout_milliseconds"] + 999) // 1000), flush=True)
+                    _refuse("windows-prepare-playwright-child-timeout-1800s"
+                            if request["timeout_milliseconds"] == 1_800_000
+                            else "windows-prepare-playwright-work-deadline")
+                if result["status"] == "fail":
+                    _refuse("windows-prepare-playwright-failed-other")
+                print("windows_prepare_stage=playwright", flush=True)
+            print("windows_prepare_stage=done", flush=True)
+        except WindowsBoundaryRefusal as error:
+            prepare_failure = error
+        except (OSError, subprocess.SubprocessError):
+            prepare_failure = WindowsBoundaryRefusal("windows-prepare-internal")
+        if prepare_failure is not None:
+            _emit_windows_prepare_refusal(prepare_failure)
     finally:
         if created_profile:
             try:
                 print("windows_prepare_stage_start=profile-cleanup", flush=True)
                 delete_profile(state_path, failure_prefix="windows-prepare", monitor_stage="profile-cleanup")
-            except Exception:
-                _refuse("windows-prepare-profile-cleanup-failed")
+            except Exception as error:
+                reason = error.reason if isinstance(error, WindowsBoundaryRefusal) else _windows_cleanup_error_reason(error)
+                cleanup_failure = WindowsBoundaryRefusal("windows-prepare-profile-cleanup-failed", reason=reason)
+    if cleanup_failure is not None:
+        raise cleanup_failure
+    if prepare_failure is not None:
+        raise prepare_failure
     node_modules = project / "node_modules"
     try:
         print("windows_prepare_stage_start=copy", flush=True)
@@ -1433,8 +1454,14 @@ def remove_tree(root):
 def delete_profile(state_path, *, failure_prefix="windows-cleanup", monitor_stage=None):
     if sys.platform != "win32":
         _refuse("windows-host-required")
-    line = _run_powershell("delete", state_path, timeout=90, failure_prefix=failure_prefix,
-                           monitor_stage=monitor_stage)
+    try:
+        line = _run_powershell("delete", state_path, timeout=90, failure_prefix=failure_prefix,
+                               monitor_stage=monitor_stage)
+    except WindowsBoundaryRefusal as error:
+        if failure_prefix == "windows-prepare" and not getattr(error, "_cleanup_reason_emitted", False):
+            print("windows_prepare_cleanup_reason=" + error.reason, flush=True)
+            error._cleanup_reason_emitted = True
+        raise
     try:
         _retry_windows_cleanup(lambda: Path(state_path).unlink(missing_ok=True))
     except OSError as error:
@@ -1545,7 +1572,8 @@ def main(argv=None):
             print("decrypt_refusal=" + reason, file=sys.stderr)
         elif args.operation == "prepare":
             code = error.code if error.code in refusal_codes.WINDOWS_PREPARE_REFUSAL_CODES else "windows-prepare-internal"
-            print("devlane_refusal=" + code, file=sys.stderr)
+            if not getattr(error, "_prepare_refusal_emitted", False):
+                print("devlane_refusal=" + code, file=sys.stderr)
         elif args.operation == "shred":
             code = error.code if error.code in refusal_codes.WINDOWS_SHRED_REFUSAL_CODES else "windows-cleanup-internal"
             if code.startswith("windows-cleanup-shred-"):
