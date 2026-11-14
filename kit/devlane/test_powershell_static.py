@@ -251,15 +251,33 @@ class PowerShellStaticTests(unittest.TestCase):
         self.assertIn("Join-Path -Path $runRoot -ChildPath 'control-python-deps' -ErrorAction Stop", target_block)
         self.assertIn("New-Item -ItemType Directory -Path $cryptoTarget -ErrorAction Stop", target_block)
 
-        protect_start = script.index("function Protect-PrivateDirectory")
-        protect_end = script.index("$env:RUN_ROOT", protect_start)
+        protect_start = script.index("$runRoot = Join-Path -Path $env:RUNNER_TEMP")
+        protect_end = script.index("$started = Join-Path", protect_start)
         protect_block = script[protect_start:protect_end]
         self.assertIn(
             "Join-Path -Path $env:RUNNER_TEMP -ChildPath ('devlane-' + $env:CI_RUN_ID) -ErrorAction Stop",
             protect_block,
         )
+        self.assertIn("if (Test-Path -LiteralPath $runRoot -ErrorAction Stop)", protect_block)
+        self.assertLess(
+            protect_block.index("Write-Output 'devlane_crypto_refusal=crypto-target-invalid'"),
+            protect_block.index("New-Item -ItemType Directory -Path $runRoot -ErrorAction Stop"),
+        )
         self.assertIn("New-Item -ItemType Directory -Path $runRoot -ErrorAction Stop", protect_block)
-        self.assertIn("Set-Acl -LiteralPath $Path -AclObject $security -ErrorAction Stop", protect_block)
+        self.assertIn("$env:RUN_ROOT = $runRoot", protect_block)
+        self.assertIn(
+            "Add-Content -LiteralPath $env:GITHUB_ENV -Value ('RUN_ROOT=' + $runRoot) -Encoding utf8",
+            protect_block,
+        )
+        self.assertLess(
+            protect_block.index("New-Item -ItemType Directory -Path $runRoot -ErrorAction Stop"),
+            protect_block.index("$env:RUN_ROOT = $runRoot"),
+        )
+        self.assertLess(
+            protect_block.index("Add-Content -LiteralPath $env:GITHUB_ENV"),
+            protect_block.index("Protect-PrivateDirectory $runRoot $runnerSid"),
+        )
+        self.assertIn("Set-Acl -LiteralPath $Path -AclObject $security -ErrorAction Stop", script)
         self.assertRegex(
             protect_block,
             re.compile(

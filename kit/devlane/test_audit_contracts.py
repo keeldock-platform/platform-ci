@@ -271,7 +271,8 @@ def _render_log(job_key, identity=None, *, records=(), kind="encrypted", skip=("
     """A hosted-shaped log generated from the reviewed workflow itself."""
     identity = identity or IDENTITY
     workflow = ".github/workflows/devlane-synthetic.yml" if kind == "synthetic" else ".github/workflows/devlane-encrypted.yml"
-    job = audit.parse_workflow(workflow)[job_key]
+    grammar = audit._Grammar(workflow, job_key, identity, kind)
+    job = grammar.job
     stamp = "2026-11-10T12:00:00.1234567Z "
     lines = [MARK + "[section]Starting: Set up job",
              MARK + "[group]Runner Image Provisioner", "Hosted Compute Agent", "Version: 20251030.1",
@@ -288,6 +289,7 @@ def _render_log(job_key, identity=None, *, records=(), kind="encrypted", skip=("
         skipped.discard("Install pinned Rust toolchain")
     else:
         skipped.add("Install Tauri Linux build dependencies")
+    runtime_env_names = set()
     for step in job["steps"]:
         if step["name"] in skipped or (step["uses"] and "setup-node" in step["uses"] and identity["profile"] in audit.RUST_PROFILES):
             continue
@@ -303,13 +305,14 @@ def _render_log(job_key, identity=None, *, records=(), kind="encrypted", skip=("
                 lines.append("  %s: %s" % (key, _with_value(step, key, identity, kind)))
         env = dict(job["env"])
         env.update(step["env"])
-        if kind == "encrypted" and job_key == audit.RUN_JOB and step["name"] != audit.STEP_NAMES[0]:
-            env["RUN_ROOT"] = "${{ runner.temp }}/devlane-" + identity["run_id"]
+        env.update({name: "" for name in runtime_env_names})
         if env:
             lines.append("env:")
             lines.extend("  %s: %s" % (name, _env_value(name, identity, kind)) for name in env)
         lines.append(MARK + "[endgroup]")
-        lines.extend(_step_outputs(step, identity, kind, records))
+        outputs = _step_outputs(step, identity, kind, records)
+        lines.extend(outputs)
+        runtime_env_names.update(grammar.environment_exports_after_step(step, outputs))
         lines.append(MARK + "[section]Finishing: " + step["name"])
     node_step = next((step for step in job["steps"] if step["uses"] and "setup-node" in step["uses"]), None)
     if node_step and identity["profile"] == "core-node":
@@ -404,6 +407,7 @@ def _render_real_runner_encrypted_log(identity, job_key=None, early_failure=None
     lines.extend((marker + "[endgroup]", "Complete job name: " + job_key))
 
     failure_seen = False
+    runtime_env_names = set()
     for step_index, step in enumerate(grammar.steps):
         if step["name"] == "Install pinned Rust toolchain":
             continue
@@ -430,7 +434,7 @@ def _render_real_runner_encrypted_log(identity, job_key=None, early_failure=None
                     lines.append("  enableCrossOsArchive: false")
                 if "/restore@" in uses:
                     lines.append("  lookup-only: false")
-        env_names = grammar.expected_env_names(step)
+        env_names = grammar.expected_env_names(step, runtime_env_names)
         if env_names:
             lines.append("env:")
             lines.extend("  %s: %s" % (key, _env_value(key, identity, "encrypted", platform_runner))
@@ -438,7 +442,7 @@ def _render_real_runner_encrypted_log(identity, job_key=None, early_failure=None
         lines.append(marker + "[endgroup]")
         outputs = _step_outputs(step, identity, "encrypted", ())
         if early_failure and step["name"] == early_failure["step"]:
-            outputs = [early_failure["marker"]]
+            outputs = early_failure.get("outputs", [early_failure["marker"]])
         if "Environment details" in outputs:
             position = outputs.index("Environment details")
             lines.extend(outputs[:position])
@@ -447,6 +451,7 @@ def _render_real_runner_encrypted_log(identity, job_key=None, early_failure=None
             lines.append(marker + "[endgroup]")
         else:
             lines.extend(outputs)
+        runtime_env_names.update(grammar.environment_exports_after_step(step, outputs))
         if early_failure and step["name"] == early_failure["step"]:
             lines.append(marker + "[error]Process completed with exit code %d." % early_failure["exit_code"])
             failure_seen = True
@@ -782,6 +787,52 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         result = audit.validate_job_contract(jobs, IDENTITY, "core-node")
         self.assertEqual(set(result), set(audit.EXECUTION_JOBS) | {audit.AUDIT_JOB})
 
+    def test_windows_crypto_target_and_acl_refusals_use_their_actual_cleanup_environment(self):
+        identity = dict(IDENTITY, platform="windows")
+        failed_step = "Fetch public control and validate dispatch"
+        cleanup_step = "Shred runner-local workspace"
+        for reason, cleanup_has_run_root in (
+                ("crypto-target-invalid", False), ("crypto-acl-output-invalid", True)):
+            with self.subTest(reason=reason):
+                jobs = _encrypted_jobs(platform="windows")
+                by_name = {job["name"]: job for job in jobs}
+                run_job = by_name[audit.PLATFORM_RUN_JOBS["windows"]]
+                run_job["conclusion"] = "failure"
+                failed_index = next(index for index, step in enumerate(run_job["steps"])
+                                    if step["name"] == failed_step)
+                for index, step in enumerate(run_job["steps"]):
+                    if step["name"] == cleanup_step:
+                        step["conclusion"] = "success"
+                    elif index < failed_index:
+                        step["conclusion"] = "success"
+                    elif index == failed_index:
+                        step["conclusion"] = "failure"
+                    else:
+                        step["conclusion"] = "skipped"
+                outputs = [
+                    "devlane_crypto_refusal=" + reason,
+                    "devlane_deadline_refusal=crypto-dependency-seal-failed",
+                ]
+                log = _render_real_runner_encrypted_log(
+                    identity,
+                    early_failure={
+                        "step": failed_step, "marker": outputs[-1], "outputs": outputs, "exit_code": 1,
+                    },
+                )
+                run_root_env = (
+                    "  RUN_ROOT: " + _env_value("RUN_ROOT", identity, "encrypted", "windows-2025")
+                ).encode("utf-8")
+                self.assertEqual(log.count(run_root_env), int(cleanup_has_run_root))
+                surface = audit.validate_job_log_surface(
+                    log, audit.PLATFORM_RUN_JOBS["windows"], identity, completed=True,
+                )
+                self.assertEqual(surface["early_failure"], failed_step)
+                self.assertEqual(surface["early_failure_code"], "crypto-dependency-seal-failed")
+                self.assertEqual(surface["crypto_refusal_reason"], reason)
+                audit.validate_job_contract(jobs, identity, "core-node")
+                audit.validate_job_log_metadata_binding(surface, run_job, identity)
+                self.assertFalse(audit.validate_dispatch_marker(log, identity, allow_missing=True))
+
     def test_macos_and_windows_early_failures_are_audited_with_fixed_dispositions(self):
         scenarios = (
             ("macos", "Prepare hosted runner isolation state",
@@ -959,19 +1010,18 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                         step["conclusion"] = "failure"
                     else:
                         step["conclusion"] = "skipped"
-                log = _render_real_runner_encrypted_log(
-                    identity, early_failure={"step": failed_step, "marker": marker, "exit_code": exit_code},
-                )
                 marker_code = marker.split("=", 1)[1]
                 crypto_reason = {
                     "crypto-dependency-seal-failed": "crypto-seal-write-failed",
                     "crypto-dependency-check-failed": "crypto-import-invalid",
                     "crypto-dependency-privileged-check-failed": "crypto-key-present",
                 }.get(marker_code)
-                if crypto_reason:
-                    log = _insert_output_before(
-                        log, marker, "devlane_crypto_refusal=" + crypto_reason,
-                    )
+                outputs = (["devlane_crypto_refusal=" + crypto_reason] if crypto_reason else []) + [marker]
+                log = _render_real_runner_encrypted_log(
+                    identity, early_failure={
+                        "step": failed_step, "marker": marker, "outputs": outputs, "exit_code": exit_code,
+                    },
+                )
                 surface = audit.validate_job_log_surface(
                     log, audit.PLATFORM_RUN_JOBS[platform_name], identity, completed=True,
                 )
@@ -2646,14 +2696,14 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             with self.subTest(platform=platform, bootstrap_code=bootstrap_code, reason=reason):
                 identity = dict(IDENTITY, platform=platform)
                 prefix = "devlane_bootstrap_refusal=" if platform == "macos" else "devlane_deadline_refusal="
-                marker = (prefix + bootstrap_code).encode("ascii")
-                log = _insert_output_before(_render_real_runner_encrypted_log(
+                marker = prefix + bootstrap_code
+                outputs = ["devlane_crypto_refusal=" + reason, marker]
+                log = _render_real_runner_encrypted_log(
                     identity,
                     early_failure={
                         "step": "Fetch public control and validate dispatch",
-                        "marker": marker.decode("ascii"), "exit_code": 1,
+                        "marker": marker, "outputs": outputs, "exit_code": 1,
                     },
-                ), marker.decode("ascii"), "devlane_crypto_refusal=" + reason,
                 )
                 jobs = _encrypted_jobs(platform=platform)
                 run_job = next(job for job in jobs if job["name"] == audit.PLATFORM_RUN_JOBS[platform])

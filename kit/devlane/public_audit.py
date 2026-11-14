@@ -587,12 +587,51 @@ class _Grammar:
         self.post = {"Post " + step["name"]: step for step in self.steps if step["uses"]
                      and step["uses"].startswith("actions/setup-node@")}
 
-    def expected_env_names(self, step):
-        names = set(self.job["env"]) | set(step["env"])
-        if (self.kind == "encrypted" and self.job_key in EXECUTION_JOBS
-                and step["name"] != self.names[0]):
-            names = names | {"RUN_ROOT"}
-        return names
+    def environment_exports(self, step):
+        run = step["run"] or []
+        export = ("Add-Content -LiteralPath $env:GITHUB_ENV -Value ('RUN_ROOT=' + $runRoot) -Encoding utf8"
+                  if self.job_runner == "windows-2025" else
+                  "printf 'RUN_ROOT=%s\\n' \"$RUN_ROOT\" >> \"$GITHUB_ENV\"")
+        return {"RUN_ROOT"} if self.kind == "encrypted" and self.job_key in EXECUTION_JOBS and export in run else set()
+
+    def environment_exports_after_step(self, step, output_lines):
+        exports = self.environment_exports(step)
+        if not exports:
+            return set()
+        run = step["run"] or []
+        export = ("Add-Content -LiteralPath $env:GITHUB_ENV -Value ('RUN_ROOT=' + $runRoot) -Encoding utf8"
+                  if self.job_runner == "windows-2025" else
+                  "printf 'RUN_ROOT=%s\\n' \"$RUN_ROOT\" >> \"$GITHUB_ENV\"")
+        export_index = run.index(export)
+        has_crypto_reason = any(line.startswith("devlane_crypto_refusal=") for line in output_lines)
+        target_refusal = (
+            "devlane_crypto_refusal=crypto-target-invalid" in output_lines
+            and "devlane_deadline_refusal=crypto-dependency-seal-failed" in output_lines
+        )
+        for output in output_lines:
+            prefix, separator, code = output.partition("=")
+            if prefix == "devlane_deadline_refusal" and has_crypto_reason:
+                continue
+            if output == "devlane_crypto_refusal=crypto-target-invalid" and not target_refusal:
+                continue
+            if not separator or prefix not in (
+                    "devlane_crypto_refusal", "devlane_deadline_refusal", "devlane_bootstrap_refusal",
+                    "devlane_macos_preflight_refusal", "devlane_windows_preflight_refusal"):
+                continue
+            emitted = []
+            for index, line in enumerate(run):
+                if output in line and any(token in line for token in (
+                        "Write-Output", "Refuse-Bootstrap", "refuse(")):
+                    emitted.append(index)
+                elif code and code in line and any(token in line for token in (
+                        "Write-Output", "Refuse-Bootstrap", "refuse(")):
+                    emitted.append(index)
+            if emitted and min(emitted) < export_index:
+                return set()
+        return exports
+
+    def expected_env_names(self, step, runtime_env_names=()):
+        return set(self.job["env"]) | set(step["env"]) | set(runtime_env_names)
 
     def env_value_ok(self, name, value):
         identity, kind = self.identity, self.kind
@@ -1314,9 +1353,9 @@ def _hosted_preamble(lines, grammar, job_name, identity, workflow_path):
     return canonical, index
 
 
-def _parse_hosted_step_block(block, step, grammar):
+def _parse_hosted_step_block(block, step, grammar, runtime_env_names=()):
     run = step["run"]
-    expected_env = grammar.expected_env_names(step)
+    expected_env = grammar.expected_env_names(step, runtime_env_names)
     canonical = []
     if run:
         shell_options = (
@@ -1395,6 +1434,7 @@ def _canonicalize_github_hosted_log(text, grammar, job_name, identity, workflow_
     position = -1
     post_output = []
     cleanup_seen = False
+    runtime_env_names = set()
     while index < len(lines):
         header = lines[index]
         if not header.startswith(LOG_MARKER + "[group]Run "):
@@ -1426,7 +1466,7 @@ def _canonicalize_github_hosted_log(text, grammar, job_name, identity, workflow_
         step = None
         for candidate_index, candidate in matches:
             try:
-                parsed = _parse_hosted_step_block(block, candidate, grammar)
+                parsed = _parse_hosted_step_block(block, candidate, grammar, runtime_env_names)
                 position, step = candidate_index, candidate
                 break
             except AuditRefusal:
@@ -1489,6 +1529,7 @@ def _canonicalize_github_hosted_log(text, grammar, job_name, identity, workflow_
             index += 1
         canonical.extend(output)
         canonical.append(LOG_MARKER + "[section]Finishing: " + step["name"])
+        runtime_env_names.update(grammar.environment_exports_after_step(step, output))
         if cleanup_seen:
             break
 
@@ -1565,6 +1606,8 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
     seen_steps = set()
     counts = {}
     records = []
+    runtime_env_names = set()
+    step_output_lines = []
     for original in lines:
         normalized = TIME_PREFIX.sub("", original, count=1).rstrip()
         if not normalized.strip():
@@ -1590,6 +1633,7 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
                 seen_steps.add(name)
                 position = index
                 section, step_name = "step", name
+                step_output_lines = []
             else:
                 _refuse()
             in_header = False
@@ -1602,6 +1646,13 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
             if in_header:
                 _refuse()
             if name == step_name:
+                finished_step = next((item for item in grammar.steps if item["name"] == step_name), None)
+                if finished_step is None and step_name.startswith("Post "):
+                    finished_step = grammar.post.get(step_name)
+                if finished_step is not None:
+                    runtime_env_names.update(
+                        grammar.environment_exports_after_step(finished_step, step_output_lines),
+                    )
                 step_name = None
             continue
         if section == "setup":
@@ -1662,7 +1713,7 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
             if original and TIME_PREFIX.sub("", original, count=1).startswith("  ") and mode:
                 key, separator, value = normalized.strip().partition(":")
                 value = value.strip()
-                if separator and mode == "env" and key in grammar.expected_env_names(step) \
+                if separator and mode == "env" and key in grammar.expected_env_names(step, runtime_env_names) \
                         and grammar.env_value_ok(key, value):
                     continue
                 if separator and mode == "with" and grammar.with_value_ok(step, key, value):
@@ -1673,6 +1724,7 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
                 mode = None
                 continue
             _refuse()
+        step_output_lines.append(normalized)
         error_exit = re.fullmatch(
             re.escape(LOG_MARKER) + r"\[error\]Process completed with exit code ([12])\.", normalized,
         )
