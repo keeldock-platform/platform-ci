@@ -1,6 +1,7 @@
 import json
 import contextlib
 import io
+import os
 import shutil
 import subprocess
 import sys
@@ -141,8 +142,9 @@ class FutureStageTests(unittest.TestCase):
 
     def test_actions_job_and_status_context_consumers_get_a_nonzero_result(self):
         bash = shutil.which("bash")
-        if bash is None:
-            self.skipTest("bash is required to exercise workflow status handling")
+        if os.name == "nt" and bash is None:
+            self.skipTest("Windows runner has no Bash executable available")
+        self.assertIsNotNone(bash, "Bash is required on POSIX workflow test runners")
         marker = '          if [[ "$probe_status" -eq 0 || "$probe_status" -eq 78 ]]; then\n'
         for relative in (".github/workflows/ci-future-stages.yml", ".github/workflows/appium-ci.yml"):
             workflow = (ROOT / relative).read_text(encoding="ascii")
@@ -152,7 +154,10 @@ class FutureStageTests(unittest.TestCase):
             for probe_status, expected_status in ((0, 78), (78, 78), (1, 1)):
                 with self.subTest(workflow=relative, probe_status=probe_status):
                     result = subprocess.run(
-                        [bash, "-c", "probe_status=%d\n%s" % (probe_status, script)],
+                        [
+                            bash, "--noprofile", "--norc", "-c",
+                            "probe_status=%d\n%s" % (probe_status, script),
+                        ],
                         capture_output=True, text=True, timeout=5, check=False,
                     )
                     self.assertEqual(result.returncode, expected_status, result.stdout + result.stderr)

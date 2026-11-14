@@ -415,7 +415,14 @@ class WorkflowPolicyTests(unittest.TestCase):
             "run_source_free_check candidate-check bash -c 'echo candidate-policy=accepted'",
             "finish_source_free_checks",
         ))
-        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+        bash = shutil.which("bash")
+        if os.name == "nt" and bash is None:
+            self.skipTest("Windows runner has no Bash executable available")
+        self.assertIsNotNone(bash, "Bash is required on POSIX workflow test runners")
+        result = subprocess.run(
+            [bash, "--noprofile", "--norc", "-c", script],
+            capture_output=True, text=True, check=False,
+        )
         self.assertEqual(result.returncode, 1)
         self.assertEqual(
             result.stdout,

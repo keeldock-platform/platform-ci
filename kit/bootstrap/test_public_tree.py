@@ -175,6 +175,8 @@ class PublicTreeTests(unittest.TestCase):
             runner_parent = Path(temporary) / "runner-workspace"
             checkout_root = runner_parent / "platform-ci"
             checkout_root.mkdir(parents=True)
+            empty_git_template = runner_parent / "empty-git-template"
+            empty_git_template.mkdir()
             for name in PLATFORM_FILES:
                 source = ROOT / name
                 destination = checkout_root / name
@@ -182,7 +184,10 @@ class PublicTreeTests(unittest.TestCase):
                 shutil.copyfile(source, destination)
 
             subprocess.run(
-                ["git", "init", "--quiet", "--template=/dev/null", str(checkout_root)],
+                [
+                    "git", "init", "--quiet", "--template=" + str(empty_git_template),
+                    str(checkout_root),
+                ],
                 check=True,
                 capture_output=True,
                 timeout=10,
@@ -191,7 +196,7 @@ class PublicTreeTests(unittest.TestCase):
                 ("user.name", "Platform fixture"),
                 ("user.email", "platform-fixture@example.invalid"),
                 ("commit.gpgsign", "false"),
-                ("core.hooksPath", "/dev/null"),
+                ("core.hooksPath", str(empty_git_template)),
             ):
                 subprocess.run(
                     ["git", "config", key, value],
