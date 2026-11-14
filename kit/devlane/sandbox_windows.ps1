@@ -15,6 +15,79 @@ function Write-LauncherPhase([string]$Phase) {
     [Console]::Out.WriteLine('windows_launcher_phase=' + $Phase)
     [Console]::Out.Flush()
 }
+function Start-CleanupBudget {
+    $script:WindowsCleanupTimer = [Diagnostics.Stopwatch]::StartNew()
+    $script:WindowsCleanupEntries = 0
+}
+function Add-CleanupBudgetEntry {
+    $script:WindowsCleanupEntries++
+    if ($script:WindowsCleanupEntries -gt 250000 -or
+            $script:WindowsCleanupTimer.ElapsedMilliseconds -gt 600000) { throw }
+}
+function Get-CleanupPathInfo([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path.Length -gt 4096 -or
+            -not [IO.Path]::IsPathRooted($Path)) { throw }
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $root = [IO.Path]::GetPathRoot($fullPath)
+    if ([string]::IsNullOrEmpty($root) -or $root.Length -ne 3 -or $fullPath.StartsWith('\\') -or
+            $fullPath.StartsWith('\\?\') -or $fullPath.StartsWith('\\.\')) { throw }
+    $current = $root
+    $item = $null
+    $remainder = $fullPath.Substring($root.Length)
+    $components = @($remainder.Split([char[]]@('\'), [System.StringSplitOptions]::RemoveEmptyEntries))
+    $paths = [Collections.Generic.List[string]]::new()
+    $paths.Add($root)
+    foreach ($component in $components) {
+        $current = [IO.Path]::Combine($current, $component)
+        $paths.Add($current)
+    }
+    foreach ($currentPath in $paths) {
+        try { $item = Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop }
+        catch {
+            if ($_.CategoryInfo.Category -eq [Management.Automation.ErrorCategory]::ObjectNotFound -or
+                    $_.Exception -is [IO.FileNotFoundException] -or
+                    $_.Exception -is [IO.DirectoryNotFoundException]) { return $null }
+            throw
+        }
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw }
+        [void][KeelDock.Platform.DevLaneWindows.Boundary]::AssertCleanupEntry(
+            [string]$currentPath, [bool]$item.PSIsContainer)
+    }
+    return [pscustomobject]@{ Path = $fullPath; Item = $item }
+}
+function Assert-CleanupTreeSafe([string]$Path) {
+    $rootInfo = Get-CleanupPathInfo $Path
+    if ($null -eq $rootInfo) { return }
+    if (-not $rootInfo.Item.PSIsContainer) { throw }
+    $pending = [Collections.Generic.Stack[string]]::new()
+    $pending.Push($rootInfo.Path)
+    while ($pending.Count -gt 0) {
+        if ($script:WindowsCleanupTimer.ElapsedMilliseconds -gt 600000) { throw }
+        $currentPath = $pending.Pop()
+        $entry = Get-CleanupPathInfo $currentPath
+        if ($null -eq $entry) { throw }
+        Add-CleanupBudgetEntry
+        if (-not $entry.Item.PSIsContainer) { continue }
+        foreach ($child in [IO.Directory]::EnumerateFileSystemEntries($entry.Path)) {
+            $name = [IO.Path]::GetFileName($child)
+            if ($name -eq '.' -or $name -eq '..') { continue }
+            if ($child.Length -gt 4096) { throw }
+            $depth = @($child.Substring([IO.Path]::GetPathRoot($child).Length).Split(
+                [char[]]@('\'), [System.StringSplitOptions]::RemoveEmptyEntries)).Count
+            if ($depth -gt 1024) { throw }
+            $pending.Push($child)
+        }
+    }
+}
+function Invoke-CleanupIcacls([string]$Path, [string[]]$Arguments) {
+    $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
+    & $icacls $Path @Arguments '/L' '/Q' 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw }
+}
+function Set-CleanupStorageAccess([string]$Path) {
+    Invoke-CleanupIcacls $Path @('/setowner', '*S-1-5-32-544')
+    Invoke-CleanupIcacls $Path @('/grant', '*S-1-5-32-544:(F)')
+}
 try {
     Write-LauncherPhase 'types-load'
     Add-Type -Path (Join-Path $scriptRoot 'sandbox_windows_native.cs') -ErrorAction Stop
@@ -84,6 +157,12 @@ try {
             $rights = [Enum]::Parse([Security.AccessControl.FileSystemRights], $rightsName)
             $existing = @($grants | Where-Object { $_.path -eq $path -and $_.rights -eq $rightsName -and $_.inheritance -eq $inheritanceValue })
             if ($existing.Count -gt 0) { return }
+            $pathInfo = Get-CleanupPathInfo $path
+            if ($null -eq $pathInfo) { throw }
+            if ($inheritanceValue -ne 0) {
+                if (-not $pathInfo.Item.PSIsContainer) { throw }
+                Assert-CleanupTreeSafe $pathInfo.Path
+            }
             $acl = Get-Acl -LiteralPath $path
             $rule = [Security.AccessControl.FileSystemAccessRule]::new($sid, $rights, $inheritance,
                 [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)
@@ -102,6 +181,9 @@ try {
         }
         function Add-TrackedIntegrityGrant([string]$path) {
             if ($integrityGrants.Contains($path)) { return }
+            $pathInfo = Get-CleanupPathInfo $path
+            if ($null -eq $pathInfo -or -not $pathInfo.Item.PSIsContainer) { throw }
+            Assert-CleanupTreeSafe $pathInfo.Path
             $integrityGrants.Add($path)
             Save-State
             $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
@@ -109,6 +191,7 @@ try {
             if ($LASTEXITCODE -ne 0) { throw }
         }
         Write-LauncherPhase 'acl-grant'
+        Start-CleanupBudget
         $basePath = [IO.Path]::GetFullPath([string]$request.access_root)
         $ancestor = [IO.DirectoryInfo]::new($basePath)
         while ($null -ne $ancestor) {
@@ -175,21 +258,70 @@ try {
             $packages = [IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Packages'))
             $expected = [IO.Path]::GetFullPath((Join-Path (Join-Path $packages $ProfileName) 'AC'))
             if (-not [string]::Equals($actual, $expected, [StringComparison]::OrdinalIgnoreCase)) { throw }
-            $result = [KeelDock.Platform.DevLaneWindows.Boundary]::RestoreAndDeleteAppContainerStorage($actual)
-            if ($result -notin @('deleted', 'missing')) { throw }
+            $rootInfo = Get-CleanupPathInfo $actual
+            if ($null -eq $rootInfo) { return 'missing' }
+            if (-not $rootInfo.Item.PSIsContainer) { throw }
+            $restorePrivilege = [KeelDock.Platform.DevLaneWindows.Boundary]::EnableCleanupRestorePrivilege()
+            try {
+                $pending = [Collections.Generic.Stack[string]]::new()
+                $entries = [Collections.Generic.List[object]]::new()
+                $pending.Push($rootInfo.Path)
+                while ($pending.Count -gt 0) {
+                    if ($script:WindowsCleanupTimer.ElapsedMilliseconds -gt 600000) { throw }
+                    $path = $pending.Pop()
+                    $entry = Get-CleanupPathInfo $path
+                    if ($null -eq $entry) { throw }
+                    Add-CleanupBudgetEntry
+                    $depth = @($entry.Path.Substring([IO.Path]::GetPathRoot($entry.Path).Length).Split(
+                        [char[]]@('\'), [System.StringSplitOptions]::RemoveEmptyEntries)).Count
+                    if ($depth -gt 1024) { throw }
+                    Set-CleanupStorageAccess $entry.Path
+                    $entries.Add([pscustomobject]@{
+                        Path = $entry.Path
+                        IsDirectory = [bool]$entry.Item.PSIsContainer
+                        Attributes = [IO.FileAttributes]$entry.Item.Attributes
+                    })
+                    if ($entry.Item.PSIsContainer) {
+                        foreach ($child in [IO.Directory]::EnumerateFileSystemEntries($entry.Path)) {
+                            $name = [IO.Path]::GetFileName($child)
+                            if ($name -eq '.' -or $name -eq '..') { continue }
+                            if ($child.Length -gt 4096) { throw }
+                            $pending.Push($child)
+                        }
+                    }
+                }
+                for ($index = $entries.Count - 1; $index -ge 0; $index--) {
+                    if ($script:WindowsCleanupTimer.ElapsedMilliseconds -gt 600000) { throw }
+                    $entry = $entries[$index]
+                    $attributes = [IO.FileAttributes]$entry.Attributes
+                    if (($attributes -band [IO.FileAttributes]::ReadOnly) -ne 0) {
+                        $writableAttributes = [IO.FileAttributes]([int]$attributes -band (-bnot [int][IO.FileAttributes]::ReadOnly))
+                        [IO.File]::SetAttributes($entry.Path, $writableAttributes)
+                    }
+                    if ($entry.IsDirectory) { [IO.Directory]::Delete($entry.Path, $false) }
+                    else { [IO.File]::Delete($entry.Path) }
+                }
+            } finally { $restorePrivilege.Dispose() }
+            return 'deleted'
         }
         Write-LauncherPhase 'acl-grant'
+        Start-CleanupBudget
         foreach ($grant in @($state.acl_grants)) {
             $path = [string]$grant.path
-            $mask = [int][Enum]::Parse([Security.AccessControl.FileSystemRights], [string]$grant.rights)
-            $directory = [int]$grant.inheritance -ne 0 -or [string]$grant.rights -match 'Traverse'
-            $result = [KeelDock.Platform.DevLaneWindows.Boundary]::RemoveTrackedGrant(
-                $path, [string]$state.package_sid, $mask, [int]$grant.inheritance, $directory)
-            if ($result -notin @('updated', 'missing')) { throw }
+            $pathInfo = Get-CleanupPathInfo $path
+            if ($null -eq $pathInfo) { continue }
+            if ([int]$grant.inheritance -ne 0) {
+                if (-not $pathInfo.Item.PSIsContainer) { throw }
+                Assert-CleanupTreeSafe $pathInfo.Path
+            }
+            Invoke-CleanupIcacls $pathInfo.Path @('/remove:g', ('*' + [string]$state.package_sid))
         }
         foreach ($path in @($state.integrity_grants)) {
-            $result = [KeelDock.Platform.DevLaneWindows.Boundary]::RestoreIntegrityMedium([string]$path)
-            if ($result -notin @('updated', 'missing')) { throw }
+            $pathInfo = Get-CleanupPathInfo ([string]$path)
+            if ($null -eq $pathInfo) { continue }
+            if (-not $pathInfo.Item.PSIsContainer) { throw }
+            Assert-CleanupTreeSafe $pathInfo.Path
+            Invoke-CleanupIcacls $pathInfo.Path @('/setintegritylevel', '(OI)(CI)M')
         }
         Clear-AppContainerStorage ([string]$state.package_sid) ([string]$state.profile_name)
         [KeelDock.Platform.DevLaneWindows.Boundary]::AssertCleanupQuiescent(

@@ -3,6 +3,7 @@
 import json
 import contextlib
 import io
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -203,6 +204,11 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         native = Path(windows.__file__).with_name("sandbox_windows_native.cs").read_text(encoding="utf-8")
         run = script.split("if ($Mode -eq 'run')", 1)[1].split("if ($Mode -eq 'delete')", 1)[0]
         cleanup = script.split("if ($Mode -eq 'delete')", 1)[1].split("\n    throw\n} catch {", 1)[0]
+        tracked_grant = run.split("function Add-TrackedGrant", 1)[1].split("function Save-State", 1)[0]
+        tracked_integrity = run.split("function Add-TrackedIntegrityGrant", 1)[1].split(
+            "Write-LauncherPhase 'acl-grant'", 1,
+        )[0]
+        storage_access = script.split("function Set-CleanupStorageAccess", 1)[1].split("try {", 1)[0]
         self.assertIn("Write-LauncherPhase 'acl-grant'", run)
         self.assertIn("$system32Path", run)
         self.assertIn("[StringComparison]::OrdinalIgnoreCase)) { continue }", run)
@@ -211,9 +217,12 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         self.assertIn("$integrityGrants = [Collections.Generic.List[string]]::new()", run)
         self.assertIn("Add-TrackedIntegrityGrant $path", run)
         self.assertIn("foreach ($path in @($state.integrity_grants))", cleanup)
-        self.assertIn("Boundary]::RemoveTrackedGrant(", cleanup)
-        self.assertIn("Boundary]::RestoreIntegrityMedium([string]$path)", cleanup)
-        self.assertIn("Boundary]::RestoreAndDeleteAppContainerStorage($actual)", cleanup)
+        self.assertIn("Invoke-CleanupIcacls $pathInfo.Path @('/remove:g'", cleanup)
+        self.assertIn("Invoke-CleanupIcacls $pathInfo.Path @('/setintegritylevel', '(OI)(CI)M')", cleanup)
+        self.assertIn("function Clear-AppContainerStorage", cleanup)
+        self.assertIn("Set-CleanupStorageAccess $entry.Path", cleanup)
+        self.assertIn("[IO.Directory]::Delete($entry.Path, $false)", cleanup)
+        self.assertIn("[IO.File]::SetAttributes($entry.Path, $writableAttributes)", cleanup)
         self.assertIn("Boundary]::AssertCleanupQuiescent(", cleanup)
         self.assertLess(cleanup.index("AssertCleanupQuiescent"), cleanup.index("Remove-NetFirewallRule"))
         self.assertLess(cleanup.index("AssertCleanupQuiescent", cleanup.index("Clear-AppContainerStorage")),
@@ -223,18 +232,33 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         self.assertIn("empty=confirmed", run)
         self.assertNotIn("Set-Acl", cleanup)
         self.assertNotIn("takeown", cleanup.lower())
-        self.assertNotRegex(cleanup, r"(?i)icacls|'/T'|Remove-Item.*-Recurse")
+        self.assertNotRegex(cleanup, r"(?i)'/T'|\"/T\"|Remove-Item.*-Recurse")
         self.assertNotIn("$modifiedPaths", cleanup)
         self.assertNotIn("Restore-RunnerAccessTree", cleanup)
+        self.assertIn("Assert-CleanupTreeSafe $pathInfo.Path", cleanup)
+        self.assertLess(tracked_grant.index("Assert-CleanupTreeSafe"), tracked_grant.index("Set-Acl"))
+        self.assertLess(tracked_integrity.index("Assert-CleanupTreeSafe"), tracked_integrity.index("'/setintegritylevel'"))
+        self.assertLess(cleanup.index("Assert-CleanupTreeSafe $pathInfo.Path"),
+                        cleanup.index("Invoke-CleanupIcacls $pathInfo.Path @('/remove:g'"))
+        self.assertNotIn("(OI)(CI)", storage_access)
+        self.assertIn("Add-CleanupBudgetEntry", script)
+        self.assertIn("if ($name -eq '.' -or $name -eq '..') { continue }", script)
+        self.assertIn("& $icacls $Path @Arguments '/L' '/Q'", script)
+        self.assertNotRegex(cleanup, r"(?i)'/T'|\"/T\"")
+        self.assertNotRegex(script, r"(?i)'/T'|\"/T\"")
+        self.assertNotIn("SetSecurityInfo", native)
+        self.assertNotIn("GetFileInformationByHandleEx", native)
+        self.assertNotIn("DeleteHandleEntry", native)
+        self.assertIn("UnprotectedDaclSecurityInformation = 0x20000000", native)
         self.assertIn("FileFlagOpenReparsePoint = 0x00200000", native)
         self.assertIn("FileFlagBackupSemantics = 0x02000000", native)
         self.assertIn("FileShareRead | FileShareWrite", native)
+        self.assertIn("AssertCleanupEntry(", native)
         self.assertIn("GetFileInformationByHandle(handle, out information)", native)
         self.assertIn("FileAttributeReparsePoint) != 0", native)
-        self.assertIn("SetSecurityInfo(handle, SeFileObject", native)
-        self.assertIn("GetFileInformationByHandleEx(directory, FileIdBothDirectoryInfoClass", native)
-        self.assertIn("CleanupEntryLimit = 250000", native)
-        self.assertIn("CleanupDeadlineMilliseconds = 600000", native)
+        self.assertIn("if (!requireDirectory && information.NumberOfLinks != 1)", native)
+        self.assertIn("$script:WindowsCleanupEntries -gt 250000", script)
+        self.assertIn("$script:WindowsCleanupTimer.ElapsedMilliseconds -gt 600000", script)
         python_source = Path(windows.__file__).read_text(encoding="utf-8")
         self.assertIn("timeout=WINDOWS_PROFILE_CLEANUP_TIMEOUT_SECONDS", python_source)
 
@@ -243,10 +267,13 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         native = Path(windows.__file__).with_name("sandbox_windows_native.cs").read_text(encoding="utf-8")
         delete = script.split("if ($Mode -eq 'delete') {", 1)[1].split("\n    throw\n} catch {", 1)[0]
         check = native.split("public static void AssertCleanupQuiescent", 1)[1].split(
-            "public static string RemoveTrackedGrant", 1,
+            "private static bool IsProcessGone", 1,
         )[0]
         self.assertIn('jobState != "none" && jobState != "terminated-empty"', check)
         self.assertIn("Process.GetProcesses()", check)
+        self.assertIn("item.SessionId", check)
+        self.assertIn("GetProcessInformation(process, ProcessProtectionLevelInfo", check)
+        self.assertIn("ClassifyCleanupProcessFixture", check)
         self.assertIn("OpenProcessToken(process, TokenQuery, out token)", check)
         self.assertIn("EqualSid(Marshal.ReadIntPtr(app), expectedSid)", check)
         self.assertIn('throw new InvalidOperationException("cleanup_process_alive")', check)
@@ -265,34 +292,142 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             self.assertEqual(caught.exception.reason, "other")
             powershell.assert_not_called()
 
-    def test_cleanup_handle_contract_covers_swapped_root_and_ancestor(self):
+    def test_cleanup_uses_bounded_reparse_refusal_and_noninheriting_path_mutations(self):
         native = Path(windows.__file__).with_name("sandbox_windows_native.cs").read_text(encoding="utf-8")
-        open_path = native.split("private static CleanupPathLease OpenCleanupPath", 1)[1].split(
-            "private static SafeFileHandle OpenCleanupHandle", 1,
-        )[0]
-        open_handle = native.split("private static SafeFileHandle OpenCleanupHandle", 1)[1].split(
-            "private static void ValidateCleanupHandle", 1,
-        )[0]
-        tracked = native.split("public static string RemoveTrackedGrant", 1)[1].split(
-            "public static string RestoreIntegrityMedium", 1,
-        )[0]
-        tree = native.split("public static string RestoreAndDeleteAppContainerStorage", 1)[1].split(
-            "private static CleanupPathLease OpenCleanupPath", 1,
-        )[0]
-        self.assertIn("OpenCleanupHandle(root", open_path)
-        self.assertIn("OpenCleanupHandle(current", open_path)
-        self.assertIn("handles.Add(next)", open_path)
-        self.assertIn("FileFlagOpenReparsePoint | FileFlagBackupSemantics", open_handle)
-        self.assertIn("FileShareRead | FileShareWrite", open_handle)
-        self.assertNotIn("FileShareDelete", open_handle)
-        self.assertIn("using (lease)", tracked)
-        self.assertIn("RemoveAccessRuleFromHandle(lease.Target", tracked)
-        self.assertIn("OpenCleanupHandle(childPath", tree)
-        self.assertIn("EnumerateCleanupChildren(frame.Handle, timer)", tree)
-        self.assertIn("RestoreStorageEntry(child", tree)
-        self.assertIn("DeleteHandleEntry(child", tree)
-        self.assertNotIn("Set-Acl", native)
+        script = Path(windows.__file__).with_name("sandbox_windows.ps1").read_text(encoding="utf-8")
+        cleanup = script.split("if ($Mode -eq 'delete') {", 1)[1].split("\n    throw\n} catch {", 1)[0]
+        self.assertIn("Get-CleanupPathInfo", script)
+        self.assertIn("Boundary]::AssertCleanupEntry", script)
+        self.assertIn("Assert-CleanupTreeSafe", cleanup)
+        self.assertIn("Set-CleanupStorageAccess", cleanup)
+        self.assertIn("'/L'", script)
+        self.assertNotIn("CleanupPathLease", native)
+        self.assertNotIn("EnumerateCleanupChildren", native)
+        self.assertNotIn("RestoreStorageEntry", native)
+        self.assertNotIn("DeleteHandleEntry", native)
+        self.assertNotIn("SetSecurityInfo", native)
         self.assertNotIn("takeown", native.lower())
+
+    def test_protected_process_fixture_does_not_block_identity_scan(self):
+        native = Path(windows.__file__).with_name("sandbox_windows_native.cs").read_text(encoding="utf-8")
+        classifier = native.split("public static string ClassifyCleanupProcessFixture", 1)[1].split(
+            "public static string RemoveTrackedGrant", 1,
+        )[0] if "public static string RemoveTrackedGrant" in native else native.split(
+            "public static string ClassifyCleanupProcessFixture", 1,
+        )[1].split("public static string Run", 1)[0]
+        self.assertIn("processSession != currentSession", classifier)
+        self.assertIn("protectionLevel != ProtectionLevelNone", classifier)
+        self.assertIn("IsSystemAccountSid(accountSid)", classifier)
+        self.assertIn("sid.StartsWith(\"S-1-5-80-\"", native)
+        self.assertIn("ClassifyCleanupProcessAccessFailureFixture", native)
+        self.assertIn('openError == ErrorAccessDenied', native)
+        self.assertIn('String.Equals(processName, "csrss", StringComparison.OrdinalIgnoreCase)', native)
+        self.assertIn("if (!inspected) return \"refuse\"", classifier)
+        self.assertIn("GetProcessInformation(process, ProcessProtectionLevelInfo", native)
+        fixtures = [
+            (0, 3, 0, "S-1-5-18", True, "skip-session"),
+            (3, 3, 8, "S-1-5-21-1-2-3-1001", True, "skip-protected"),
+            (3, 3, 0xfffffffe, "S-1-5-18", True, "skip-system"),
+            (3, 3, 0xfffffffe, "S-1-5-80-123456", True, "skip-system"),
+            (3, 3, 0xfffffffe, "S-1-5-21-1-2-3-1001", False, "refuse"),
+            (3, 3, 0xfffffffe, "S-1-5-21-1-2-3-1001", True, "inspect-identity"),
+        ]
+        for session, current, protection, account, inspected, expected in fixtures:
+            with self.subTest(expected=expected, session=session, protection=protection):
+                if not inspected:
+                    result = "refuse"
+                elif session != current:
+                    result = "skip-session"
+                elif protection != 0xfffffffe:
+                    result = "skip-protected"
+                elif account in {"S-1-5-18", "S-1-5-19", "S-1-5-20"} or account.startswith("S-1-5-80-"):
+                    result = "skip-system"
+                else:
+                    result = "inspect-identity"
+                self.assertEqual(result, expected)
+        access_fixtures = [
+            (5, "csrss", False, "skip-protected-system"),
+            (5, "worker", False, "refuse"),
+            (5, "worker", True, "skip-gone"),
+        ]
+        for error, process_name, process_gone, expected in access_fixtures:
+            with self.subTest(expected=expected, process_name=process_name):
+                if process_gone:
+                    result = "skip-gone"
+                elif error == 5 and process_name.lower() == "csrss":
+                    result = "skip-protected-system"
+                else:
+                    result = "refuse"
+                self.assertEqual(result, expected)
+
+    def test_native_constant_values_are_pinned_to_windows_sdk_definitions(self):
+        native = Path(windows.__file__).with_name("sandbox_windows_native.cs").read_text(encoding="utf-8")
+        observed = {
+            name: value.strip()
+            for name, value in re.findall(
+                r"private const (?:uint|int|ulong|byte) ([A-Za-z_]\w*) = ([^;]+);",
+                native,
+            )
+        }
+        expected = {
+            "ProcThreadAttributeHandleList": "0x00020002",
+            "ProcThreadAttributeSecurityCapabilities": "0x00020009",
+            "ProcThreadAttributeAllApplicationPackagesPolicy": "0x0002000f",
+            "CreateSuspended": "0x00000004",
+            "CreateUnicodeEnvironment": "0x00000400",
+            "ExtendedStartupInfoPresent": "0x00080000",
+            "StartfUseStdHandles": "0x00000100",
+            "JobObjectExtendedLimitInformation": "9",
+            "JobObjectBasicProcessIdList": "3",
+            "JobObjectLimitActiveProcess": "0x00000008",
+            "JobObjectLimitProcessMemory": "0x00000100",
+            "JobObjectLimitJobMemory": "0x00000200",
+            "JobObjectLimitKillOnJobClose": "0x00002000",
+            "JobLimitFlags": "JobObjectLimitActiveProcess | JobObjectLimitProcessMemory | JobObjectLimitJobMemory | JobObjectLimitKillOnJobClose",
+            "TokenQuery": "0x0008",
+            "TokenIntegrityLevel": "25",
+            "TokenIsAppContainer": "29",
+            "TokenCapabilities": "30",
+            "TokenAppContainerSid": "31",
+            "TokenUser": "1",
+            "TokenIsLessPrivilegedAppContainer": "46",
+            "ErrorInsufficientBuffer": "122",
+            "ErrorMoreData": "234",
+            "WaitObject0": "0",
+            "WaitTimeout": "0x00000102",
+            "JobExitCode": "0x4b44574b",
+            "ProcessMemoryLimit": "4294967296UL",
+            "JobMemoryLimit": "12884901888UL",
+            "ActiveProcessLimit": "256",
+            "CreateNewConsole": "0x00000010",
+            "FileAttributeNormal": "0x00000080",
+            "OpenExisting": "3",
+            "GenericRead": "0x80000000",
+            "GenericWrite": "0x40000000",
+            "FileShareRead": "1",
+            "FileShareWrite": "2",
+            "FileFlagOpenReparsePoint": "0x00200000",
+            "FileFlagBackupSemantics": "0x02000000",
+            "FileReadAttributes": "0x00000080",
+            "FileAttributeDirectory": "0x00000010",
+            "FileAttributeReparsePoint": "0x00000400",
+            "ProcessQueryLimitedInformation": "0x1000",
+            "TokenAdjustPrivileges": "0x0020",
+            "SePrivilegeEnabled": "0x00000002",
+            "UnprotectedDaclSecurityInformation": "0x20000000",
+            "ProcessProtectionLevelInfo": "7",
+            "ProtectionLevelNone": "0xfffffffe",
+            "ErrorInvalidParameter": "87",
+            "ErrorAccessDenied": "5",
+            "ErrorNotFound": "1168",
+            "ErrorFileNotFound": "2",
+            "ErrorPathNotFound": "3",
+            "ErrorNotAllAssigned": "1300",
+            "CleanupEntryLimit": "250000",
+            "CleanupDeadlineMilliseconds": "600000",
+            "SecurityEnabled": "0x00000004",
+        }
+        self.assertEqual(observed, expected)
 
     def test_substituted_cleanup_root_is_refused_before_powershell_acl_cleanup(self):
         with tempfile.TemporaryDirectory() as temporary:
