@@ -383,23 +383,80 @@ class PowerShellStaticTests(unittest.TestCase):
         self.assertIn("function Clear-AppContainerStorage", script)
         self.assertIn("GetProfileFolderPath($PackageSid)", script)
         self.assertIn("[StringComparison]::OrdinalIgnoreCase", script)
-        self.assertIn("[IO.FileAttributes]::ReparsePoint", script)
-        restore = script.split("function Restore-RunnerAccessTree", 1)[1].split(
-            "function Clear-AppContainerStorage", 1,
-        )[0]
-        self.assertIn("'/F' $Root '/A' '/R' '/D' 'Y'", restore)
-        self.assertIn("$Root '/reset' '/T' '/C' '/Q'", restore)
-        self.assertIn("$Root '/grant:r' '*S-1-5-32-544:(OI)(CI)F'", restore)
-        self.assertIn("$entryCount -gt 250000", restore)
-        self.assertLess(restore.index("while ($pending.Count -gt 0)"), restore.index("& $takeown"))
-        scan = restore[:restore.index("& $takeown")]
-        self.assertNotIn("& $takeown", scan)
-        self.assertNotIn("& $icacls", scan)
         cleanup = script.split("if ($Mode -eq 'delete') {", 1)[1].split("\n    throw\n} catch {", 1)[0]
         self.assertLess(cleanup.index("Clear-AppContainerStorage"), cleanup.index("DeleteProfile"))
-        self.assertIn("'/T'", cleanup)
-        self.assertIn("Restore-RunnerAccessTree $fullPath", cleanup)
+        self.assertIn("Set-CleanupStorageAccess $entry.Path", cleanup)
+        self.assertIn("Invoke-CleanupIcacls $pathInfo.Path @('/remove:g'", cleanup)
+        self.assertIn("Invoke-CleanupIcacls $pathInfo.Path @('/setintegritylevel', '(OI)(CI)M')", cleanup)
+        self.assertIn("$state.integrity_grants", cleanup)
+        self.assertNotIn("Set-Acl", cleanup)
+        self.assertNotIn("takeown", cleanup.lower())
+        self.assertIn("icacls.exe", script)
+        self.assertIn("'/L'", script)
+        self.assertNotRegex(cleanup, r"(?i)'/T'|\"/T\"|Get-ChildItem|Remove-Item.*-Recurse")
+        self.assertIn("AssertCleanupQuiescent(", cleanup)
+        self.assertLess(cleanup.index("AssertCleanupQuiescent"), cleanup.index("Remove-NetFirewallRule"))
+        self.assertIn("job_state", script)
+        self.assertNotIn("$modifiedPaths", cleanup)
+        self.assertNotIn("Restore-RunnerAccessTree", cleanup)
+        self.assertIn("FileFlagOpenReparsePoint = 0x00200000", native)
+        self.assertIn("FileFlagBackupSemantics = 0x02000000", native)
+        self.assertIn("FileShareRead | FileShareWrite", native)
+        self.assertIn("GetFileInformationByHandle(handle, out information)", native)
+        self.assertIn("AssertCleanupEntry(", native)
+        self.assertNotIn("GetFileInformationByHandleEx", native)
+        self.assertNotIn("SetSecurityInfo", native)
+        self.assertIn("UnprotectedDaclSecurityInformation = 0x20000000", native)
+        self.assertIn("$script:WindowsCleanupEntries -ge 250000", script)
+        self.assertIn("$PendingCount -ge 250000", script)
+        self.assertIn("$script:WindowsCleanupTimer.ElapsedMilliseconds -gt 600000", script)
+        self.assertIn('jobState != "none" && jobState != "terminated-empty"', native)
+        self.assertIn('result.Job += " terminated=confirmed empty=confirmed"', native)
+        windows_source = (ROOT / "kit/devlane/sandbox_windows.py").read_text(encoding="utf-8")
+        self.assertIn("timeout=MAX_CHILD_SECONDS + 300", windows_source)
+        self.assertIn("timeout=WINDOWS_PROFILE_CLEANUP_TIMEOUT_SECONDS", windows_source)
         self.assertIn("windows_cleanup_reason=", script)
+
+    def test_add_type_native_helper_uses_csharp5_syntax(self):
+        native = (ROOT / "kit/devlane/sandbox_windows_native.cs").read_text(encoding="utf-8")
+        self.assertNotRegex(native, r'\$@"|@\$"|\$"')
+        code = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', '""', native)
+        self.assertNotRegex(code, r"\?\.")
+        self.assertNotRegex(code, r"\bnameof\s*\(")
+        self.assertNotIn("=>", code)
+        self.assertNotRegex(code, r"\bis\s+(?:var|[A-Z][A-Za-z0-9_.<>\[\]]*)\s+[A-Za-z_]\w*")
+        self.assertNotRegex(code, r"\bis\s+null\b|\bis\s+not\s+null\b")
+        self.assertNotRegex(code, r"\bcase\s+(?:var\s+[A-Za-z_]\w*|[A-Z][A-Za-z0-9_.<>\[\]]*\s+[A-Za-z_]\w*)\s*:")
+        self.assertNotRegex(code, r"\b(?:is|case)\s+[A-Z][A-Za-z0-9_.<>\[\]]*\s*\{")
+        self.assertNotRegex(code, r"\bvar\s*\([^)]*,[^)]*\)\s*=")
+        tuple_element = r"(?:bool|byte|char|short|ushort|int|uint|long|ulong|float|double|decimal|string|object|[A-Z][A-Za-z0-9_.<>\[\]]*)"
+        self.assertNotRegex(
+            code,
+            r"\(\s*" + tuple_element + r"\s+[A-Za-z_]\w*\s*,\s*"
+            + tuple_element + r"\s+[A-Za-z_]\w*\s*\)\s*=",
+        )
+        self.assertNotRegex(
+            code,
+            r"\b(?:public|private|protected|internal)\s+static\s*"
+            r"\([^)]*,[^)]*\)\s+[A-Za-z_]\w*",
+        )
+        inline_out = []
+        for match in re.finditer(
+            r"\bout\s+(?:var|bool|byte|char|short|ushort|int|uint|long|ulong|"
+            r"float|double|decimal|object|string|IntPtr|UIntPtr|[A-Z][A-Za-z0-9_.<>]*)"
+            r"\s+[A-Za-z_]\w*",
+            code,
+        ):
+            prefix = code[:match.start()]
+            segment = re.split(r"[;{}]", prefix)[-1]
+            is_parameter = re.search(
+                r"\b(?:extern|public|private|protected|internal)\s+"
+                r"(?:static\s+)?[^;{}]*\([^;{}]*$",
+                segment,
+            )
+            if not is_parameter:
+                inline_out.append(match.group(0))
+        self.assertEqual(inline_out, [])
 
 
 if __name__ == "__main__":

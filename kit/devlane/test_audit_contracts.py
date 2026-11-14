@@ -253,6 +253,8 @@ def _step_outputs(step, identity, kind, records):
     if identity.get("platform") == "windows":
         outputs.update({
             "Prepare dependencies before the cut": [
+                "windows_prepare_stage_start=npm-ci",
+                "windows_token_bypass_traverse=present",
                 "windows_prepare=complete lifecycle_scripts=disabled identity=lpac network=outbound-only",
             ],
             "Prove public connectivity before the cut": ["windows_public_connectivity=proved"],
@@ -3043,6 +3045,7 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         denial = "macos_sandbox_denial op=mach-lookup target=com.apple.SystemConfiguration.configd"
         self.assertTrue(grammar.step_output_ok(audit.MACOS_PREPARE_STEP, denial, counts))
         self.assertFalse(grammar.step_output_ok(audit.MACOS_PREPARE_STEP, denial, counts))
+        slash = chr(47)
         for invalid in (
             "macos_dns_probe_variant name=private result=ok",
             "macos_dns_probe_variant name=all result=okay",
@@ -3050,9 +3053,34 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             "macos_sandbox_denial op=mach-lookup target=/secret",
             "macos_sandbox_denial op=file-read-data target=com.apple.networkd",
             "macos_sandbox_denial op=file-read-data target=private-path",
+            "macos_sandbox_denial op=file-read-data target=" + chr(47) + "Users/runner/private.txt",
+            "macos_sandbox_denial op=file-read-data target=/System/../" + "Users/runner/private.txt",
+            "macos_sandbox_denial op=file-read-data target=" + slash + "System" + slash * 2
+            + "Volumes" + slash * 3 + "Data" + slash * 2 + "Users" + slash + "alice/private.txt",
+            "macos_sandbox_denial op=file-read-data target=" + slash + slash.join(
+                ("System", "Volumes", "Data", "Users", "alice", "..", "alice", "private.txt"),
+            ),
+            "macos_sandbox_denial op=file-read-data target=" + slash + slash.join(
+                ("system", "volumes", "data", "users", "alice", "private.txt"),
+            ),
+            "macos_sandbox_denial op=file-read-data target=" + slash + "SYSTEM" + slash * 2
+            + "VOLUMES" + slash * 2 + "DATA" + slash * 2 + "USERS" + slash + "alice/private.txt",
+            "macos_sandbox_denial op=mach-lookup target=com.apple." + "x" * 121,
+            "macos_sandbox_denial op=mach-lookup target=com.apple.safe:extra",
         ):
             with self.subTest(invalid=invalid):
                 self.assertFalse(grammar.step_output_ok(audit.MACOS_PREPARE_STEP, invalid, {}))
+        for target in (
+            "com.apple.SystemConfiguration.DNSConfiguration", "runner-home", "run-root", "toolcache",
+            "/System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration",
+            chr(47) + "private/var/run/resolv.conf", chr(47) + "var/run/resolv.conf",
+        ):
+            operation = "mach-lookup" if target.startswith("com.apple.") else "file-read-data"
+            with self.subTest(target=target):
+                self.assertTrue(grammar.step_output_ok(
+                    audit.MACOS_PREPARE_STEP,
+                    "macos_sandbox_denial op=" + operation + " target=" + target, {},
+                ))
         self.assertFalse(grammar.step_output_ok(audit.MACOS_PROBE_STEP, denial, {}))
         windows = audit._Grammar(
             Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml",
@@ -3091,6 +3119,24 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         self.assertTrue(grammar.step_output_ok(
             audit.WINDOWS_PREPARE_STEP, "windows_prepare_timeout limit=npm-child seconds=3600", counts,
         ))
+        self.assertTrue(grammar.step_output_ok(
+            audit.WINDOWS_PREPARE_STEP,
+            "windows_prepare_limit stage=npm-ci limit=work-deadline seconds=600 powershell-seconds=630", counts,
+        ))
+        self.assertTrue(grammar.step_output_ok(
+            audit.WINDOWS_PREPARE_STEP,
+            "windows_prepare_limit stage=playwright limit=work-deadline seconds=600 powershell-seconds=630", counts,
+        ))
+        for phase in sorted(audit.WINDOWS_LAUNCHER_PHASES):
+            self.assertTrue(grammar.step_output_ok(
+                audit.WINDOWS_PREPARE_STEP, "windows_launcher_phase=" + phase, counts,
+            ))
+        self.assertTrue(grammar.step_output_ok(
+            "Shred runner-local workspace", "windows_launcher_phase=acl-grant", {},
+        ))
+        self.assertFalse(grammar.step_output_ok(
+            "Decrypt authenticated bundle", "windows_launcher_phase=wait", {},
+        ))
         for invalid in (
             "windows_prepare_stage_start=unknown",
             "windows_prepare_heartbeat stage=npm-ci elapsed=59 children=0 top=other",
@@ -3098,11 +3144,37 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             "windows_prepare_heartbeat stage=npm-ci elapsed=240 children=1 top=private.exe",
             "windows_prepare_timeout limit=external seconds=960",
             "windows_prepare_timeout limit=powershell seconds=0",
+            "windows_prepare_limit stage=npm-ci limit=playwright-child seconds=600 powershell-seconds=630",
+            "windows_prepare_limit stage=npm-ci limit=work-deadline seconds=600 powershell-seconds=600",
+            "windows_prepare_limit stage=playwright limit=playwright-child seconds=1801 powershell-seconds=1831",
+            "windows_launcher_phase=private-data",
         ):
             with self.subTest(invalid=invalid):
                 self.assertFalse(grammar.step_output_ok(audit.WINDOWS_PREPARE_STEP, invalid, {}))
         self.assertFalse(grammar.step_output_ok(
             "Shred runner-local workspace", "windows_prepare_stage_start=copy", {},
+        ))
+        token_counts = {}
+        self.assertFalse(grammar.step_output_ok(
+            audit.WINDOWS_PREPARE_STEP, "windows_token_bypass_traverse=present", token_counts,
+        ))
+        self.assertTrue(grammar.step_output_ok(
+            audit.WINDOWS_PREPARE_STEP, "windows_prepare_stage_start=npm-ci", token_counts,
+        ))
+        self.assertTrue(grammar.step_output_ok(
+            audit.WINDOWS_PREPARE_STEP, "windows_token_bypass_traverse=present", token_counts,
+        ))
+        self.assertFalse(grammar.step_output_ok(
+            audit.WINDOWS_PREPARE_STEP, "windows_token_bypass_traverse=absent", token_counts,
+        ))
+        self.assertFalse(grammar.step_output_ok(
+            "Probe isolation before decryption", "windows_token_bypass_traverse=present", {},
+        ))
+        self.assertFalse(grammar.step_output_ok(
+            "Fetch public control and validate dispatch", "windows_launcher_phase=types-load", {},
+        ))
+        self.assertFalse(grammar.step_output_ok(
+            "Cut network and start the isolated supervisor", "windows_launcher_phase=job-create", {},
         ))
         bounded = {}
         for stage in ("profile-create", "npm-ci"):
@@ -3146,8 +3218,17 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                     else:
                         step["conclusion"] = "skipped"
                 marker = "devlane_refusal=" + code
+                failure_outputs = None
+                if code == "windows-prepare-token-bypass-traverse-absent":
+                    failure_outputs = [
+                        "windows_prepare_stage=none",
+                        "windows_prepare_stage_start=npm-ci",
+                        "windows_token_bypass_traverse=absent",
+                        marker,
+                    ]
                 log = _render_real_runner_encrypted_log(
-                    identity, early_failure={"step": failed_step, "marker": marker, "exit_code": 1},
+                    identity, early_failure={"step": failed_step, "marker": marker, "exit_code": 1,
+                                              **({"outputs": failure_outputs} if failure_outputs else {})},
                 )
                 surface = audit.validate_job_log_surface(log, audit.PLATFORM_RUN_JOBS["windows"], identity,
                                                          completed=True)

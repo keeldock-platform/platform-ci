@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.ComponentModel;
+using Microsoft.Win32.SafeHandles;
 
 namespace KeelDock.Platform.DevLaneWindows
 {
@@ -19,6 +21,12 @@ namespace KeelDock.Platform.DevLaneWindows
 
     public static class Boundary
     {
+        private static void Phase(string name)
+        {
+            Console.Out.WriteLine("windows_launcher_phase=" + name);
+            Console.Out.Flush();
+        }
+
         private const uint ProcThreadAttributeHandleList = 0x00020002;
         private const uint ProcThreadAttributeSecurityCapabilities = 0x00020009;
         private const uint ProcThreadAttributeAllApplicationPackagesPolicy = 0x0002000f;
@@ -38,6 +46,8 @@ namespace KeelDock.Platform.DevLaneWindows
         private const int TokenIsAppContainer = 29;
         private const int TokenCapabilities = 30;
         private const int TokenAppContainerSid = 31;
+        private const int TokenUser = 1;
+        private const int TokenPrivilegesInformation = 3;
         private const int TokenIsLessPrivilegedAppContainer = 46;
         private const uint ErrorInsufficientBuffer = 122;
         private const int ErrorMoreData = 234;
@@ -54,6 +64,25 @@ namespace KeelDock.Platform.DevLaneWindows
         private const uint GenericWrite = 0x40000000;
         private const uint FileShareRead = 1;
         private const uint FileShareWrite = 2;
+        private const uint FileFlagOpenReparsePoint = 0x00200000;
+        private const uint FileFlagBackupSemantics = 0x02000000;
+        private const uint FileReadAttributes = 0x00000080;
+        private const uint FileAttributeDirectory = 0x00000010;
+        private const uint FileAttributeReparsePoint = 0x00000400;
+        private const uint ProcessQueryLimitedInformation = 0x1000;
+        private const uint TokenAdjustPrivileges = 0x0020;
+        private const uint SePrivilegeEnabled = 0x00000002;
+        private const uint UnprotectedDaclSecurityInformation = 0x20000000;
+        private const int ProcessProtectionLevelInfo = 7;
+        private const uint ProtectionLevelNone = 0xfffffffe;
+        private const int ErrorInvalidParameter = 87;
+        private const int ErrorAccessDenied = 5;
+        private const int ErrorNotFound = 1168;
+        private const int ErrorFileNotFound = 2;
+        private const int ErrorPathNotFound = 3;
+        private const int ErrorNotAllAssigned = 1300;
+        private const int CleanupEntryLimit = 250000;
+        private const int CleanupDeadlineMilliseconds = 600000;
         private const uint SecurityEnabled = 0x00000004;
 
         [StructLayout(LayoutKind.Sequential)]
@@ -123,6 +152,78 @@ namespace KeelDock.Platform.DevLaneWindows
         private struct TokenAppContainerInformation
         {
             public IntPtr TokenAppContainer;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileTime
+        {
+            public uint Low;
+            public uint High;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ByHandleFileInformation
+        {
+            public uint FileAttributes;
+            public FileTime CreationTime;
+            public FileTime LastAccessTime;
+            public FileTime LastWriteTime;
+            public uint VolumeSerialNumber;
+            public uint FileSizeHigh;
+            public uint FileSizeLow;
+            public uint NumberOfLinks;
+            public uint FileIndexHigh;
+            public uint FileIndexLow;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Luid
+        {
+            public uint LowPart;
+            public int HighPart;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LuidAndAttributes
+        {
+            public Luid Luid;
+            public uint Attributes;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct TokenPrivileges
+        {
+            public uint PrivilegeCount;
+            public LuidAndAttributes Privileges;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ProcessProtectionLevelInformation
+        {
+            public uint ProtectionLevel;
+        }
+
+        private sealed class PrivilegeScope : IDisposable
+        {
+            private readonly IntPtr token;
+            private TokenPrivileges previous;
+
+            public PrivilegeScope(IntPtr tokenHandle, TokenPrivileges previousState)
+            {
+                token = tokenHandle;
+                previous = previousState;
+            }
+
+            public void Dispose()
+            {
+                if (token == IntPtr.Zero) return;
+                if (!RestoreTokenPrivileges(token, false, ref previous, 0, IntPtr.Zero, IntPtr.Zero))
+                {
+                    Close(token);
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+                Close(token);
+            }
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -198,9 +299,27 @@ namespace KeelDock.Platform.DevLaneWindows
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern IntPtr LocalFree(IntPtr memory);
 
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "CreateFileW", SetLastError = true)]
+        private static extern SafeFileHandle CreateCleanupFile(string name, uint access, uint share, IntPtr security,
+            uint creation, uint flags, IntPtr template);
+
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern IntPtr CreateFileW(string name, uint access, uint share, ref SecurityAttributes security,
             uint creation, uint flags, IntPtr template);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out ByHandleFileInformation information);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint access, bool inherit, uint processId);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentProcess();
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool EqualSid(IntPtr first, IntPtr second);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -238,6 +357,11 @@ namespace KeelDock.Platform.DevLaneWindows
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetProcessInformation(IntPtr process, int informationClass,
+            ref ProcessProtectionLevelInformation information, uint informationSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool TerminateProcess(IntPtr process, uint exitCode);
 
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -265,6 +389,20 @@ namespace KeelDock.Platform.DevLaneWindows
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
 
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool LookupPrivilegeValueW(string systemName, string name, out Luid luid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TokenPrivileges newState,
+            uint bufferLength, out TokenPrivileges previousState, out uint returnLength);
+
+        [DllImport("advapi32.dll", EntryPoint = "AdjustTokenPrivileges", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool RestoreTokenPrivileges(IntPtr token, bool disableAll, ref TokenPrivileges newState,
+            uint bufferLength, IntPtr previousState, IntPtr returnLength);
+
         [DllImport("advapi32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool GetTokenInformation(IntPtr token, int informationClass, IntPtr information,
@@ -278,6 +416,7 @@ namespace KeelDock.Platform.DevLaneWindows
         public static string CreateProfile(string name)
         {
             if (String.IsNullOrEmpty(name) || name.Length > 64) throw new InvalidOperationException("profile_name");
+            Phase("appcontainer-sid");
             IntPtr sid = IntPtr.Zero;
             int status = CreateAppContainerProfile(name, name, name, IntPtr.Zero, 0, out sid);
             if (status != 0 && unchecked((uint)status) != 0x800700b7) throw new InvalidOperationException("profile_create");
@@ -303,6 +442,16 @@ namespace KeelDock.Platform.DevLaneWindows
             return "other";
         }
 
+        private static string CleanupReason(int status)
+        {
+            uint value = unchecked((uint)status);
+            uint code = (value & 0xffff0000U) == 0x80070000U ? value & 0xffffU : value;
+            if (code == 32U || code == 33U) return "sharing-violation";
+            if (code == 5U) return "access-denied";
+            if (code == 2U || code == 3U) return "not-found";
+            return "other";
+        }
+
         public static string GetProfileFolderPath(string packageSid)
         {
             if (String.IsNullOrEmpty(packageSid)) throw new InvalidOperationException("profile_sid");
@@ -319,14 +468,223 @@ namespace KeelDock.Platform.DevLaneWindows
             finally { CoTaskMemFree(path); }
         }
 
-        private static string CleanupReason(int status)
+        private static PrivilegeScope EnablePrivilege(string name)
         {
-            uint value = unchecked((uint)status);
-            uint code = (value & 0xffff0000U) == 0x80070000U ? value & 0xffffU : value;
-            if (code == 32U || code == 33U) return "sharing-violation";
-            if (code == 5U) return "access-denied";
-            if (code == 2U || code == 3U) return "not-found";
-            return "other";
+            IntPtr token = IntPtr.Zero;
+            try
+            {
+                if (!OpenProcessToken(GetCurrentProcess(), TokenQuery | TokenAdjustPrivileges, out token)
+                    || token == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+                Luid luid;
+                if (!LookupPrivilegeValueW(null, name, out luid)) throw new Win32Exception(Marshal.GetLastWin32Error());
+                TokenPrivileges requested = new TokenPrivileges();
+                requested.PrivilegeCount = 1;
+                requested.Privileges.Luid = luid;
+                requested.Privileges.Attributes = SePrivilegeEnabled;
+                TokenPrivileges previous;
+                uint returned;
+                if (!AdjustTokenPrivileges(token, false, ref requested,
+                    (uint)Marshal.SizeOf(typeof(TokenPrivileges)), out previous, out returned))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                int status = Marshal.GetLastWin32Error();
+                if (status == ErrorNotAllAssigned) throw new Win32Exception(status);
+                PrivilegeScope scope = new PrivilegeScope(token, previous);
+                token = IntPtr.Zero;
+                return scope;
+            }
+            finally
+            {
+                if (token != IntPtr.Zero) Close(token);
+            }
+        }
+
+        public static IDisposable EnableCleanupRestorePrivilege()
+        {
+            return EnablePrivilege("SeRestorePrivilege");
+        }
+
+        public static void AssertCleanupQuiescent(string packageSid, string jobState)
+        {
+            if (jobState != "none" && jobState != "terminated-empty")
+                throw new InvalidOperationException("cleanup_job_state");
+            IntPtr expectedSid = IntPtr.Zero;
+            try
+            {
+                if (String.IsNullOrEmpty(packageSid) || !ConvertStringSidToSidW(packageSid, out expectedSid)
+                    || expectedSid == IntPtr.Zero || !IsValidSid(expectedSid))
+                    throw new InvalidOperationException("cleanup_identity_sid");
+                using (PrivilegeScope debugPrivilege = EnablePrivilege("SeDebugPrivilege"))
+                {
+                    Process[] processes = Process.GetProcesses();
+                    if (processes == null || processes.Length > CleanupEntryLimit)
+                        throw new InvalidOperationException("cleanup_process_enumeration");
+                    int currentSession = Process.GetCurrentProcess().SessionId;
+                    Stopwatch timer = Stopwatch.StartNew();
+                    try
+                    {
+                        foreach (Process item in processes)
+                        {
+                            if (timer.ElapsedMilliseconds > CleanupDeadlineMilliseconds)
+                                throw new InvalidOperationException("cleanup_process_timeout");
+                            uint processId;
+                            try { processId = unchecked((uint)item.Id); }
+                            catch { throw new InvalidOperationException("cleanup_process_enumeration"); }
+                            if (processId == 0) continue;
+                            if (processId == 4) continue;
+                            int processSession;
+                            try { processSession = item.SessionId; }
+                            catch
+                            {
+                                if (IsProcessGone(item)) continue;
+                                throw new InvalidOperationException("cleanup_process_session");
+                            }
+                            if (processSession != currentSession) continue;
+                            IntPtr process = OpenProcess(ProcessQueryLimitedInformation, false, processId);
+                            if (process == IntPtr.Zero)
+                            {
+                                int openError = Marshal.GetLastWin32Error();
+                                bool processGone = openError == ErrorInvalidParameter || openError == ErrorNotFound
+                                    || openError == ErrorFileNotFound || openError == ErrorPathNotFound
+                                    || IsProcessGone(item);
+                                if (processGone) continue;
+                                string accessClassification = ClassifyCleanupProcessAccessFailureFixture(
+                                    openError, item.ProcessName, false);
+                                if (accessClassification != "refuse") continue;
+                                throw new InvalidOperationException("cleanup_process_inspection");
+                            }
+                            try
+                            {
+                                ProcessProtectionLevelInformation protection = new ProcessProtectionLevelInformation();
+                                if (!GetProcessInformation(process, ProcessProtectionLevelInfo, ref protection,
+                                    (uint)Marshal.SizeOf(typeof(ProcessProtectionLevelInformation))))
+                                {
+                                    if (WaitForSingleObject(process, 0) == WaitObject0) continue;
+                                    throw new InvalidOperationException("cleanup_process_protection");
+                                }
+                                string classification = ClassifyCleanupProcessFixture(processSession, currentSession,
+                                    protection.ProtectionLevel, null, true);
+                                if (classification != "inspect-identity") continue;
+                                IntPtr token = IntPtr.Zero;
+                                if (!OpenProcessToken(process, TokenQuery, out token) || token == IntPtr.Zero)
+                                {
+                                    if (WaitForSingleObject(process, 0) == WaitObject0) continue;
+                                    throw new InvalidOperationException("cleanup_process_token");
+                                }
+                                try
+                                {
+                                    string accountSid = ReadTokenUserSid(token);
+                                    classification = ClassifyCleanupProcessFixture(processSession, currentSession,
+                                        protection.ProtectionLevel, accountSid, true);
+                                    if (classification != "inspect-identity") continue;
+                                    if (ReadTokenDword(token, TokenIsAppContainer) != 1) continue;
+                                    int appLength;
+                                    IntPtr app = QueryToken(token, TokenAppContainerSid, out appLength);
+                                    try
+                                    {
+                                        if (appLength < IntPtr.Size || Marshal.ReadIntPtr(app) == IntPtr.Zero
+                                            || !IsValidSid(Marshal.ReadIntPtr(app)))
+                                            throw new InvalidOperationException("cleanup_process_identity");
+                                        if (EqualSid(Marshal.ReadIntPtr(app), expectedSid))
+                                        {
+                                            if (ReadTokenDword(token, TokenIsLessPrivilegedAppContainer) != 1)
+                                                throw new InvalidOperationException("cleanup_process_identity");
+                                            throw new InvalidOperationException("cleanup_process_alive");
+                                        }
+                                    }
+                                    finally { Marshal.FreeHGlobal(app); }
+                                }
+                                finally { Close(token); }
+                            }
+                            finally { Close(process); }
+                        }
+                    }
+                    finally
+                    {
+                        foreach (Process item in processes) item.Dispose();
+                    }
+                }
+            }
+            catch
+            {
+                throw new InvalidOperationException("cleanup_processes");
+            }
+            finally
+            {
+                LocalFree(expectedSid);
+            }
+        }
+
+        private static bool IsProcessGone(Process process)
+        {
+            try { return process.HasExited; }
+            catch { return false; }
+        }
+
+        private static string ReadTokenUserSid(IntPtr token)
+        {
+            int length;
+            IntPtr user = QueryToken(token, TokenUser, out length);
+            try
+            {
+                if (length < Marshal.SizeOf(typeof(SidAndAttributes)))
+                    throw new InvalidOperationException("cleanup_process_user");
+                SidAndAttributes identity = (SidAndAttributes)Marshal.PtrToStructure(
+                    user, typeof(SidAndAttributes));
+                if (identity.Sid == IntPtr.Zero || !IsValidSid(identity.Sid))
+                    throw new InvalidOperationException("cleanup_process_user");
+                return SidText(identity.Sid);
+            }
+            finally { Marshal.FreeHGlobal(user); }
+        }
+
+        private static bool IsSystemAccountSid(string sid)
+        {
+            return sid == "S-1-5-18" || sid == "S-1-5-19" || sid == "S-1-5-20"
+                || (sid != null && sid.StartsWith("S-1-5-80-", StringComparison.Ordinal));
+        }
+
+        public static string ClassifyCleanupProcessFixture(int processSession, int currentSession,
+            uint protectionLevel, string accountSid, bool inspected)
+        {
+            if (!inspected) return "refuse";
+            if (processSession != currentSession) return "skip-session";
+            if (protectionLevel != ProtectionLevelNone) return "skip-protected";
+            if (IsSystemAccountSid(accountSid)) return "skip-system";
+            return "inspect-identity";
+        }
+
+        public static string ClassifyCleanupProcessAccessFailureFixture(int openError, string processName,
+            bool processGone)
+        {
+            if (processGone) return "skip-gone";
+            if (openError == ErrorAccessDenied
+                && String.Equals(processName, "csrss", StringComparison.OrdinalIgnoreCase))
+                return "skip-protected-system";
+            return "refuse";
+        }
+
+        public static void AssertCleanupEntry(string path, bool requireDirectory)
+        {
+            if (String.IsNullOrWhiteSpace(path) || path.Length > 4096 || !System.IO.Path.IsPathRooted(path))
+                throw new InvalidOperationException("cleanup_path");
+            string fullPath = System.IO.Path.GetFullPath(path);
+            string extendedPath = fullPath.StartsWith("\\\\?\\", StringComparison.Ordinal)
+                ? fullPath : "\\\\?\\" + fullPath;
+            using (SafeFileHandle handle = CreateCleanupFile(extendedPath, FileReadAttributes,
+                FileShareRead | FileShareWrite, IntPtr.Zero, OpenExisting,
+                FileFlagOpenReparsePoint | FileFlagBackupSemantics, IntPtr.Zero))
+            {
+                if (handle == null || handle.IsInvalid)
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                ByHandleFileInformation information;
+                if (!GetFileInformationByHandle(handle, out information))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                if ((information.FileAttributes & FileAttributeReparsePoint) != 0
+                    || (requireDirectory && (information.FileAttributes & FileAttributeDirectory) == 0))
+                    throw new InvalidOperationException("cleanup_reparse_or_type");
+                if (!requireDirectory && information.NumberOfLinks != 1)
+                    throw new InvalidOperationException("cleanup_file_link_count");
+            }
         }
 
         public static RunResult Run(string profileName, string appContainerSid, string executable, string[] arguments,
@@ -348,9 +706,11 @@ namespace KeelDock.Platform.DevLaneWindows
             IntPtr process = IntPtr.Zero;
             IntPtr thread = IntPtr.Zero;
             bool attributesReady = false;
+            bool jobReaped = false;
             RunResult result = new RunResult();
             try
             {
+                Phase("appcontainer-sid");
                 if (DeriveAppContainerSidFromAppContainerName(profileName, out sid) != 0
                     || sid == IntPtr.Zero || SidText(sid) != appContainerSid) throw new InvalidOperationException("profile_sid_mismatch");
                 SecurityAttributes security = new SecurityAttributes();
@@ -360,6 +720,7 @@ namespace KeelDock.Platform.DevLaneWindows
                     OpenExisting, FileAttributeNormal, IntPtr.Zero);
                 if (nul == IntPtr.Zero || nul.ToInt64() == -1) throw new InvalidOperationException("nul_handle");
 
+                Phase("job-create");
                 job = CreateJobObjectW(IntPtr.Zero, null);
                 if (job == IntPtr.Zero) throw new InvalidOperationException("job_create");
                 SetJobLimits(job);
@@ -375,6 +736,7 @@ namespace KeelDock.Platform.DevLaneWindows
                 Marshal.WriteIntPtr(handleList, nul);
                 if (!UpdateProcThreadAttribute(attributes, 0, ProcThreadAttributeHandleList, handleList,
                         new UIntPtr((uint)IntPtr.Size), IntPtr.Zero, IntPtr.Zero)) throw new InvalidOperationException("attribute_handles");
+                Phase("token-create");
                 SecurityCapabilities securityCapabilities = new SecurityCapabilities();
                 securityCapabilities.AppContainerSid = sid;
                 if (internetClient)
@@ -418,6 +780,7 @@ namespace KeelDock.Platform.DevLaneWindows
                 if (commandLine.Length > 30000) throw new InvalidOperationException("command_size");
                 ProcessInformation information;
                 uint flags = ExtendedStartupInfoPresent | CreateSuspended | CreateUnicodeEnvironment;
+                Phase("process-create-suspended");
                 if (!CreateProcessW(executable, commandLine, IntPtr.Zero, IntPtr.Zero, true, flags,
                         environmentBlock, workingDirectory, ref startup, out information))
                 {
@@ -427,36 +790,65 @@ namespace KeelDock.Platform.DevLaneWindows
                 process = information.Process;
                 thread = information.Thread;
                 result.Created = true;
+                Phase("job-assign");
                 if (!AssignProcessToJobObject(job, process)) throw new InvalidOperationException("job_assign");
                 result.Job = VerifyJob(job, process);
-                result.AppContainer = VerifyToken(process, sid, internetClient);
+                bool bypassTraverse;
+                result.AppContainer = VerifyToken(process, sid, internetClient, out bypassTraverse);
+                if (!bypassTraverse)
+                {
+                    TerminateAndConfirmEmptyJob(job);
+                    jobReaped = true;
+                    if (WaitForSingleObject(process, 10000) != WaitObject0)
+                        throw new InvalidOperationException("traverse_refusal_reap");
+                    if (!GetExitCodeProcess(process, out result.ExitCode))
+                        throw new InvalidOperationException("traverse_refusal_exit_code");
+                    result.Exited = true;
+                    result.Job += " terminated=confirmed empty=confirmed";
+                    result.Failure = "token-bypass-traverse-absent";
+                    return result;
+                }
+                Phase("resume");
                 if (ResumeThread(thread) == UInt32.MaxValue) throw new InvalidOperationException("thread_resume");
+                Phase("wait");
                 uint wait = WaitForSingleObject(process, (uint)timeoutMilliseconds);
                 if (wait == WaitTimeout)
                 {
                     result.TimedOut = true;
-                    TerminateJobObject(job, JobExitCode);
-                    if (WaitForSingleObject(process, 10000) != WaitObject0 || !WaitForEmptyJob(job, 10000))
+                    TerminateAndConfirmEmptyJob(job);
+                    jobReaped = true;
+                    if (WaitForSingleObject(process, 10000) != WaitObject0)
                         throw new InvalidOperationException("job_reap");
                 }
                 else if (wait != WaitObject0) throw new InvalidOperationException("process_wait");
+                Phase("exit");
                 if (!GetExitCodeProcess(process, out result.ExitCode)) throw new InvalidOperationException("process_exit_code");
                 result.Exited = true;
-                TerminateJobObject(job, JobExitCode);
-                if (!WaitForEmptyJob(job, 10000)) throw new InvalidOperationException("job_reap");
+                if (!jobReaped)
+                {
+                    TerminateAndConfirmEmptyJob(job);
+                    jobReaped = true;
+                }
+                result.Job += " terminated=confirmed empty=confirmed";
                 return result;
             }
             finally
             {
                 string reapFailure = null;
-                if (job != IntPtr.Zero) TerminateJobObject(job, JobExitCode);
                 if (process != IntPtr.Zero && !result.Exited)
                 {
+                    if (job != IntPtr.Zero) TerminateJobObject(job, JobExitCode);
                     if (!TerminateProcess(process, JobExitCode) && WaitForSingleObject(process, 0) != WaitObject0)
                         reapFailure = "process_terminate";
                     if (WaitForSingleObject(process, 10000) != WaitObject0) reapFailure = "process_reap";
                 }
-                if (job != IntPtr.Zero && !WaitForEmptyJob(job, 10000)) reapFailure = "job_reap";
+                if (job != IntPtr.Zero && !jobReaped)
+                {
+                    bool terminated = TerminateJobObject(job, JobExitCode);
+                    bool empty = WaitForEmptyJob(job, 10000);
+                    if (!terminated || !empty) reapFailure = "job_reap";
+                    else jobReaped = true;
+                }
                 Close(thread);
                 Close(process);
                 Close(job);
@@ -472,6 +864,13 @@ namespace KeelDock.Platform.DevLaneWindows
                 Free(sid);
                 if (reapFailure != null) throw new InvalidOperationException(reapFailure);
             }
+        }
+
+        private static void TerminateAndConfirmEmptyJob(IntPtr job)
+        {
+            if (job == IntPtr.Zero || !TerminateJobObject(job, JobExitCode))
+                throw new InvalidOperationException("job_terminate");
+            if (!WaitForEmptyJob(job, 10000)) throw new InvalidOperationException("job_reap");
         }
 
         private static void SetJobLimits(IntPtr job)
@@ -537,15 +936,18 @@ namespace KeelDock.Platform.DevLaneWindows
             finally { Marshal.FreeHGlobal(buffer); }
         }
 
-        private static string VerifyToken(IntPtr process, IntPtr expectedSid, bool internetClient)
+        private static string VerifyToken(IntPtr process, IntPtr expectedSid, bool internetClient,
+            out bool bypassTraverse)
         {
+            bypassTraverse = false;
             IntPtr token;
             if (!OpenProcessToken(process, TokenQuery, out token) || token == IntPtr.Zero) throw new InvalidOperationException("token_open");
             try
             {
                 if (ReadTokenDword(token, TokenIsAppContainer) != 1
                     || ReadTokenDword(token, TokenIsLessPrivilegedAppContainer) != 1) throw new InvalidOperationException("token_lpac");
-                IntPtr capabilities = QueryToken(token, TokenCapabilities, out int capabilitiesLength);
+                int capabilitiesLength;
+                IntPtr capabilities = QueryToken(token, TokenCapabilities, out capabilitiesLength);
                 try
                 {
                     int expectedCount = internetClient ? 1 : 0;
@@ -564,7 +966,8 @@ namespace KeelDock.Platform.DevLaneWindows
                     }
                 }
                 finally { Marshal.FreeHGlobal(capabilities); }
-                IntPtr app = QueryToken(token, TokenAppContainerSid, out int appLength);
+                int appLength;
+                IntPtr app = QueryToken(token, TokenAppContainerSid, out appLength);
                 try
                 {
                     if (appLength < IntPtr.Size || Marshal.ReadIntPtr(app) == IntPtr.Zero
@@ -572,7 +975,8 @@ namespace KeelDock.Platform.DevLaneWindows
                         throw new InvalidOperationException("token_sid");
                 }
                 finally { Marshal.FreeHGlobal(app); }
-                IntPtr integrity = QueryToken(token, TokenIntegrityLevel, out int integrityLength);
+                int integrityLength;
+                IntPtr integrity = QueryToken(token, TokenIntegrityLevel, out integrityLength);
                 try
                 {
                     if (integrityLength < Marshal.SizeOf(typeof(SidAndAttributes))) throw new InvalidOperationException("token_integrity");
@@ -585,11 +989,42 @@ namespace KeelDock.Platform.DevLaneWindows
                     if (ridAddress == IntPtr.Zero || Marshal.ReadInt32(ridAddress) != 0x1000) throw new InvalidOperationException("token_integrity");
                 }
                 finally { Marshal.FreeHGlobal(integrity); }
+                bypassTraverse = HasEnabledPrivilege(token, "SeChangeNotifyPrivilege");
                 return internetClient
-                    ? "lpac=verified capabilities=internetClient integrity=low sid=verified"
-                    : "lpac=verified capabilities=empty integrity=low sid=verified";
+                    ? "lpac=verified capabilities=internetClient integrity=low sid=verified bypass_traverse="
+                        + (bypassTraverse ? "present" : "absent")
+                    : "lpac=verified capabilities=empty integrity=low sid=verified bypass_traverse="
+                        + (bypassTraverse ? "present" : "absent");
             }
             finally { Close(token); }
+        }
+
+        private static bool HasEnabledPrivilege(IntPtr token, string privilegeName)
+        {
+            Luid expected;
+            if (!LookupPrivilegeValueW(null, privilegeName, out expected))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            int length;
+            IntPtr privileges = QueryToken(token, TokenPrivilegesInformation, out length);
+            try
+            {
+                if (length < 4) throw new InvalidOperationException("token_privileges_size");
+                int count = Marshal.ReadInt32(privileges);
+                int entrySize = Marshal.SizeOf(typeof(LuidAndAttributes));
+                if (count < 0 || count > (length - 4) / entrySize)
+                    throw new InvalidOperationException("token_privileges_count");
+                for (int index = 0; index < count; index++)
+                {
+                    int offset = checked(4 + index * entrySize);
+                    uint lowPart = unchecked((uint)Marshal.ReadInt32(privileges, offset));
+                    int highPart = Marshal.ReadInt32(privileges, offset + 4);
+                    uint attributes = unchecked((uint)Marshal.ReadInt32(privileges, offset + 8));
+                    if (lowPart == expected.LowPart && highPart == expected.HighPart)
+                        return (attributes & SePrivilegeEnabled) != 0;
+                }
+                return false;
+            }
+            finally { Marshal.FreeHGlobal(privileges); }
         }
 
         private static IntPtr QueryToken(IntPtr token, int kind, out int length)

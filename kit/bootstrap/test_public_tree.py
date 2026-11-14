@@ -1102,6 +1102,7 @@ class PublicTreeTests(unittest.TestCase):
             'kit/confinement/test_macos_context_load.py',
             'kit/confinement/test_macos_deny_default.py',
             'kit/confinement/test_macos_public_audit.py',
+            'kit/devlane/macos_denial_paths.py',
             'kit/devlane/sandbox_macos.py',
             'kit/devlane/control-crypto-requirements.txt',
             'kit/devlane/test_sandbox_macos.py',
