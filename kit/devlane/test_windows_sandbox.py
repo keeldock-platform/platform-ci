@@ -4,7 +4,6 @@ import json
 import contextlib
 import io
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -123,6 +122,15 @@ class WindowsSandboxValidationTests(unittest.TestCase):
 
     def test_native_launcher_terminates_a_created_process_on_assignment_failure(self):
         source = (Path(windows.__file__).with_name("sandbox_windows_native.cs")).read_text(encoding="utf-8")
+        script = Path(windows.__file__).with_name("sandbox_windows.ps1").read_text(encoding="utf-8")
+        self.assertIn("Write-LauncherPhase 'types-load'", script)
+        self.assertIn("Write-LauncherPhase 'acl-grant'", script)
+        for phase in (
+            "appcontainer-sid", "token-create", "job-create", "process-create-suspended",
+            "job-assign", "resume", "wait", "exit",
+        ):
+            with self.subTest(phase=phase):
+                self.assertIn('Phase("' + phase + '")', source)
         self.assertIn("TerminateProcess(process, JobExitCode)", source)
         self.assertIn("WaitForSingleObject(process, 10000) != WaitObject0", source)
         self.assertIn("JobObjectLimitKillOnJobClose", source)
@@ -135,16 +143,20 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         self.assertLess(source.index("TerminateProcess(process, JobExitCode)"), source.index("Close(process)"))
 
     def test_profile_cleanup_reason_is_emitted_from_only_the_bounded_native_vocabulary(self):
-        result = mock.Mock(returncode=1, stdout=(
-            b"windows_cleanup_reason=sharing-violation\nwindows_sandbox=refused code=boundary\n"
-        ))
-        with mock.patch.object(windows.subprocess, "run", return_value=result), \
-                mock.patch("builtins.print") as output:
+        process = mock.Mock(returncode=1)
+        process.stdout = io.BytesIO(
+            b"windows_launcher_phase=acl-grant\r\nwindows_cleanup_reason=sharing-violation\n"
+            b"windows_sandbox=refused code=boundary\n"
+        )
+        with mock.patch.object(windows.subprocess, "Popen", return_value=process), \
+                contextlib.redirect_stdout(io.StringIO()) as streamed:
             with self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
                 windows._run_powershell("delete", "sandbox.json", failure_prefix="windows-prepare")
         self.assertEqual(caught.exception.code, "windows-prepare-powershell-nonzero")
         self.assertEqual(caught.exception.reason, "sharing-violation")
-        output.assert_called_once_with("windows_prepare_cleanup_reason=sharing-violation", flush=True)
+        self.assertEqual(streamed.getvalue(), (
+            "windows_launcher_phase=acl-grant\r\nwindows_prepare_cleanup_reason=sharing-violation\n"
+        ))
 
     def test_prepare_refusal_is_emitted_before_cleanup_refusal(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -184,34 +196,26 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         self.assertEqual(text.count("devlane_refusal="), 2)
         self.assertIn("windows_prepare_cleanup_reason=access-denied", text)
 
-    def test_large_node_modules_cleanup_uses_a_fixed_number_of_child_processes(self):
+    def test_acl_grant_cleanup_removes_only_tracked_rules_without_recursive_runner_repair(self):
         script = Path(windows.__file__).with_name("sandbox_windows.ps1").read_text(encoding="utf-8")
-        body = script.split("function Restore-RunnerAccessTree", 1)[1].split(
-            "function Clear-AppContainerStorage", 1,
-        )[0]
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "node_modules"
-            started = time.perf_counter()
-            for package in range(200):
-                package_root = root / ("package-%03d" % package) / "lib"
-                package_root.mkdir(parents=True)
-                for entry in range(100):
-                    (package_root / ("module-%03d.js" % entry)).touch()
-            generation_seconds = time.perf_counter() - started
-            item_count = sum(1 for _ in root.rglob("*")) + 1
-            self.assertGreaterEqual(item_count, 20000)
-            self.assertLessEqual(item_count, 250000)
-            self.assertGreater(generation_seconds, 0)
-
-        self.assertEqual(body.count("& $takeown"), 1)
-        self.assertEqual(body.count("& $icacls"), 2)
-        self.assertIn("while ($pending.Count -gt 0)", body)
-        self.assertLess(body.index("while ($pending.Count -gt 0)"), body.index("& $takeown"))
-        self.assertIn("'/R'", body)
-        self.assertIn("'/T'", body)
-        scan = body[:body.index("& $takeown")]
-        self.assertNotIn("& $takeown", scan)
-        self.assertNotIn("& $icacls", scan)
+        run = script.split("if ($Mode -eq 'run')", 1)[1].split("if ($Mode -eq 'delete')", 1)[0]
+        cleanup = script.split("if ($Mode -eq 'delete')", 1)[1]
+        self.assertIn("Write-LauncherPhase 'acl-grant'", run)
+        self.assertIn("$system32Path", run)
+        self.assertIn("[StringComparison]::OrdinalIgnoreCase)) { continue }", run)
+        self.assertIn("if ($item.PSIsContainer) { 3 } else { 0 }", run)
+        self.assertIn("$grants.Add([pscustomobject]@{ path = $path; rights = $rightsName; inheritance = $inheritanceValue })", run)
+        self.assertIn("$acl.RemoveAccessRuleSpecific($rule)", cleanup)
+        self.assertIn("$integrityGrants = [Collections.Generic.List[string]]::new()", run)
+        self.assertIn("Add-TrackedIntegrityGrant $path", run)
+        self.assertIn("foreach ($path in @($state.integrity_grants))", cleanup)
+        self.assertIn("'/setintegritylevel' '(OI)(CI)M'", cleanup)
+        self.assertNotIn("$modifiedPaths", cleanup)
+        self.assertNotIn("Restore-RunnerAccessTree", cleanup)
+        self.assertIn("Restore-AppContainerStorage $actual", cleanup)
+        self.assertIn("if ($entryCount -gt 250000) { throw }", cleanup)
+        python_source = Path(windows.__file__).read_text(encoding="utf-8")
+        self.assertIn("timeout=MAX_CHILD_SECONDS, failure_prefix=failure_prefix", python_source)
 
     def test_shred_failure_prints_a_fixed_failed_cleanup_receipt(self):
         output = io.StringIO()
@@ -363,6 +367,9 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             self.assertEqual(len(requests), 2)
             for request in requests:
                 self.assertTrue(request["internet_client"])
+                self.assertIn(str(node), request["read_paths"])
+                self.assertIn(str(npm.parent.parent), request["read_paths"])
+                self.assertNotIn(str(Path("C:/Windows/System32")), request["read_paths"])
                 self.assertIn(str(output / "project"), request["write_paths"])
                 self.assertIn(str(output / "npm-cache"), request["write_paths"])
                 self.assertIn(str(output / "prepared" / "ms-playwright"), request["write_paths"])
@@ -380,8 +387,11 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             self.assertEqual(
                 [call.args[0] for call in stage_output.call_args_list],
                 ["windows_prepare_stage_start=profile-create", "windows_prepare_stage=none",
-                 "windows_prepare_stage_start=npm-ci", "windows_prepare_job=empty",
+                 "windows_prepare_stage_start=npm-ci",
+                 "windows_prepare_limit stage=npm-ci limit=work-deadline seconds=600 powershell-seconds=630",
+                 "windows_prepare_job=empty",
                  "windows_prepare_stage=npm-ci", "windows_prepare_stage_start=playwright",
+                 "windows_prepare_limit stage=playwright limit=work-deadline seconds=600 powershell-seconds=630",
                  "windows_prepare_job=empty", "windows_prepare_stage=playwright", "windows_prepare_stage=done",
                  "windows_prepare_stage_start=profile-cleanup", "windows_prepare_stage_start=copy"],
             )
@@ -413,15 +423,18 @@ class WindowsSandboxValidationTests(unittest.TestCase):
                     windows.prepare_dependencies(projection, root / "prepared", root / "deadline", state)
             self.assertEqual(caught.exception.code, "windows-prepare-npm-child-timeout-3600s")
             output.assert_any_call("windows_prepare_timeout limit=npm-child seconds=3600", flush=True)
+            output.assert_any_call(
+                "windows_prepare_limit stage=npm-ci limit=npm-child seconds=3600 powershell-seconds=3630",
+                flush=True,
+            )
 
     def test_prepare_powershell_monitor_reports_allowlisted_heartbeat_and_timeout(self):
         process = mock.Mock(pid=123, returncode=0)
-        process.communicate.side_effect = [
-            windows.subprocess.TimeoutExpired("pwsh", 0.01), (b"{\"status\":\"pass\"}", None),
-        ]
+        process.stdout = io.BytesIO(b'{"status":"pass"}\r\n')
+        process.wait.side_effect = [windows.subprocess.TimeoutExpired("pwsh", 60), None]
         with mock.patch.object(windows.subprocess, "Popen", return_value=process), \
                 mock.patch.object(windows, "_windows_process_summary", return_value=(2, "node")), \
-                mock.patch.object(windows.time, "monotonic", side_effect=(0, 60.1, 60.1, 60.1)), \
+                mock.patch.object(windows.time, "monotonic", side_effect=(0, 0, 60.1, 60.1)), \
                 mock.patch("builtins.print") as output:
             result = windows._run_powershell(
                 "run", "sandbox.json", timeout=600, failure_prefix="windows-prepare", monitor_stage="npm-ci",
@@ -432,9 +445,10 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         )
 
         hung = mock.Mock(pid=456)
-        hung.communicate.return_value = (b"", None)
+        hung.stdout = io.BytesIO(b"")
+        hung.wait.side_effect = [windows.subprocess.TimeoutExpired("pwsh", 1), None]
         with mock.patch.object(windows.subprocess, "Popen", return_value=hung), \
-                mock.patch.object(windows.time, "monotonic", side_effect=(0, 1.1)), \
+                mock.patch.object(windows.time, "monotonic", side_effect=(0, 0, 1.1)), \
                 mock.patch("builtins.print") as output:
             with self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
                 windows._run_powershell(

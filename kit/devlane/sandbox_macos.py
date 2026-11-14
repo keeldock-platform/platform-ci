@@ -54,19 +54,20 @@ CLT_CLANG_PATH = CLT_DEVELOPER_DIRECTORY + "/usr/bin/clang"
 CLT_OTOOL_PATH = CLT_DEVELOPER_DIRECTORY + "/usr/bin/otool"
 DNS_PROBE_TIMEOUT_SECONDS = 8
 DNS_LOOKUP_TIMEOUT_MILLISECONDS = 5000
+MACOS_PRIVATE_ROOT = chr(47) + "private"
 MACOS_DNS_VARIANTS = (
-    "base", "configd", "resolver-files", "mdnsresponder-socket", "networkd", "all",
+    "base", "configd", "resolver-files", "mdnsresponder-socket", "networkd", "dnsconfig", "all",
 )
-MACOS_DNS_MACH_SERVICES = frozenset((
-    "com.apple.SystemConfiguration.configd", "com.apple.networkd", "com.apple.nesessionmanager",
-))
+MACOS_DNS_MACH_SERVICE_RE = re.compile(r"^com\.apple\.[A-Za-z0-9._-]{1,120}$")
+MACOS_DNS_SYSTEM_READ_PREFIXES = (
+    "/System/", "/usr/lib/", "/usr/share/", MACOS_PRIVATE_ROOT + "/etc/", "/etc/",
+    MACOS_PRIVATE_ROOT + "/var/run/", "/var/run/", MACOS_PRIVATE_ROOT + "/var/db/", "/Library/Preferences/",
+    "/Library/Apple/", "/dev/",
+)
 MACOS_DNS_DENIAL_OPERATIONS = frozenset((
     "file-read-data", "file-read-metadata", "file-read*", "mach-lookup", "network-outbound",
     "system-socket",
 ))
-MACOS_PRIVATE_ROOT = chr(47) + "private"
-
-
 DECRYPT_REFUSAL_CODES = frozenset((
     "archive-invalid", "auth-tag", "binding-mismatch", "crypto-unavailable",
     "decrypt-failed", "decrypt-timeout", "expired", "invalid-envelope", "key-format",
@@ -793,9 +794,17 @@ def preparation_profile_text(*, project, prepared, cache, home, temporary, node,
             '(allow mach-lookup (global-name "com.apple.networkd"))',
             '(allow mach-lookup (global-name "com.apple.nesessionmanager"))',
         ),
+        "dnsconfig": (
+            '(allow mach-lookup (global-name "com.apple.SystemConfiguration.DNSConfiguration"))',
+            '(allow mach-lookup (global-name "com.apple.SystemConfiguration.configd"))',
+            '(allow file-read-data (subpath "/System/Library/Frameworks/SystemConfiguration.framework"))',
+            '(allow file-read-metadata (subpath "/System/Library/Frameworks/SystemConfiguration.framework"))',
+            '(allow file-read-data (subpath "/usr/lib/system"))',
+            '(allow file-read-metadata (subpath "/usr/lib/system"))',
+        ),
     }
     if variant == "all":
-        for name in ("configd", "resolver-files", "mdnsresponder-socket", "networkd"):
+        for name in ("configd", "resolver-files", "mdnsresponder-socket", "networkd", "dnsconfig"):
             lines.extend(variant_additions[name])
     elif variant != "base":
         lines.extend(variant_additions[variant])
@@ -824,23 +833,33 @@ def _preparation_env(ident, *, home, temporary, cache, prepared):
     }
 
 
-def _macos_dns_denial_target(operation, remainder):
+def _macos_dns_denial_target(operation, remainder, *, run_root=None):
     if operation == "mach-lookup":
-        match = re.search(r"com\.apple\.[A-Za-z0-9_.-]+", remainder)
-        service = match.group(0) if match else ""
-        return service if service in MACOS_DNS_MACH_SERVICES else "mach-other"
-    path_match = re.search(r'(?:"([^"]+)"|\'([^\']+)\'|(/[^\s,;]+))', remainder)
+        match = re.search(r"(?:^|[\s\"'(])(com\.apple\.[^\s\"')]+)", remainder)
+        service = match.group(1) if match else ""
+        return service if MACOS_DNS_MACH_SERVICE_RE.fullmatch(service) else "mach-other"
+    path_match = re.search(r'(?:(?:"([^"\r\n]{1,4096})")|(?:\'([^\'\r\n]{1,4096})\')|(/[^\s,;]{1,4096}))', remainder)
     path = next((value for value in path_match.groups() if value), "") if path_match else ""
-    if path.startswith((MACOS_PRIVATE_ROOT + "/etc/", "/etc/")):
-        return "etc"
-    if path.startswith((MACOS_PRIVATE_ROOT + "/var/run/", "/var/run/")):
-        return "var-run"
-    if path.startswith("/Library/Preferences/SystemConfiguration/"):
-        return "library-prefs"
+    if operation.startswith("file-read"):
+        normalized_path = os.path.normpath(path) if path else ""
+        has_dot_segment = any(part in (".", "..") for part in Path(path).parts)
+        if path.startswith((chr(47) + "Users/runner/hostedtoolcache/", "/opt/hostedtoolcache/")):
+            return "toolcache"
+        if run_root is not None:
+            try:
+                Path(normalized_path).relative_to(Path(run_root))
+                return "run-root"
+            except (ValueError, OSError):
+                pass
+        if normalized_path.startswith((chr(47) + "Users/", "/System/Volumes/Data/" + "Users/")):
+            return "runner-home"
+        if has_dot_segment:
+            return "other"
+        if path.startswith(MACOS_DNS_SYSTEM_READ_PREFIXES):
+            return path
     return "other"
 
-
-def _collect_macos_sandbox_denials(pid, emitted):
+def _collect_macos_sandbox_denials(pid, emitted, *, run_root=None):
     if type(pid) is not int or pid <= 0 or len(emitted) >= 20:
         return
     try:
@@ -870,7 +889,7 @@ def _collect_macos_sandbox_denials(pid, emitted):
         operation = match.group(2)
         if operation not in MACOS_DNS_DENIAL_OPERATIONS:
             continue
-        target = _macos_dns_denial_target(operation, match.group(3))
+        target = _macos_dns_denial_target(operation, match.group(3), run_root=run_root)
         line = "macos_sandbox_denial op=" + operation + " target=" + target
         if line in emitted:
             continue
@@ -889,7 +908,8 @@ def _preparation_dns_probe(*, ident, profiles, cwd, env):
         'dns.lookup("registry.npmjs.org", { all: true }, (error, addresses) => {'
         ' clearTimeout(timer); process.exit(error || !addresses.length ? 1 : 0); });'
     )
-    resolver_command = (ident["node"], "-e", resolver_script)
+    preparation_command = _npm_preparation_command(ident)
+    resolver_command = (preparation_command[0], "-e", resolver_script)
 
     def probe(command):
         try:
@@ -912,13 +932,14 @@ def _preparation_dns_probe(*, ident, profiles, cwd, env):
 
     unconfined, _unconfined_pid = probe(resolver_command)
     emitted_denials = set()
+    run_root = Path(profiles["base"]).parent.parent
     results = {}
     for variant in MACOS_DNS_VARIANTS:
         confined, pid = probe(("/usr/bin/sandbox-exec", "-f", str(profiles[variant]), *resolver_command))
         results[variant] = confined
         print("macos_dns_probe_variant name=" + variant + " result=" + confined, flush=True)
         if confined == "fail":
-            _collect_macos_sandbox_denials(pid, emitted_denials)
+            _collect_macos_sandbox_denials(pid, emitted_denials, run_root=run_root)
     selected = next((variant for variant in MACOS_DNS_VARIANTS if results[variant] == "ok"), "all")
     confined = results[selected]
     print("macos_dns_probe unconfined=" + unconfined + " confined=" + confined, flush=True)

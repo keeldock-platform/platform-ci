@@ -19,6 +19,12 @@ namespace KeelDock.Platform.DevLaneWindows
 
     public static class Boundary
     {
+        private static void Phase(string name)
+        {
+            Console.Out.WriteLine("windows_launcher_phase=" + name);
+            Console.Out.Flush();
+        }
+
         private const uint ProcThreadAttributeHandleList = 0x00020002;
         private const uint ProcThreadAttributeSecurityCapabilities = 0x00020009;
         private const uint ProcThreadAttributeAllApplicationPackagesPolicy = 0x0002000f;
@@ -278,6 +284,7 @@ namespace KeelDock.Platform.DevLaneWindows
         public static string CreateProfile(string name)
         {
             if (String.IsNullOrEmpty(name) || name.Length > 64) throw new InvalidOperationException("profile_name");
+            Phase("appcontainer-sid");
             IntPtr sid = IntPtr.Zero;
             int status = CreateAppContainerProfile(name, name, name, IntPtr.Zero, 0, out sid);
             if (status != 0 && unchecked((uint)status) != 0x800700b7) throw new InvalidOperationException("profile_create");
@@ -351,6 +358,7 @@ namespace KeelDock.Platform.DevLaneWindows
             RunResult result = new RunResult();
             try
             {
+                Phase("appcontainer-sid");
                 if (DeriveAppContainerSidFromAppContainerName(profileName, out sid) != 0
                     || sid == IntPtr.Zero || SidText(sid) != appContainerSid) throw new InvalidOperationException("profile_sid_mismatch");
                 SecurityAttributes security = new SecurityAttributes();
@@ -360,6 +368,7 @@ namespace KeelDock.Platform.DevLaneWindows
                     OpenExisting, FileAttributeNormal, IntPtr.Zero);
                 if (nul == IntPtr.Zero || nul.ToInt64() == -1) throw new InvalidOperationException("nul_handle");
 
+                Phase("job-create");
                 job = CreateJobObjectW(IntPtr.Zero, null);
                 if (job == IntPtr.Zero) throw new InvalidOperationException("job_create");
                 SetJobLimits(job);
@@ -375,6 +384,7 @@ namespace KeelDock.Platform.DevLaneWindows
                 Marshal.WriteIntPtr(handleList, nul);
                 if (!UpdateProcThreadAttribute(attributes, 0, ProcThreadAttributeHandleList, handleList,
                         new UIntPtr((uint)IntPtr.Size), IntPtr.Zero, IntPtr.Zero)) throw new InvalidOperationException("attribute_handles");
+                Phase("token-create");
                 SecurityCapabilities securityCapabilities = new SecurityCapabilities();
                 securityCapabilities.AppContainerSid = sid;
                 if (internetClient)
@@ -418,6 +428,7 @@ namespace KeelDock.Platform.DevLaneWindows
                 if (commandLine.Length > 30000) throw new InvalidOperationException("command_size");
                 ProcessInformation information;
                 uint flags = ExtendedStartupInfoPresent | CreateSuspended | CreateUnicodeEnvironment;
+                Phase("process-create-suspended");
                 if (!CreateProcessW(executable, commandLine, IntPtr.Zero, IntPtr.Zero, true, flags,
                         environmentBlock, workingDirectory, ref startup, out information))
                 {
@@ -427,10 +438,13 @@ namespace KeelDock.Platform.DevLaneWindows
                 process = information.Process;
                 thread = information.Thread;
                 result.Created = true;
+                Phase("job-assign");
                 if (!AssignProcessToJobObject(job, process)) throw new InvalidOperationException("job_assign");
                 result.Job = VerifyJob(job, process);
                 result.AppContainer = VerifyToken(process, sid, internetClient);
+                Phase("resume");
                 if (ResumeThread(thread) == UInt32.MaxValue) throw new InvalidOperationException("thread_resume");
+                Phase("wait");
                 uint wait = WaitForSingleObject(process, (uint)timeoutMilliseconds);
                 if (wait == WaitTimeout)
                 {
@@ -440,6 +454,7 @@ namespace KeelDock.Platform.DevLaneWindows
                         throw new InvalidOperationException("job_reap");
                 }
                 else if (wait != WaitObject0) throw new InvalidOperationException("process_wait");
+                Phase("exit");
                 if (!GetExitCodeProcess(process, out result.ExitCode)) throw new InvalidOperationException("process_exit_code");
                 result.Exited = true;
                 TerminateJobObject(job, JobExitCode);

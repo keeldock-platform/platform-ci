@@ -384,7 +384,7 @@ class PowerShellStaticTests(unittest.TestCase):
         self.assertIn("GetProfileFolderPath($PackageSid)", script)
         self.assertIn("[StringComparison]::OrdinalIgnoreCase", script)
         self.assertIn("[IO.FileAttributes]::ReparsePoint", script)
-        restore = script.split("function Restore-RunnerAccessTree", 1)[1].split(
+        restore = script.split("function Restore-AppContainerStorage", 1)[1].split(
             "function Clear-AppContainerStorage", 1,
         )[0]
         self.assertIn("'/F' $Root '/A' '/R' '/D' 'Y'", restore)
@@ -398,7 +398,13 @@ class PowerShellStaticTests(unittest.TestCase):
         cleanup = script.split("if ($Mode -eq 'delete') {", 1)[1].split("\n    throw\n} catch {", 1)[0]
         self.assertLess(cleanup.index("Clear-AppContainerStorage"), cleanup.index("DeleteProfile"))
         self.assertIn("'/T'", cleanup)
-        self.assertIn("Restore-RunnerAccessTree $fullPath", cleanup)
+        self.assertIn("Restore-AppContainerStorage $actual", cleanup)
+        self.assertIn("$acl.RemoveAccessRuleSpecific($rule)", cleanup)
+        self.assertIn("$state.integrity_grants", cleanup)
+        self.assertIn("'/setintegritylevel' '(OI)(CI)M'", cleanup)
+        self.assertNotIn("$modifiedPaths", cleanup)
+        self.assertNotIn("Restore-RunnerAccessTree", cleanup)
+        self.assertIn("timeout=MAX_CHILD_SECONDS + 300", (ROOT / "kit/devlane/sandbox_windows.py").read_text(encoding="utf-8"))
         self.assertIn("windows_cleanup_reason=", script)
 
 

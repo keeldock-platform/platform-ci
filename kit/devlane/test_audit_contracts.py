@@ -3050,9 +3050,24 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             "macos_sandbox_denial op=mach-lookup target=/secret",
             "macos_sandbox_denial op=file-read-data target=com.apple.networkd",
             "macos_sandbox_denial op=file-read-data target=private-path",
+            "macos_sandbox_denial op=file-read-data target=" + chr(47) + "Users/runner/private.txt",
+            "macos_sandbox_denial op=file-read-data target=/System/../" + "Users/runner/private.txt",
+            "macos_sandbox_denial op=mach-lookup target=com.apple." + "x" * 121,
+            "macos_sandbox_denial op=mach-lookup target=com.apple.safe:extra",
         ):
             with self.subTest(invalid=invalid):
                 self.assertFalse(grammar.step_output_ok(audit.MACOS_PREPARE_STEP, invalid, {}))
+        for target in (
+            "com.apple.SystemConfiguration.DNSConfiguration", "runner-home", "run-root", "toolcache",
+            "/System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration",
+            chr(47) + "private/var/run/resolv.conf",
+        ):
+            operation = "mach-lookup" if target.startswith("com.apple.") else "file-read-data"
+            with self.subTest(target=target):
+                self.assertTrue(grammar.step_output_ok(
+                    audit.MACOS_PREPARE_STEP,
+                    "macos_sandbox_denial op=" + operation + " target=" + target, {},
+                ))
         self.assertFalse(grammar.step_output_ok(audit.MACOS_PROBE_STEP, denial, {}))
         windows = audit._Grammar(
             Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml",
@@ -3091,6 +3106,24 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         self.assertTrue(grammar.step_output_ok(
             audit.WINDOWS_PREPARE_STEP, "windows_prepare_timeout limit=npm-child seconds=3600", counts,
         ))
+        self.assertTrue(grammar.step_output_ok(
+            audit.WINDOWS_PREPARE_STEP,
+            "windows_prepare_limit stage=npm-ci limit=work-deadline seconds=600 powershell-seconds=630", counts,
+        ))
+        self.assertTrue(grammar.step_output_ok(
+            audit.WINDOWS_PREPARE_STEP,
+            "windows_prepare_limit stage=playwright limit=work-deadline seconds=600 powershell-seconds=630", counts,
+        ))
+        for phase in sorted(audit.WINDOWS_LAUNCHER_PHASES):
+            self.assertTrue(grammar.step_output_ok(
+                audit.WINDOWS_PREPARE_STEP, "windows_launcher_phase=" + phase, counts,
+            ))
+        self.assertTrue(grammar.step_output_ok(
+            "Shred runner-local workspace", "windows_launcher_phase=acl-grant", {},
+        ))
+        self.assertFalse(grammar.step_output_ok(
+            "Decrypt authenticated bundle", "windows_launcher_phase=wait", {},
+        ))
         for invalid in (
             "windows_prepare_stage_start=unknown",
             "windows_prepare_heartbeat stage=npm-ci elapsed=59 children=0 top=other",
@@ -3098,11 +3131,21 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             "windows_prepare_heartbeat stage=npm-ci elapsed=240 children=1 top=private.exe",
             "windows_prepare_timeout limit=external seconds=960",
             "windows_prepare_timeout limit=powershell seconds=0",
+            "windows_prepare_limit stage=npm-ci limit=playwright-child seconds=600 powershell-seconds=630",
+            "windows_prepare_limit stage=npm-ci limit=work-deadline seconds=600 powershell-seconds=600",
+            "windows_prepare_limit stage=playwright limit=playwright-child seconds=1801 powershell-seconds=1831",
+            "windows_launcher_phase=private-data",
         ):
             with self.subTest(invalid=invalid):
                 self.assertFalse(grammar.step_output_ok(audit.WINDOWS_PREPARE_STEP, invalid, {}))
         self.assertFalse(grammar.step_output_ok(
             "Shred runner-local workspace", "windows_prepare_stage_start=copy", {},
+        ))
+        self.assertFalse(grammar.step_output_ok(
+            "Fetch public control and validate dispatch", "windows_launcher_phase=types-load", {},
+        ))
+        self.assertFalse(grammar.step_output_ok(
+            "Cut network and start the isolated supervisor", "windows_launcher_phase=job-create", {},
         ))
         bounded = {}
         for stage in ("profile-create", "npm-ci"):

@@ -353,14 +353,63 @@ WINDOWS_PREPARE_STAGES = ("none", "npm-ci", "playwright", "done")
 WINDOWS_PREPARE_START_STAGES = ("profile-create", "npm-ci", "playwright", "profile-cleanup", "copy")
 WINDOWS_PREPARE_PROCESS_CLASSES = frozenset(("node", "npm", "cmd", "powershell", "git", "esbuild", "playwright", "other"))
 WINDOWS_PREPARE_TIMEOUT_LIMITS = frozenset(("npm-child", "playwright-child", "work-deadline", "powershell"))
-MACOS_DNS_VARIANTS = ("base", "configd", "resolver-files", "mdnsresponder-socket", "networkd", "all")
+WINDOWS_LAUNCHER_PHASES = frozenset((
+    "types-load", "appcontainer-sid", "token-create", "acl-grant", "job-create",
+    "process-create-suspended", "job-assign", "resume", "wait", "exit",
+))
+WINDOWS_LAUNCHER_PHASE_STEPS = {
+    "types-load": frozenset((
+        WINDOWS_PREPARE_STEP, "Cut network and start the isolated supervisor",
+        "Probe isolation before decryption", "Execute offline profile and filter public summary",
+        "Shred runner-local workspace",
+    )),
+    "appcontainer-sid": frozenset((
+        WINDOWS_PREPARE_STEP, "Cut network and start the isolated supervisor",
+        "Probe isolation before decryption", "Execute offline profile and filter public summary",
+    )),
+    "acl-grant": frozenset((
+        WINDOWS_PREPARE_STEP, "Probe isolation before decryption",
+        "Execute offline profile and filter public summary", "Shred runner-local workspace",
+    )),
+    "token-create": frozenset((
+        WINDOWS_PREPARE_STEP, "Probe isolation before decryption",
+        "Execute offline profile and filter public summary",
+    )),
+    "job-create": frozenset((
+        WINDOWS_PREPARE_STEP, "Probe isolation before decryption",
+        "Execute offline profile and filter public summary",
+    )),
+    "process-create-suspended": frozenset((
+        WINDOWS_PREPARE_STEP, "Probe isolation before decryption",
+        "Execute offline profile and filter public summary",
+    )),
+    "job-assign": frozenset((
+        WINDOWS_PREPARE_STEP, "Probe isolation before decryption",
+        "Execute offline profile and filter public summary",
+    )),
+    "resume": frozenset((
+        WINDOWS_PREPARE_STEP, "Probe isolation before decryption",
+        "Execute offline profile and filter public summary",
+    )),
+    "wait": frozenset((
+        WINDOWS_PREPARE_STEP, "Probe isolation before decryption",
+        "Execute offline profile and filter public summary",
+    )),
+    "exit": frozenset((
+        WINDOWS_PREPARE_STEP, "Probe isolation before decryption",
+        "Execute offline profile and filter public summary",
+    )),
+}
+MACOS_DNS_VARIANTS = ("base", "configd", "resolver-files", "mdnsresponder-socket", "networkd", "dnsconfig", "all")
 MACOS_DNS_DENIAL_OPERATIONS = frozenset((
     "file-read-data", "file-read-metadata", "file-read*", "mach-lookup", "network-outbound", "system-socket",
 ))
-MACOS_DNS_DENIAL_TARGETS = frozenset((
-    "com.apple.SystemConfiguration.configd", "com.apple.networkd", "com.apple.nesessionmanager",
-    "etc", "var-run", "library-prefs", "mach-other", "other",
-))
+MACOS_DNS_FILE_READ_TARGET_CLASSES = frozenset(("runner-home", "run-root", "toolcache", "other"))
+MACOS_DNS_SYSTEM_READ_PREFIXES = (
+    "/System/", "/usr/lib/", "/usr/share/", chr(47) + "private/etc/", "/etc/",
+    chr(47) + "private/var/run/", "/var/run/", chr(47) + "private/var/db/", "/Library/Preferences/",
+    "/Library/Apple/", "/dev/",
+)
 FETCH_REFUSAL_CODES = refusal_codes.DOWNLOAD_REFUSAL_CODES | frozenset(("fetch-failed",))
 SUPERVISOR_START_REFUSAL_CODES = (
     refusal_codes.STARTUP_REFUSAL_CODES | refusal_codes.STARTUP_DIAGNOSTIC_CODES
@@ -936,6 +985,18 @@ class _Grammar:
         """Fixed output lines, each bound to the step that is allowed to print it."""
         step = next((item for item in self.steps if item["name"] == step_name), None)
         uses = (step or {}).get("uses") or ""
+        launcher_phase = re.fullmatch(r"windows_launcher_phase=([a-z-]+)", line)
+        if launcher_phase is not None:
+            phase = launcher_phase.group(1)
+            if (self.job_runner != "windows-2025" or phase not in WINDOWS_LAUNCHER_PHASES
+                    or step_name not in WINDOWS_LAUNCHER_PHASE_STEPS[phase]):
+                return False
+            count = public_counts.get("windows_launcher_phase_count", 0) + 1
+            if count > 256:
+                return False
+            public_counts["windows_launcher_phase_count"] = count
+            public_counts["windows_launcher_last_phase"] = launcher_phase.group(1)
+            return True
         if line.startswith("windows_prepare_stage="):
             stage = line.removeprefix("windows_prepare_stage=")
             if (self.job_runner != "windows-2025" or step_name != WINDOWS_PREPARE_STEP
@@ -979,6 +1040,27 @@ class _Grammar:
                 return False
             public_counts["windows_prepare_heartbeat_last_" + stage] = int(elapsed)
             public_counts["windows_prepare_heartbeat_count"] = count
+            return True
+        prepare_limit = re.fullmatch(
+            r"windows_prepare_limit stage=(npm-ci|playwright) limit=(npm-child|playwright-child|work-deadline) "
+            r"seconds=([1-9][0-9]{0,3}) powershell-seconds=([1-9][0-9]{0,3})", line,
+        )
+        if prepare_limit is not None:
+            stage, limit, seconds, powershell_seconds = prepare_limit.groups()
+            seconds = int(seconds)
+            powershell_seconds = int(powershell_seconds)
+            stage_limit = 3600 if stage == "npm-ci" else 1800
+            expected_child_limit = "npm-child" if seconds == 3600 else (
+                "playwright-child" if stage == "playwright" and seconds == 1800 else "work-deadline"
+            )
+            if (self.job_runner != "windows-2025" or step_name != WINDOWS_PREPARE_STEP
+                    or public_counts.get("windows_prepare_start_stage_" + stage) != 1
+                    or stage in public_counts.get("windows_prepare_limit_stages", set())
+                    or seconds > stage_limit or powershell_seconds != seconds + 30
+                    or limit != expected_child_limit):
+                return False
+            seen_limits = public_counts.setdefault("windows_prepare_limit_stages", set())
+            seen_limits.add(stage)
             return True
         timeout_line = re.fullmatch(
             r"windows_prepare_timeout limit=(npm-child|playwright-child|work-deadline|powershell) "
@@ -1041,7 +1123,7 @@ class _Grammar:
             public_counts["cleanup_failure_completion"] = public_counts.get("cleanup_failure_completion", 0) + 1
             return public_counts["cleanup_failure_completion"] == 1
         variant_line = re.fullmatch(
-            r"macos_dns_probe_variant name=(base|configd|resolver-files|mdnsresponder-socket|networkd|all) "
+            r"macos_dns_probe_variant name=(base|configd|resolver-files|mdnsresponder-socket|networkd|dnsconfig|all) "
             r"result=(ok|fail)", line,
         )
         if variant_line is not None:
@@ -1057,22 +1139,27 @@ class _Grammar:
             public_counts["macos_dns_probe_variant_" + variant] = variant_line.group(2)
             return True
         if line.startswith("macos_sandbox_denial "):
-            denial = re.fullmatch(r"macos_sandbox_denial op=([a-z][a-z0-9*-]*) target=([A-Za-z0-9_.-]+)", line)
+            denial = re.fullmatch(r"macos_sandbox_denial op=([a-z][a-z0-9*-]*) target=(.{1,4096})", line)
             if (self.job_runner != "macos-15" or step_name != MACOS_PREPARE_STEP
                     or self.identity.get("platform") != "macos" or self.identity.get("profile") != "core-node"
-                    or denial is None or denial.group(1) not in MACOS_DNS_DENIAL_OPERATIONS
-                    or denial.group(2) not in MACOS_DNS_DENIAL_TARGETS):
+                    or denial is None or denial.group(1) not in MACOS_DNS_DENIAL_OPERATIONS):
                 return False
             if denial.group(1) == "mach-lookup":
-                if denial.group(2) not in {
-                    "com.apple.SystemConfiguration.configd", "com.apple.networkd",
-                    "com.apple.nesessionmanager", "mach-other",
-                }:
-                    return False
-            elif denial.group(2) in {
-                "com.apple.SystemConfiguration.configd", "com.apple.networkd", "com.apple.nesessionmanager",
-                "mach-other",
-            }:
+                target_ok = (denial.group(2) == "mach-other" or re.fullmatch(
+                    r"com\.apple\.[A-Za-z0-9._-]{1,120}", denial.group(2),
+                ) is not None)
+            elif denial.group(1).startswith("file-read"):
+                target = denial.group(2)
+                path_parts = target.split("/")
+                target_ok = target in MACOS_DNS_FILE_READ_TARGET_CLASSES or (
+                    target.startswith(MACOS_DNS_SYSTEM_READ_PREFIXES)
+                    and re.fullmatch(r"/[A-Za-z0-9._/ -]{1,4096}", target) is not None
+                    and not any(part in (".", "..") for part in path_parts)
+                    and not target.startswith((chr(47) + "Users/", "/System/Volumes/Data/" + "Users/"))
+                )
+            else:
+                target_ok = denial.group(2) == "other"
+            if not target_ok:
                 return False
             seen = public_counts.setdefault("macos_sandbox_denials", [])
             if denial.group(0) in seen or len(seen) >= 20:

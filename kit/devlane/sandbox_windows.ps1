@@ -9,7 +9,14 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $cleanupReason = $null
+function Write-LauncherPhase([string]$Phase) {
+    if ($Phase -notin @('types-load', 'appcontainer-sid', 'token-create', 'acl-grant', 'job-create',
+            'process-create-suspended', 'job-assign', 'resume', 'wait', 'exit')) { throw }
+    [Console]::Out.WriteLine('windows_launcher_phase=' + $Phase)
+    [Console]::Out.Flush()
+}
 try {
+    Write-LauncherPhase 'types-load'
     Add-Type -Path (Join-Path $scriptRoot 'sandbox_windows_native.cs') -ErrorAction Stop
     $statePath = [IO.Path]::GetFullPath($StateFile)
     if ($Mode -eq 'create') {
@@ -18,7 +25,7 @@ try {
         $sid = [KeelDock.Platform.DevLaneWindows.Boundary]::CreateProfile($profileName)
         $ruleName = 'KD-DevLane-' + $env:CI_RUN_ID
         try {
-            $value = [ordered]@{ schema = 1; profile_name = $profileName; package_sid = $sid; firewall_rule = $ruleName; acl_grants = @() }
+            $value = [ordered]@{ schema = 1; profile_name = $profileName; package_sid = $sid; firewall_rule = $ruleName; acl_grants = @(); integrity_grants = @() }
             $json = $value | ConvertTo-Json -Compress
             [IO.File]::WriteAllText($statePath, $json + "`n", [Text.UTF8Encoding]::new($false))
         } catch {
@@ -32,7 +39,7 @@ try {
     if ($state.schema -ne 1 -or $state.profile_name -notmatch '^KDDevLane[a-f0-9]{32}$' -or
             $state.package_sid -notmatch '^S-1-15-2-(?:[0-9]+-){6}[0-9]+$' -or
             $state.firewall_rule -ne ('KD-DevLane-' + $env:CI_RUN_ID) -or
-            $null -eq $state.acl_grants) { throw }
+            $null -eq $state.acl_grants -or $null -eq $state.integrity_grants) { throw }
     if ($Mode -eq 'firewall-install') {
         $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
         if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw }
@@ -69,6 +76,8 @@ try {
         $sid = [Security.Principal.SecurityIdentifier]::new([string]$state.package_sid)
         $grants = [Collections.Generic.List[object]]::new()
         foreach ($grant in @($state.acl_grants)) { $grants.Add($grant) }
+        $integrityGrants = [Collections.Generic.List[string]]::new()
+        foreach ($path in @($state.integrity_grants)) { $integrityGrants.Add([string]$path) }
         function Add-TrackedGrant([string]$path, [string]$rightsName, [int]$inheritanceValue) {
             $inheritance = [Security.AccessControl.InheritanceFlags]$inheritanceValue
             $rights = [Enum]::Parse([Security.AccessControl.FileSystemRights], $rightsName)
@@ -77,50 +86,59 @@ try {
             $acl = Get-Acl -LiteralPath $path
             $rule = [Security.AccessControl.FileSystemAccessRule]::new($sid, $rights, $inheritance,
                 [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)
+            $grants.Add([pscustomobject]@{ path = $path; rights = $rightsName; inheritance = $inheritanceValue })
+            Save-State
             [void]$acl.AddAccessRule($rule)
             Set-Acl -LiteralPath $path -AclObject $acl
-            $grants.Add([pscustomobject]@{ path = $path; rights = $rightsName; inheritance = $inheritanceValue })
         }
         function Save-State {
             $state.acl_grants = @($grants)
+            $state.integrity_grants = @($integrityGrants)
             $temporaryState = $statePath + '.tmp'
             $json = $state | ConvertTo-Json -Depth 8 -Compress
             [IO.File]::WriteAllText($temporaryState, $json + "`n", [Text.UTF8Encoding]::new($false))
             Move-Item -LiteralPath $temporaryState -Destination $statePath -Force
         }
+        function Add-TrackedIntegrityGrant([string]$path) {
+            if ($integrityGrants.Contains($path)) { return }
+            $integrityGrants.Add($path)
+            Save-State
+            $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
+            & $icacls $path '/setintegritylevel' '(OI)(CI)L' 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw }
+        }
+        Write-LauncherPhase 'acl-grant'
         $basePath = [IO.Path]::GetFullPath([string]$request.access_root)
         $ancestor = [IO.DirectoryInfo]::new($basePath)
         while ($null -ne $ancestor) {
             $item = Get-Item -LiteralPath $ancestor.FullName -Force
             if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw }
             Add-TrackedGrant $ancestor.FullName 'Traverse, Synchronize' 0
-            Save-State
             $ancestor = $ancestor.Parent
         }
         foreach ($entry in @($request.read_paths)) {
             $path = [IO.Path]::GetFullPath([string]$entry)
             $item = Get-Item -LiteralPath $path -Force
             if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw }
-            $ancestor = [IO.DirectoryInfo]::new($path)
+            $system32Path = [IO.Path]::GetFullPath((Join-Path $env:SystemRoot 'System32'))
+            if ([string]::Equals($path, $system32Path, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            $directoryPath = if ($item.PSIsContainer) { $path } else { Split-Path -Parent $path }
+            $ancestor = [IO.DirectoryInfo]::new($directoryPath)
             while ($null -ne $ancestor) {
                 $parentItem = Get-Item -LiteralPath $ancestor.FullName -Force
                 if (($parentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw }
                 Add-TrackedGrant $ancestor.FullName 'Traverse, Synchronize' 0
-                Save-State
                 $ancestor = $ancestor.Parent
             }
-            Add-TrackedGrant $path 'ReadAndExecute' 3
-            Save-State
+            Add-TrackedGrant $path 'ReadAndExecute' $(if ($item.PSIsContainer) { 3 } else { 0 })
         }
         foreach ($entry in @($request.write_paths)) {
             $path = [IO.Path]::GetFullPath([string]$entry)
             $item = Get-Item -LiteralPath $path -Force
             if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw }
+            if (-not $item.PSIsContainer) { throw }
             Add-TrackedGrant $path 'Modify' 3
-            Save-State
-            $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
-            & $icacls $path '/setintegritylevel' '(OI)(CI)L' 2>$null | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw }
+            Add-TrackedIntegrityGrant $path
         }
         Save-State
         $environment = [string[]]@($request.environment)
@@ -151,7 +169,7 @@ try {
             if ($code -in @(2, 3)) { return 'not-found' }
             return 'other'
         }
-        function Restore-RunnerAccessTree([string]$Root) {
+        function Restore-AppContainerStorage([string]$Root) {
             if (-not (Test-Path -LiteralPath $Root)) { return }
             $takeown = Join-Path $env:SystemRoot 'System32\takeown.exe'
             $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
@@ -183,18 +201,11 @@ try {
             $expected = [IO.Path]::GetFullPath((Join-Path (Join-Path $packages $ProfileName) 'AC'))
             if (-not [string]::Equals($actual, $expected, [StringComparison]::OrdinalIgnoreCase)) { throw }
             if (-not (Test-Path -LiteralPath $actual)) { return }
-            Restore-RunnerAccessTree $actual
+            Restore-AppContainerStorage $actual
             Remove-Item -LiteralPath $actual -Recurse -Force
         }
         $sid = [Security.Principal.SecurityIdentifier]::new([string]$state.package_sid)
-        $runnerRoot = [IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $statePath)))
-        $runnerPrefix = $runnerRoot.TrimEnd([char]92) + [IO.Path]::DirectorySeparatorChar
-        $modifiedPaths = @($state.acl_grants | Where-Object { $_.rights -eq 'Modify' } | ForEach-Object { [string]$_.path })
-        foreach ($modifiedPath in $modifiedPaths) {
-            $fullPath = [IO.Path]::GetFullPath($modifiedPath)
-            if (-not $fullPath.StartsWith($runnerPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw }
-            Restore-RunnerAccessTree $fullPath
-        }
+        Write-LauncherPhase 'acl-grant'
         foreach ($grant in @($state.acl_grants)) {
             $path = [string]$grant.path
             if (-not (Test-Path -LiteralPath $path)) { continue }
@@ -206,6 +217,12 @@ try {
                 [Security.AccessControl.AccessControlType]::Allow)
             $acl.RemoveAccessRuleSpecific($rule)
             Set-Acl -LiteralPath $path -AclObject $acl
+        }
+        $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
+        foreach ($path in @($state.integrity_grants)) {
+            if (-not (Test-Path -LiteralPath ([string]$path))) { continue }
+            & $icacls ([string]$path) '/setintegritylevel' '(OI)(CI)M' 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) { $cleanupReason = 'other'; throw }
         }
         try { Clear-AppContainerStorage ([string]$state.package_sid) ([string]$state.profile_name) }
         catch {

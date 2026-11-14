@@ -503,44 +503,72 @@ def _run_powershell(mode, state_path, request_path=None, timeout=MAX_CHILD_SECON
     host_environment = os.environ
     names = ("PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "USERPROFILE", "PSModulePath", "CI_RUN_ID")
     child_environment = {name: host_environment[name] for name in names if host_environment.get(name)}
+    phase_line = re.compile(rb"windows_launcher_phase=(types-load|appcontainer-sid|token-create|acl-grant|job-create|"
+                            rb"process-create-suspended|job-assign|resume|wait|exit)\r?\n?\Z")
+    captured = bytearray()
+    overflow = [False]
+    output_lock = threading.Lock()
+    process = None
+    reader = None
+
+    def drain_stdout():
+        while True:
+            line = process.stdout.readline()
+            if not line:
+                return
+            if phase_line.fullmatch(line):
+                with output_lock:
+                    sys.stdout.write(line.decode("ascii", "strict"))
+                    sys.stdout.flush()
+                continue
+            if len(captured) + len(line) > 8192:
+                overflow[0] = True
+            elif not overflow[0]:
+                captured.extend(line)
+
     try:
-        if monitor_stage is None:
-            result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, timeout=timeout, check=False,
-                                    env=child_environment)
-        else:
-            process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                        stderr=subprocess.DEVNULL, env=child_environment)
-            started = time.monotonic()
-            next_heartbeat = WINDOWS_PREPARE_HEARTBEAT_SECONDS
-            timed_out = False
-            while True:
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, env=child_environment)
+        reader = threading.Thread(target=drain_stdout, name="devlane-powershell-output", daemon=True)
+        reader.start()
+        started = time.monotonic()
+        next_heartbeat = WINDOWS_PREPARE_HEARTBEAT_SECONDS
+        timed_out = False
+        while True:
+            elapsed = time.monotonic() - started
+            remaining = timeout - elapsed
+            wait_for = min(remaining, next_heartbeat - elapsed) if monitor_stage is not None else remaining
+            if wait_for <= 0 and elapsed >= timeout:
+                timed_out = True
+                process.kill()
+                process.wait()
+                break
+            try:
+                process.wait(timeout=max(0.01, wait_for))
+                break
+            except subprocess.TimeoutExpired:
                 elapsed = time.monotonic() - started
-                remaining = min(timeout - elapsed, next_heartbeat - elapsed)
-                if remaining <= 0 and elapsed >= timeout:
+                if elapsed >= timeout:
                     timed_out = True
                     process.kill()
-                    stdout, _stderr = process.communicate()
+                    process.wait()
                     break
-                try:
-                    stdout, _stderr = process.communicate(timeout=max(0.01, remaining))
-                    break
-                except subprocess.TimeoutExpired:
-                    elapsed = time.monotonic() - started
-                    if elapsed >= next_heartbeat:
-                        children, top = _windows_process_summary(process.pid)
-                        print("windows_prepare_heartbeat stage=" + monitor_stage
-                              + " elapsed=" + str(int(elapsed)) + " children=" + str(children)
-                              + " top=" + top, flush=True)
-                        next_heartbeat += WINDOWS_PREPARE_HEARTBEAT_SECONDS
-            if timed_out:
+                if monitor_stage is not None and elapsed >= next_heartbeat:
+                    children, top = _windows_process_summary(process.pid)
+                    print("windows_prepare_heartbeat stage=" + monitor_stage
+                          + " elapsed=" + str(int(elapsed)) + " children=" + str(children)
+                          + " top=" + top, flush=True)
+                    next_heartbeat += WINDOWS_PREPARE_HEARTBEAT_SECONDS
+        reader.join(timeout=5)
+        if reader.is_alive():
+            raise subprocess.SubprocessError("powershell-output-drain")
+        if overflow[0]:
+            captured.extend(b"x" * (8193 - len(captured)))
+        result = subprocess.CompletedProcess(argv, process.returncode, bytes(captured), b"")
+        if timed_out:
+            if failure_prefix == "windows-prepare":
                 print("windows_prepare_timeout limit=powershell seconds=" + str(int(timeout)), flush=True)
-                _refuse((failure_prefix or "windows") + "-powershell-timeout")
-            result = subprocess.CompletedProcess(argv, process.returncode, stdout, b"")
-    except subprocess.TimeoutExpired:
-        if failure_prefix == "windows-prepare":
-            print("windows_prepare_timeout limit=powershell seconds=" + str(int(timeout)), flush=True)
-        _refuse((failure_prefix or "windows") + "-powershell-timeout")
+            _refuse((failure_prefix or "windows") + "-powershell-timeout")
     except OSError:
         _refuse((failure_prefix or "windows") + "-powershell-start-failed")
     except subprocess.SubprocessError:
@@ -566,16 +594,19 @@ def _run_powershell(mode, state_path, request_path=None, timeout=MAX_CHILD_SECON
     except UnicodeError:
         _refuse("native-boundary-output")
 
-
 def create_profile(state_path, *, failure_prefix=None, monitor_stage=None):
     if sys.platform != "win32":
         _refuse("windows-host-required")
     _run_powershell("create", state_path, timeout=30, failure_prefix=failure_prefix,
                     monitor_stage=monitor_stage)
     state = _read_json(state_path, 4096)
-    if (type(state) is not dict or set(state) != {"schema", "profile_name", "package_sid", "firewall_rule", "acl_grants"}
+    if (type(state) is not dict or set(state) != {
+            "schema", "profile_name", "package_sid", "firewall_rule", "acl_grants", "integrity_grants",
+    }
             or state["schema"] != 1 or not PROFILE_PATTERN.fullmatch(state["profile_name"])
-            or not PACKAGE_SID_PATTERN.fullmatch(state["package_sid"]) or type(state["acl_grants"]) is not list):
+            or not PACKAGE_SID_PATTERN.fullmatch(state["package_sid"]) or type(state["acl_grants"]) is not list
+            or type(state["integrity_grants"]) is not list
+            or any(type(path) is not str or len(path) > 260 for path in state["integrity_grants"])):
         _refuse("profile-state")
     return state
 
@@ -688,7 +719,7 @@ def run_network_probe(state_path, run_root, *, node_path, scratch, environment):
             request = {
                 "executable": str(node_path), "arguments": ["-e", source],
                 "working_directory": str(scratch), "environment": environment,
-                "access_root": str(run_root), "read_paths": [str(Path(node_path).parent), str(system_root / "System32")],
+                "access_root": str(run_root), "read_paths": [str(node_path)],
                 "write_paths": [str(scratch)], "timeout_milliseconds": 15000,
             }
             result = _native_run(state_path, request, run_root)
@@ -829,11 +860,15 @@ def prepare_dependencies(projection_path, output_root, deadline_file, state_path
             request = {
                 "executable": str(node), "arguments": [str(npm_cli), *NPM_INSTALL_ARGUMENTS],
                 "working_directory": str(project), "environment": environment, "access_root": str(runner_root),
-                "read_paths": [str(system_root / "System32"), str(node.parent), str(project), str(npm_cli)],
+                "read_paths": [str(node), str(npm_cli.parent.parent), str(project)],
                 "write_paths": [str(project), str(cache), str(browser_root)],
                 "timeout_milliseconds": min(3_600_000, max(1000, int(remaining * 1000))), "internet_client": True,
             }
             print("windows_prepare_stage_start=npm-ci", flush=True)
+            limit = "npm-child" if request["timeout_milliseconds"] == 3_600_000 else "work-deadline"
+            child_seconds = request["timeout_milliseconds"] // 1000
+            print("windows_prepare_limit stage=npm-ci limit=" + limit + " seconds=" + str(child_seconds)
+                  + " powershell-seconds=" + str(child_seconds + 30), flush=True)
             result = _native_run(
                 state_path, request, runner_root, failure_prefix="windows-prepare", monitor_stage="npm-ci",
             )
@@ -864,6 +899,10 @@ def prepare_dependencies(projection_path, output_root, deadline_file, state_path
                     "timeout_milliseconds": min(1_800_000, max(1000, int(remaining * 1000))),
                 })
                 print("windows_prepare_stage_start=playwright", flush=True)
+                limit = "playwright-child" if request["timeout_milliseconds"] == 1_800_000 else "work-deadline"
+                child_seconds = request["timeout_milliseconds"] // 1000
+                print("windows_prepare_limit stage=playwright limit=" + limit + " seconds=" + str(child_seconds)
+                      + " powershell-seconds=" + str(child_seconds + 30), flush=True)
                 result = _native_run(
                     state_path, request, runner_root, failure_prefix="windows-prepare", monitor_stage="playwright",
                 )
@@ -1019,8 +1058,7 @@ def _run_reporter(mode, input_path, *, state_path, run_root, scratch, source_pat
         "access_root": str(Path(run_root)),
         "read_paths": [str(Path(source_path)), str(Path(prepared_path)), str(Path(manifest_path)),
                        str(Path(config_path)) if config_path is not None else str(Path(manifest_path)),
-                       str(Path(scratch)), str(Path(node).parent),
-                       str(Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32"),
+                       str(Path(scratch)), str(Path(node)),
                        *(str(path) for path in support_paths), str(reporter)],
         "write_paths": [str(scratch)], "timeout_milliseconds": timeout_milliseconds,
     }
@@ -1193,9 +1231,9 @@ def run_profile(context_path, manifest_path, source_root, prepared_root, scratch
             "executable": executable, "arguments": arguments,
             "working_directory": str(source_path), "environment": list(entries),
             "access_root": str(Path(run_root)),
-            "read_paths": [str(source_path), str(prepared_path), str(Path(node).parent),
-                           str(Path(npm_cli).parent.parent.parent),
-                           str(Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32")],
+            "read_paths": [str(source_path), str(prepared_path), str(Path(node)),
+                           str(Path(npm_cli).parent.parent),
+                           str(Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32" / "cmd.exe")],
             "write_paths": [str(scratch)],
             "timeout_milliseconds": min(3_600_000, remaining * 1000),
         }
@@ -1214,9 +1252,9 @@ def run_profile(context_path, manifest_path, source_root, prepared_root, scratch
             "executable": executable, "arguments": arguments,
             "working_directory": str(source_path), "environment": list(entries),
             "access_root": str(Path(run_root)),
-            "read_paths": [str(source_path), str(prepared_path), str(Path(node).parent),
-                           str(Path(npm_cli).parent.parent.parent),
-                           str(Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32")],
+            "read_paths": [str(source_path), str(prepared_path), str(Path(node)),
+                           str(Path(npm_cli).parent.parent),
+                           str(Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32" / "cmd.exe")],
             "write_paths": [str(scratch)],
             "timeout_milliseconds": min(3_600_000, remaining * 1000),
         }
@@ -1455,7 +1493,7 @@ def delete_profile(state_path, *, failure_prefix="windows-cleanup", monitor_stag
     if sys.platform != "win32":
         _refuse("windows-host-required")
     try:
-        line = _run_powershell("delete", state_path, timeout=90, failure_prefix=failure_prefix,
+        line = _run_powershell("delete", state_path, timeout=MAX_CHILD_SECONDS, failure_prefix=failure_prefix,
                                monitor_stage=monitor_stage)
     except WindowsBoundaryRefusal as error:
         if failure_prefix == "windows-prepare" and not getattr(error, "_cleanup_reason_emitted", False):
