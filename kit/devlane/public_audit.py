@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "confinement"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from macos_public_audit import (
     API_ORIGIN,
@@ -21,6 +22,7 @@ from macos_public_audit import (
 import diagnostic_contract
 import network_probe
 import refusal_codes
+import macos_denial_paths
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -404,12 +406,8 @@ MACOS_DNS_VARIANTS = ("base", "configd", "resolver-files", "mdnsresponder-socket
 MACOS_DNS_DENIAL_OPERATIONS = frozenset((
     "file-read-data", "file-read-metadata", "file-read*", "mach-lookup", "network-outbound", "system-socket",
 ))
-MACOS_DNS_FILE_READ_TARGET_CLASSES = frozenset(("runner-home", "run-root", "toolcache", "other"))
-MACOS_DNS_SYSTEM_READ_PREFIXES = (
-    "/System/", "/usr/lib/", "/usr/share/", chr(47) + "private/etc/", "/etc/",
-    chr(47) + "private/var/run/", "/var/run/", chr(47) + "private/var/db/", "/Library/Preferences/",
-    "/Library/Apple/", "/dev/",
-)
+MACOS_DNS_FILE_READ_TARGET_CLASSES = macos_denial_paths.MACOS_DNS_FILE_READ_TARGET_CLASSES
+MACOS_DNS_SYSTEM_READ_PREFIXES = macos_denial_paths.MACOS_DNS_SYSTEM_READ_PREFIXES
 FETCH_REFUSAL_CODES = refusal_codes.DOWNLOAD_REFUSAL_CODES | frozenset(("fetch-failed",))
 SUPERVISOR_START_REFUSAL_CODES = (
     refusal_codes.STARTUP_REFUSAL_CODES | refusal_codes.STARTUP_DIAGNOSTIC_CODES
@@ -1150,13 +1148,7 @@ class _Grammar:
                 ) is not None)
             elif denial.group(1).startswith("file-read"):
                 target = denial.group(2)
-                path_parts = target.split("/")
-                target_ok = target in MACOS_DNS_FILE_READ_TARGET_CLASSES or (
-                    target.startswith(MACOS_DNS_SYSTEM_READ_PREFIXES)
-                    and re.fullmatch(r"/[A-Za-z0-9._/ -]{1,4096}", target) is not None
-                    and not any(part in (".", "..") for part in path_parts)
-                    and not target.startswith((chr(47) + "Users/", "/System/Volumes/Data/" + "Users/"))
-                )
+                target_ok = macos_denial_paths.validate_macos_denial_path(target, public_target=True) is not None
             else:
                 target_ok = denial.group(2) == "other"
             if not target_ok:

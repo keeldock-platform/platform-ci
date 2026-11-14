@@ -750,6 +750,23 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         )
         self.assertEqual(sandbox._macos_dns_denial_target("file-read-data", slash + "Users/runner/.npmrc"), "runner-home")
         self.assertEqual(sandbox._macos_dns_denial_target("file-read-data", slash + "Users/alice/private"), "runner-home")
+        for private_path in (
+                slash + "System" + slash * 2 + "Volumes" + slash * 3 + "Data" + slash * 2
+                + "Users" + slash + "alice" + slash + "private.txt",
+                slash + slash.join(("System", "Volumes", "Data", "Users", "alice", "..", "alice", "private.txt")),
+                slash + slash.join(("system", "volumes", "data", "users", "alice", "private.txt")),
+                slash + "private" + slash + "Users" + slash + "alice" + slash + "private.txt",
+        ):
+            with self.subTest(private_path=private_path):
+                self.assertEqual(sandbox._macos_dns_denial_target("file-read-data", private_path), "runner-home")
+        self.assertEqual(
+            sandbox._macos_dns_denial_target("file-read-data", slash + "private//var/./run/resolv.conf"),
+            slash + "var/run/resolv.conf",
+        )
+        self.assertEqual(
+            sandbox._macos_dns_denial_target("file-read-data", slash + "var/run/resolv.conf"),
+            slash + "var/run/resolv.conf",
+        )
         self.assertEqual(sandbox._macos_dns_denial_target("file-read-data", slash + "private/var/tmp/private"), "other")
         self.assertEqual(sandbox._macos_dns_denial_target("network-outbound", "/System/private"), "other")
 
@@ -770,11 +787,11 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         self.assertEqual(
             [call.args[0] for call in output.call_args_list],
             ["macos_sandbox_denial op=mach-lookup target=com.apple.SystemConfiguration.configd",
-             "macos_sandbox_denial op=file-read-data target=" + slash + "private/etc/resolv.conf",
+             "macos_sandbox_denial op=file-read-data target=" + slash + "etc/resolv.conf",
              "macos_sandbox_denial op=network-outbound target=other",
              "macos_sandbox_denial op=mach-lookup target=com.apple.private.secret"],
         )
-        self.assertIn(slash + "private/etc/resolv.conf", output.call_args_list[1].args[0])
+        self.assertIn(slash + "etc/resolv.conf", output.call_args_list[1].args[0])
         self.assertEqual(run.call_args.args[0][0:3], ("/usr/bin/log", "show", "--last"))
         self.assertNotIn("--process", run.call_args.args[0])
         self.assertIn(

@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -28,6 +29,9 @@ MAX_COMMANDS = 32
 MAX_COMMAND_ARGUMENTS = 128
 MAX_COMMAND_LINE = 30000
 MAX_CHILD_SECONDS = 10800
+WINDOWS_CLEANUP_STEP_SECONDS = 900
+WINDOWS_SHRED_RESERVE_SECONDS = 300
+WINDOWS_PROFILE_CLEANUP_TIMEOUT_SECONDS = WINDOWS_CLEANUP_STEP_SECONDS - WINDOWS_SHRED_RESERVE_SECONDS
 WINDOWS_PREPARE_HEARTBEAT_SECONDS = 60
 WINDOWS_PROCESS_CLASSES = {
     "node.exe": "node", "npm.exe": "npm", "npm.cmd": "npm", "cmd.exe": "cmd",
@@ -371,6 +375,47 @@ def _read_json(path, maximum):
         return bundle.strict_json(target.read_bytes(), maximum)
     except OSError:
         _refuse("input-unavailable")
+
+
+def _validate_cleanup_roots(state_path):
+    try:
+        state = _read_json(state_path, 4 * 1024 * 1024)
+        grants = state.get("acl_grants") if type(state) is dict else None
+        integrity_roots = state.get("integrity_grants") if type(state) is dict else None
+        if (type(state) is not dict or state.get("schema") != 1
+                or type(grants) is not list or type(integrity_roots) is not list
+                or len(grants) + len(integrity_roots) > 10000):
+            _refuse("profile-cleanup", reason="other")
+        roots = []
+        for grant in grants:
+            if type(grant) is not dict:
+                _refuse("profile-cleanup", reason="other")
+            roots.append(grant.get("path"))
+        roots.extend(integrity_roots)
+        for value in roots:
+            if type(value) is not str or not value or len(value) > 4096 or "\x00" in value:
+                _refuse("profile-cleanup", reason="other")
+            path = Path(value)
+            if not path.is_absolute():
+                _refuse("profile-cleanup", reason="other")
+            current = path
+            while True:
+                try:
+                    metadata = os.stat(current, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    _refuse("profile-cleanup", reason="other")
+                else:
+                    if (stat.S_ISLNK(metadata.st_mode)
+                            or getattr(metadata, "st_file_attributes", 0) & 0x400):
+                        _refuse("profile-cleanup", reason="other")
+                parent = current.parent
+                if parent == current:
+                    break
+                current = parent
+    except (bundle.Refusal, OSError, ValueError, TypeError):
+        _refuse("profile-cleanup", reason="other")
 
 
 def _is_reparse(path):
@@ -1492,8 +1537,10 @@ def remove_tree(root):
 def delete_profile(state_path, *, failure_prefix="windows-cleanup", monitor_stage=None):
     if sys.platform != "win32":
         _refuse("windows-host-required")
+    _validate_cleanup_roots(state_path)
     try:
-        line = _run_powershell("delete", state_path, timeout=MAX_CHILD_SECONDS, failure_prefix=failure_prefix,
+        line = _run_powershell("delete", state_path, timeout=WINDOWS_PROFILE_CLEANUP_TIMEOUT_SECONDS,
+                               failure_prefix=failure_prefix,
                                monitor_stage=monitor_stage)
     except WindowsBoundaryRefusal as error:
         if failure_prefix == "windows-prepare" and not getattr(error, "_cleanup_reason_emitted", False):

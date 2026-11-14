@@ -3043,6 +3043,7 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         denial = "macos_sandbox_denial op=mach-lookup target=com.apple.SystemConfiguration.configd"
         self.assertTrue(grammar.step_output_ok(audit.MACOS_PREPARE_STEP, denial, counts))
         self.assertFalse(grammar.step_output_ok(audit.MACOS_PREPARE_STEP, denial, counts))
+        slash = chr(47)
         for invalid in (
             "macos_dns_probe_variant name=private result=ok",
             "macos_dns_probe_variant name=all result=okay",
@@ -3052,6 +3053,16 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             "macos_sandbox_denial op=file-read-data target=private-path",
             "macos_sandbox_denial op=file-read-data target=" + chr(47) + "Users/runner/private.txt",
             "macos_sandbox_denial op=file-read-data target=/System/../" + "Users/runner/private.txt",
+            "macos_sandbox_denial op=file-read-data target=" + slash + "System" + slash * 2
+            + "Volumes" + slash * 3 + "Data" + slash * 2 + "Users" + slash + "alice/private.txt",
+            "macos_sandbox_denial op=file-read-data target=" + slash + slash.join(
+                ("System", "Volumes", "Data", "Users", "alice", "..", "alice", "private.txt"),
+            ),
+            "macos_sandbox_denial op=file-read-data target=" + slash + slash.join(
+                ("system", "volumes", "data", "users", "alice", "private.txt"),
+            ),
+            "macos_sandbox_denial op=file-read-data target=" + slash + "SYSTEM" + slash * 2
+            + "VOLUMES" + slash * 2 + "DATA" + slash * 2 + "USERS" + slash + "alice/private.txt",
             "macos_sandbox_denial op=mach-lookup target=com.apple." + "x" * 121,
             "macos_sandbox_denial op=mach-lookup target=com.apple.safe:extra",
         ):
@@ -3060,7 +3071,7 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         for target in (
             "com.apple.SystemConfiguration.DNSConfiguration", "runner-home", "run-root", "toolcache",
             "/System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration",
-            chr(47) + "private/var/run/resolv.conf",
+            chr(47) + "private/var/run/resolv.conf", chr(47) + "var/run/resolv.conf",
         ):
             operation = "mach-lookup" if target.startswith("com.apple.") else "file-read-data"
             with self.subTest(target=target):

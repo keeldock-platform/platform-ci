@@ -28,6 +28,7 @@ import macos_boundary_guard as boundary_guard
 import filter as output_filter
 import supervisor as linux_supervisor
 import refusal_codes
+import macos_denial_paths
 
 WORKER_NAME_PREFIX = "kddevlane"
 WORKER_GROUP = 20
@@ -59,11 +60,7 @@ MACOS_DNS_VARIANTS = (
     "base", "configd", "resolver-files", "mdnsresponder-socket", "networkd", "dnsconfig", "all",
 )
 MACOS_DNS_MACH_SERVICE_RE = re.compile(r"^com\.apple\.[A-Za-z0-9._-]{1,120}$")
-MACOS_DNS_SYSTEM_READ_PREFIXES = (
-    "/System/", "/usr/lib/", "/usr/share/", MACOS_PRIVATE_ROOT + "/etc/", "/etc/",
-    MACOS_PRIVATE_ROOT + "/var/run/", "/var/run/", MACOS_PRIVATE_ROOT + "/var/db/", "/Library/Preferences/",
-    "/Library/Apple/", "/dev/",
-)
+MACOS_DNS_SYSTEM_READ_PREFIXES = macos_denial_paths.MACOS_DNS_SYSTEM_READ_PREFIXES
 MACOS_DNS_DENIAL_OPERATIONS = frozenset((
     "file-read-data", "file-read-metadata", "file-read*", "mach-lookup", "network-outbound",
     "system-socket",
@@ -841,22 +838,7 @@ def _macos_dns_denial_target(operation, remainder, *, run_root=None):
     path_match = re.search(r'(?:(?:"([^"\r\n]{1,4096})")|(?:\'([^\'\r\n]{1,4096})\')|(/[^\s,;]{1,4096}))', remainder)
     path = next((value for value in path_match.groups() if value), "") if path_match else ""
     if operation.startswith("file-read"):
-        normalized_path = os.path.normpath(path) if path else ""
-        has_dot_segment = any(part in (".", "..") for part in Path(path).parts)
-        if path.startswith((chr(47) + "Users/runner/hostedtoolcache/", "/opt/hostedtoolcache/")):
-            return "toolcache"
-        if run_root is not None:
-            try:
-                Path(normalized_path).relative_to(Path(run_root))
-                return "run-root"
-            except (ValueError, OSError):
-                pass
-        if normalized_path.startswith((chr(47) + "Users/", "/System/Volumes/Data/" + "Users/")):
-            return "runner-home"
-        if has_dot_segment:
-            return "other"
-        if path.startswith(MACOS_DNS_SYSTEM_READ_PREFIXES):
-            return path
+        return macos_denial_paths.validate_macos_denial_path(path, run_root)
     return "other"
 
 def _collect_macos_sandbox_denials(pid, emitted, *, run_root=None):

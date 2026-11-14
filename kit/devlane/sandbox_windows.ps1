@@ -104,7 +104,7 @@ try {
             $integrityGrants.Add($path)
             Save-State
             $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
-            & $icacls $path '/setintegritylevel' '(OI)(CI)L' 2>$null | Out-Null
+            & $icacls $path '/setintegritylevel' '(OI)(CI)L' '/L' 2>$null | Out-Null
             if ($LASTEXITCODE -ne 0) { throw }
         }
         Write-LauncherPhase 'acl-grant'
@@ -169,30 +169,86 @@ try {
             if ($code -in @(2, 3)) { return 'not-found' }
             return 'other'
         }
+        function Assert-CleanupPathSafe([string]$Path) {
+            try {
+                if ([string]::IsNullOrWhiteSpace($Path) -or $Path.Length -gt 4096 -or -not [IO.Path]::IsPathRooted($Path)) { throw }
+                $current = [IO.Path]::GetFullPath($Path)
+                while ($null -ne $current) {
+                    $item = $null
+                    try { $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop }
+                    catch {
+                        if ($_.CategoryInfo.Category -ne 'ObjectNotFound') { throw }
+                    }
+                    if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw }
+                    $parent = [IO.DirectoryInfo]::new($current).Parent
+                    if ($null -eq $parent -or [string]::Equals($parent.FullName, $current, [StringComparison]::OrdinalIgnoreCase)) {
+                        break
+                    }
+                    $current = $parent.FullName
+                }
+            } catch {
+                $script:cleanupReason = 'other'
+                throw
+            }
+        }
+        function Assert-TrackedCleanupRootsSafe {
+            try {
+                $grants = @($state.acl_grants)
+                $integrityRoots = @($state.integrity_grants)
+                if ($grants.Count + $integrityRoots.Count -gt 10000) { throw }
+                foreach ($grant in $grants) {
+                    if ($null -eq $grant -or $grant.path -isnot [string]) { throw }
+                    Assert-CleanupPathSafe ([string]$grant.path)
+                }
+                foreach ($path in $integrityRoots) {
+                    if ($path -isnot [string]) { throw }
+                    Assert-CleanupPathSafe ([string]$path)
+                }
+            } catch {
+                $script:cleanupReason = 'other'
+                throw
+            }
+        }
+        function Assert-CleanupTreeSafe([string]$Root) {
+            try {
+                Assert-CleanupPathSafe $Root
+                if (-not (Test-Path -LiteralPath $Root -ErrorAction Stop)) { return }
+                $pending = [Collections.Generic.Stack[string]]::new()
+                $pending.Push($Root)
+                $entryCount = 0
+                while ($pending.Count -gt 0) {
+                    $path = $pending.Pop()
+                    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+                    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw }
+                    if ($item.PSIsContainer) {
+                        foreach ($entry in Get-ChildItem -LiteralPath $path -Force -ErrorAction Stop) {
+                            $entryCount++
+                            if ($entryCount -gt 250000) { throw }
+                            if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw }
+                            $pending.Push($entry.FullName)
+                        }
+                    }
+                }
+            } catch {
+                $script:cleanupReason = 'other'
+                throw
+            }
+        }
         function Restore-AppContainerStorage([string]$Root) {
             if (-not (Test-Path -LiteralPath $Root)) { return }
             $takeown = Join-Path $env:SystemRoot 'System32\takeown.exe'
             $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
-            $pending = [Collections.Generic.Stack[string]]::new()
-            $pending.Push($Root)
-            $entryCount = 1
-            while ($pending.Count -gt 0) {
-                $path = $pending.Pop()
-                $item = Get-Item -LiteralPath $path -Force
-                if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw }
-                if ($item.PSIsContainer) {
-                    foreach ($entry in Get-ChildItem -LiteralPath $path -Force) {
-                        $entryCount++
-                        if ($entryCount -gt 250000) { throw }
-                        $pending.Push($entry.FullName)
-                    }
-                }
-            }
+            Assert-TrackedCleanupRootsSafe
+            Assert-CleanupTreeSafe $Root
             & $takeown '/F' $Root '/A' '/R' '/D' 'Y' *> $null
             if ($LASTEXITCODE -ne 0) { $script:cleanupReason = 'other'; throw }
-            & $icacls $Root '/reset' '/T' '/C' '/Q' *> $null
+            Assert-TrackedCleanupRootsSafe
+            Assert-CleanupTreeSafe $Root
+            & $icacls $Root '/reset' '/T' '/C' '/Q' '/L' *> $null
             if ($LASTEXITCODE -ne 0) { $script:cleanupReason = 'other'; throw }
-            & $icacls $Root '/grant:r' '*S-1-5-32-544:(OI)(CI)F' '/C' '/Q' *> $null
+            Assert-TrackedCleanupRootsSafe
+            Assert-CleanupTreeSafe $Root
+            & $icacls $Root '/grant:r' '*S-1-5-32-544:(OI)(CI)F' '/C' '/Q' '/L' *> $null
             if ($LASTEXITCODE -ne 0) { $script:cleanupReason = 'other'; throw }
         }
         function Clear-AppContainerStorage([string]$PackageSid, [string]$ProfileName) {
@@ -201,13 +257,19 @@ try {
             $expected = [IO.Path]::GetFullPath((Join-Path (Join-Path $packages $ProfileName) 'AC'))
             if (-not [string]::Equals($actual, $expected, [StringComparison]::OrdinalIgnoreCase)) { throw }
             if (-not (Test-Path -LiteralPath $actual)) { return }
+            Assert-TrackedCleanupRootsSafe
+            Assert-CleanupTreeSafe $actual
             Restore-AppContainerStorage $actual
+            Assert-TrackedCleanupRootsSafe
+            Assert-CleanupTreeSafe $actual
             Remove-Item -LiteralPath $actual -Recurse -Force
         }
         $sid = [Security.Principal.SecurityIdentifier]::new([string]$state.package_sid)
         Write-LauncherPhase 'acl-grant'
+        Assert-TrackedCleanupRootsSafe
         foreach ($grant in @($state.acl_grants)) {
             $path = [string]$grant.path
+            Assert-TrackedCleanupRootsSafe
             if (-not (Test-Path -LiteralPath $path)) { continue }
             $acl = Get-Acl -LiteralPath $path
             $rule = [Security.AccessControl.FileSystemAccessRule]::new($sid,
@@ -216,12 +278,15 @@ try {
                 [Security.AccessControl.PropagationFlags]::None,
                 [Security.AccessControl.AccessControlType]::Allow)
             $acl.RemoveAccessRuleSpecific($rule)
+            Assert-TrackedCleanupRootsSafe
             Set-Acl -LiteralPath $path -AclObject $acl
         }
         $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
         foreach ($path in @($state.integrity_grants)) {
+            Assert-TrackedCleanupRootsSafe
             if (-not (Test-Path -LiteralPath ([string]$path))) { continue }
-            & $icacls ([string]$path) '/setintegritylevel' '(OI)(CI)M' 2>$null | Out-Null
+            Assert-TrackedCleanupRootsSafe
+            & $icacls ([string]$path) '/setintegritylevel' '(OI)(CI)M' '/L' 2>$null | Out-Null
             if ($LASTEXITCODE -ne 0) { $cleanupReason = 'other'; throw }
         }
         try { Clear-AppContainerStorage ([string]$state.package_sid) ([string]$state.profile_name) }
@@ -229,6 +294,7 @@ try {
             if ($null -eq $cleanupReason) { $cleanupReason = Get-CleanupReason $_ }
             throw
         }
+        Assert-TrackedCleanupRootsSafe
         $deleteResult = [KeelDock.Platform.DevLaneWindows.Boundary]::DeleteProfile([string]$state.profile_name)
         if ($deleteResult -ne 'deleted') {
             $cleanupReason = [string]$deleteResult

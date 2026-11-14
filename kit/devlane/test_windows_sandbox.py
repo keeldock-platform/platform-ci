@@ -210,12 +210,47 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         self.assertIn("Add-TrackedIntegrityGrant $path", run)
         self.assertIn("foreach ($path in @($state.integrity_grants))", cleanup)
         self.assertIn("'/setintegritylevel' '(OI)(CI)M'", cleanup)
+        self.assertIn("Assert-TrackedCleanupRootsSafe", cleanup)
+        self.assertIn("[IO.FileAttributes]::ReparsePoint", cleanup)
+        self.assertIn("'/L'", cleanup)
         self.assertNotIn("$modifiedPaths", cleanup)
         self.assertNotIn("Restore-RunnerAccessTree", cleanup)
         self.assertIn("Restore-AppContainerStorage $actual", cleanup)
         self.assertIn("if ($entryCount -gt 250000) { throw }", cleanup)
         python_source = Path(windows.__file__).read_text(encoding="utf-8")
-        self.assertIn("timeout=MAX_CHILD_SECONDS, failure_prefix=failure_prefix", python_source)
+        self.assertIn("timeout=WINDOWS_PROFILE_CLEANUP_TIMEOUT_SECONDS", python_source)
+
+    def test_substituted_cleanup_root_is_refused_before_powershell_acl_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            target = base / "outside"
+            target.mkdir()
+            writable = base / "writable"
+            writable.symlink_to(target, target_is_directory=True)
+            state = base / "sandbox.json"
+            state.write_text(json.dumps({
+                "schema": 1,
+                "acl_grants": [{"path": str(writable), "rights": "Modify", "inheritance": 3}],
+                "integrity_grants": [str(writable)],
+            }), encoding="ascii")
+            with mock.patch.object(windows.sys, "platform", "win32"), \
+                    mock.patch.object(windows, "_run_powershell") as powershell:
+                with self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
+                    windows.delete_profile(state)
+            self.assertEqual(caught.exception.reason, "other")
+            powershell.assert_not_called()
+
+    def test_profile_cleanup_child_cap_leaves_the_shred_reserve_inside_the_step(self):
+        self.assertEqual(windows.WINDOWS_CLEANUP_STEP_SECONDS, 900)
+        self.assertEqual(windows.WINDOWS_SHRED_RESERVE_SECONDS, 300)
+        self.assertEqual(windows.WINDOWS_PROFILE_CLEANUP_TIMEOUT_SECONDS, 600)
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "sandbox.json"
+            state.write_text(json.dumps({"schema": 1, "acl_grants": [], "integrity_grants": []}), encoding="ascii")
+            with mock.patch.object(windows.sys, "platform", "win32"), \
+                    mock.patch.object(windows, "_run_powershell", return_value="removed") as powershell:
+                windows.delete_profile(state)
+            self.assertEqual(powershell.call_args.kwargs["timeout"], 600)
 
     def test_shred_failure_prints_a_fixed_failed_cleanup_receipt(self):
         output = io.StringIO()
