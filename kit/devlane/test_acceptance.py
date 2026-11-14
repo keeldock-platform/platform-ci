@@ -876,10 +876,157 @@ class FetchProjectionAcceptanceTests(unittest.TestCase):
         )
         macos_start = workflow.index("  devlane-encrypted-run-macos:")
         windows_start = workflow.index("  devlane-encrypted-run-windows:", macos_start)
-        linux_job, macos_job, windows_job = workflow[:macos_start], workflow[macos_start:windows_start], workflow[windows_start:]
+        audit_start = workflow.index("  devlane-encrypted-audit:", windows_start)
+        linux_job, macos_job = workflow[:macos_start], workflow[macos_start:windows_start]
+        windows_job = workflow[windows_start:audit_start]
         self.assertNotIn("--transient-retries", linux_job)
         self.assertEqual(macos_job.count("--transient-retries 4"), 2)
         self.assertNotIn("--transient-retries", windows_job)
+        self.assertIn("    permissions:\n      contents: read\n", macos_job)
+        fetch_step = macos_job.split("      - name: Fetch ciphertext and sanitized dependency projection\n", 1)[1]
+        fetch_step = fetch_step.split("      - name: Install pinned Rust toolchain\n", 1)[0]
+        self.assertIn("          GITHUB_TOKEN: ${{ github.token }}\n", fetch_step)
+        self.assertIn("deadline.py run --file \"$RUN_ROOT/deadline.json\"", fetch_step)
+        self.assertLess(fetch_step.index('unset GITHUB_TOKEN'), fetch_step.index('fetch_script="$(cat'))
+        self.assertIn("          unset fetch_token\n", fetch_step)
+        self.assertNotIn("GITHUB_TOKEN", linux_job)
+        self.assertNotIn("GITHUB_TOKEN", windows_job)
+
+    def test_authenticated_asset_download_keeps_token_on_api_and_preserves_asset_binding(self):
+        payload = b"bound-ciphertext"
+        token = "fixed-test-token"
+        api_url = "https://api.github.com/repos/keeldock-platform/platform-ci/releases/assets/123"
+        asset_url = "https://release-assets.githubusercontent.com/download/asset"
+        redirect = fetch.urllib.error.HTTPError(
+            api_url, 302, "Found", {"Location": asset_url}, None,
+        )
+
+        class Response:
+            status = 200
+
+            def __init__(self):
+                self.body = payload
+
+            def geturl(self):
+                return asset_url
+
+            def read(self, size):
+                result, self.body = self.body[:size], self.body[size:]
+                return result
+
+            def close(self):
+                return None
+
+        class Opener:
+            def __init__(self):
+                self.requests = []
+                self.responses = [redirect, Response()]
+
+            def open(self, request, timeout):
+                self.requests.append((request.full_url, request.get_header("Authorization")))
+                result = self.responses.pop(0)
+                if isinstance(result, BaseException):
+                    raise result
+                return result
+
+        opener = Opener()
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.dict(os.environ, {"GITHUB_TOKEN": token}), \
+                patch.object(fetch.urllib.request, "build_opener", return_value=opener), \
+                contextlib.redirect_stdout(output):
+            destination = Path(temporary) / "asset.bin"
+            result = fetch.main([
+                "download", "--asset-id", "123", "--size", str(len(payload)),
+                "--sha256", hashlib.sha256(payload).hexdigest(), "--output", str(destination),
+            ])
+            self.assertEqual(result, 0)
+            self.assertEqual(destination.read_bytes(), payload)
+            self.assertNotIn(token.encode("ascii"), destination.read_bytes())
+        self.assertEqual(opener.requests, [(api_url, "Bearer " + token), (asset_url, None)])
+        self.assertNotIn(token, output.getvalue())
+
+    def test_rate_limited_asset_download_retries_with_a_bounded_retry_after(self):
+        api_url = "https://api.github.com/repos/keeldock-platform/platform-ci/releases/assets/123"
+
+        class Opener:
+            def __init__(self):
+                self.calls = 0
+
+            def open(self, request, timeout):
+                self.calls += 1
+                raise fetch.urllib.error.HTTPError(
+                    api_url, 403, "private reason", {"retry-after": "3600"}, None,
+                )
+
+        opener = Opener()
+        delays = []
+        with patch.object(fetch.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaisesRegex(bundle.Refusal, "download-rate-limited"):
+                fetch._open_limited(
+                    api_url, 64, fetch.ALLOWED_HOSTS, transient_retries=4, sleep=delays.append,
+                )
+        self.assertEqual(opener.calls, 5)
+        self.assertEqual(delays, [30, 30, 30, 30])
+
+    def test_rate_limit_headers_retry_403_and_429_but_hard_403_is_forbidden(self):
+        api_url = "https://api.github.com/repos/keeldock-platform/platform-ci/releases/assets/123"
+        payload = b"asset"
+
+        class Response:
+            status = 200
+
+            def __init__(self):
+                self.body = payload
+
+            def geturl(self):
+                return api_url
+
+            def read(self, size):
+                result, self.body = self.body[:size], self.body[size:]
+                return result
+
+            def close(self):
+                return None
+
+        class SequenceOpener:
+            def __init__(self, responses):
+                self.responses = responses
+
+            def open(self, request, timeout):
+                result = self.responses.pop(0)
+                if isinstance(result, BaseException):
+                    raise result
+                return result
+
+        for status, response_headers, expected_delay in (
+            (403, {"x-ratelimit-remaining": "0"}, 1),
+            (429, {"retry-after": "3"}, 3),
+        ):
+            delays = []
+            first = fetch.urllib.error.HTTPError(api_url, status, "private reason", response_headers, None)
+            opener = SequenceOpener([first, Response()])
+            with self.subTest(status=status), patch.object(
+                    fetch.urllib.request, "build_opener", return_value=opener):
+                self.assertEqual(fetch._open_limited(
+                    api_url, 64, fetch.ALLOWED_HOSTS, transient_retries=1, sleep=delays.append,
+                ), payload)
+            self.assertEqual(delays, [expected_delay])
+
+        forbidden = fetch.urllib.error.HTTPError(api_url, 403, "private reason", {}, None)
+        delays = []
+
+        class ForbiddenOpener:
+            def open(self, request, timeout):
+                raise forbidden
+
+        with patch.object(fetch.urllib.request, "build_opener", return_value=ForbiddenOpener()):
+            with self.assertRaisesRegex(bundle.Refusal, "download-forbidden"):
+                fetch._open_limited(api_url, 64, fetch.ALLOWED_HOSTS, transient_retries=4, sleep=delays.append)
+        self.assertEqual(delays, [])
+
+        with self.assertRaisesRegex(bundle.Refusal, "download-auth-invalid"):
+            fetch._open_limited(api_url, 64, fetch.ALLOWED_HOSTS, token="invalid\ntoken")
 
     def test_release_asset_download_retries_transient_http_errors_and_refetches_redirect(self):
         payload = b"ciphertext"
@@ -965,9 +1112,9 @@ class FetchProjectionAcceptanceTests(unittest.TestCase):
                 return self.response
 
         for status, code in (
-            (401, "download-http-401"), (403, "download-http-403"),
+            (401, "download-http-401"), (403, "download-forbidden"),
             (404, "download-http-404"), (410, "download-http-410"),
-            (429, "download-http-429"), (400, "download-http-4xx"),
+            (429, "download-rate-limited"), (400, "download-http-4xx"),
             (503, "download-http-5xx"), (300, "download-http-3xx"),
         ):
             error = fetch.urllib.error.HTTPError(api_url, status, "private reason", {}, None)

@@ -22,6 +22,10 @@ CONTROL_SHA = acceptance.CONTROL_SHA
 
 
 class PreparationTests(unittest.TestCase):
+    def test_shared_deadline_binding_tolerates_float_rounding_but_not_budget_changes(self):
+        self.assertTrue(constraint_resolver._deadline_matches(0.5000000000000071, 0.5))
+        self.assertFalse(constraint_resolver._deadline_matches(0.500002, 0.5))
+
     def test_worker_device_permissions_are_independent_of_setup_umask(self):
         expected = {"null": 0o666, "zero": 0o666, "random": 0o444, "urandom": 0o444}
         for mask in (0o022, 0o077):

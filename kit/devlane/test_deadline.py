@@ -329,7 +329,10 @@ class DeadlineTests(unittest.TestCase):
                     patch.object(deadline.subprocess, "Popen", return_value=process), \
                     patch.object(deadline.os, "killpg") as kill:
                 self.assertEqual(deadline.run(path, ["fixed-command"], timeout_cleanup_reserve=300), 124)
-            self.assertEqual([call.kwargs["timeout"] for call in process.wait.call_args_list], [0.5, 297, 3])
+            wait_timeouts = [call.kwargs["timeout"] for call in process.wait.call_args_list]
+            self.assertEqual(len(wait_timeouts), 3)
+            self.assertAlmostEqual(wait_timeouts[0], 0.5)
+            self.assertEqual(wait_timeouts[1:], [297, 3])
             self.assertEqual([call.args[1] for call in kill.call_args_list], [signal.SIGTERM, signal.SIGKILL])
 
     def test_watchdog_cleanup_reserve_cannot_exceed_the_bound_file(self):

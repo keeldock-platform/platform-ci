@@ -11,6 +11,7 @@ import hashlib
 import fnmatch
 import http.server
 import json
+import math
 import os
 import posixpath
 import re
@@ -55,6 +56,13 @@ INDEX_VERSION = re.compile(
 
 class Refusal(ValueError):
     """A safe, bounded refusal code."""
+
+
+def _deadline_matches(actual, expected):
+    return (
+        type(actual) in (int, float) and math.isfinite(actual)
+        and math.isclose(actual, float(expected), rel_tol=0.0, abs_tol=1e-6)
+    )
 
 
 class _LocalSparseIndex:
@@ -1061,9 +1069,10 @@ def run_cargo_fixed_point(envelope: dict[str, Any], *, expected_source_sha: str,
                 outer["work_deadline"], outer["work_deadline"] + outer["cleanup_reserve"])
         else:
             if (not isinstance(phase_budget, bounded_registry_io.PhaseBudget)
-                    or phase_budget.deadline != float(outer["work_deadline"])
-                    or phase_budget.cleanup_deadline != float(
-                        outer["work_deadline"] + outer["cleanup_reserve"]
+                    or not _deadline_matches(phase_budget.deadline, outer["work_deadline"])
+                    or not _deadline_matches(
+                        phase_budget.cleanup_deadline,
+                        outer["work_deadline"] + outer["cleanup_reserve"],
                     )):
                 _fail("resolver-shared-budget-binding")
             phase_budget.remaining()

@@ -535,7 +535,8 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 180
     environment: devlane-decrypt
-    permissions: {}
+    permissions:
+      contents: read
     defaults:
       run:
         shell: bash
@@ -945,14 +946,23 @@ jobs:
             librsvg2-dev >/dev/null 2>&1
           printf 'tauri_linux_dependencies=installed\n'
       - name: Fetch ciphertext and sanitized dependency projection
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- bash -euo pipefail -c "$(cat <<'DEVLANE_FETCH'
-          python3 -B kit/devlane/fetch.py download --transient-retries 4 --asset-id "$DEVLANE_BUNDLE_ASSET_ID" --size "$DEVLANE_BUNDLE_SIZE" --sha256 "$DEVLANE_BUNDLE_SHA256" --output "$RUN_ROOT/bundle.enc"
-          python3 -B kit/devlane/fetch.py download --transient-retries 4 --maximum 16777216 --asset-id "$DEVLANE_PROJECTION_ASSET_ID" --size "$DEVLANE_PROJECTION_SIZE" --sha256 "$DEVLANE_PROJECTION_SHA256" --output "$RUN_ROOT/projection.json"
+          fetch_token="$GITHUB_TOKEN"
+          unset GITHUB_TOKEN
+          fetch_script="$(cat <<'DEVLANE_FETCH'
+          fetch_token="$GITHUB_TOKEN"
+          unset GITHUB_TOKEN
+          GITHUB_TOKEN="$fetch_token" python3 -B kit/devlane/fetch.py download --transient-retries 4 --asset-id "$DEVLANE_BUNDLE_ASSET_ID" --size "$DEVLANE_BUNDLE_SIZE" --sha256 "$DEVLANE_BUNDLE_SHA256" --output "$RUN_ROOT/bundle.enc"
+          GITHUB_TOKEN="$fetch_token" python3 -B kit/devlane/fetch.py download --transient-retries 4 --maximum 16777216 --asset-id "$DEVLANE_PROJECTION_ASSET_ID" --size "$DEVLANE_PROJECTION_SIZE" --sha256 "$DEVLANE_PROJECTION_SHA256" --output "$RUN_ROOT/projection.json"
+          unset fetch_token
           python3 -B kit/devlane/fetch.py check-projection --file "$RUN_ROOT/projection.json" --profile "$DEVLANE_PROFILE" --control-sha "$CI_SHA"
           DEVLANE_FETCH
           )"
+          GITHUB_TOKEN="$fetch_token" python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- bash -euo pipefail -c "$fetch_script"
+          unset fetch_token fetch_script
       - name: Install pinned Rust toolchain
         if: ${{ inputs.profile == 'core-rust' || inputs.profile == 'desktop' || inputs.profile == 'local-sync-rust' }}
         run: |

@@ -1,6 +1,7 @@
-"""Bounded anonymous fetch and validation for public dev-lane inputs."""
+"""Bounded fetch and validation for public dev-lane inputs."""
 
 import argparse
+import email.utils
 import hashlib
 import json
 import os
@@ -132,6 +133,53 @@ def _http_status_refusal(status):
     return "download-http-" + str(status // 100) + "xx"
 
 
+def _header_value(headers, name):
+    if headers is None:
+        return None
+    target = name.lower()
+    for key, value in headers.items():
+        if type(key) is str and key.lower() == target:
+            return value
+    return None
+
+
+def _is_rate_limited(status, headers):
+    return status == 429 or (
+        status == 403 and (
+            _header_value(headers, "Retry-After") is not None
+            or _header_value(headers, "X-RateLimit-Remaining") == "0"
+        )
+    )
+
+
+def _download_status_refusal(status, headers=None, rate_limited_seen=False):
+    if status == 403:
+        if rate_limited_seen or _is_rate_limited(status, headers):
+            return "download-rate-limited"
+        return "download-forbidden"
+    if status == 429:
+        return "download-rate-limited"
+    return _http_status_refusal(status)
+
+
+def _retry_delay(retries, headers):
+    delay = min(8, 2 ** retries)
+    retry_after = _header_value(headers, "Retry-After")
+    if type(retry_after) is str and len(retry_after) <= 64:
+        requested = None
+        if retry_after.isdecimal():
+            requested = int(retry_after)
+        else:
+            try:
+                retry_at = email.utils.parsedate_to_datetime(retry_after)
+                requested = max(0, int(retry_at.timestamp() - time.time()))
+            except (TypeError, ValueError, OverflowError):
+                pass
+        if requested is not None:
+            delay = min(30, max(delay, requested))
+    return delay
+
+
 def _is_timeout(error):
     if isinstance(error, (TimeoutError, socket.timeout)):
         return True
@@ -144,18 +192,27 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _open_limited(url, maximum, allowed_hosts, *, transient_retries=0, sleep=time.sleep):
+def _open_limited(url, maximum, allowed_hosts, *, transient_retries=0,
+                  sleep=time.sleep, token=None):
     if type(transient_retries) is not int or not 0 <= transient_retries <= MAX_TRANSIENT_RETRIES:
         _fail("download-retry-bounds")
+    if token is not None and (
+            type(token) is not str or not token or len(token) > 4096
+            or any(ord(character) < 33 or ord(character) > 126 for character in token)):
+        _fail("download-auth-invalid")
     handlers = [_NoRedirect()]
     opener = urllib.request.build_opener(*handlers)
     initial = _validate_url(url, allowed_hosts)
     current = initial
     redirects = retries = 0
+    rate_limited_seen = False
     while True:
+        headers = {"Accept": "application/octet-stream", "User-Agent": "platform-devlane-fetch/1"}
+        if token is not None and current == initial and urllib.parse.urlsplit(current).hostname == "api.github.com":
+            headers["Authorization"] = "Bearer " + token
         request = urllib.request.Request(
             current,
-            headers={"Accept": "application/octet-stream", "User-Agent": "platform-devlane-fetch/1"},
+            headers=headers,
             method="GET",
         )
         try:
@@ -171,17 +228,14 @@ def _open_limited(url, maximum, allowed_hosts, *, transient_retries=0, sleep=tim
                     current = _validate_url(urllib.parse.urljoin(current, location), allowed_hosts)
                     redirects += 1
                     continue
+                rate_limited = _is_rate_limited(error.code, error.headers)
+                rate_limited_seen = rate_limited_seen or rate_limited
                 retryable = error.code in (408, 425, 429, 500, 502, 503, 504)
-                if error.code == 403 and (
-                        error.headers.get("Retry-After") is not None
-                        or error.headers.get("X-RateLimit-Remaining") == "0"):
+                if rate_limited:
                     retryable = True
                 if not retryable or retries >= transient_retries:
-                    _fail(_http_status_refusal(error.code))
-                delay = min(8, 2 ** retries)
-                retry_after = error.headers.get("Retry-After")
-                if type(retry_after) is str and len(retry_after) <= 3 and retry_after.isdecimal():
-                    delay = min(30, max(delay, int(retry_after)))
+                    _fail(_download_status_refusal(error.code, error.headers, rate_limited_seen))
+                delay = _retry_delay(retries, error.headers)
                 retries += 1
                 error.close()
                 sleep(delay)
@@ -199,7 +253,9 @@ def _open_limited(url, maximum, allowed_hosts, *, transient_retries=0, sleep=tim
         try:
             _validate_url(response.geturl(), allowed_hosts)
             if response.status != 200:
-                _fail(_http_status_refusal(response.status))
+                _fail(_download_status_refusal(
+                    response.status, getattr(response, "headers", None), rate_limited_seen,
+                ))
             chunks = []
             size = 0
             try:
@@ -223,7 +279,7 @@ def _open_limited(url, maximum, allowed_hosts, *, transient_retries=0, sleep=tim
 
 
 def download_release_asset(asset_id, expected_size, expected_sha256, destination, maximum=MAX_CIPHERTEXT,
-                           *, transient_retries=0):
+                           *, transient_retries=0, token=None):
     if type(asset_id) is not str or not re.fullmatch(r"[1-9][0-9]{0,18}", asset_id):
         _fail("asset-id")
     if type(expected_size) is not int or expected_size < 1 or expected_size > maximum:
@@ -231,7 +287,9 @@ def download_release_asset(asset_id, expected_size, expected_sha256, destination
     if type(expected_sha256) is not str or not SHA256.fullmatch(expected_sha256):
         _fail("asset-digest")
     url = "https://api.github.com/repos/" + REPOSITORY + "/releases/assets/" + asset_id
-    payload = _open_limited(url, maximum, ALLOWED_HOSTS, transient_retries=transient_retries)
+    payload = _open_limited(
+        url, maximum, ALLOWED_HOSTS, transient_retries=transient_retries, token=token,
+    )
     if len(payload) != expected_size or hashlib.sha256(payload).hexdigest() != expected_sha256:
         _fail("asset-binding-mismatch")
     destination = Path(destination)
@@ -782,7 +840,7 @@ def main(argv=None):
         if args.operation == "download":
             size = download_release_asset(
                 args.asset_id, args.size, args.sha256, args.output, args.maximum,
-                transient_retries=args.transient_retries,
+                transient_retries=args.transient_retries, token=os.environ.get("GITHUB_TOKEN") or None,
             )
             print("public_asset_verified=true bytes=" + str(size))
         elif args.operation == "check-projection":
