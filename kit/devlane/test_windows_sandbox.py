@@ -3,6 +3,7 @@
 import json
 import contextlib
 import io
+import os
 import re
 import tempfile
 import unittest
@@ -257,10 +258,94 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         self.assertIn("GetFileInformationByHandle(handle, out information)", native)
         self.assertIn("FileAttributeReparsePoint) != 0", native)
         self.assertIn("if (!requireDirectory && information.NumberOfLinks != 1)", native)
-        self.assertIn("$script:WindowsCleanupEntries -gt 250000", script)
+        self.assertIn("$script:WindowsCleanupEntries -ge 250000", script)
+        self.assertIn("$PendingCount -ge 250000", script)
         self.assertIn("$script:WindowsCleanupTimer.ElapsedMilliseconds -gt 600000", script)
+        self.assertIn("[void](Clear-AppContainerStorage", cleanup)
         python_source = Path(windows.__file__).read_text(encoding="utf-8")
         self.assertIn("timeout=WINDOWS_PROFILE_CLEANUP_TIMEOUT_SECONDS", python_source)
+
+    def test_ancestor_traverse_grant_uses_a_direct_nonpropagating_setter(self):
+        script = Path(windows.__file__).with_name("sandbox_windows.ps1").read_text(encoding="utf-8")
+        run = script.split("if ($Mode -eq 'run')", 1)[1].split("if ($Mode -eq 'delete')", 1)[0]
+        self.assertEqual(run.count("Add-TrackedTraverseGrant $ancestor.FullName"), 2)
+        traverse = "function Add-TrackedTraverseGrant" + run.split(
+            "function Add-TrackedTraverseGrant", 1,
+        )[1].split("function Add-TrackedIntegrityGrant", 1)[0]
+        self.assertNotRegex(traverse, r"\bGet-Acl\b|\bSet-Acl\b")
+        self.assertIn("@('/grant:r', ('*' + [string]$sid + ':(X,S)'))", traverse)
+        self.assertNotRegex(traverse, r"(?i)\(OI\)|\(CI\)|'/T'|\"/T\"")
+        self.assertIn("'/L'", script.split("function Invoke-CleanupIcacls", 1)[1].split("function Set-CleanupStorageAccess", 1)[0])
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary) / "ancestor" / "child" / "leaf"
+            fixture.mkdir(parents=True)
+            ancestors = []
+            current = fixture
+            while current != current.parent:
+                ancestors.append(current)
+                current = current.parent
+            sid = "S-1-15-2-1-2-3-4-5-6-7"
+            writes = [(str(path), "/grant:r", "*" + sid + ":(X,S)", "/L", "/Q") for path in ancestors]
+            self.assertGreaterEqual(len(writes), 4)
+            self.assertTrue(all("(OI)" not in " ".join(write) and "(CI)" not in " ".join(write)
+                                and "/T" not in write for write in writes))
+            self.assertTrue(all(write[1:] == ("/grant:r", "*" + sid + ":(X,S)", "/L", "/Q")
+                                for write in writes))
+
+    def test_cleanup_discovery_budget_refuses_a_generated_wide_directory(self):
+        script = Path(windows.__file__).with_name("sandbox_windows.ps1").read_text(encoding="utf-8")
+        budget = script.split("function Start-CleanupBudget", 1)[1].split("function Get-CleanupPathInfo", 1)[0]
+        preflight = script.split("function Assert-CleanupTreeSafe", 1)[1].split(
+            "function Invoke-CleanupIcacls", 1,
+        )[0]
+        cleanup = script.split("if ($Mode -eq 'delete') {", 1)[1].split("\n    throw\n} catch {", 1)[0]
+        storage = cleanup.split("function Clear-AppContainerStorage", 1)[1].split(
+            "Write-LauncherPhase 'acl-grant'", 1,
+        )[0]
+        self.assertIn("$PendingCount -ge 250000", budget)
+        self.assertIn("$script:WindowsCleanupEntries -ge 250000", budget)
+        self.assertIn("$script:cleanupReason = 'other'", budget)
+        self.assertIn("Assert-CleanupBudgetTime", budget)
+        for walker in (preflight, storage):
+            self.assertLess(walker.index("Add-CleanupBudgetEntry $pending.Count"), walker.index("$pending.Push($child)"))
+            self.assertIn("Assert-CleanupBudgetTime", walker)
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary) / "wide"
+            fixture.mkdir()
+            for index in range(70):
+                (fixture / ("entry-" + str(index))).touch()
+            def discover_with_contract(entry_limit, pending_limit):
+                entries = 0
+                pending = []
+
+                class BudgetRefusal(Exception):
+                    def __init__(self):
+                        self.reason = "other"
+                        self.entries = entries
+                        self.pending = len(pending)
+
+                def charge():
+                    nonlocal entries
+                    if entries >= entry_limit or len(pending) >= pending_limit:
+                        raise BudgetRefusal()
+                    entries += 1
+
+                try:
+                    charge()
+                    pending.append(fixture)
+                    while pending:
+                        current = pending.pop()
+                        if current.is_dir():
+                            with os.scandir(current) as children:
+                                for child in children:
+                                    charge()
+                                    pending.append(Path(child.path))
+                except BudgetRefusal as refusal:
+                    return refusal.reason, refusal.entries, refusal.pending
+                return "accepted", entries, len(pending)
+
+            self.assertEqual(discover_with_contract(64, 64), ("other", 64, 63))
+            self.assertEqual(discover_with_contract(128, 4), ("other", 5, 4))
 
     def test_cleanup_refuses_an_unreaped_job_or_live_appcontainer_process(self):
         script = Path(windows.__file__).with_name("sandbox_windows.ps1").read_text(encoding="utf-8")

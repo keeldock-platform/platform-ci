@@ -19,10 +19,19 @@ function Start-CleanupBudget {
     $script:WindowsCleanupTimer = [Diagnostics.Stopwatch]::StartNew()
     $script:WindowsCleanupEntries = 0
 }
-function Add-CleanupBudgetEntry {
+function Assert-CleanupBudgetTime {
+    if ($script:WindowsCleanupTimer.ElapsedMilliseconds -gt 600000) {
+        $script:cleanupReason = 'other'
+        throw
+    }
+}
+function Add-CleanupBudgetEntry([int]$PendingCount = 0) {
+    Assert-CleanupBudgetTime
+    if ($script:WindowsCleanupEntries -ge 250000 -or $PendingCount -ge 250000) {
+        $script:cleanupReason = 'other'
+        throw
+    }
     $script:WindowsCleanupEntries++
-    if ($script:WindowsCleanupEntries -gt 250000 -or
-            $script:WindowsCleanupTimer.ElapsedMilliseconds -gt 600000) { throw }
 }
 function Get-CleanupPathInfo([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path) -or $Path.Length -gt 4096 -or
@@ -60,17 +69,18 @@ function Assert-CleanupTreeSafe([string]$Path) {
     if ($null -eq $rootInfo) { return }
     if (-not $rootInfo.Item.PSIsContainer) { throw }
     $pending = [Collections.Generic.Stack[string]]::new()
+    Add-CleanupBudgetEntry $pending.Count
     $pending.Push($rootInfo.Path)
     while ($pending.Count -gt 0) {
-        if ($script:WindowsCleanupTimer.ElapsedMilliseconds -gt 600000) { throw }
+        Assert-CleanupBudgetTime
         $currentPath = $pending.Pop()
         $entry = Get-CleanupPathInfo $currentPath
         if ($null -eq $entry) { throw }
-        Add-CleanupBudgetEntry
         if (-not $entry.Item.PSIsContainer) { continue }
         foreach ($child in [IO.Directory]::EnumerateFileSystemEntries($entry.Path)) {
             $name = [IO.Path]::GetFileName($child)
             if ($name -eq '.' -or $name -eq '..') { continue }
+            Add-CleanupBudgetEntry $pending.Count
             if ($child.Length -gt 4096) { throw }
             $depth = @($child.Substring([IO.Path]::GetPathRoot($child).Length).Split(
                 [char[]]@('\'), [System.StringSplitOptions]::RemoveEmptyEntries)).Count
@@ -179,6 +189,19 @@ try {
             [IO.File]::WriteAllText($temporaryState, $json + "`n", [Text.UTF8Encoding]::new($false))
             Move-Item -LiteralPath $temporaryState -Destination $statePath -Force
         }
+        function Add-TrackedTraverseGrant([string]$path) {
+            $rightsName = 'Traverse, Synchronize'
+            $inheritanceValue = 0
+            $existing = @($grants | Where-Object {
+                $_.path -eq $path -and $_.rights -eq $rightsName -and $_.inheritance -eq $inheritanceValue
+            })
+            if ($existing.Count -gt 0) { return }
+            $pathInfo = Get-CleanupPathInfo $path
+            if ($null -eq $pathInfo -or -not $pathInfo.Item.PSIsContainer) { throw }
+            $grants.Add([pscustomobject]@{ path = $path; rights = $rightsName; inheritance = $inheritanceValue })
+            Save-State
+            Invoke-CleanupIcacls $pathInfo.Path @('/grant:r', ('*' + [string]$sid + ':(X,S)'))
+        }
         function Add-TrackedIntegrityGrant([string]$path) {
             if ($integrityGrants.Contains($path)) { return }
             $pathInfo = Get-CleanupPathInfo $path
@@ -197,7 +220,7 @@ try {
         while ($null -ne $ancestor) {
             $item = Get-Item -LiteralPath $ancestor.FullName -Force
             if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw }
-            Add-TrackedGrant $ancestor.FullName 'Traverse, Synchronize' 0
+            Add-TrackedTraverseGrant $ancestor.FullName
             $ancestor = $ancestor.Parent
         }
         foreach ($entry in @($request.read_paths)) {
@@ -211,7 +234,7 @@ try {
             while ($null -ne $ancestor) {
                 $parentItem = Get-Item -LiteralPath $ancestor.FullName -Force
                 if (($parentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw }
-                Add-TrackedGrant $ancestor.FullName 'Traverse, Synchronize' 0
+                Add-TrackedTraverseGrant $ancestor.FullName
                 $ancestor = $ancestor.Parent
             }
             Add-TrackedGrant $path 'ReadAndExecute' $(if ($item.PSIsContainer) { 3 } else { 0 })
@@ -265,13 +288,13 @@ try {
             try {
                 $pending = [Collections.Generic.Stack[string]]::new()
                 $entries = [Collections.Generic.List[object]]::new()
+                Add-CleanupBudgetEntry $pending.Count
                 $pending.Push($rootInfo.Path)
                 while ($pending.Count -gt 0) {
-                    if ($script:WindowsCleanupTimer.ElapsedMilliseconds -gt 600000) { throw }
+                    Assert-CleanupBudgetTime
                     $path = $pending.Pop()
                     $entry = Get-CleanupPathInfo $path
                     if ($null -eq $entry) { throw }
-                    Add-CleanupBudgetEntry
                     $depth = @($entry.Path.Substring([IO.Path]::GetPathRoot($entry.Path).Length).Split(
                         [char[]]@('\'), [System.StringSplitOptions]::RemoveEmptyEntries)).Count
                     if ($depth -gt 1024) { throw }
@@ -285,13 +308,14 @@ try {
                         foreach ($child in [IO.Directory]::EnumerateFileSystemEntries($entry.Path)) {
                             $name = [IO.Path]::GetFileName($child)
                             if ($name -eq '.' -or $name -eq '..') { continue }
+                            Add-CleanupBudgetEntry $pending.Count
                             if ($child.Length -gt 4096) { throw }
                             $pending.Push($child)
                         }
                     }
                 }
                 for ($index = $entries.Count - 1; $index -ge 0; $index--) {
-                    if ($script:WindowsCleanupTimer.ElapsedMilliseconds -gt 600000) { throw }
+                    Assert-CleanupBudgetTime
                     $entry = $entries[$index]
                     $attributes = [IO.FileAttributes]$entry.Attributes
                     if (($attributes -band [IO.FileAttributes]::ReadOnly) -ne 0) {
@@ -323,7 +347,7 @@ try {
             Assert-CleanupTreeSafe $pathInfo.Path
             Invoke-CleanupIcacls $pathInfo.Path @('/setintegritylevel', '(OI)(CI)M')
         }
-        Clear-AppContainerStorage ([string]$state.package_sid) ([string]$state.profile_name)
+        [void](Clear-AppContainerStorage ([string]$state.package_sid) ([string]$state.profile_name))
         [KeelDock.Platform.DevLaneWindows.Boundary]::AssertCleanupQuiescent(
             [string]$state.package_sid, [string]$state.job_state)
         $deleteResult = [KeelDock.Platform.DevLaneWindows.Boundary]::DeleteProfile([string]$state.profile_name)
