@@ -383,43 +383,33 @@ class PowerShellStaticTests(unittest.TestCase):
         self.assertIn("function Clear-AppContainerStorage", script)
         self.assertIn("GetProfileFolderPath($PackageSid)", script)
         self.assertIn("[StringComparison]::OrdinalIgnoreCase", script)
-        self.assertIn("[IO.FileAttributes]::ReparsePoint", script)
-        restore = script.split("function Restore-AppContainerStorage", 1)[1].split(
-            "function Clear-AppContainerStorage", 1,
-        )[0]
-        self.assertIn("'/F' $Root '/A' '/R' '/D' 'Y'", restore)
-        self.assertIn("$Root '/reset' '/T' '/C' '/Q'", restore)
-        self.assertIn("$Root '/grant:r' '*S-1-5-32-544:(OI)(CI)F'", restore)
-        self.assertIn("Assert-CleanupTreeSafe $Root", restore)
-        tree_check = script.split("function Assert-CleanupTreeSafe", 1)[1].split(
-            "function Restore-AppContainerStorage", 1,
-        )[0]
-        self.assertIn("$entryCount -gt 250000", tree_check)
-        self.assertLess(tree_check.index("while ($pending.Count -gt 0)"), tree_check.index("Get-ChildItem"))
-        self.assertIn("'/L'", restore)
         cleanup = script.split("if ($Mode -eq 'delete') {", 1)[1].split("\n    throw\n} catch {", 1)[0]
         self.assertLess(cleanup.index("Clear-AppContainerStorage"), cleanup.index("DeleteProfile"))
-        self.assertIn("'/T'", cleanup)
-        self.assertIn("Restore-AppContainerStorage $actual", cleanup)
-        self.assertIn("$acl.RemoveAccessRuleSpecific($rule)", cleanup)
+        self.assertIn("RestoreAndDeleteAppContainerStorage($actual)", cleanup)
+        self.assertIn("RemoveTrackedGrant(", cleanup)
         self.assertIn("$state.integrity_grants", cleanup)
-        self.assertIn("'/setintegritylevel' '(OI)(CI)M'", cleanup)
-        self.assertIn("function Assert-TrackedCleanupRootsSafe", cleanup)
-        self.assertIn("function Assert-CleanupPathSafe", cleanup)
-        self.assertIn("[IO.FileAttributes]::ReparsePoint", cleanup)
-        self.assertLess(cleanup.index("Assert-TrackedCleanupRootsSafe\n        foreach ($grant"),
-                        cleanup.index("Set-Acl -LiteralPath $path"))
-        dacl_loop = cleanup.split("foreach ($grant in @($state.acl_grants))", 1)[1].split("$icacls =", 1)[0]
-        self.assertLess(dacl_loop.rindex("Assert-TrackedCleanupRootsSafe"), dacl_loop.index("Set-Acl -LiteralPath $path"))
-        integrity_loop = cleanup.split("foreach ($path in @($state.integrity_grants))", 1)[1].split(
-            "try { Clear-AppContainerStorage", 1,
-        )[0]
-        self.assertLess(integrity_loop.rindex("Assert-TrackedCleanupRootsSafe"), integrity_loop.index("& $icacls"))
-        self.assertIn("'/L'", integrity_loop)
-        self.assertIn("'/reset' '/T' '/C' '/Q' '/L'", cleanup)
-        self.assertIn("'/grant:r' '*S-1-5-32-544:(OI)(CI)F' '/C' '/Q' '/L'", cleanup)
+        self.assertIn("RestoreIntegrityMedium([string]$path)", cleanup)
+        self.assertNotIn("Set-Acl", cleanup)
+        self.assertNotIn("takeown", cleanup.lower())
+        self.assertNotRegex(cleanup, r"(?i)icacls|'/T'|Get-ChildItem|Remove-Item.*-Recurse")
+        self.assertIn("AssertCleanupQuiescent(", cleanup)
+        self.assertLess(cleanup.index("AssertCleanupQuiescent"), cleanup.index("Remove-NetFirewallRule"))
+        self.assertIn("job_state", script)
         self.assertNotIn("$modifiedPaths", cleanup)
         self.assertNotIn("Restore-RunnerAccessTree", cleanup)
+        self.assertIn("FileFlagOpenReparsePoint = 0x00200000", native)
+        self.assertIn("FileFlagBackupSemantics = 0x02000000", native)
+        self.assertIn("FileShareRead | FileShareWrite", native)
+        self.assertIn("FileFlagOpenReparsePoint | FileFlagBackupSemantics", native)
+        self.assertIn("GetFileInformationByHandle(handle, out information)", native)
+        self.assertIn("FileAttributeReparsePoint) != 0", native)
+        self.assertIn("GetFileInformationByHandleEx(directory, FileIdBothDirectoryInfoClass", native)
+        self.assertIn("SetSecurityInfo(handle, SeFileObject", native)
+        self.assertIn("SetSecurityInfo(lease.Target", native)
+        self.assertIn("CleanupEntryLimit = 250000", native)
+        self.assertIn("CleanupDeadlineMilliseconds = 600000", native)
+        self.assertIn('jobState != "none" && jobState != "terminated-empty"', native)
+        self.assertIn('result.Job += " terminated=confirmed empty=confirmed"', native)
         windows_source = (ROOT / "kit/devlane/sandbox_windows.py").read_text(encoding="utf-8")
         self.assertIn("timeout=MAX_CHILD_SECONDS + 300", windows_source)
         self.assertIn("timeout=WINDOWS_PROFILE_CLEANUP_TIMEOUT_SECONDS", windows_source)

@@ -25,7 +25,7 @@ try {
         $sid = [KeelDock.Platform.DevLaneWindows.Boundary]::CreateProfile($profileName)
         $ruleName = 'KD-DevLane-' + $env:CI_RUN_ID
         try {
-            $value = [ordered]@{ schema = 1; profile_name = $profileName; package_sid = $sid; firewall_rule = $ruleName; acl_grants = @(); integrity_grants = @() }
+            $value = [ordered]@{ schema = 1; profile_name = $profileName; package_sid = $sid; firewall_rule = $ruleName; acl_grants = @(); integrity_grants = @(); job_state = 'none' }
             $json = $value | ConvertTo-Json -Compress
             [IO.File]::WriteAllText($statePath, $json + "`n", [Text.UTF8Encoding]::new($false))
         } catch {
@@ -39,7 +39,8 @@ try {
     if ($state.schema -ne 1 -or $state.profile_name -notmatch '^KDDevLane[a-f0-9]{32}$' -or
             $state.package_sid -notmatch '^S-1-15-2-(?:[0-9]+-){6}[0-9]+$' -or
             $state.firewall_rule -ne ('KD-DevLane-' + $env:CI_RUN_ID) -or
-            $null -eq $state.acl_grants -or $null -eq $state.integrity_grants) { throw }
+            $null -eq $state.acl_grants -or $null -eq $state.integrity_grants -or
+            $state.job_state -notin @('none', 'pending', 'terminated-empty')) { throw }
     if ($Mode -eq 'firewall-install') {
         $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
         if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw }
@@ -143,158 +144,56 @@ try {
         Save-State
         $environment = [string[]]@($request.environment)
         $arguments = [string[]]@($request.arguments)
+        $state.job_state = 'pending'
+        Save-State
         $result = [KeelDock.Platform.DevLaneWindows.Boundary]::Run(
             [string]$state.profile_name, [string]$state.package_sid, [string]$request.executable,
             $arguments, [string]$request.working_directory, $environment, [int]$request.timeout_milliseconds, $internetClient)
         if ($result.Failure -eq 'process-start-failed') {
+            $state.job_state = 'none'
+            Save-State
             [ordered]@{ status = 'process-start-failed'; exit_code = [uint32]0; token = ''; job = '' } |
                 ConvertTo-Json -Compress
             exit 0
         }
         if (-not $result.Created -or -not $result.Exited -or $result.AppContainer -notlike 'lpac=verified*' -or
-            $result.Job -notlike 'assigned kill_on_close=enabled breakaway=disabled*') { throw }
+            $result.Job -notlike 'assigned kill_on_close=enabled breakaway=disabled* terminated=confirmed empty=confirmed') { throw }
+        $state.job_state = 'terminated-empty'
+        Save-State
         $status = if ($result.TimedOut) { 'timeout' } elseif ($result.ExitCode -eq 0) { 'pass' } else { 'fail' }
         [ordered]@{ status = $status; exit_code = [uint32]$result.ExitCode; token = $result.AppContainer; job = $result.Job } |
             ConvertTo-Json -Compress
         exit 0
     }
     if ($Mode -eq 'delete') {
+        [KeelDock.Platform.DevLaneWindows.Boundary]::AssertCleanupQuiescent(
+            [string]$state.package_sid, [string]$state.job_state)
         Remove-NetFirewallRule -Name $state.firewall_rule -ErrorAction SilentlyContinue
         if (@(Get-NetFirewallRule -Name $state.firewall_rule -ErrorAction SilentlyContinue).Count -ne 0) { throw }
-        function Get-CleanupReason([object]$Failure) {
-            if ($null -eq $Failure -or $null -eq $Failure.Exception) { return 'other' }
-            $code = ([int]$Failure.Exception.HResult) -band 65535
-            if ($code -in @(32, 33)) { return 'sharing-violation' }
-            if ($code -eq 5) { return 'access-denied' }
-            if ($code -in @(2, 3)) { return 'not-found' }
-            return 'other'
-        }
-        function Assert-CleanupPathSafe([string]$Path) {
-            try {
-                if ([string]::IsNullOrWhiteSpace($Path) -or $Path.Length -gt 4096 -or -not [IO.Path]::IsPathRooted($Path)) { throw }
-                $current = [IO.Path]::GetFullPath($Path)
-                while ($null -ne $current) {
-                    $item = $null
-                    try { $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop }
-                    catch {
-                        if ($_.CategoryInfo.Category -ne 'ObjectNotFound') { throw }
-                    }
-                    if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw }
-                    $parent = [IO.DirectoryInfo]::new($current).Parent
-                    if ($null -eq $parent -or [string]::Equals($parent.FullName, $current, [StringComparison]::OrdinalIgnoreCase)) {
-                        break
-                    }
-                    $current = $parent.FullName
-                }
-            } catch {
-                $script:cleanupReason = 'other'
-                throw
-            }
-        }
-        function Assert-TrackedCleanupRootsSafe {
-            try {
-                $grants = @($state.acl_grants)
-                $integrityRoots = @($state.integrity_grants)
-                if ($grants.Count + $integrityRoots.Count -gt 10000) { throw }
-                foreach ($grant in $grants) {
-                    if ($null -eq $grant -or $grant.path -isnot [string]) { throw }
-                    Assert-CleanupPathSafe ([string]$grant.path)
-                }
-                foreach ($path in $integrityRoots) {
-                    if ($path -isnot [string]) { throw }
-                    Assert-CleanupPathSafe ([string]$path)
-                }
-            } catch {
-                $script:cleanupReason = 'other'
-                throw
-            }
-        }
-        function Assert-CleanupTreeSafe([string]$Root) {
-            try {
-                Assert-CleanupPathSafe $Root
-                if (-not (Test-Path -LiteralPath $Root -ErrorAction Stop)) { return }
-                $pending = [Collections.Generic.Stack[string]]::new()
-                $pending.Push($Root)
-                $entryCount = 0
-                while ($pending.Count -gt 0) {
-                    $path = $pending.Pop()
-                    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
-                    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw }
-                    if ($item.PSIsContainer) {
-                        foreach ($entry in Get-ChildItem -LiteralPath $path -Force -ErrorAction Stop) {
-                            $entryCount++
-                            if ($entryCount -gt 250000) { throw }
-                            if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw }
-                            $pending.Push($entry.FullName)
-                        }
-                    }
-                }
-            } catch {
-                $script:cleanupReason = 'other'
-                throw
-            }
-        }
-        function Restore-AppContainerStorage([string]$Root) {
-            if (-not (Test-Path -LiteralPath $Root)) { return }
-            $takeown = Join-Path $env:SystemRoot 'System32\takeown.exe'
-            $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
-            Assert-TrackedCleanupRootsSafe
-            Assert-CleanupTreeSafe $Root
-            & $takeown '/F' $Root '/A' '/R' '/D' 'Y' *> $null
-            if ($LASTEXITCODE -ne 0) { $script:cleanupReason = 'other'; throw }
-            Assert-TrackedCleanupRootsSafe
-            Assert-CleanupTreeSafe $Root
-            & $icacls $Root '/reset' '/T' '/C' '/Q' '/L' *> $null
-            if ($LASTEXITCODE -ne 0) { $script:cleanupReason = 'other'; throw }
-            Assert-TrackedCleanupRootsSafe
-            Assert-CleanupTreeSafe $Root
-            & $icacls $Root '/grant:r' '*S-1-5-32-544:(OI)(CI)F' '/C' '/Q' '/L' *> $null
-            if ($LASTEXITCODE -ne 0) { $script:cleanupReason = 'other'; throw }
-        }
         function Clear-AppContainerStorage([string]$PackageSid, [string]$ProfileName) {
             $actual = [IO.Path]::GetFullPath([KeelDock.Platform.DevLaneWindows.Boundary]::GetProfileFolderPath($PackageSid))
             $packages = [IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Packages'))
             $expected = [IO.Path]::GetFullPath((Join-Path (Join-Path $packages $ProfileName) 'AC'))
             if (-not [string]::Equals($actual, $expected, [StringComparison]::OrdinalIgnoreCase)) { throw }
-            if (-not (Test-Path -LiteralPath $actual)) { return }
-            Assert-TrackedCleanupRootsSafe
-            Assert-CleanupTreeSafe $actual
-            Restore-AppContainerStorage $actual
-            Assert-TrackedCleanupRootsSafe
-            Assert-CleanupTreeSafe $actual
-            Remove-Item -LiteralPath $actual -Recurse -Force
+            $result = [KeelDock.Platform.DevLaneWindows.Boundary]::RestoreAndDeleteAppContainerStorage($actual)
+            if ($result -notin @('deleted', 'missing')) { throw }
         }
-        $sid = [Security.Principal.SecurityIdentifier]::new([string]$state.package_sid)
         Write-LauncherPhase 'acl-grant'
-        Assert-TrackedCleanupRootsSafe
         foreach ($grant in @($state.acl_grants)) {
             $path = [string]$grant.path
-            Assert-TrackedCleanupRootsSafe
-            if (-not (Test-Path -LiteralPath $path)) { continue }
-            $acl = Get-Acl -LiteralPath $path
-            $rule = [Security.AccessControl.FileSystemAccessRule]::new($sid,
-                [Enum]::Parse([Security.AccessControl.FileSystemRights], [string]$grant.rights),
-                [Security.AccessControl.InheritanceFlags][int]$grant.inheritance,
-                [Security.AccessControl.PropagationFlags]::None,
-                [Security.AccessControl.AccessControlType]::Allow)
-            $acl.RemoveAccessRuleSpecific($rule)
-            Assert-TrackedCleanupRootsSafe
-            Set-Acl -LiteralPath $path -AclObject $acl
+            $mask = [int][Enum]::Parse([Security.AccessControl.FileSystemRights], [string]$grant.rights)
+            $directory = [int]$grant.inheritance -ne 0 -or [string]$grant.rights -match 'Traverse'
+            $result = [KeelDock.Platform.DevLaneWindows.Boundary]::RemoveTrackedGrant(
+                $path, [string]$state.package_sid, $mask, [int]$grant.inheritance, $directory)
+            if ($result -notin @('updated', 'missing')) { throw }
         }
-        $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
         foreach ($path in @($state.integrity_grants)) {
-            Assert-TrackedCleanupRootsSafe
-            if (-not (Test-Path -LiteralPath ([string]$path))) { continue }
-            Assert-TrackedCleanupRootsSafe
-            & $icacls ([string]$path) '/setintegritylevel' '(OI)(CI)M' '/L' 2>$null | Out-Null
-            if ($LASTEXITCODE -ne 0) { $cleanupReason = 'other'; throw }
+            $result = [KeelDock.Platform.DevLaneWindows.Boundary]::RestoreIntegrityMedium([string]$path)
+            if ($result -notin @('updated', 'missing')) { throw }
         }
-        try { Clear-AppContainerStorage ([string]$state.package_sid) ([string]$state.profile_name) }
-        catch {
-            if ($null -eq $cleanupReason) { $cleanupReason = Get-CleanupReason $_ }
-            throw
-        }
-        Assert-TrackedCleanupRootsSafe
+        Clear-AppContainerStorage ([string]$state.package_sid) ([string]$state.profile_name)
+        [KeelDock.Platform.DevLaneWindows.Boundary]::AssertCleanupQuiescent(
+            [string]$state.package_sid, [string]$state.job_state)
         $deleteResult = [KeelDock.Platform.DevLaneWindows.Boundary]::DeleteProfile([string]$state.profile_name)
         if ($deleteResult -ne 'deleted') {
             $cleanupReason = [string]$deleteResult

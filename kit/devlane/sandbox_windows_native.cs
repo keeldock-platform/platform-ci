@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.ComponentModel;
+using Microsoft.Win32.SafeHandles;
 
 namespace KeelDock.Platform.DevLaneWindows
 {
@@ -60,6 +62,44 @@ namespace KeelDock.Platform.DevLaneWindows
         private const uint GenericWrite = 0x40000000;
         private const uint FileShareRead = 1;
         private const uint FileShareWrite = 2;
+        private const uint FileFlagOpenReparsePoint = 0x00200000;
+        private const uint FileFlagBackupSemantics = 0x02000000;
+        private const uint FileReadAttributes = 0x00000080;
+        private const uint FileListDirectory = 0x00000001;
+        private const uint ReadControl = 0x00020000;
+        private const uint WriteDac = 0x00040000;
+        private const uint WriteOwner = 0x00080000;
+        private const uint DeleteAccess = 0x00010000;
+        private const uint AccessSystemSecurity = 0x01000000;
+        private const uint FileAttributeDirectory = 0x00000010;
+        private const uint FileAttributeReparsePoint = 0x00000400;
+        private const uint FileAttributeReadOnly = 0x00000001;
+        private const uint FileAllAccess = 0x001F01FF;
+        private const uint ProcessQueryLimitedInformation = 0x1000;
+        private const uint TokenAdjustPrivileges = 0x0020;
+        private const uint SePrivilegeEnabled = 0x00000002;
+        private const uint DaclSecurityInformation = 0x00000004;
+        private const uint OwnerSecurityInformation = 0x00000001;
+        private const uint LabelSecurityInformation = 0x00000010;
+        private const uint UnprotectedDaclSecurityInformation = 0x2000;
+        private const int SeFileObject = 1;
+        private const uint AclSizeInformationClass = 2;
+        private const uint AclRevision = 2;
+        private const byte AccessAllowedAceType = 0;
+        private const byte ObjectInheritAceFlag = 0x01;
+        private const byte ContainerInheritAceFlag = 0x02;
+        private const uint SystemMandatoryLabelNoWriteUp = 0x01;
+        private const int FileBasicInfoClass = 0;
+        private const int FileDispositionInfoClass = 4;
+        private const int FileIdBothDirectoryInfoClass = 10;
+        private const int ErrorNoMoreFiles = 18;
+        private const int ErrorInvalidParameter = 87;
+        private const int ErrorNotFound = 1168;
+        private const int ErrorFileNotFound = 2;
+        private const int ErrorPathNotFound = 3;
+        private const int ErrorNotAllAssigned = 1300;
+        private const int CleanupEntryLimit = 250000;
+        private const int CleanupDeadlineMilliseconds = 600000;
         private const uint SecurityEnabled = 0x00000004;
 
         [StructLayout(LayoutKind.Sequential)]
@@ -129,6 +169,126 @@ namespace KeelDock.Platform.DevLaneWindows
         private struct TokenAppContainerInformation
         {
             public IntPtr TokenAppContainer;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileTime
+        {
+            public uint Low;
+            public uint High;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ByHandleFileInformation
+        {
+            public uint FileAttributes;
+            public FileTime CreationTime;
+            public FileTime LastAccessTime;
+            public FileTime LastWriteTime;
+            public uint VolumeSerialNumber;
+            public uint FileSizeHigh;
+            public uint FileSizeLow;
+            public uint NumberOfLinks;
+            public uint FileIndexHigh;
+            public uint FileIndexLow;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct AclSizeInformation
+        {
+            public uint AceCount;
+            public uint AclBytesInUse;
+            public uint AclBytesFree;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Luid
+        {
+            public uint LowPart;
+            public int HighPart;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LuidAndAttributes
+        {
+            public Luid Luid;
+            public uint Attributes;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct TokenPrivileges
+        {
+            public uint PrivilegeCount;
+            public LuidAndAttributes Privileges;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileBasicInformation
+        {
+            public long CreationTime;
+            public long LastAccessTime;
+            public long LastWriteTime;
+            public long ChangeTime;
+            public uint FileAttributes;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileDispositionInformation
+        {
+            public int DeleteFile;
+        }
+
+        private sealed class CleanupPathLease : IDisposable
+        {
+            public readonly List<SafeFileHandle> Handles;
+            public readonly string FullPath;
+            public readonly uint Attributes;
+            public SafeFileHandle Target { get { return Handles[Handles.Count - 1]; } }
+
+            public CleanupPathLease(List<SafeFileHandle> handles, string fullPath, uint attributes)
+            {
+                Handles = handles;
+                FullPath = fullPath;
+                Attributes = attributes;
+            }
+
+            public void Dispose()
+            {
+                for (int index = Handles.Count - 1; index >= 0; index--)
+                    if (Handles[index] != null) Handles[index].Dispose();
+            }
+        }
+
+        private sealed class CleanupTreeFrame
+        {
+            public string Path;
+            public SafeFileHandle Handle;
+            public uint Attributes;
+            public List<string> Children;
+            public int NextChild;
+        }
+
+        private sealed class PrivilegeScope : IDisposable
+        {
+            private readonly IntPtr token;
+            private TokenPrivileges previous;
+
+            public PrivilegeScope(IntPtr tokenHandle, TokenPrivileges previousState)
+            {
+                token = tokenHandle;
+                previous = previousState;
+            }
+
+            public void Dispose()
+            {
+                if (token == IntPtr.Zero) return;
+                if (!RestoreTokenPrivileges(token, false, ref previous, 0, IntPtr.Zero, IntPtr.Zero))
+                {
+                    Close(token);
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+                Close(token);
+            }
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -208,6 +368,75 @@ namespace KeelDock.Platform.DevLaneWindows
         private static extern IntPtr CreateFileW(string name, uint access, uint share, ref SecurityAttributes security,
             uint creation, uint flags, IntPtr template);
 
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "CreateFileW", SetLastError = true)]
+        private static extern SafeFileHandle CreateCleanupFile(string name, uint access, uint share, IntPtr security,
+            uint creation, uint flags, IntPtr template);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out ByHandleFileInformation information);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int informationClass,
+            IntPtr information, uint bufferSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int informationClass,
+            ref FileBasicInformation information, uint bufferSize);
+
+        [DllImport("kernel32.dll", SetLastError = true, EntryPoint = "SetFileInformationByHandle")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetFileDispositionByHandle(SafeFileHandle handle, int informationClass,
+            ref FileDispositionInformation information, uint bufferSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint access, bool inherit, uint processId);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentProcess();
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern uint GetSecurityInfo(SafeFileHandle handle, int objectType, uint securityInfo,
+            out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr securityDescriptor);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern uint SetSecurityInfo(SafeFileHandle handle, int objectType, uint securityInfo,
+            IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetAclInformation(IntPtr acl, out AclSizeInformation information,
+            uint informationLength, uint informationClass);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetAce(IntPtr acl, uint index, out IntPtr ace);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool InitializeAcl(IntPtr acl, uint length, uint revision);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AddAce(IntPtr acl, uint revision, uint startingAceIndex,
+            IntPtr aceList, uint aceListLength);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AddAccessAllowedAceEx(IntPtr acl, uint revision, uint aceFlags,
+            uint accessMask, IntPtr sid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AddMandatoryAce(IntPtr acl, uint revision, uint aceFlags,
+            uint policy, IntPtr sid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool EqualSid(IntPtr first, IntPtr second);
+
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool CloseHandle(IntPtr handle);
@@ -271,6 +500,20 @@ namespace KeelDock.Platform.DevLaneWindows
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
 
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool LookupPrivilegeValueW(string systemName, string name, out Luid luid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TokenPrivileges newState,
+            uint bufferLength, out TokenPrivileges previousState, out uint returnLength);
+
+        [DllImport("advapi32.dll", EntryPoint = "AdjustTokenPrivileges", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool RestoreTokenPrivileges(IntPtr token, bool disableAll, ref TokenPrivileges newState,
+            uint bufferLength, IntPtr previousState, IntPtr returnLength);
+
         [DllImport("advapi32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool GetTokenInformation(IntPtr token, int informationClass, IntPtr information,
@@ -326,6 +569,509 @@ namespace KeelDock.Platform.DevLaneWindows
             finally { CoTaskMemFree(path); }
         }
 
+        private static PrivilegeScope EnablePrivilege(string name)
+        {
+            IntPtr token = IntPtr.Zero;
+            try
+            {
+                if (!OpenProcessToken(GetCurrentProcess(), TokenQuery | TokenAdjustPrivileges, out token)
+                    || token == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+                Luid luid;
+                if (!LookupPrivilegeValueW(null, name, out luid)) throw new Win32Exception(Marshal.GetLastWin32Error());
+                TokenPrivileges requested = new TokenPrivileges();
+                requested.PrivilegeCount = 1;
+                requested.Privileges.Luid = luid;
+                requested.Privileges.Attributes = SePrivilegeEnabled;
+                TokenPrivileges previous;
+                uint returned;
+                if (!AdjustTokenPrivileges(token, false, ref requested,
+                    (uint)Marshal.SizeOf(typeof(TokenPrivileges)), out previous, out returned))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                int status = Marshal.GetLastWin32Error();
+                if (status == ErrorNotAllAssigned) throw new Win32Exception(status);
+                PrivilegeScope scope = new PrivilegeScope(token, previous);
+                token = IntPtr.Zero;
+                return scope;
+            }
+            finally
+            {
+                if (token != IntPtr.Zero) Close(token);
+            }
+        }
+
+        public static void AssertCleanupQuiescent(string packageSid, string jobState)
+        {
+            if (jobState != "none" && jobState != "terminated-empty")
+                throw new InvalidOperationException("cleanup_job_state");
+            IntPtr expectedSid = IntPtr.Zero;
+            try
+            {
+                if (String.IsNullOrEmpty(packageSid) || !ConvertStringSidToSidW(packageSid, out expectedSid)
+                    || expectedSid == IntPtr.Zero || !IsValidSid(expectedSid))
+                    throw new InvalidOperationException("cleanup_identity_sid");
+                using (PrivilegeScope debugPrivilege = EnablePrivilege("SeDebugPrivilege"))
+                {
+                    Process[] processes = Process.GetProcesses();
+                    if (processes == null || processes.Length > CleanupEntryLimit)
+                        throw new InvalidOperationException("cleanup_process_enumeration");
+                    Stopwatch timer = Stopwatch.StartNew();
+                    try
+                    {
+                        foreach (Process item in processes)
+                        {
+                            if (timer.ElapsedMilliseconds > CleanupDeadlineMilliseconds)
+                                throw new InvalidOperationException("cleanup_process_timeout");
+                            uint processId;
+                            try { processId = unchecked((uint)item.Id); }
+                            catch { throw new InvalidOperationException("cleanup_process_enumeration"); }
+                            if (processId == 0) continue;
+                            IntPtr process = OpenProcess(ProcessQueryLimitedInformation, false, processId);
+                            if (process == IntPtr.Zero)
+                            {
+                                int openError = Marshal.GetLastWin32Error();
+                                if (openError == ErrorInvalidParameter || openError == ErrorNotFound
+                                    || openError == ErrorFileNotFound || openError == ErrorPathNotFound) continue;
+                                throw new InvalidOperationException("cleanup_process_inspection");
+                            }
+                            try
+                            {
+                                IntPtr token = IntPtr.Zero;
+                                if (!OpenProcessToken(process, TokenQuery, out token) || token == IntPtr.Zero)
+                                {
+                                    if (WaitForSingleObject(process, 0) == WaitObject0) continue;
+                                    throw new InvalidOperationException("cleanup_process_token");
+                                }
+                                try
+                                {
+                                    if (ReadTokenDword(token, TokenIsAppContainer) != 1) continue;
+                                    IntPtr app = QueryToken(token, TokenAppContainerSid, out int appLength);
+                                    try
+                                    {
+                                        if (appLength < IntPtr.Size || Marshal.ReadIntPtr(app) == IntPtr.Zero
+                                            || !IsValidSid(Marshal.ReadIntPtr(app)))
+                                            throw new InvalidOperationException("cleanup_process_identity");
+                                        if (EqualSid(Marshal.ReadIntPtr(app), expectedSid))
+                                        {
+                                            if (ReadTokenDword(token, TokenIsLessPrivilegedAppContainer) != 1)
+                                                throw new InvalidOperationException("cleanup_process_identity");
+                                            throw new InvalidOperationException("cleanup_process_alive");
+                                        }
+                                    }
+                                    finally { Marshal.FreeHGlobal(app); }
+                                }
+                                finally { Close(token); }
+                            }
+                            finally { Close(process); }
+                        }
+                    }
+                    finally
+                    {
+                        foreach (Process item in processes) item.Dispose();
+                    }
+                }
+            }
+            catch
+            {
+                throw new InvalidOperationException("cleanup_processes");
+            }
+            finally
+            {
+                LocalFree(expectedSid);
+            }
+        }
+
+        public static string RemoveTrackedGrant(string path, string packageSid, int accessMask, int inheritance,
+            bool requireDirectory)
+        {
+            if (inheritance < 0 || inheritance > 3 || String.IsNullOrEmpty(packageSid))
+                throw new InvalidOperationException("cleanup_grant_arguments");
+            IntPtr sid = IntPtr.Zero;
+            try
+            {
+                if (!ConvertStringSidToSidW(packageSid, out sid) || sid == IntPtr.Zero || !IsValidSid(sid))
+                    throw new InvalidOperationException("cleanup_grant_sid");
+                uint targetAccess = ReadControl | WriteDac | FileReadAttributes;
+                CleanupPathLease lease;
+                try { lease = OpenCleanupPath(path, targetAccess, requireDirectory); }
+                catch (Win32Exception error)
+                {
+                    if (error.NativeErrorCode == ErrorFileNotFound || error.NativeErrorCode == ErrorPathNotFound)
+                        return "missing";
+                    throw;
+                }
+                using (lease)
+                    RemoveAccessRuleFromHandle(lease.Target, sid, unchecked((uint)accessMask), (byte)inheritance);
+                return "updated";
+            }
+            finally { LocalFree(sid); }
+        }
+
+        public static string RestoreIntegrityMedium(string path)
+        {
+            IntPtr mediumSid = IntPtr.Zero;
+            IntPtr acl = IntPtr.Zero;
+            try
+            {
+                if (!ConvertStringSidToSidW("S-1-16-8192", out mediumSid) || mediumSid == IntPtr.Zero
+                    || !IsValidSid(mediumSid)) throw new InvalidOperationException("cleanup_integrity_sid");
+                using (PrivilegeScope securityPrivilege = EnablePrivilege("SeSecurityPrivilege"))
+                {
+                    CleanupPathLease lease;
+                    try { lease = OpenCleanupPath(path, ReadControl | WriteDac | AccessSystemSecurity | FileReadAttributes, true); }
+                    catch (Win32Exception error)
+                    {
+                        if (error.NativeErrorCode == ErrorFileNotFound || error.NativeErrorCode == ErrorPathNotFound)
+                            return "missing";
+                        throw;
+                    }
+                    using (lease)
+                    {
+                        acl = Marshal.AllocHGlobal(1024);
+                        if (!InitializeAcl(acl, 1024, AclRevision)) throw new Win32Exception(Marshal.GetLastWin32Error());
+                        uint flags = (lease.Attributes & FileAttributeDirectory) != 0
+                            ? (uint)(ObjectInheritAceFlag | ContainerInheritAceFlag) : 0U;
+                        if (!AddMandatoryAce(acl, AclRevision, flags, SystemMandatoryLabelNoWriteUp, mediumSid))
+                            throw new Win32Exception(Marshal.GetLastWin32Error());
+                        uint status = SetSecurityInfo(lease.Target, SeFileObject, LabelSecurityInformation,
+                            IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, acl);
+                        if (status != 0) throw new Win32Exception((int)status);
+                    }
+                }
+                return "updated";
+            }
+            finally
+            {
+                if (acl != IntPtr.Zero) Marshal.FreeHGlobal(acl);
+                LocalFree(mediumSid);
+            }
+        }
+
+        public static string RestoreAndDeleteAppContainerStorage(string root)
+        {
+            Stopwatch timer = Stopwatch.StartNew();
+            IntPtr administratorsSid = IntPtr.Zero;
+            try
+            {
+                if (!ConvertStringSidToSidW("S-1-5-32-544", out administratorsSid)
+                    || administratorsSid == IntPtr.Zero || !IsValidSid(administratorsSid))
+                    throw new InvalidOperationException("cleanup_admin_sid");
+                CleanupPathLease rootLease;
+                try
+                {
+                    rootLease = OpenCleanupPath(root,
+                        ReadControl | WriteDac | WriteOwner | DeleteAccess | FileReadAttributes | FileListDirectory,
+                        true);
+                }
+                catch (Win32Exception error)
+                {
+                    if (error.NativeErrorCode == ErrorFileNotFound || error.NativeErrorCode == ErrorPathNotFound)
+                        return "missing";
+                    throw;
+                }
+                using (rootLease)
+                using (PrivilegeScope restorePrivilege = EnablePrivilege("SeRestorePrivilege"))
+                {
+                    Stack<CleanupTreeFrame> pending = new Stack<CleanupTreeFrame>();
+                    CleanupTreeFrame rootFrame = new CleanupTreeFrame();
+                    rootFrame.Path = rootLease.FullPath;
+                    rootFrame.Handle = rootLease.Target;
+                    rootFrame.Attributes = rootLease.Attributes;
+                    pending.Push(rootFrame);
+                    int entries = 0;
+                    while (pending.Count > 0)
+                    {
+                        if (timer.ElapsedMilliseconds > CleanupDeadlineMilliseconds || entries > CleanupEntryLimit)
+                            throw new InvalidOperationException("cleanup_tree_limit");
+                        CleanupTreeFrame frame = pending.Peek();
+                        if (frame.Children == null)
+                        {
+                            RestoreStorageEntry(frame.Handle, administratorsSid, frame.Attributes);
+                            frame.Children = (frame.Attributes & FileAttributeDirectory) != 0
+                                ? EnumerateCleanupChildren(frame.Handle, timer) : new List<string>();
+                        }
+                        if (frame.NextChild < frame.Children.Count)
+                        {
+                            string name = frame.Children[frame.NextChild++];
+                            entries++;
+                            if (entries > CleanupEntryLimit) throw new InvalidOperationException("cleanup_tree_limit");
+                            string childPath = System.IO.Path.Combine(frame.Path, name);
+                            SafeFileHandle child = OpenCleanupHandle(childPath,
+                                ReadControl | WriteDac | WriteOwner | DeleteAccess | FileReadAttributes | FileListDirectory,
+                                out uint attributes);
+                            if ((attributes & FileAttributeReparsePoint) != 0)
+                            {
+                                child.Dispose();
+                                throw new InvalidOperationException("cleanup_tree_reparse");
+                            }
+                            if ((attributes & FileAttributeDirectory) != 0)
+                            {
+                                if (pending.Count >= 1024)
+                                {
+                                    child.Dispose();
+                                    throw new InvalidOperationException("cleanup_tree_depth");
+                                }
+                                CleanupTreeFrame childFrame = new CleanupTreeFrame();
+                                childFrame.Path = childPath;
+                                childFrame.Handle = child;
+                                childFrame.Attributes = attributes;
+                                pending.Push(childFrame);
+                            }
+                            else
+                            {
+                                RejectMultipleFileLinks(child);
+                                RestoreStorageEntry(child, administratorsSid, attributes);
+                                DeleteHandleEntry(child, attributes);
+                                child.Dispose();
+                            }
+                        }
+                        else
+                        {
+                            DeleteHandleEntry(frame.Handle, frame.Attributes);
+                            pending.Pop();
+                            if (pending.Count > 0) frame.Handle.Dispose();
+                        }
+                    }
+                }
+                return "deleted";
+            }
+            finally { LocalFree(administratorsSid); }
+        }
+
+        private static CleanupPathLease OpenCleanupPath(string path, uint targetAccess, bool requireDirectory)
+        {
+            if (String.IsNullOrWhiteSpace(path) || path.Length > 4096 || !System.IO.Path.IsPathRooted(path))
+                throw new InvalidOperationException("cleanup_path");
+            string fullPath = System.IO.Path.GetFullPath(path);
+            string root = System.IO.Path.GetPathRoot(fullPath);
+            if (String.IsNullOrEmpty(root) || root.Length != 3 || fullPath.StartsWith("\\\\", StringComparison.Ordinal)
+                || fullPath.StartsWith("\\\\?\\", StringComparison.Ordinal)
+                || fullPath.StartsWith("\\\\.\\", StringComparison.Ordinal))
+                throw new InvalidOperationException("cleanup_path");
+            List<SafeFileHandle> handles = new List<SafeFileHandle>();
+            try
+            {
+                string remainder = fullPath.Substring(root.Length);
+                string[] components = remainder.Split(new char[] { '\\' }, StringSplitOptions.RemoveEmptyEntries);
+                uint rootAccess = components.Length == 0 ? targetAccess : FileReadAttributes;
+                SafeFileHandle rootHandle = OpenCleanupHandle(root, rootAccess, out uint rootAttributes);
+                ValidateCleanupHandle(rootHandle, rootAttributes, true);
+                handles.Add(rootHandle);
+                string current = root;
+                uint attributes = rootAttributes;
+                for (int index = 0; index < components.Length; index++)
+                {
+                    current = System.IO.Path.Combine(current, components[index]);
+                    bool final = index == components.Length - 1;
+                    SafeFileHandle next = OpenCleanupHandle(current, final ? targetAccess : FileReadAttributes,
+                        out attributes);
+                    try { ValidateCleanupHandle(next, attributes, !final || requireDirectory); }
+                    catch { next.Dispose(); throw; }
+                    handles.Add(next);
+                }
+                return new CleanupPathLease(handles, fullPath, attributes);
+            }
+            catch
+            {
+                for (int index = handles.Count - 1; index >= 0; index--) handles[index].Dispose();
+                throw;
+            }
+        }
+
+        private static SafeFileHandle OpenCleanupHandle(string path, uint access, out uint attributes)
+        {
+            string extendedPath = path.StartsWith("\\\\?\\", StringComparison.Ordinal) ? path : "\\\\?\\" + path;
+            SafeFileHandle handle = CreateCleanupFile(extendedPath, access, FileShareRead | FileShareWrite,
+                IntPtr.Zero, OpenExisting, FileFlagOpenReparsePoint | FileFlagBackupSemantics, IntPtr.Zero);
+            if (handle == null || handle.IsInvalid)
+            {
+                int error = Marshal.GetLastWin32Error();
+                if (handle != null) handle.Dispose();
+                throw new Win32Exception(error);
+            }
+            try
+            {
+                ByHandleFileInformation information;
+                if (!GetFileInformationByHandle(handle, out information)) throw new Win32Exception(Marshal.GetLastWin32Error());
+                attributes = information.FileAttributes;
+                ValidateCleanupHandle(handle, attributes, false);
+                return handle;
+            }
+            catch
+            {
+                handle.Dispose();
+                throw;
+            }
+        }
+
+        private static void ValidateCleanupHandle(SafeFileHandle handle, uint attributes, bool requireDirectory)
+        {
+            if (handle == null || handle.IsInvalid || (attributes & FileAttributeReparsePoint) != 0
+                || (requireDirectory && (attributes & FileAttributeDirectory) == 0))
+                throw new InvalidOperationException("cleanup_reparse_or_type");
+        }
+
+        private static void RemoveAccessRuleFromHandle(SafeFileHandle handle, IntPtr targetSid,
+            uint accessMask, byte inheritance)
+        {
+            IntPtr owner;
+            IntPtr group;
+            IntPtr dacl;
+            IntPtr sacl;
+            IntPtr securityDescriptor;
+            uint status = GetSecurityInfo(handle, SeFileObject, DaclSecurityInformation,
+                out owner, out group, out dacl, out sacl, out securityDescriptor);
+            if (status != 0) throw new Win32Exception((int)status);
+            IntPtr replacement = IntPtr.Zero;
+            try
+            {
+                if (dacl == IntPtr.Zero) return;
+                AclSizeInformation aclInfo;
+                if (!GetAclInformation(dacl, out aclInfo, (uint)Marshal.SizeOf(typeof(AclSizeInformation)),
+                    AclSizeInformationClass)) throw new Win32Exception(Marshal.GetLastWin32Error());
+                int oldLength = unchecked((ushort)Marshal.ReadInt16(dacl, 2));
+                if (oldLength < 8 || oldLength > 65535 || aclInfo.AceCount > 65535)
+                    throw new InvalidOperationException("cleanup_acl_size");
+                replacement = Marshal.AllocHGlobal(oldLength);
+                uint revision = Marshal.ReadByte(dacl);
+                if (revision < AclRevision) revision = AclRevision;
+                if (!InitializeAcl(replacement, (uint)oldLength, revision))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                bool changed = false;
+                for (uint index = 0; index < aclInfo.AceCount; index++)
+                {
+                    IntPtr ace;
+                    if (!GetAce(dacl, index, out ace)) throw new Win32Exception(Marshal.GetLastWin32Error());
+                    int aceLength = unchecked((ushort)Marshal.ReadInt16(ace, 2));
+                    if (aceLength < 8 || aceLength > oldLength) throw new InvalidOperationException("cleanup_ace_size");
+                    byte[] bytes = new byte[aceLength];
+                    Marshal.Copy(ace, bytes, 0, aceLength);
+                    bool matching = bytes[0] == AccessAllowedAceType && bytes[1] == inheritance
+                        && aceLength >= 16 && EqualSid(IntPtr.Add(ace, 8), targetSid);
+                    if (matching)
+                    {
+                        uint existing = unchecked((uint)Marshal.ReadInt32(ace, 4));
+                        uint remaining = existing & ~accessMask;
+                        if (remaining != existing)
+                        {
+                            changed = true;
+                            if (remaining == 0) continue;
+                            Buffer.BlockCopy(BitConverter.GetBytes(remaining), 0, bytes, 4, 4);
+                        }
+                    }
+                    IntPtr rawAce = Marshal.AllocHGlobal(aceLength);
+                    try
+                    {
+                        Marshal.Copy(bytes, 0, rawAce, aceLength);
+                        if (!AddAce(replacement, revision, UInt32.MaxValue, rawAce, (uint)aceLength))
+                            throw new Win32Exception(Marshal.GetLastWin32Error());
+                    }
+                    finally { Marshal.FreeHGlobal(rawAce); }
+                }
+                if (changed)
+                {
+                    status = SetSecurityInfo(handle, SeFileObject, DaclSecurityInformation,
+                        IntPtr.Zero, IntPtr.Zero, replacement, IntPtr.Zero);
+                    if (status != 0) throw new Win32Exception((int)status);
+                }
+            }
+            finally
+            {
+                if (replacement != IntPtr.Zero) Marshal.FreeHGlobal(replacement);
+                if (securityDescriptor != IntPtr.Zero) LocalFree(securityDescriptor);
+            }
+        }
+
+        private static void RestoreStorageEntry(SafeFileHandle handle, IntPtr administratorsSid, uint attributes)
+        {
+            uint status = SetSecurityInfo(handle, SeFileObject, OwnerSecurityInformation,
+                administratorsSid, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+            if (status != 0) throw new Win32Exception((int)status);
+            IntPtr acl = Marshal.AllocHGlobal(1024);
+            try
+            {
+                if (!InitializeAcl(acl, 1024, AclRevision)) throw new Win32Exception(Marshal.GetLastWin32Error());
+                uint flags = (attributes & FileAttributeDirectory) != 0
+                    ? (uint)(ObjectInheritAceFlag | ContainerInheritAceFlag) : 0U;
+                if (!AddAccessAllowedAceEx(acl, AclRevision, flags, FileAllAccess, administratorsSid))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                status = SetSecurityInfo(handle, SeFileObject,
+                    DaclSecurityInformation | UnprotectedDaclSecurityInformation,
+                    IntPtr.Zero, IntPtr.Zero, acl, IntPtr.Zero);
+                if (status != 0) throw new Win32Exception((int)status);
+            }
+            finally { Marshal.FreeHGlobal(acl); }
+        }
+
+        private static void RejectMultipleFileLinks(SafeFileHandle handle)
+        {
+            ByHandleFileInformation information;
+            if (!GetFileInformationByHandle(handle, out information))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (information.NumberOfLinks != 1)
+                throw new InvalidOperationException("cleanup_file_link_count");
+        }
+
+        private static List<string> EnumerateCleanupChildren(SafeFileHandle directory, Stopwatch timer)
+        {
+            List<string> children = new List<string>();
+            IntPtr buffer = Marshal.AllocHGlobal(65536);
+            try
+            {
+                while (true)
+                {
+                    if (timer.ElapsedMilliseconds > CleanupDeadlineMilliseconds)
+                        throw new InvalidOperationException("cleanup_tree_timeout");
+                    if (!GetFileInformationByHandleEx(directory, FileIdBothDirectoryInfoClass, buffer, 65536))
+                    {
+                        int error = Marshal.GetLastWin32Error();
+                        if (error == ErrorNoMoreFiles) break;
+                        throw new Win32Exception(error);
+                    }
+                    int offset = 0;
+                    while (true)
+                    {
+                        uint nextOffset = unchecked((uint)Marshal.ReadInt32(buffer, offset));
+                        uint attributes = unchecked((uint)Marshal.ReadInt32(buffer, offset + 56));
+                        int nameLength = Marshal.ReadInt32(buffer, offset + 60);
+                        if (nameLength < 0 || (nameLength & 1) != 0 || nameLength > 65500)
+                            throw new InvalidOperationException("cleanup_child_name");
+                        string name = Marshal.PtrToStringUni(IntPtr.Add(buffer, offset + 104), nameLength / 2);
+                        if (String.IsNullOrEmpty(name) || name == "." || name == ".."
+                            || name.IndexOfAny(new char[] { '\\', '/', '\0' }) >= 0)
+                            throw new InvalidOperationException("cleanup_child_name");
+                        if ((attributes & FileAttributeReparsePoint) != 0)
+                            throw new InvalidOperationException("cleanup_tree_reparse");
+                        children.Add(name);
+                        if (children.Count > CleanupEntryLimit || timer.ElapsedMilliseconds > CleanupDeadlineMilliseconds)
+                            throw new InvalidOperationException("cleanup_tree_limit");
+                        if (nextOffset == 0) break;
+                        if (nextOffset < 104 || nextOffset > 65536 - offset)
+                            throw new InvalidOperationException("cleanup_directory_entry");
+                        offset = checked(offset + (int)nextOffset);
+                    }
+                }
+            }
+            finally { Marshal.FreeHGlobal(buffer); }
+            return children;
+        }
+
+        private static void DeleteHandleEntry(SafeFileHandle handle, uint attributes)
+        {
+            if ((attributes & FileAttributeReadOnly) != 0)
+            {
+                FileBasicInformation basic = new FileBasicInformation();
+                basic.FileAttributes = attributes & ~FileAttributeReadOnly;
+                if (!SetFileInformationByHandle(handle, FileBasicInfoClass, ref basic,
+                    (uint)Marshal.SizeOf(typeof(FileBasicInformation))))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            FileDispositionInformation disposition = new FileDispositionInformation();
+            disposition.DeleteFile = 1;
+            if (!SetFileDispositionByHandle(handle, FileDispositionInfoClass, ref disposition,
+                (uint)Marshal.SizeOf(typeof(FileDispositionInformation))))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+
         private static string CleanupReason(int status)
         {
             uint value = unchecked((uint)status);
@@ -355,6 +1101,7 @@ namespace KeelDock.Platform.DevLaneWindows
             IntPtr process = IntPtr.Zero;
             IntPtr thread = IntPtr.Zero;
             bool attributesReady = false;
+            bool jobReaped = false;
             RunResult result = new RunResult();
             try
             {
@@ -449,29 +1196,40 @@ namespace KeelDock.Platform.DevLaneWindows
                 if (wait == WaitTimeout)
                 {
                     result.TimedOut = true;
-                    TerminateJobObject(job, JobExitCode);
-                    if (WaitForSingleObject(process, 10000) != WaitObject0 || !WaitForEmptyJob(job, 10000))
+                    TerminateAndConfirmEmptyJob(job);
+                    jobReaped = true;
+                    if (WaitForSingleObject(process, 10000) != WaitObject0)
                         throw new InvalidOperationException("job_reap");
                 }
                 else if (wait != WaitObject0) throw new InvalidOperationException("process_wait");
                 Phase("exit");
                 if (!GetExitCodeProcess(process, out result.ExitCode)) throw new InvalidOperationException("process_exit_code");
                 result.Exited = true;
-                TerminateJobObject(job, JobExitCode);
-                if (!WaitForEmptyJob(job, 10000)) throw new InvalidOperationException("job_reap");
+                if (!jobReaped)
+                {
+                    TerminateAndConfirmEmptyJob(job);
+                    jobReaped = true;
+                }
+                result.Job += " terminated=confirmed empty=confirmed";
                 return result;
             }
             finally
             {
                 string reapFailure = null;
-                if (job != IntPtr.Zero) TerminateJobObject(job, JobExitCode);
                 if (process != IntPtr.Zero && !result.Exited)
                 {
+                    if (job != IntPtr.Zero) TerminateJobObject(job, JobExitCode);
                     if (!TerminateProcess(process, JobExitCode) && WaitForSingleObject(process, 0) != WaitObject0)
                         reapFailure = "process_terminate";
                     if (WaitForSingleObject(process, 10000) != WaitObject0) reapFailure = "process_reap";
                 }
-                if (job != IntPtr.Zero && !WaitForEmptyJob(job, 10000)) reapFailure = "job_reap";
+                if (job != IntPtr.Zero && !jobReaped)
+                {
+                    bool terminated = TerminateJobObject(job, JobExitCode);
+                    bool empty = WaitForEmptyJob(job, 10000);
+                    if (!terminated || !empty) reapFailure = "job_reap";
+                    else jobReaped = true;
+                }
                 Close(thread);
                 Close(process);
                 Close(job);
@@ -487,6 +1245,13 @@ namespace KeelDock.Platform.DevLaneWindows
                 Free(sid);
                 if (reapFailure != null) throw new InvalidOperationException(reapFailure);
             }
+        }
+
+        private static void TerminateAndConfirmEmptyJob(IntPtr job)
+        {
+            if (job == IntPtr.Zero || !TerminateJobObject(job, JobExitCode))
+                throw new InvalidOperationException("job_terminate");
+            if (!WaitForEmptyJob(job, 10000)) throw new InvalidOperationException("job_reap");
         }
 
         private static void SetJobLimits(IntPtr job)

@@ -138,9 +138,11 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         self.assertIn("System.Threading.Thread.Sleep(50 << attempt)", source)
         self.assertIn("for (int attempt = 0; attempt < 4; attempt++)", source)
         self.assertIn("private static string CleanupReason(int status)", source)
-        self.assertLess(source.index("TerminateJobObject(job, JobExitCode);\n                if (!WaitForEmptyJob(job, 10000))"),
-                        source.index("return result;", source.index("TerminateJobObject(job, JobExitCode);\n                if (!WaitForEmptyJob(job, 10000)")))
-        self.assertLess(source.index("TerminateProcess(process, JobExitCode)"), source.index("Close(process)"))
+        terminate = source.index("TerminateAndConfirmEmptyJob(job);")
+        self.assertIn("private static void TerminateAndConfirmEmptyJob(IntPtr job)", source)
+        self.assertLess(terminate, source.index("return result;", terminate))
+        terminate_process = source.index("TerminateProcess(process, JobExitCode)")
+        self.assertLess(terminate_process, source.index("Close(process)", terminate_process))
 
     def test_profile_cleanup_reason_is_emitted_from_only_the_bounded_native_vocabulary(self):
         process = mock.Mock(returncode=1)
@@ -198,27 +200,99 @@ class WindowsSandboxValidationTests(unittest.TestCase):
 
     def test_acl_grant_cleanup_removes_only_tracked_rules_without_recursive_runner_repair(self):
         script = Path(windows.__file__).with_name("sandbox_windows.ps1").read_text(encoding="utf-8")
+        native = Path(windows.__file__).with_name("sandbox_windows_native.cs").read_text(encoding="utf-8")
         run = script.split("if ($Mode -eq 'run')", 1)[1].split("if ($Mode -eq 'delete')", 1)[0]
-        cleanup = script.split("if ($Mode -eq 'delete')", 1)[1]
+        cleanup = script.split("if ($Mode -eq 'delete')", 1)[1].split("\n    throw\n} catch {", 1)[0]
         self.assertIn("Write-LauncherPhase 'acl-grant'", run)
         self.assertIn("$system32Path", run)
         self.assertIn("[StringComparison]::OrdinalIgnoreCase)) { continue }", run)
         self.assertIn("if ($item.PSIsContainer) { 3 } else { 0 }", run)
         self.assertIn("$grants.Add([pscustomobject]@{ path = $path; rights = $rightsName; inheritance = $inheritanceValue })", run)
-        self.assertIn("$acl.RemoveAccessRuleSpecific($rule)", cleanup)
         self.assertIn("$integrityGrants = [Collections.Generic.List[string]]::new()", run)
         self.assertIn("Add-TrackedIntegrityGrant $path", run)
         self.assertIn("foreach ($path in @($state.integrity_grants))", cleanup)
-        self.assertIn("'/setintegritylevel' '(OI)(CI)M'", cleanup)
-        self.assertIn("Assert-TrackedCleanupRootsSafe", cleanup)
-        self.assertIn("[IO.FileAttributes]::ReparsePoint", cleanup)
-        self.assertIn("'/L'", cleanup)
+        self.assertIn("Boundary]::RemoveTrackedGrant(", cleanup)
+        self.assertIn("Boundary]::RestoreIntegrityMedium([string]$path)", cleanup)
+        self.assertIn("Boundary]::RestoreAndDeleteAppContainerStorage($actual)", cleanup)
+        self.assertIn("Boundary]::AssertCleanupQuiescent(", cleanup)
+        self.assertLess(cleanup.index("AssertCleanupQuiescent"), cleanup.index("Remove-NetFirewallRule"))
+        self.assertLess(cleanup.index("AssertCleanupQuiescent", cleanup.index("Clear-AppContainerStorage")),
+                        cleanup.index("DeleteProfile"))
+        self.assertIn("$state.job_state = 'pending'", run)
+        self.assertIn("$state.job_state = 'terminated-empty'", run)
+        self.assertIn("empty=confirmed", run)
+        self.assertNotIn("Set-Acl", cleanup)
+        self.assertNotIn("takeown", cleanup.lower())
+        self.assertNotRegex(cleanup, r"(?i)icacls|'/T'|Remove-Item.*-Recurse")
         self.assertNotIn("$modifiedPaths", cleanup)
         self.assertNotIn("Restore-RunnerAccessTree", cleanup)
-        self.assertIn("Restore-AppContainerStorage $actual", cleanup)
-        self.assertIn("if ($entryCount -gt 250000) { throw }", cleanup)
+        self.assertIn("FileFlagOpenReparsePoint = 0x00200000", native)
+        self.assertIn("FileFlagBackupSemantics = 0x02000000", native)
+        self.assertIn("FileShareRead | FileShareWrite", native)
+        self.assertIn("GetFileInformationByHandle(handle, out information)", native)
+        self.assertIn("FileAttributeReparsePoint) != 0", native)
+        self.assertIn("SetSecurityInfo(handle, SeFileObject", native)
+        self.assertIn("GetFileInformationByHandleEx(directory, FileIdBothDirectoryInfoClass", native)
+        self.assertIn("CleanupEntryLimit = 250000", native)
+        self.assertIn("CleanupDeadlineMilliseconds = 600000", native)
         python_source = Path(windows.__file__).read_text(encoding="utf-8")
         self.assertIn("timeout=WINDOWS_PROFILE_CLEANUP_TIMEOUT_SECONDS", python_source)
+
+    def test_cleanup_refuses_an_unreaped_job_or_live_appcontainer_process(self):
+        script = Path(windows.__file__).with_name("sandbox_windows.ps1").read_text(encoding="utf-8")
+        native = Path(windows.__file__).with_name("sandbox_windows_native.cs").read_text(encoding="utf-8")
+        delete = script.split("if ($Mode -eq 'delete') {", 1)[1].split("\n    throw\n} catch {", 1)[0]
+        check = native.split("public static void AssertCleanupQuiescent", 1)[1].split(
+            "public static string RemoveTrackedGrant", 1,
+        )[0]
+        self.assertIn('jobState != "none" && jobState != "terminated-empty"', check)
+        self.assertIn("Process.GetProcesses()", check)
+        self.assertIn("OpenProcessToken(process, TokenQuery, out token)", check)
+        self.assertIn("EqualSid(Marshal.ReadIntPtr(app), expectedSid)", check)
+        self.assertIn('throw new InvalidOperationException("cleanup_process_alive")', check)
+        self.assertLess(delete.index("AssertCleanupQuiescent"), delete.index("Remove-NetFirewallRule"))
+        self.assertIn("WaitForEmptyJob(job, 10000)", native)
+        self.assertIn('result.Job += " terminated=confirmed empty=confirmed"', native)
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "sandbox.json"
+            state.write_text(json.dumps({
+                "schema": 1, "acl_grants": [], "integrity_grants": [], "job_state": "pending",
+            }), encoding="ascii")
+            with mock.patch.object(windows.sys, "platform", "win32"), \
+                    mock.patch.object(windows, "_run_powershell") as powershell:
+                with self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
+                    windows.delete_profile(state)
+            self.assertEqual(caught.exception.reason, "other")
+            powershell.assert_not_called()
+
+    def test_cleanup_handle_contract_covers_swapped_root_and_ancestor(self):
+        native = Path(windows.__file__).with_name("sandbox_windows_native.cs").read_text(encoding="utf-8")
+        open_path = native.split("private static CleanupPathLease OpenCleanupPath", 1)[1].split(
+            "private static SafeFileHandle OpenCleanupHandle", 1,
+        )[0]
+        open_handle = native.split("private static SafeFileHandle OpenCleanupHandle", 1)[1].split(
+            "private static void ValidateCleanupHandle", 1,
+        )[0]
+        tracked = native.split("public static string RemoveTrackedGrant", 1)[1].split(
+            "public static string RestoreIntegrityMedium", 1,
+        )[0]
+        tree = native.split("public static string RestoreAndDeleteAppContainerStorage", 1)[1].split(
+            "private static CleanupPathLease OpenCleanupPath", 1,
+        )[0]
+        self.assertIn("OpenCleanupHandle(root", open_path)
+        self.assertIn("OpenCleanupHandle(current", open_path)
+        self.assertIn("handles.Add(next)", open_path)
+        self.assertIn("FileFlagOpenReparsePoint | FileFlagBackupSemantics", open_handle)
+        self.assertIn("FileShareRead | FileShareWrite", open_handle)
+        self.assertNotIn("FileShareDelete", open_handle)
+        self.assertIn("using (lease)", tracked)
+        self.assertIn("RemoveAccessRuleFromHandle(lease.Target", tracked)
+        self.assertIn("OpenCleanupHandle(childPath", tree)
+        self.assertIn("EnumerateCleanupChildren(frame.Handle, timer)", tree)
+        self.assertIn("RestoreStorageEntry(child", tree)
+        self.assertIn("DeleteHandleEntry(child", tree)
+        self.assertNotIn("Set-Acl", native)
+        self.assertNotIn("takeown", native.lower())
 
     def test_substituted_cleanup_root_is_refused_before_powershell_acl_cleanup(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -232,6 +306,7 @@ class WindowsSandboxValidationTests(unittest.TestCase):
                 "schema": 1,
                 "acl_grants": [{"path": str(writable), "rights": "Modify", "inheritance": 3}],
                 "integrity_grants": [str(writable)],
+                "job_state": "none",
             }), encoding="ascii")
             with mock.patch.object(windows.sys, "platform", "win32"), \
                     mock.patch.object(windows, "_run_powershell") as powershell:
@@ -240,13 +315,53 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             self.assertEqual(caught.exception.reason, "other")
             powershell.assert_not_called()
 
+    def test_cleanup_contract_refuses_root_or_ancestor_swapped_after_python_preflight(self):
+        for swap_ancestor in (False, True):
+            with self.subTest(swap_ancestor=swap_ancestor), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                parent = base / "runner"
+                writable = parent / "writable"
+                writable.mkdir(parents=True)
+                outside = base / "outside"
+                outside.mkdir()
+                state = base / "sandbox.json"
+                state.write_text(json.dumps({
+                    "schema": 1,
+                    "acl_grants": [{"path": str(writable), "rights": "Modify", "inheritance": 3}],
+                    "integrity_grants": [str(writable)],
+                    "job_state": "none",
+                }), encoding="ascii")
+                mutation = []
+
+                def swap_then_open_cleanup_handle(*_args, **_kwargs):
+                    if swap_ancestor:
+                        saved = base / "runner-saved"
+                        parent.rename(saved)
+                        parent.symlink_to(outside, target_is_directory=True)
+                    else:
+                        saved = base / "writable-saved"
+                        writable.rename(saved)
+                        writable.symlink_to(outside, target_is_directory=True)
+                    windows._validate_cleanup_roots(state)
+                    mutation.append("would-have-mutated")
+                    return "removed"
+
+                with mock.patch.object(windows.sys, "platform", "win32"), \
+                        mock.patch.object(windows, "_run_powershell", side_effect=swap_then_open_cleanup_handle):
+                    with self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
+                        windows.delete_profile(state)
+                self.assertEqual(caught.exception.reason, "other")
+                self.assertEqual(mutation, [])
+
     def test_profile_cleanup_child_cap_leaves_the_shred_reserve_inside_the_step(self):
         self.assertEqual(windows.WINDOWS_CLEANUP_STEP_SECONDS, 900)
         self.assertEqual(windows.WINDOWS_SHRED_RESERVE_SECONDS, 300)
         self.assertEqual(windows.WINDOWS_PROFILE_CLEANUP_TIMEOUT_SECONDS, 600)
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary) / "sandbox.json"
-            state.write_text(json.dumps({"schema": 1, "acl_grants": [], "integrity_grants": []}), encoding="ascii")
+            state.write_text(json.dumps({
+                "schema": 1, "acl_grants": [], "integrity_grants": [], "job_state": "none",
+            }), encoding="ascii")
             with mock.patch.object(windows.sys, "platform", "win32"), \
                     mock.patch.object(windows, "_run_powershell", return_value="removed") as powershell:
                 windows.delete_profile(state)

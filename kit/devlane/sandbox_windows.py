@@ -384,6 +384,7 @@ def _validate_cleanup_roots(state_path):
         integrity_roots = state.get("integrity_grants") if type(state) is dict else None
         if (type(state) is not dict or state.get("schema") != 1
                 or type(grants) is not list or type(integrity_roots) is not list
+                or state.get("job_state") not in ("none", "terminated-empty")
                 or len(grants) + len(integrity_roots) > 10000):
             _refuse("profile-cleanup", reason="other")
         roots = []
@@ -646,11 +647,12 @@ def create_profile(state_path, *, failure_prefix=None, monitor_stage=None):
                     monitor_stage=monitor_stage)
     state = _read_json(state_path, 4096)
     if (type(state) is not dict or set(state) != {
-            "schema", "profile_name", "package_sid", "firewall_rule", "acl_grants", "integrity_grants",
+            "schema", "profile_name", "package_sid", "firewall_rule", "acl_grants", "integrity_grants", "job_state",
     }
             or state["schema"] != 1 or not PROFILE_PATTERN.fullmatch(state["profile_name"])
             or not PACKAGE_SID_PATTERN.fullmatch(state["package_sid"]) or type(state["acl_grants"]) is not list
             or type(state["integrity_grants"]) is not list
+            or state["job_state"] != "none"
             or any(type(path) is not str or len(path) > 260 for path in state["integrity_grants"])):
         _refuse("profile-state")
     return state
