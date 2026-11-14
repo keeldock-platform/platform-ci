@@ -78,6 +78,13 @@ NODE_LOCK_STEP_NAMES = (
 LINUX_POLICY_STEP_NAMES = ("Fetch public candidate", "Run unprivileged source-free checks")
 LINUX_HARNESS_STEP_NAMES = ("Fetch public candidate", "Run Linux namespace harness fixtures")
 WINDOWS_POLICY_STEP_NAMES = ("Fetch public candidate", "Run unprivileged source-free checks")
+WINDOWS_POLICY_JOB = "windows-confinement / windows-policy"
+_WINDOWS_ACL_LIVE_LINE = re.compile(
+    r"windows_acl_live=(pass cases=2|skipped platform|failed stage="
+    r"(powershell-missing|fixture-create|protected-run|protected-parse|extra-writer-exit) "
+    r"exit=(0|[1-9]|1[0-5]|other) stderr=(present|empty) "
+    r"stdout=(empty|multiple-lines|not-sid|bom-or-whitespace|sid))\Z"
+)
 WINDOWS_NATIVE_STEP_NAMES = (
     "Fetch public candidate", "Parse every PowerShell file under kit", "Compile native confinement module",
 )
@@ -382,6 +389,37 @@ def validate_control_marker(log, identity, expected_runner):
         _refuse()
 
 
+def windows_acl_live_outcome(log):
+    if type(log) is not bytes or len(log) > 32 * 1024 * 1024:
+        _refuse()
+    log = log.replace(b"\r\n", b"\n")
+    for sequence in public_audit.ANSI_SGR:
+        log = log.replace(sequence, b"")
+    matches = []
+    for row in log.splitlines():
+        try:
+            line = row.decode("ascii", "strict")
+        except UnicodeError:
+            continue
+        line = public_audit.TIME_PREFIX.sub("", line, count=1)
+        if not line.startswith("windows_acl_live="):
+            continue
+        match = _WINDOWS_ACL_LIVE_LINE.fullmatch(line)
+        if match is None:
+            _refuse()
+        value = match.group(1)
+        matches.append("pass" if value == "pass cases=2" else
+                       "skipped" if value == "skipped platform" else "failed")
+    if len(matches) != 1:
+        _refuse()
+    return matches[0]
+
+
+def validate_windows_policy_log(log):
+    if windows_acl_live_outcome(log) != "pass":
+        _refuse()
+
+
 def validate_artifacts(value, identity):
     expected_name = "development-feedback-smoke-" + identity["run_id"] + "-1"
     if (type(value) is not dict or value.get("total_count") != 1
@@ -455,6 +493,9 @@ def run_audit(api, identity):
         api.log_text(synthetic_job["id"]), identity,
         failed_acceptance=synthetic_job["conclusion"] == "failure",
     )
+    windows_policy_job = jobs[WINDOWS_POLICY_JOB]
+    _under_stage("windows-policy-log", validate_windows_policy_log,
+                 api.log_text(windows_policy_job["id"]))
     for runner in CONTROL_RUNNERS:
         name = "policy-" + runner
         log = api.log_text(jobs[name]["id"])

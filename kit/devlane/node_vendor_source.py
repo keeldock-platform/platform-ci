@@ -273,11 +273,15 @@ def _finish_links(root, root_fd, links, remaining, owner_uid):
             os.symlink(target, parts[-1], dir_fd=parent)
         finally:
             os.close(parent)
+    try:
+        resolved_root = root.resolve(strict=True)
+    except (OSError, RuntimeError):
+        _fail("vendor-node-link")
     for parts, _target in links:
         _tick(remaining)
         try:
             resolved = root.joinpath(*parts).resolve(strict=True)
-            if not resolved.is_relative_to(root) or not (resolved.is_file() or resolved.is_dir()):
+            if not resolved.is_relative_to(resolved_root) or not (resolved.is_file() or resolved.is_dir()):
                 _fail("vendor-node-link")
         except (OSError, RuntimeError):
             _fail("vendor-node-link")
@@ -336,17 +340,23 @@ def _seal(root, remaining):
 
 
 def _layout(node_root):
-    for name in ("bin/node", "lib/node_modules/npm/bin/npm-cli.js"):
-        path = node_root / name
-        if not path.is_file() or path.is_symlink():
-            _fail("vendor-node-layout")
+    node = node_root / "bin/node"
+    npm_cli = node_root / "lib/node_modules/npm/bin/npm-cli.js"
+    if not node.is_file() or node.is_symlink():
+        _fail("vendor-node-node-missing")
+    if not npm_cli.is_file() or npm_cli.is_symlink():
+        _fail("vendor-node-npm-cli-missing")
     try:
-        expected = node_root / "lib/node_modules/npm/bin/npm-cli.js"
-        if (not os.access(node_root / "bin/node", os.X_OK)
-                or (node_root / "bin/npm").resolve(strict=True) != expected):
-            _fail("vendor-node-layout")
+        if not stat.S_IMODE(node.stat().st_mode) & 0o111:
+            _fail("vendor-node-node-not-executable")
+    except OSError:
+        _fail("vendor-node-node-missing")
+    try:
+        npm_link = node_root / "bin/npm"
+        if not npm_link.is_symlink() or npm_link.resolve(strict=True) != npm_cli.resolve(strict=True):
+            _fail("vendor-node-npm-link-mismatch")
     except (OSError, RuntimeError):
-        _fail("vendor-node-layout")
+        _fail("vendor-node-npm-link-mismatch")
 
 
 def acquire_node_source(snapshot_id, deadline_file, profile="core-node"):
@@ -396,39 +406,53 @@ def source_node_root(snapshot_id, profile="desktop"):
         area / "cache", area / "cache/node",
         area / "cache/node" / distribution["node_version"],
     )
-    for path in paths:
+    for index, path in enumerate(paths, start=1):
         try:
             metadata = os.lstat(path)
         except OSError:
-            _fail("vendor-node-layout")
-        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0
-                or stat.S_IMODE(metadata.st_mode) & 0o022):
-            _fail("vendor-node-layout")
+            _fail("vendor-node-path-%02d-type" % index)
+        if not stat.S_ISDIR(metadata.st_mode):
+            _fail("vendor-node-path-%02d-type" % index)
+        if metadata.st_uid != 0:
+            _fail("vendor-node-path-%02d-owner" % index)
+        if stat.S_IMODE(metadata.st_mode) & 0o022:
+            _fail("vendor-node-path-%02d-mode" % index)
     root = area / "cache/node" / distribution["node_version"] / "x64"
     try:
         metadata = os.lstat(root)
     except OSError:
-        _fail("vendor-node-layout")
-    if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0
-            or stat.S_IMODE(metadata.st_mode) != 0o555):
-        _fail("vendor-node-layout")
+        _fail("vendor-node-path-08-type")
+    if not stat.S_ISDIR(metadata.st_mode):
+        _fail("vendor-node-path-08-type")
+    if metadata.st_uid != 0:
+        _fail("vendor-node-path-08-owner")
+    if stat.S_IMODE(metadata.st_mode) != 0o555:
+        _fail("vendor-node-path-08-mode")
     _layout(root)
-    for name in ("bin", "lib", "lib/node_modules", "lib/node_modules/npm",
-                 "lib/node_modules/npm/bin"):
+    for index, name in enumerate(("bin", "lib", "lib/node_modules", "lib/node_modules/npm",
+                                  "lib/node_modules/npm/bin"), start=9):
+        path = root / name
         try:
-            metadata = os.lstat(root / name)
+            metadata = os.lstat(path)
         except OSError:
-            _fail("vendor-node-layout")
-        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0
-                or stat.S_IMODE(metadata.st_mode) != 0o555):
-            _fail("vendor-node-layout")
-    for name in ("bin/node", "lib/node_modules/npm/bin/npm-cli.js"):
+            _fail("vendor-node-path-%02d-type" % index)
+        if not stat.S_ISDIR(metadata.st_mode):
+            _fail("vendor-node-path-%02d-type" % index)
+        if metadata.st_uid != 0:
+            _fail("vendor-node-path-%02d-owner" % index)
+        if stat.S_IMODE(metadata.st_mode) != 0o555:
+            _fail("vendor-node-path-%02d-mode" % index)
+    for index, name in enumerate(("bin/node", "lib/node_modules/npm/bin/npm-cli.js"), start=14):
+        path = root / name
         try:
-            metadata = os.lstat(root / name)
+            metadata = os.lstat(path)
         except OSError:
-            _fail("vendor-node-layout")
-        expected_mode = 0o555 if name == "bin/node" else 0o444
-        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0
-                or stat.S_IMODE(metadata.st_mode) != expected_mode):
-            _fail("vendor-node-layout")
+            _fail("vendor-node-path-%02d-type" % index)
+        if not stat.S_ISREG(metadata.st_mode):
+            _fail("vendor-node-path-%02d-type" % index)
+        if metadata.st_uid != 0:
+            _fail("vendor-node-path-%02d-owner" % index)
+        expected_mode = 0o555
+        if stat.S_IMODE(metadata.st_mode) != expected_mode:
+            _fail("vendor-node-path-%02d-mode" % index)
     return root

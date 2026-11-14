@@ -54,6 +54,17 @@ CLEANUP_SUBREASONS = frozenset((
 ))
 E2E_PROGRESS_MAX_LINES = 4096
 
+VENDOR_NODE_LAYOUT_CODES = frozenset((
+    "vendor-node-node-missing", "vendor-node-npm-cli-missing",
+    "vendor-node-node-not-executable", "vendor-node-npm-link-mismatch",
+))
+VENDOR_NODE_PATH_CODES = frozenset(
+    "vendor-node-path-%02d-%s" % (index, field)
+    for index in range(1, 16) for field in ("type", "owner", "mode")
+)
+VENDOR_NODE_DIAGNOSTIC_CODES = VENDOR_NODE_LAYOUT_CODES | VENDOR_NODE_PATH_CODES
+VENDOR_NODE_DIAGNOSTIC_STAGE = "prepare-node-vendor-acquisition"
+
 PREPARATION_REFUSAL_CODES = frozenset((
     "preparation-control-size", "preparation-control-type", "projection-baseline-constraints",
     "action-budget-invalid", "action-work-budget-insufficient", "asset-binding-mismatch",
@@ -98,7 +109,7 @@ PREPARATION_REFUSAL_CODES = frozenset((
     "npm-manifest-projection-mismatch", "npm-manifest-shape", "npm-workspaces-unsupported",
     "vendor-node-archive-size", "vendor-node-archive-type", "vendor-node-archive-write",
     "vendor-node-checksum", "vendor-node-deadline", "vendor-node-directory",
-    "vendor-node-expanded-size", "vendor-node-layout", "vendor-node-link",
+    "vendor-node-expanded-size", "vendor-node-link",
     "vendor-node-member-count", "vendor-node-member-path", "vendor-node-member-read",
     "vendor-node-member-size", "vendor-node-member-type", "vendor-node-member-write",
     "vendor-node-origin", "vendor-node-platform-or-id",
@@ -121,7 +132,7 @@ PREPARATION_REFUSAL_CODES = frozenset((
     "run-attempt", "rust-tool-layout", "rust-toolchain-missing", "rust-toolchain-path",
     "rust-toolchain-version", "total-deadline-exhausted", "total-deadline-unavailable",
     "toolchain-version", "playwright-browsers-missing", "playwright-cli-missing", "cleanup-incomplete",
-)) | refusal_codes.DOWNLOAD_REFUSAL_CODES
+)) | refusal_codes.DOWNLOAD_REFUSAL_CODES | VENDOR_NODE_DIAGNOSTIC_CODES
 
 PREPARATION_EXCEPTION_LABELS = frozenset((
     "assertion-error", "attribute-error", "file-exists", "file-not-found", "index-error",
@@ -499,6 +510,8 @@ def public_preparation_diagnostic(line):
     stage, category, route_detail, reason, version, cleanup = match.groups()
     if stage not in PUBLIC_DIAGNOSTIC_PHASES or category not in PREPARATION_E2E_CATEGORIES:
         return False
+    if category in VENDOR_NODE_DIAGNOSTIC_CODES and stage != VENDOR_NODE_DIAGNOSTIC_STAGE:
+        return False
     if category in NETWORK_PROBE_E2E_CATEGORIES and stage not in NETWORK_PROBE_E2E_STAGES:
         return False
     if route_detail is not None and (
@@ -519,6 +532,13 @@ def public_preparation_diagnostic(line):
     elif version is not None:
         return False
     return cleanup is None or cleanup == "unconfirmed"
+
+
+def is_vendor_node_diagnostic(line):
+    if type(line) is not str:
+        return False
+    match = _E2E_REFUSAL.fullmatch(line)
+    return match is not None and match.group(2) in VENDOR_NODE_DIAGNOSTIC_CODES
 
 
 def public_e2e_runtime_diagnostic(line):

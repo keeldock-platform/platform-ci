@@ -1198,6 +1198,9 @@ class _Grammar:
                 public_counts["acceptance_refused"] = public_counts.get("acceptance_refused", 0) + 1
                 public_counts["acceptance_refusal_stage"] = stage
                 return public_counts["acceptance_refused"] == 1
+            if (diagnostic_contract.is_vendor_node_diagnostic(line)
+                    and (self.kind != "synthetic" or self.job_runner != "ubuntu-24.04")):
+                return False
             if self.kind == "synthetic":
                 if diagnostic_contract.public_e2e_vitest_diagnostic(line):
                     public_counts["e2e_vitest_diagnostic_lines"] = public_counts.get(

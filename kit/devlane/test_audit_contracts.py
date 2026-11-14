@@ -2259,6 +2259,74 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         )
         self.assertFalse(encrypted.step_output_ok("Prepare dependencies before the cut", detail, {}))
 
+    def test_vendor_node_diagnostics_are_linux_synthetic_acquisition_only(self):
+        line = (
+            "devlane_production_e2e=refused stage=prepare-node-vendor-acquisition "
+            "exception=vendor-node-node-not-executable"
+        )
+        self.assertTrue(diagnostic_contract.public_preparation_diagnostic(line))
+        self.assertTrue(diagnostic_contract.is_vendor_node_diagnostic(line))
+        self.assertEqual(
+            acceptance_diagnostics.failure_tail("production-path-e2e", (line + "\n").encode("ascii")),
+            [line],
+        )
+        grammar = audit._Grammar(
+            Path(__file__).resolve().parents[2] / ".github/workflows/devlane-synthetic.yml",
+            "devlane-synthetic", {"run_id": "12345", "control_sha": SHA, "platform": "linux"}, "synthetic",
+        )
+        self.assertTrue(grammar.step_output_ok(
+            "Run full source-free production-path acceptance", line, {},
+        ))
+        for code in diagnostic_contract.VENDOR_NODE_DIAGNOSTIC_CODES:
+            candidate = (
+                "devlane_production_e2e=refused stage=prepare-node-vendor-acquisition exception=" + code
+            )
+            self.assertTrue(diagnostic_contract.public_preparation_diagnostic(candidate))
+            self.assertTrue(grammar.step_output_ok(
+                "Run full source-free production-path acceptance", candidate, {},
+            ))
+        for invalid in (
+            line.replace("prepare-node-vendor-acquisition", "prepare-node-toolchain-validation"),
+            line.replace("vendor-node-node-not-executable", "vendor-node-path-16-mode"),
+            line.replace("vendor-node-node-not-executable", "vendor-node-layout"),
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertFalse(diagnostic_contract.public_preparation_diagnostic(invalid))
+                self.assertFalse(grammar.step_output_ok(
+                    "Run full source-free production-path acceptance", invalid, {},
+                ))
+        windows = audit._Grammar(
+            Path(__file__).resolve().parents[2] / ".github/workflows/devlane-synthetic.yml",
+            "devlane-synthetic", {"run_id": "12345", "control_sha": SHA, "platform": "windows"}, "synthetic",
+        )
+        self.assertFalse(windows.step_output_ok(
+            "Run full source-free production-path acceptance", line, {},
+        ))
+        self.assertEqual(len(diagnostic_contract.VENDOR_NODE_PATH_CODES), 45)
+
+    def test_windows_acl_live_log_audits_only_fixed_shapes(self):
+        self.assertEqual(control_audit.windows_acl_live_outcome(
+            b"2026-11-14T03:05:16.5060466Z windows_acl_live=pass cases=2\n",
+        ), "pass")
+        control_audit.validate_windows_policy_log(b"windows_acl_live=pass cases=2\n")
+        for stage in ("powershell-missing", "fixture-create", "protected-run", "protected-parse", "extra-writer-exit"):
+            line = (
+                "windows_acl_live=failed stage=%s exit=6 stderr=present stdout=bom-or-whitespace\n" % stage
+            ).encode("ascii")
+            with self.subTest(stage=stage):
+                self.assertEqual(control_audit.windows_acl_live_outcome(line), "failed")
+                with self.assertRaises(control_audit.ControlAuditRefusal):
+                    control_audit.validate_windows_policy_log(line)
+        for invalid in (
+            b"windows_acl_live=failed stage=private-path exit=6 stderr=present stdout=not-sid\n",
+            b"windows_acl_live=failed stage=fixture-create exit=16 stderr=present stdout=not-sid\n",
+            b"windows_acl_live=failed stage=fixture-create exit=6 stderr=private-path stdout=not-sid\n",
+            b"windows_acl_live=failed stage=fixture-create exit=6 stderr=present stdout=private-path\n",
+            b"windows_acl_live=pass cases=2\nwindows_acl_live=pass cases=2\n",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(control_audit.ControlAuditRefusal):
+                control_audit.windows_acl_live_outcome(invalid)
+
     def test_e2e_progress_markers_use_fixed_phase_and_scenario_vocabulary(self):
         root = Path(__file__).resolve().parents[2]
         grammar = audit._Grammar(
