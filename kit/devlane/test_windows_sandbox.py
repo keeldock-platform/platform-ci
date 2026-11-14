@@ -14,6 +14,21 @@ import sandbox_windows as windows
 
 
 class WindowsSandboxValidationTests(unittest.TestCase):
+    @staticmethod
+    def _toolchain_fixture(root):
+        root = Path(root)
+        node = root / "host-toolcache" / "node.exe"
+        npm_cli = root / "host-npm" / "node_modules" / "npm" / "bin" / "npm-cli.js"
+        cmd = root / "system" / "cmd.exe"
+        node.parent.mkdir(parents=True, exist_ok=True)
+        npm_cli.parent.mkdir(parents=True, exist_ok=True)
+        cmd.parent.mkdir(parents=True, exist_ok=True)
+        node.write_bytes(b"pinned-node-fixture")
+        npm_cli.write_bytes(b"pinned-npm-fixture")
+        (npm_cli.parent.parent / "package.json").write_bytes(b"{}")
+        cmd.write_bytes(b"pinned-cmd-fixture")
+        return node, npm_cli, cmd
+
     def test_only_the_core_node_profile_is_enabled(self):
         self.assertEqual(windows.validate_profile("core-node"), "core-node")
         for profile in ("core-rust", "desktop", "", None):
@@ -122,6 +137,32 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         self.assertEqual(arguments[-2], "--config=" + str(windows.PureWindowsPath(source) / "vitest.config.ts"))
         self.assertEqual(arguments[-1], "--outputFile=" + str(windows.PureWindowsPath(scratch) / "reports" / "vitest.json"))
 
+    def test_pinned_toolchain_copy_is_hash_verified_and_stays_under_the_owned_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary) / "run-root"
+            prepared = run_root / "prepared"
+            prepared.mkdir(parents=True)
+            node, npm_cli, cmd = self._toolchain_fixture(Path(temporary))
+            copied_node, copied_npm_cli, copied_cmd, hashes = windows._copy_pinned_windows_toolchain(
+                node, npm_cli, prepared / "toolchain", cmd_path=cmd,
+            )
+            record_path = prepared / "toolchain.json"
+            record = {"node": str(copied_node), "npm_cli": str(copied_npm_cli), "cmd": str(copied_cmd),
+                      "hashes": hashes}
+            record_path.write_text(json.dumps(record), encoding="ascii")
+            self.assertEqual(copied_node.read_bytes(), node.read_bytes())
+            self.assertEqual(copied_npm_cli.read_bytes(), npm_cli.read_bytes())
+            self.assertEqual(copied_cmd.read_bytes(), cmd.read_bytes())
+            self.assertEqual(windows._validate_windows_toolchain(record_path, prepared, run_root), record)
+            self.assertTrue(windows._owned_path_within(copied_node, run_root))
+            self.assertFalse(windows._owned_path_within(node, run_root))
+
+    def test_execute_requires_the_hashed_owned_toolchain_record(self):
+        source = Path(windows.__file__).read_text(encoding="utf-8")
+        execute = source.split('elif args.operation == "execute":', 1)[1]
+        self.assertIn("_validate_windows_toolchain(", execute)
+        self.assertIn('set(toolchain) != {"node", "npm_cli", "cmd", "hashes"}', execute)
+
     def test_native_launcher_terminates_a_created_process_on_assignment_failure(self):
         source = (Path(windows.__file__).with_name("sandbox_windows_native.cs")).read_text(encoding="utf-8")
         script = Path(windows.__file__).with_name("sandbox_windows.ps1").read_text(encoding="utf-8")
@@ -145,6 +186,50 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         self.assertLess(terminate, source.index("return result;", terminate))
         terminate_process = source.index("TerminateProcess(process, JobExitCode)")
         self.assertLess(terminate_process, source.index("Close(process)", terminate_process))
+        self.assertIn("TokenPrivilegesInformation = 3", source)
+        self.assertIn('HasEnabledPrivilege(token, "SeChangeNotifyPrivilege")', source)
+        self.assertIn("LookupPrivilegeValueW(null, privilegeName, out expected)", source)
+        verify = source.split("private static string VerifyToken", 1)[1].split(
+            "private static IntPtr QueryToken", 1,
+        )[0]
+        self.assertLess(verify.index("HasEnabledPrivilege"), verify.index("bypass_traverse="))
+        self.assertLess(source.index("VerifyToken(process, sid, internetClient"), source.index("ResumeThread(thread)"))
+        refusal = source.index('result.Failure = "token-bypass-traverse-absent"')
+        self.assertLess(source.index("TerminateAndConfirmEmptyJob(job);", source.index("bool bypassTraverse")), refusal)
+        self.assertLess(refusal, source.index("ResumeThread(thread)"))
+
+    def test_prepare_reports_and_refuses_missing_bypass_traverse_privilege(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run"
+            state = root / "state" / "preparation.json"
+            state.parent.mkdir(parents=True)
+            projection = root / "projection.json"
+            projection.write_text("{}", encoding="ascii")
+            node, npm, cmd = self._toolchain_fixture(root)
+            output = io.StringIO()
+            with mock.patch.object(windows.sys, "platform", "win32"), \
+                    mock.patch.object(windows.fetch, "validate_projection", return_value={
+                        "npm_package": {}, "npm_lock": {}, "playwright": [],
+                    }), \
+                    mock.patch.object(windows, "_npm_tools", return_value=(node, npm)), \
+                    mock.patch.object(windows, "_system_cmd_path", return_value=cmd), \
+                    mock.patch.object(windows, "_deadline_remaining", return_value=120), \
+                    mock.patch.object(windows, "create_profile", return_value={}), \
+                    mock.patch.object(windows, "delete_profile"), \
+                    mock.patch.object(windows, "_native_run", return_value={
+                        "status": "token-bypass-traverse-absent", "exit_code": 0,
+                        "token": "lpac=verified bypass_traverse=absent",
+                        "job": "assigned kill_on_close=enabled breakaway=disabled terminated=confirmed empty=confirmed",
+                    }), \
+                    contextlib.redirect_stdout(output):
+                with self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
+                    windows.prepare_dependencies(projection, root / "prepared", root / "deadline", state)
+            self.assertEqual(caught.exception.code, "windows-prepare-token-bypass-traverse-absent")
+            self.assertEqual(windows._token_bypass_traverse_status("lpac=verified bypass_traverse=absent"), "absent")
+            self.assertEqual(windows._token_bypass_traverse_status("lpac=verified bypass_traverse=present"), "present")
+            self.assertIsNone(windows._token_bypass_traverse_status("lpac=verified"))
+            self.assertIn("windows_token_bypass_traverse=absent\n", output.getvalue())
+            self.assertIn(caught.exception.code, windows.refusal_codes.WINDOWS_PREPARE_REFUSAL_CODES)
 
     def test_profile_cleanup_reason_is_emitted_from_only_the_bounded_native_vocabulary(self):
         process = mock.Mock(returncode=1)
@@ -168,6 +253,7 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             projection = root / "projection.json"
             projection.write_text("{}", encoding="ascii")
             state = root / "runner" / "state.json"
+            node, npm, cmd = self._toolchain_fixture(root)
             output = io.StringIO()
 
             def fail_cleanup(*_args, **_kwargs):
@@ -180,7 +266,8 @@ class WindowsSandboxValidationTests(unittest.TestCase):
                     mock.patch.object(windows.fetch, "validate_projection", return_value={
                         "npm_package": {}, "npm_lock": {}, "playwright": [],
                     }), \
-                    mock.patch.object(windows, "_npm_tools", return_value=(Path("node.exe"), Path("npm-cli.js"))), \
+                    mock.patch.object(windows, "_npm_tools", return_value=(node, npm)), \
+                    mock.patch.object(windows, "_system_cmd_path", return_value=cmd), \
                     mock.patch.object(windows, "create_profile"), \
                     mock.patch.object(windows, "_deadline_remaining", return_value=100), \
                     mock.patch.object(windows, "_native_run", return_value={"status": "fail"}), \
@@ -211,8 +298,8 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         )[0]
         storage_access = script.split("function Set-CleanupStorageAccess", 1)[1].split("try {", 1)[0]
         self.assertIn("Write-LauncherPhase 'acl-grant'", run)
-        self.assertIn("$system32Path", run)
-        self.assertIn("[StringComparison]::OrdinalIgnoreCase)) { continue }", run)
+        self.assertIn("$script:OwnedRoots = @($baseInfo.Path)", run)
+        self.assertIn("$state.owned_roots = @($script:OwnedRoots)", run)
         self.assertIn("if ($item.PSIsContainer) { 3 } else { 0 }", run)
         self.assertIn("$grants.Add([pscustomobject]@{ path = $path; rights = $rightsName; inheritance = $inheritanceValue })", run)
         self.assertIn("$integrityGrants = [Collections.Generic.List[string]]::new()", run)
@@ -237,8 +324,8 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         self.assertNotIn("$modifiedPaths", cleanup)
         self.assertNotIn("Restore-RunnerAccessTree", cleanup)
         self.assertIn("Assert-CleanupTreeSafe $pathInfo.Path", cleanup)
-        self.assertLess(tracked_grant.index("Assert-CleanupTreeSafe"), tracked_grant.index("Set-Acl"))
-        self.assertLess(tracked_integrity.index("Assert-CleanupTreeSafe"), tracked_integrity.index("'/setintegritylevel'"))
+        self.assertLess(tracked_grant.index("Assert-OwnedPath"), tracked_grant.index("Set-Acl"))
+        self.assertLess(tracked_integrity.index("Assert-OwnedPath"), tracked_integrity.index("Invoke-CleanupIcacls"))
         self.assertLess(cleanup.index("Assert-CleanupTreeSafe $pathInfo.Path"),
                         cleanup.index("Invoke-CleanupIcacls $pathInfo.Path @('/remove:g'"))
         self.assertNotIn("(OI)(CI)", storage_access)
@@ -265,32 +352,49 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         python_source = Path(windows.__file__).read_text(encoding="utf-8")
         self.assertIn("timeout=WINDOWS_PROFILE_CLEANUP_TIMEOUT_SECONDS", python_source)
 
-    def test_ancestor_traverse_grant_uses_a_direct_nonpropagating_setter(self):
+    def test_acl_mutations_are_confined_to_recorded_owned_roots(self):
         script = Path(windows.__file__).with_name("sandbox_windows.ps1").read_text(encoding="utf-8")
         run = script.split("if ($Mode -eq 'run')", 1)[1].split("if ($Mode -eq 'delete')", 1)[0]
-        self.assertEqual(run.count("Add-TrackedTraverseGrant $ancestor.FullName"), 2)
-        traverse = "function Add-TrackedTraverseGrant" + run.split(
-            "function Add-TrackedTraverseGrant", 1,
-        )[1].split("function Add-TrackedIntegrityGrant", 1)[0]
-        self.assertNotRegex(traverse, r"\bGet-Acl\b|\bSet-Acl\b")
-        self.assertIn("@('/grant:r', ('*' + [string]$sid + ':(X,S)'))", traverse)
-        self.assertNotRegex(traverse, r"(?i)\(OI\)|\(CI\)|'/T'|\"/T\"")
-        self.assertIn("'/L'", script.split("function Invoke-CleanupIcacls", 1)[1].split("function Set-CleanupStorageAccess", 1)[0])
+        cleanup = script.split("if ($Mode -eq 'delete')", 1)[1].split("\n    throw\n} catch {", 1)[0]
+        icacls_writer = script.split("function Invoke-CleanupIcacls", 1)[1].split(
+            "function Set-CleanupStorageAccess", 1,
+        )[0]
+        self.assertNotIn("Add-TrackedTraverseGrant", script)
+        self.assertNotIn(":(X,S)", script)
+        self.assertNotIn("$ancestor", run)
+        self.assertNotIn("[IO.DirectoryInfo]", run)
+        self.assertIn("function Assert-OwnedPath", script)
+        self.assertIn("$Path = Assert-OwnedPath $Path", icacls_writer)
+        self.assertIn("$path = Assert-OwnedPath $path", run)
+        self.assertIn("$script:OwnedRoots = @($state.owned_roots", cleanup)
+        self.assertIn("$state.owned_roots = @($script:OwnedRoots)", cleanup)
+        self.assertIn("$actual, $expected", cleanup)
+        self.assertIn("Set-CleanupStorageAccess $entry.Path", cleanup)
+        self.assertIn("Assert-OwnedPath $Path", script.split("function Set-CleanupStorageAccess", 1)[1].split("try {", 1)[0])
+        self.assertIn("'/L'", icacls_writer)
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml").read_text(
+            encoding="utf-8",
+        )
+        workflow_acl = workflow.split("function Protect-PrivateDirectory", 1)[1].split(
+            "try {\n            $runRoot", 1,
+        )[0]
+        acl_call_sites = re.findall(r"Protect-PrivateDirectory\s+(\$[A-Za-z][A-Za-z0-9]*)", workflow)
+        self.assertEqual(acl_call_sites, ["$runRoot", "$cryptoTarget"])
+        self.assertIn("New-Item -ItemType Directory -Path $runRoot", workflow)
+        self.assertIn("Join-Path -Path $runRoot -ChildPath 'control-python-deps'", workflow)
+        self.assertIn("SetAccessControl([IO.DirectoryInfo]$Path, $security)", workflow_acl)
+        self.assertNotRegex(workflow, r"(?i)icacls|Set-Acl|SetSecurityDescriptor")
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = Path(temporary) / "ancestor" / "child" / "leaf"
-            fixture.mkdir(parents=True)
-            ancestors = []
-            current = fixture
-            while current != current.parent:
-                ancestors.append(current)
-                current = current.parent
-            sid = "S-1-15-2-1-2-3-4-5-6-7"
-            writes = [(str(path), "/grant:r", "*" + sid + ":(X,S)", "/L", "/Q") for path in ancestors]
-            self.assertGreaterEqual(len(writes), 4)
-            self.assertTrue(all("(OI)" not in " ".join(write) and "(CI)" not in " ".join(write)
-                                and "/T" not in write for write in writes))
-            self.assertTrue(all(write[1:] == ("/grant:r", "*" + sid + ":(X,S)", "/L", "/Q")
-                                for write in writes))
+            owned = Path(temporary) / "run-root"
+            child = owned / "toolchain" / "node.exe"
+            child.parent.mkdir(parents=True)
+            outsider = owned.parent / "hostedtoolcache" / "node.exe"
+            self.assertTrue(windows._owned_path_within(child, owned))
+            self.assertFalse(windows._owned_path_within(owned.parent, owned))
+            self.assertFalse(windows._owned_path_within(outsider, owned))
+        python_source = Path(windows.__file__).read_text(encoding="utf-8")
+        self.assertIn("if not any(_owned_path_within(value, owned_root) for owned_root in owned_roots)", python_source)
+        self.assertIn("not _path_within(value, owned_root)", python_source)
 
     def test_cleanup_discovery_budget_refuses_a_generated_wide_directory(self):
         script = Path(windows.__file__).with_name("sandbox_windows.ps1").read_text(encoding="utf-8")
@@ -368,7 +472,7 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary) / "sandbox.json"
             state.write_text(json.dumps({
-                "schema": 1, "acl_grants": [], "integrity_grants": [], "job_state": "pending",
+                "schema": 1, "owned_roots": [], "acl_grants": [], "integrity_grants": [], "job_state": "pending",
             }), encoding="ascii")
             with mock.patch.object(windows.sys, "platform", "win32"), \
                     mock.patch.object(windows, "_run_powershell") as powershell:
@@ -470,6 +574,7 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             "JobObjectLimitKillOnJobClose": "0x00002000",
             "JobLimitFlags": "JobObjectLimitActiveProcess | JobObjectLimitProcessMemory | JobObjectLimitJobMemory | JobObjectLimitKillOnJobClose",
             "TokenQuery": "0x0008",
+            "TokenPrivilegesInformation": "3",
             "TokenIntegrityLevel": "25",
             "TokenIsAppContainer": "29",
             "TokenCapabilities": "30",
@@ -524,6 +629,7 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             state = base / "sandbox.json"
             state.write_text(json.dumps({
                 "schema": 1,
+                "owned_roots": [str(base)],
                 "acl_grants": [{"path": str(writable), "rights": "Modify", "inheritance": 3}],
                 "integrity_grants": [str(writable)],
                 "job_state": "none",
@@ -547,6 +653,7 @@ class WindowsSandboxValidationTests(unittest.TestCase):
                 state = base / "sandbox.json"
                 state.write_text(json.dumps({
                     "schema": 1,
+                    "owned_roots": [str(parent)],
                     "acl_grants": [{"path": str(writable), "rights": "Modify", "inheritance": 3}],
                     "integrity_grants": [str(writable)],
                     "job_state": "none",
@@ -580,7 +687,7 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary) / "sandbox.json"
             state.write_text(json.dumps({
-                "schema": 1, "acl_grants": [], "integrity_grants": [], "job_state": "none",
+                "schema": 1, "owned_roots": [], "acl_grants": [], "integrity_grants": [], "job_state": "none",
             }), encoding="ascii")
             with mock.patch.object(windows.sys, "platform", "win32"), \
                     mock.patch.object(windows, "_run_powershell", return_value="removed") as powershell:
@@ -707,10 +814,7 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             projection = root / "projection.json"
             projection.write_text("{}", encoding="ascii")
             output = root / "prepared-root"
-            node = root / "node.exe"
-            npm = root / "npm-cli.js"
-            node.write_text("", encoding="ascii")
-            npm.write_text("", encoding="ascii")
+            node, npm, cmd = self._toolchain_fixture(root)
             requests = []
 
             def isolated(_state, request, _run_root, **_kwargs):
@@ -720,13 +824,16 @@ class WindowsSandboxValidationTests(unittest.TestCase):
                 modules.mkdir(exist_ok=True)
                 (modules / "playwright").mkdir(exist_ok=True)
                 (modules / "playwright" / "cli.js").write_text("", encoding="ascii")
-                return {"status": "pass", "exit_code": 0, "token": "lpac=verified", "job": "assigned kill_on_close=enabled breakaway=disabled"}
+                return {"status": "pass", "exit_code": 0,
+                        "token": "lpac=verified bypass_traverse=present",
+                        "job": "assigned kill_on_close=enabled breakaway=disabled"}
 
             with mock.patch.object(windows.sys, "platform", "win32"), \
                     mock.patch.object(windows.fetch, "validate_projection", return_value={
                         "npm_package": {}, "npm_lock": {}, "playwright": ["chromium"],
                     }), \
                     mock.patch.object(windows, "_npm_tools", return_value=(node, npm)), \
+                    mock.patch.object(windows, "_system_cmd_path", return_value=cmd), \
                     mock.patch.object(windows, "_deadline_remaining", return_value=600), \
                     mock.patch.object(windows, "create_profile", return_value={}), \
                     mock.patch.object(windows, "delete_profile"), \
@@ -735,15 +842,19 @@ class WindowsSandboxValidationTests(unittest.TestCase):
                 windows.prepare_dependencies(projection, output, root / "deadline.json", state)
 
             self.assertEqual(len(requests), 2)
+            copied_node = output / "prepared" / "toolchain" / "node.exe"
+            copied_npm = output / "prepared" / "toolchain" / "node_modules" / "npm" / "bin" / "npm-cli.js"
             for request in requests:
                 self.assertTrue(request["internet_client"])
-                self.assertIn(str(node), request["read_paths"])
-                self.assertIn(str(npm.parent.parent), request["read_paths"])
+                self.assertIn(str(output / "prepared" / "toolchain"), request["read_paths"])
+                self.assertNotIn(str(node), request["read_paths"])
+                self.assertNotIn(str(npm.parent.parent), request["read_paths"])
                 self.assertNotIn(str(Path("C:/Windows/System32")), request["read_paths"])
                 self.assertIn(str(output / "project"), request["write_paths"])
                 self.assertIn(str(output / "npm-cache"), request["write_paths"])
                 self.assertIn(str(output / "prepared" / "ms-playwright"), request["write_paths"])
-                self.assertEqual(request["environment"][0].startswith("PATH="), True)
+                self.assertTrue(request["environment"][0].startswith("PATH=" + str(copied_node.parent)))
+                self.assertIn("ComSpec=" + str(copied_node.parent / "cmd.exe"), request["environment"])
                 self.assertIn("NPM_CONFIG_IGNORE_SCRIPTS=true", request["environment"])
                 self.assertIn("NPM_CONFIG_OFFLINE=false", request["environment"])
                 self.assertIn("NPM_CONFIG_LOGS_DIR=" + str(output / "npm-cache" / "_logs"), request["environment"])
@@ -751,14 +862,17 @@ class WindowsSandboxValidationTests(unittest.TestCase):
                 self.assertIn("NPM_CONFIG_YES=true", request["environment"])
                 self.assertIn("NPM_CONFIG_PROMPT=false", request["environment"])
                 self.assertIn("GIT_TERMINAL_PROMPT=0", request["environment"])
-                if request["arguments"][0] == str(npm):
+                self.assertEqual(request["executable"], str(copied_node))
+                if request["arguments"][0] == str(copied_npm):
                     self.assertIn("--yes", request["arguments"])
             self.assertTrue((output / "prepared" / "toolchain.json").is_file())
+            self.assertEqual((output / "prepared" / "toolchain.json").exists(), True)
             self.assertEqual(
                 [call.args[0] for call in stage_output.call_args_list],
                 ["windows_prepare_stage_start=profile-create", "windows_prepare_stage=none",
                  "windows_prepare_stage_start=npm-ci",
                  "windows_prepare_limit stage=npm-ci limit=work-deadline seconds=600 powershell-seconds=630",
+                 "windows_token_bypass_traverse=present",
                  "windows_prepare_job=empty",
                  "windows_prepare_stage=npm-ci", "windows_prepare_stage_start=playwright",
                  "windows_prepare_limit stage=playwright limit=work-deadline seconds=600 powershell-seconds=630",
@@ -773,15 +887,13 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             state.parent.mkdir(parents=True)
             projection = root / "projection.json"
             projection.write_text("{}", encoding="ascii")
-            node = root / "node.exe"
-            npm = root / "npm-cli.js"
-            node.write_text("", encoding="ascii")
-            npm.write_text("", encoding="ascii")
+            node, npm, cmd = self._toolchain_fixture(root)
             with mock.patch.object(windows.sys, "platform", "win32"), \
                     mock.patch.object(windows.fetch, "validate_projection", return_value={
                         "npm_package": {}, "npm_lock": {}, "playwright": [],
                     }), \
                     mock.patch.object(windows, "_npm_tools", return_value=(node, npm)), \
+                    mock.patch.object(windows, "_system_cmd_path", return_value=cmd), \
                     mock.patch.object(windows, "_deadline_remaining", return_value=7200), \
                     mock.patch.object(windows, "create_profile", return_value={}), \
                     mock.patch.object(windows, "delete_profile"), \
@@ -838,15 +950,13 @@ class WindowsSandboxValidationTests(unittest.TestCase):
                 state.parent.mkdir(parents=True)
                 projection = root / "projection.json"
                 projection.write_text("{}", encoding="ascii")
-                node = root / "node.exe"
-                npm = root / "npm-cli.js"
-                node.write_text("", encoding="ascii")
-                npm.write_text("", encoding="ascii")
+                node, npm, cmd = self._toolchain_fixture(root)
                 with mock.patch.object(windows.sys, "platform", "win32"), \
                         mock.patch.object(windows.fetch, "validate_projection", return_value={
                             "npm_package": {}, "npm_lock": {}, "playwright": [],
                         }), \
                         mock.patch.object(windows, "_npm_tools", return_value=(node, npm)), \
+                        mock.patch.object(windows, "_system_cmd_path", return_value=cmd), \
                         mock.patch.object(windows, "_deadline_remaining", return_value=120), \
                         mock.patch.object(windows, "create_profile", return_value={}), \
                         mock.patch.object(windows, "delete_profile"), \
@@ -864,10 +974,7 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             state.parent.mkdir(parents=True)
             projection = root / "projection.json"
             projection.write_text("{}", encoding="ascii")
-            node = root / "node.exe"
-            npm = root / "npm-cli.js"
-            node.write_text("", encoding="ascii")
-            npm.write_text("", encoding="ascii")
+            node, npm, cmd = self._toolchain_fixture(root)
             with mock.patch.object(windows.sys, "platform", "win32"), \
                     mock.patch.object(windows.fetch, "validate_projection", side_effect=windows.fetch.Refusal("invalid")):
                 with self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
@@ -890,6 +997,7 @@ class WindowsSandboxValidationTests(unittest.TestCase):
                         "npm_package": {}, "npm_lock": {}, "playwright": [],
                     }), \
                     mock.patch.object(windows, "_npm_tools", return_value=(node, npm)), \
+                    mock.patch.object(windows, "_system_cmd_path", return_value=cmd), \
                     mock.patch.object(windows, "create_profile", side_effect=windows.WindowsBoundaryRefusal("profile-state")):
                 with self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
                     windows.prepare_dependencies(projection, root / "profile-failed", root / "deadline", state)

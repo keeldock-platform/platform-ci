@@ -138,6 +138,7 @@ WINDOWS_PREPARE_REFUSAL_CODES = frozenset((
     "windows-prepare-profile-create-failed", "windows-prepare-profile-cleanup-failed",
     "windows-prepare-workspace-copy-failed", "windows-prepare-output-invalid",
     "windows-prepare-projection-invalid", "windows-prepare-toolchain-invalid",
+    "windows-prepare-token-bypass-traverse-absent",
     "windows-prepare-internal",
 )) | frozenset(
     "windows-prepare-" + phase + "-failed-" + error_class

@@ -145,6 +145,22 @@ def _path_within(path, root):
         return False
 
 
+def _owned_path_within(path, root):
+    path_text = str(path)
+    root_text = str(root)
+    try:
+        path_object = Path(path_text)
+        root_object = Path(root_text)
+        if path_object.is_absolute() and root_object.is_absolute():
+            path_object.relative_to(root_object)
+            return True
+    except ValueError:
+        pass
+    if PureWindowsPath(path_text).is_absolute() and PureWindowsPath(root_text).is_absolute():
+        return _path_within(path_text, root_text)
+    return False
+
+
 def validate_command(command, *, node, npm_cli, source, scratch, stages):
     if type(command) is not list or not command or len(command) > MAX_COMMAND_ARGUMENTS:
         _refuse("profile-command")
@@ -382,11 +398,37 @@ def _validate_cleanup_roots(state_path):
         state = _read_json(state_path, 4 * 1024 * 1024)
         grants = state.get("acl_grants") if type(state) is dict else None
         integrity_roots = state.get("integrity_grants") if type(state) is dict else None
+        owned_roots = state.get("owned_roots") if type(state) is dict else None
         if (type(state) is not dict or state.get("schema") != 1
                 or type(grants) is not list or type(integrity_roots) is not list
+                or type(owned_roots) is not list or len(owned_roots) > 128
                 or state.get("job_state") not in ("none", "terminated-empty")
                 or len(grants) + len(integrity_roots) > 10000):
             _refuse("profile-cleanup", reason="other")
+        for root in owned_roots:
+            if type(root) is not str or not root or len(root) > 4096 or "\x00" in root:
+                _refuse("profile-cleanup", reason="other")
+            if not Path(root).is_absolute() and not PureWindowsPath(root).is_absolute():
+                _refuse("profile-cleanup", reason="other")
+        for root in owned_roots:
+            if PureWindowsPath(root).is_absolute() and os.name != "nt":
+                continue
+            current = Path(root)
+            while True:
+                try:
+                    metadata = os.stat(current, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    _refuse("profile-cleanup", reason="other")
+                else:
+                    if (stat.S_ISLNK(metadata.st_mode)
+                            or getattr(metadata, "st_file_attributes", 0) & 0x400):
+                        _refuse("profile-cleanup", reason="other")
+                parent = current.parent
+                if parent == current:
+                    break
+                current = parent
         roots = []
         for grant in grants:
             if type(grant) is not dict:
@@ -398,6 +440,9 @@ def _validate_cleanup_roots(state_path):
                 _refuse("profile-cleanup", reason="other")
             path = Path(value)
             if not path.is_absolute():
+                if not PureWindowsPath(value).is_absolute():
+                    _refuse("profile-cleanup", reason="other")
+            if not any(_owned_path_within(value, owned_root) for owned_root in owned_roots):
                 _refuse("profile-cleanup", reason="other")
             current = path
             while True:
@@ -647,10 +692,13 @@ def create_profile(state_path, *, failure_prefix=None, monitor_stage=None):
                     monitor_stage=monitor_stage)
     state = _read_json(state_path, 4096)
     if (type(state) is not dict or set(state) != {
-            "schema", "profile_name", "package_sid", "firewall_rule", "acl_grants", "integrity_grants", "job_state",
+            "schema", "profile_name", "package_sid", "firewall_rule", "owned_roots", "acl_grants",
+            "integrity_grants", "job_state",
     }
             or state["schema"] != 1 or not PROFILE_PATTERN.fullmatch(state["profile_name"])
-            or not PACKAGE_SID_PATTERN.fullmatch(state["package_sid"]) or type(state["acl_grants"]) is not list
+            or not PACKAGE_SID_PATTERN.fullmatch(state["package_sid"])
+            or type(state["owned_roots"]) is not list or state["owned_roots"]
+            or type(state["acl_grants"]) is not list
             or type(state["integrity_grants"]) is not list
             or state["job_state"] != "none"
             or any(type(path) is not str or len(path) > 260 for path in state["integrity_grants"])):
@@ -684,6 +732,23 @@ def _native_run(state_path, request, run_root, *, failure_prefix=None, monitor_s
             or type(request.get("timeout_milliseconds")) is not int
             or not 1000 <= request["timeout_milliseconds"] <= MAX_CHILD_SECONDS * 1000):
         _refuse("native-request")
+    if sys.platform == "win32":
+        owned_root = PureWindowsPath(str(run_root))
+        request_root = PureWindowsPath(str(request.get("access_root", "")))
+        if (not owned_root.is_absolute() or len(owned_root.drive) != 2
+                or not request_root.is_absolute() or len(request_root.drive) != 2
+                or not _path_within(request_root, owned_root) or not _path_within(owned_root, request_root)):
+            _refuse("native-request")
+        path_values = [request.get("executable"), request.get("working_directory")]
+        for key in ("read_paths", "write_paths"):
+            values = request.get(key)
+            if type(values) is not list or len(values) > 128:
+                _refuse("native-request")
+            path_values.extend(values)
+        for value in path_values:
+            if (type(value) is not str or not PureWindowsPath(value).is_absolute()
+                    or len(PureWindowsPath(value).drive) != 2 or not _path_within(value, owned_root)):
+                _refuse("native-request")
     internet_client = request.get("internet_client", False)
     if type(internet_client) is not bool:
         _refuse("native-request")
@@ -711,15 +776,27 @@ def _native_run(state_path, request, run_root, *, failure_prefix=None, monitor_s
     except bundle.Refusal:
         _refuse("native-result")
     if (type(result) is not dict or set(result) != {"status", "exit_code", "token", "job"}
-            or result.get("status") not in ("pass", "fail", "timeout", "process-start-failed")
+            or result.get("status") not in ("pass", "fail", "timeout", "process-start-failed",
+                                             "token-bypass-traverse-absent")
             or type(result.get("exit_code")) is not int
             or (result.get("status") != "process-start-failed" and
                 (not str(result.get("token", "")).startswith("lpac=verified")
                  or not str(result.get("job", "")).startswith("assigned kill_on_close=enabled breakaway=disabled")))
             or (result.get("status") == "process-start-failed"
-                and (result.get("exit_code") != 0 or result.get("token") or result.get("job")))):
+                and (result.get("exit_code") != 0 or result.get("token") or result.get("job")))
+            or (result.get("status") == "token-bypass-traverse-absent"
+                and _token_bypass_traverse_status(result.get("token", "")) != "absent")
+            or (result.get("status") not in ("process-start-failed", "token-bypass-traverse-absent")
+                and _token_bypass_traverse_status(result.get("token", "")) != "present")):
         _refuse("native-result")
     return result
+
+
+def _token_bypass_traverse_status(token):
+    if type(token) is not str:
+        return None
+    match = re.search(r"(?:^| )bypass_traverse=(present|absent)(?: |$)", token)
+    return match.group(1) if match else None
 
 
 def run_network_probe(state_path, run_root, *, node_path, scratch, environment):
@@ -817,6 +894,162 @@ def _npm_tools():
     return node, npm_cli
 
 
+def _system_cmd_path():
+    return Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32" / "cmd.exe"
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_tree(root):
+    root = Path(root)
+    digest = hashlib.sha256()
+    count = 0
+    for current, directories, files in os.walk(root, topdown=True, followlinks=False):
+        directories.sort()
+        files.sort()
+        for name in directories:
+            path = Path(current) / name
+            metadata = path.stat(follow_symlinks=False)
+            if path.is_symlink() or getattr(metadata, "st_file_attributes", 0) & 0x400:
+                _refuse("windows-prepare-toolchain-invalid")
+            count += 1
+            if count > 250000:
+                _refuse("windows-prepare-toolchain-invalid")
+            relative = path.relative_to(root).as_posix().encode("utf-8", "strict")
+            digest.update(b"D" + len(relative).to_bytes(4, "big") + relative)
+        for name in files:
+            path = Path(current) / name
+            metadata = path.stat(follow_symlinks=False)
+            if (path.is_symlink() or getattr(metadata, "st_file_attributes", 0) & 0x400
+                    or not stat.S_ISREG(metadata.st_mode)):
+                _refuse("windows-prepare-toolchain-invalid")
+            count += 1
+            if count > 250000:
+                _refuse("windows-prepare-toolchain-invalid")
+            relative = path.relative_to(root).as_posix().encode("utf-8", "strict")
+            digest.update(b"F" + len(relative).to_bytes(4, "big") + relative)
+            digest.update(metadata.st_size.to_bytes(8, "big"))
+            with path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _copy_pinned_windows_toolchain(node, npm_cli, destination, *, cmd_path=None):
+    node = Path(node)
+    npm_cli = Path(npm_cli)
+    npm_root = npm_cli.parent.parent
+    cmd_path = Path(cmd_path) if cmd_path is not None else _system_cmd_path()
+    destination = Path(destination)
+    try:
+        for source in (node, npm_cli, cmd_path):
+            metadata = source.stat(follow_symlinks=False)
+            if (source.is_symlink() or getattr(metadata, "st_file_attributes", 0) & 0x400
+                    or not stat.S_ISREG(metadata.st_mode)):
+                _refuse("windows-prepare-toolchain-invalid")
+        _reject_reparse_tree(npm_root)
+        if not _owned_path_within(npm_cli, npm_root):
+            _refuse("windows-prepare-toolchain-invalid")
+        destination.mkdir(mode=0o700)
+        copied_node = destination / "node.exe"
+        copied_cmd = destination / "cmd.exe"
+        copied_npm_root = destination / "node_modules" / "npm"
+        copied_npm_root.parent.mkdir(mode=0o700)
+        shutil.copyfile(node, copied_node)
+        shutil.copyfile(cmd_path, copied_cmd)
+        shutil.copytree(npm_root, copied_npm_root, symlinks=False)
+        copied_npm_cli = copied_npm_root / npm_cli.relative_to(npm_root)
+        hashes = {
+            "node_sha256": _sha256_file(copied_node),
+            "npm_tree_sha256": _sha256_tree(copied_npm_root),
+            "cmd_sha256": _sha256_file(copied_cmd),
+        }
+        if (hashes["node_sha256"] != _sha256_file(node)
+                or hashes["npm_tree_sha256"] != _sha256_tree(npm_root)
+                or hashes["cmd_sha256"] != _sha256_file(cmd_path)
+                or not copied_npm_cli.is_file() or copied_npm_cli.is_symlink()):
+            _refuse("windows-prepare-toolchain-invalid")
+        return copied_node, copied_npm_cli, copied_cmd, hashes
+    except WindowsBoundaryRefusal as error:
+        if error.code == "windows-prepare-toolchain-invalid":
+            raise
+        _refuse("windows-prepare-toolchain-invalid")
+    except (OSError, UnicodeError, ValueError, OverflowError):
+        _refuse("windows-prepare-toolchain-invalid")
+
+
+def _copy_reporter_support(destination):
+    destination = Path(destination)
+    try:
+        destination.mkdir(mode=0o700)
+        names = ("sandbox_windows_reporter.mjs", "safe_json.mjs", "test_adapters.mjs",
+                 "typescript_reporter.mjs")
+        copied = {}
+        for name in names:
+            source = Path(__file__).with_name(name)
+            metadata = source.stat(follow_symlinks=False)
+            if (source.is_symlink() or getattr(metadata, "st_file_attributes", 0) & 0x400
+                    or not stat.S_ISREG(metadata.st_mode)):
+                _refuse("windows-prepare-toolchain-invalid")
+            target = destination / name
+            shutil.copyfile(source, target)
+            if _sha256_file(source) != _sha256_file(target):
+                _refuse("windows-prepare-toolchain-invalid")
+            copied[name] = target
+        return copied
+    except WindowsBoundaryRefusal:
+        raise
+    except (OSError, UnicodeError, ValueError):
+        _refuse("windows-prepare-toolchain-invalid")
+
+
+def _validate_windows_toolchain(toolchain_path, prepared_root, run_root):
+    record = _read_json(toolchain_path, 4096)
+    if (type(record) is not dict or set(record) != {"node", "npm_cli", "cmd", "hashes"}
+            or type(record["hashes"]) is not dict
+            or set(record["hashes"]) != {"node_sha256", "npm_tree_sha256", "cmd_sha256"}):
+        _refuse("windows-prepare-toolchain-invalid")
+    prepared_root = str(Path(prepared_root))
+    run_root = str(Path(run_root))
+    for name in ("node", "npm_cli", "cmd"):
+        value = record.get(name)
+        if (type(value) is not str or not Path(value).is_absolute()
+                or not _owned_path_within(value, prepared_root)
+                or not _owned_path_within(value, run_root)):
+            _refuse("windows-prepare-toolchain-invalid")
+    node = Path(record["node"])
+    npm_cli = Path(record["npm_cli"])
+    cmd = Path(record["cmd"])
+    npm_root = npm_cli.parent.parent
+    if (node.name.lower() != "node.exe" or cmd != node.parent / "cmd.exe"
+            or npm_cli.name.lower() != "npm-cli.js"
+            or not _owned_path_within(npm_cli, npm_root)):
+        _refuse("windows-prepare-toolchain-invalid")
+    try:
+        for path in (node, npm_cli, cmd, npm_root):
+            metadata = path.stat(follow_symlinks=False)
+            if (path.is_symlink() or getattr(metadata, "st_file_attributes", 0) & 0x400
+                    or (path == npm_root and not stat.S_ISDIR(metadata.st_mode))
+                    or (path != npm_root and not stat.S_ISREG(metadata.st_mode))):
+                _refuse("windows-prepare-toolchain-invalid")
+        hashes = record["hashes"]
+        if (any(type(value) is not str or not re.fullmatch(r"[a-f0-9]{64}", value)
+                for value in hashes.values())
+                or _sha256_file(node) != hashes["node_sha256"]
+                or _sha256_tree(npm_root) != hashes["npm_tree_sha256"]
+                or _sha256_file(cmd) != hashes["cmd_sha256"]):
+            _refuse("windows-prepare-toolchain-invalid")
+    except (OSError, ValueError):
+        _refuse("windows-prepare-toolchain-invalid")
+    return record
+
+
 def _npm_preparation_error_class(log_root):
     root = Path(log_root)
     try:
@@ -856,6 +1089,7 @@ def prepare_dependencies(projection_path, output_root, deadline_file, state_path
     project = root / "project"
     prepared = root / "prepared"
     cache = root / "npm-cache"
+    toolchain_root = prepared / "toolchain"
     try:
         project.mkdir(mode=0o700, parents=True)
         prepared.mkdir(mode=0o700)
@@ -870,13 +1104,16 @@ def prepare_dependencies(projection_path, output_root, deadline_file, state_path
         cache.mkdir(mode=0o700)
     except OSError:
         _refuse("windows-prepare-output-invalid")
+    node, npm_cli, cmd_path, toolchain_hashes = _copy_pinned_windows_toolchain(
+        node, npm_cli, toolchain_root,
+    )
     system_root = Path(os.environ.get("SystemRoot", "C:\\Windows"))
     environment = [
-        "PATH=" + str(node.parent) + os.pathsep + str(system_root / "System32"),
+        "PATH=" + str(node.parent),
         "TEMP=" + str(cache), "TMP=" + str(cache), "USERPROFILE=" + str(project),
         "APPDATA=" + str(project), "LOCALAPPDATA=" + str(project), "HOME=" + str(project), "CI=1",
         "SystemRoot=" + str(system_root), "WINDIR=" + str(system_root),
-        "ComSpec=" + str(system_root / "System32" / "cmd.exe"),
+        "ComSpec=" + str(cmd_path),
         "NPM_CONFIG_CACHE=" + str(cache), "NPM_CONFIG_PREFIX=" + str(project),
         "NPM_CONFIG_IGNORE_SCRIPTS=true",
         "NPM_CONFIG_AUDIT=false", "NPM_CONFIG_FUND=false", "NPM_CONFIG_OFFLINE=false",
@@ -888,6 +1125,7 @@ def prepare_dependencies(projection_path, output_root, deadline_file, state_path
     ]
     runner_root = Path(state_path).resolve().parents[1]
     created_profile = False
+    bypass_traverse_reported = False
     prepare_failure = None
     cleanup_failure = None
     try:
@@ -907,7 +1145,7 @@ def prepare_dependencies(projection_path, output_root, deadline_file, state_path
             request = {
                 "executable": str(node), "arguments": [str(npm_cli), *NPM_INSTALL_ARGUMENTS],
                 "working_directory": str(project), "environment": environment, "access_root": str(runner_root),
-                "read_paths": [str(node), str(npm_cli.parent.parent), str(project)],
+                "read_paths": [str(toolchain_root), str(project)],
                 "write_paths": [str(project), str(cache), str(browser_root)],
                 "timeout_milliseconds": min(3_600_000, max(1000, int(remaining * 1000))), "internet_client": True,
             }
@@ -919,6 +1157,13 @@ def prepare_dependencies(projection_path, output_root, deadline_file, state_path
             result = _native_run(
                 state_path, request, runner_root, failure_prefix="windows-prepare", monitor_stage="npm-ci",
             )
+            bypass_status = _token_bypass_traverse_status(result.get("token", ""))
+            if bypass_status is not None:
+                if not bypass_traverse_reported:
+                    print("windows_token_bypass_traverse=" + bypass_status, flush=True)
+                    bypass_traverse_reported = True
+                if bypass_status != "present":
+                    _refuse("windows-prepare-token-bypass-traverse-absent")
             print("windows_prepare_job=empty", flush=True)
             if result["status"] == "process-start-failed":
                 _refuse("windows-prepare-npm-process-start-failed")
@@ -990,12 +1235,14 @@ def prepare_dependencies(projection_path, output_root, deadline_file, state_path
         print("windows_prepare_stage_start=copy", flush=True)
         _reject_reparse_tree(node_modules)
         shutil.copytree(node_modules, prepared / "node_modules", symlinks=False)
+        _copy_reporter_support(prepared / "support")
     except Exception:
         _refuse("windows-prepare-workspace-copy-failed")
     try:
         _write_private_json(prepared / "projection.json", projection)
         _write_private_json(prepared / "toolchain.json", {
-            "node": str(node), "npm_cli": str(npm_cli),
+            "node": str(node), "npm_cli": str(npm_cli), "cmd": str(cmd_path),
+            "hashes": toolchain_hashes,
         })
     except OSError:
         _refuse("windows-prepare-output-invalid")
@@ -1089,10 +1336,10 @@ def _run_reporter(mode, input_path, *, state_path, run_root, scratch, source_pat
                   node, environment, manifest_path, config_path, typescript_path, timeout_milliseconds):
     if mode not in ("typescript", "vitest", "playwright"):
         _refuse("adapter-mode")
-    reporter = Path(__file__).with_name("sandbox_windows_reporter.mjs").resolve(strict=True)
+    reporter = Path(prepared_path) / "support" / "sandbox_windows_reporter.mjs"
     output_path = Path(scratch) / "reports" / (mode + "-adapter.jsonl")
     _remove_adapter_output(output_path)
-    support_paths = [Path(__file__).with_name(name).resolve(strict=True) for name in (
+    support_paths = [Path(prepared_path) / "support" / name for name in (
         "safe_json.mjs", "test_adapters.mjs", "typescript_reporter.mjs",
     )]
     if mode == "typescript":
@@ -1247,19 +1494,20 @@ def run_profile(context_path, manifest_path, source_root, prepared_root, scratch
     prepared_path = Path(prepared_root)
     if source_path.is_symlink() or prepared_path.is_symlink():
         _refuse("workload-root")
+    cmd_path = Path(node).parent / "cmd.exe"
     module_path = source_path / "node_modules"
     if not module_path.exists():
         _reject_reparse_tree(prepared_path / "node_modules")
         shutil.copytree(prepared_path / "node_modules", module_path, symlinks=False)
     _reject_reparse_tree(module_path)
     environment = {
-        "PATH": str(Path(node).parent) + os.pathsep + str(Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32"),
+        "PATH": str(Path(node).parent),
         "TEMP": str(scratch), "TMP": str(scratch), "USERPROFILE": str(Path(scratch) / "profile"),
         "APPDATA": str(Path(scratch) / "appdata"), "LOCALAPPDATA": str(Path(scratch) / "localappdata"),
         "HOME": str(Path(scratch) / "profile"), "CI": "1",
         "SystemRoot": os.environ.get("SystemRoot", "C:\\Windows"),
         "WINDIR": os.environ.get("SystemRoot", "C:\\Windows"),
-        "ComSpec": str(Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32" / "cmd.exe"),
+        "ComSpec": str(cmd_path),
         "NPM_CONFIG_CACHE": str(Path(scratch) / "npm-cache"),
         "NPM_CONFIG_IGNORE_SCRIPTS": "true", "NPM_CONFIG_AUDIT": "false", "NPM_CONFIG_FUND": "false",
         "NPM_CONFIG_OFFLINE": "true", "PLAYWRIGHT_BROWSERS_PATH": str(Path(prepared_root) / "ms-playwright"),
@@ -1279,8 +1527,7 @@ def run_profile(context_path, manifest_path, source_root, prepared_root, scratch
             "working_directory": str(source_path), "environment": list(entries),
             "access_root": str(Path(run_root)),
             "read_paths": [str(source_path), str(prepared_path), str(Path(node)),
-                           str(Path(npm_cli).parent.parent),
-                           str(Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32" / "cmd.exe")],
+                           str(Path(npm_cli).parent.parent), str(cmd_path)],
             "write_paths": [str(scratch)],
             "timeout_milliseconds": min(3_600_000, remaining * 1000),
         }
@@ -1300,8 +1547,7 @@ def run_profile(context_path, manifest_path, source_root, prepared_root, scratch
             "working_directory": str(source_path), "environment": list(entries),
             "access_root": str(Path(run_root)),
             "read_paths": [str(source_path), str(prepared_path), str(Path(node)),
-                           str(Path(npm_cli).parent.parent),
-                           str(Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32" / "cmd.exe")],
+                           str(Path(npm_cli).parent.parent), str(cmd_path)],
             "write_paths": [str(scratch)],
             "timeout_milliseconds": min(3_600_000, remaining * 1000),
         }
@@ -1572,7 +1818,7 @@ def main(argv=None):
     probe = sub.add_parser("probe")
     probe.add_argument("--state", required=True)
     probe.add_argument("--run-root", required=True)
-    probe.add_argument("--node", required=True)
+    probe.add_argument("--prepared", required=True)
     probe.add_argument("--scratch", required=True)
     remove = sub.add_parser("firewall-remove")
     remove.add_argument("--state", required=True)
@@ -1612,15 +1858,20 @@ def main(argv=None):
             sys.stdout.write(install_firewall(args.state))
         elif args.operation == "probe":
             system_root = os.environ.get("SystemRoot", "C:\\Windows")
+            toolchain = _validate_windows_toolchain(
+                Path(args.prepared) / "toolchain.json", args.prepared, args.run_root,
+            )
+            node = Path(toolchain["node"])
+            cmd_path = Path(toolchain["cmd"])
             environment = [
-                "PATH=" + str(Path(args.node).parent) + os.pathsep + str(Path(system_root) / "System32"),
+                "PATH=" + str(node.parent),
                 "TEMP=" + str(args.scratch), "TMP=" + str(args.scratch),
                 "USERPROFILE=" + str(Path(args.scratch) / "profile"),
                 "APPDATA=" + str(Path(args.scratch) / "appdata"),
                 "LOCALAPPDATA=" + str(Path(args.scratch) / "localappdata"),
                 "HOME=" + str(Path(args.scratch) / "profile"), "CI=1",
                 "SystemRoot=" + system_root, "WINDIR=" + system_root,
-                "ComSpec=" + str(Path(system_root) / "System32" / "cmd.exe"),
+                "ComSpec=" + str(cmd_path),
                 "NPM_CONFIG_CACHE=" + str(Path(args.scratch) / "npm-cache"),
                 "NPM_CONFIG_IGNORE_SCRIPTS=true", "NPM_CONFIG_AUDIT=false", "NPM_CONFIG_FUND=false",
                 "NPM_CONFIG_OFFLINE=true", "NO_COLOR=1", "TERM=dumb", "PYTHONDONTWRITEBYTECODE=1",
@@ -1628,7 +1879,7 @@ def main(argv=None):
             for directory in (Path(args.scratch) / "profile", Path(args.scratch) / "appdata",
                               Path(args.scratch) / "localappdata", Path(args.scratch) / "npm-cache"):
                 directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-            sys.stdout.write(run_network_probe(args.state, args.run_root, node_path=args.node,
+            sys.stdout.write(run_network_probe(args.state, args.run_root, node_path=node,
                                                 scratch=args.scratch, environment=environment))
         elif args.operation == "firewall-remove":
             sys.stdout.write(remove_firewall(args.state))
@@ -1640,8 +1891,10 @@ def main(argv=None):
         elif args.operation == "decrypt":
             sys.stdout.write(decrypt_bundle(args.context, args.bundle, args.source, args.manifest))
         elif args.operation == "execute":
-            toolchain = _read_json(Path(args.prepared) / "toolchain.json", 4096)
-            if type(toolchain) is not dict or set(toolchain) != {"node", "npm_cli"}:
+            toolchain = _validate_windows_toolchain(
+                Path(args.prepared) / "toolchain.json", args.prepared, args.run_root,
+            )
+            if type(toolchain) is not dict or set(toolchain) != {"node", "npm_cli", "cmd", "hashes"}:
                 _refuse("toolchain-record")
             return run_profile(args.context, args.manifest, args.source, args.prepared, args.scratch,
                                args.run_root, args.state, args.deadline, toolchain["node"], toolchain["npm_cli"])

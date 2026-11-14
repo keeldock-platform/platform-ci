@@ -47,6 +47,7 @@ namespace KeelDock.Platform.DevLaneWindows
         private const int TokenCapabilities = 30;
         private const int TokenAppContainerSid = 31;
         private const int TokenUser = 1;
+        private const int TokenPrivilegesInformation = 3;
         private const int TokenIsLessPrivilegedAppContainer = 46;
         private const uint ErrorInsufficientBuffer = 122;
         private const int ErrorMoreData = 234;
@@ -792,7 +793,21 @@ namespace KeelDock.Platform.DevLaneWindows
                 Phase("job-assign");
                 if (!AssignProcessToJobObject(job, process)) throw new InvalidOperationException("job_assign");
                 result.Job = VerifyJob(job, process);
-                result.AppContainer = VerifyToken(process, sid, internetClient);
+                bool bypassTraverse;
+                result.AppContainer = VerifyToken(process, sid, internetClient, out bypassTraverse);
+                if (!bypassTraverse)
+                {
+                    TerminateAndConfirmEmptyJob(job);
+                    jobReaped = true;
+                    if (WaitForSingleObject(process, 10000) != WaitObject0)
+                        throw new InvalidOperationException("traverse_refusal_reap");
+                    if (!GetExitCodeProcess(process, out result.ExitCode))
+                        throw new InvalidOperationException("traverse_refusal_exit_code");
+                    result.Exited = true;
+                    result.Job += " terminated=confirmed empty=confirmed";
+                    result.Failure = "token-bypass-traverse-absent";
+                    return result;
+                }
                 Phase("resume");
                 if (ResumeThread(thread) == UInt32.MaxValue) throw new InvalidOperationException("thread_resume");
                 Phase("wait");
@@ -921,8 +936,10 @@ namespace KeelDock.Platform.DevLaneWindows
             finally { Marshal.FreeHGlobal(buffer); }
         }
 
-        private static string VerifyToken(IntPtr process, IntPtr expectedSid, bool internetClient)
+        private static string VerifyToken(IntPtr process, IntPtr expectedSid, bool internetClient,
+            out bool bypassTraverse)
         {
+            bypassTraverse = false;
             IntPtr token;
             if (!OpenProcessToken(process, TokenQuery, out token) || token == IntPtr.Zero) throw new InvalidOperationException("token_open");
             try
@@ -972,11 +989,42 @@ namespace KeelDock.Platform.DevLaneWindows
                     if (ridAddress == IntPtr.Zero || Marshal.ReadInt32(ridAddress) != 0x1000) throw new InvalidOperationException("token_integrity");
                 }
                 finally { Marshal.FreeHGlobal(integrity); }
+                bypassTraverse = HasEnabledPrivilege(token, "SeChangeNotifyPrivilege");
                 return internetClient
-                    ? "lpac=verified capabilities=internetClient integrity=low sid=verified"
-                    : "lpac=verified capabilities=empty integrity=low sid=verified";
+                    ? "lpac=verified capabilities=internetClient integrity=low sid=verified bypass_traverse="
+                        + (bypassTraverse ? "present" : "absent")
+                    : "lpac=verified capabilities=empty integrity=low sid=verified bypass_traverse="
+                        + (bypassTraverse ? "present" : "absent");
             }
             finally { Close(token); }
+        }
+
+        private static bool HasEnabledPrivilege(IntPtr token, string privilegeName)
+        {
+            Luid expected;
+            if (!LookupPrivilegeValueW(null, privilegeName, out expected))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            int length;
+            IntPtr privileges = QueryToken(token, TokenPrivilegesInformation, out length);
+            try
+            {
+                if (length < 4) throw new InvalidOperationException("token_privileges_size");
+                int count = Marshal.ReadInt32(privileges);
+                int entrySize = Marshal.SizeOf(typeof(LuidAndAttributes));
+                if (count < 0 || count > (length - 4) / entrySize)
+                    throw new InvalidOperationException("token_privileges_count");
+                for (int index = 0; index < count; index++)
+                {
+                    int offset = checked(4 + index * entrySize);
+                    uint lowPart = unchecked((uint)Marshal.ReadInt32(privileges, offset));
+                    int highPart = Marshal.ReadInt32(privileges, offset + 4);
+                    uint attributes = unchecked((uint)Marshal.ReadInt32(privileges, offset + 8));
+                    if (lowPart == expected.LowPart && highPart == expected.HighPart)
+                        return (attributes & SePrivilegeEnabled) != 0;
+                }
+                return false;
+            }
+            finally { Marshal.FreeHGlobal(privileges); }
         }
 
         private static IntPtr QueryToken(IntPtr token, int kind, out int length)

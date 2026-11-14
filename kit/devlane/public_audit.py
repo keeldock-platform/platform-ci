@@ -1019,6 +1019,15 @@ class _Grammar:
             public_counts["windows_prepare_start_stage_index"] = index
             public_counts["windows_prepare_start_stage_" + stage] = 1
             return True
+        bypass_traverse = re.fullmatch(r"windows_token_bypass_traverse=(present|absent)", line)
+        if bypass_traverse is not None:
+            if (self.job_runner != "windows-2025" or step_name != WINDOWS_PREPARE_STEP
+                    or public_counts.get("windows_prepare_start_stage_npm-ci") != 1
+                    or public_counts.get("windows_prepare_token_bypass_traverse", 0) != 0):
+                return False
+            public_counts["windows_prepare_token_bypass_traverse"] = 1
+            public_counts["windows_prepare_token_bypass_traverse_value"] = bypass_traverse.group(1)
+            return True
         heartbeat = re.fullmatch(
             r"windows_prepare_heartbeat stage=(profile-create|npm-ci|playwright|profile-cleanup) "
             r"elapsed=([1-9][0-9]{0,4}) "
@@ -2413,6 +2422,19 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
                          or counts.get("windows_prepare_cleanup_reason") != 1))):
             _refuse()
         if windows_job:
+            bypass_count = counts.get("windows_prepare_token_bypass_traverse", 0)
+            bypass_value = counts.get("windows_prepare_token_bypass_traverse_value")
+            bypass_absent_refusal = (
+                early_failure == WINDOWS_PREPARE_STEP
+                and counts.get("early_failure_code") == "windows-prepare-token-bypass-traverse-absent"
+            )
+            if (bypass_count > 1
+                    or ((early_failure is None) and (bypass_count != 1 or bypass_value != "present"))
+                    or (bypass_value == "absent") != bypass_absent_refusal
+                    or (early_failure not in (None, WINDOWS_PREPARE_STEP)
+                        and WINDOWS_PREPARE_STEP in seen_steps
+                        and (bypass_count != 1 or bypass_value != "present"))):
+                _refuse()
             cleanup_modes = {
                 "unowned": counts.get("cleanup_mode_unowned", 0),
                 "absent": counts.get("cleanup_mode_absent", 0),

@@ -253,6 +253,8 @@ def _step_outputs(step, identity, kind, records):
     if identity.get("platform") == "windows":
         outputs.update({
             "Prepare dependencies before the cut": [
+                "windows_prepare_stage_start=npm-ci",
+                "windows_token_bypass_traverse=present",
                 "windows_prepare=complete lifecycle_scripts=disabled identity=lpac network=outbound-only",
             ],
             "Prove public connectivity before the cut": ["windows_public_connectivity=proved"],
@@ -3152,6 +3154,22 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         self.assertFalse(grammar.step_output_ok(
             "Shred runner-local workspace", "windows_prepare_stage_start=copy", {},
         ))
+        token_counts = {}
+        self.assertFalse(grammar.step_output_ok(
+            audit.WINDOWS_PREPARE_STEP, "windows_token_bypass_traverse=present", token_counts,
+        ))
+        self.assertTrue(grammar.step_output_ok(
+            audit.WINDOWS_PREPARE_STEP, "windows_prepare_stage_start=npm-ci", token_counts,
+        ))
+        self.assertTrue(grammar.step_output_ok(
+            audit.WINDOWS_PREPARE_STEP, "windows_token_bypass_traverse=present", token_counts,
+        ))
+        self.assertFalse(grammar.step_output_ok(
+            audit.WINDOWS_PREPARE_STEP, "windows_token_bypass_traverse=absent", token_counts,
+        ))
+        self.assertFalse(grammar.step_output_ok(
+            "Probe isolation before decryption", "windows_token_bypass_traverse=present", {},
+        ))
         self.assertFalse(grammar.step_output_ok(
             "Fetch public control and validate dispatch", "windows_launcher_phase=types-load", {},
         ))
@@ -3200,8 +3218,17 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                     else:
                         step["conclusion"] = "skipped"
                 marker = "devlane_refusal=" + code
+                failure_outputs = None
+                if code == "windows-prepare-token-bypass-traverse-absent":
+                    failure_outputs = [
+                        "windows_prepare_stage=none",
+                        "windows_prepare_stage_start=npm-ci",
+                        "windows_token_bypass_traverse=absent",
+                        marker,
+                    ]
                 log = _render_real_runner_encrypted_log(
-                    identity, early_failure={"step": failed_step, "marker": marker, "exit_code": 1},
+                    identity, early_failure={"step": failed_step, "marker": marker, "exit_code": 1,
+                                              **({"outputs": failure_outputs} if failure_outputs else {})},
                 )
                 surface = audit.validate_job_log_surface(log, audit.PLATFORM_RUN_JOBS["windows"], identity,
                                                          completed=True)

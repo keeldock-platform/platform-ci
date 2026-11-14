@@ -1622,8 +1622,7 @@ jobs:
       - name: Probe isolation before decryption
         timeout-minutes: 1
         run: |
-          $toolchain = Get-Content -LiteralPath (Join-Path $env:RUN_ROOT 'prepared-root\prepared\toolchain.json') -Raw | ConvertFrom-Json
-          python -B kit/devlane/sandbox_windows.py probe --state (Join-Path $env:RUN_ROOT 'state\sandbox.json') --run-root $env:RUN_ROOT --node $toolchain.node --scratch (Join-Path $env:RUN_ROOT 'scratch')
+          python -B kit/devlane/sandbox_windows.py probe --state (Join-Path $env:RUN_ROOT 'state\sandbox.json') --run-root $env:RUN_ROOT --prepared (Join-Path $env:RUN_ROOT 'prepared-root\prepared') --scratch (Join-Path $env:RUN_ROOT 'scratch')
           if ($LASTEXITCODE -ne 0) { exit 1 }
       - name: Decrypt authenticated bundle
         env:
