@@ -25,6 +25,7 @@ class PowerShellSource:
     name: str
     text: str
     first_line: int = 1
+    runtime: str = ""
 
 
 def _shell_kind(value):
@@ -97,16 +98,22 @@ def _workflow_powershell_blocks(path):
                     content_indent = min(nonblank_indents, default=run_indent + 1)
                     content = "\n".join(item[content_indent:] if item.strip() else "" for item in body)
                     first_line = start + 1 + step_start + line_index + 2
-                    blocks.append(PowerShellSource(f"{path.relative_to(ROOT)} run block", content, first_line))
+                    runtime = "pwsh 7" if shell == "pwsh" else "powershell.exe 5.1"
+                    blocks.append(PowerShellSource(
+                        f"{path.relative_to(ROOT)} run block", content, first_line, runtime,
+                    ))
                 elif _shell_kind(shell):
                     first_line = start + 1 + step_start + line_index + 1
-                    blocks.append(PowerShellSource(f"{path.relative_to(ROOT)} run line", value, first_line))
+                    runtime = "pwsh 7" if shell == "pwsh" else "powershell.exe 5.1"
+                    blocks.append(PowerShellSource(
+                        f"{path.relative_to(ROOT)} run line", value, first_line, runtime,
+                    ))
     return blocks
 
 
 def powershell_sources(root=ROOT):
     sources = [
-        PowerShellSource(str(path.relative_to(root)), path.read_text(encoding="utf-8"))
+        PowerShellSource(str(path.relative_to(root)), path.read_text(encoding="utf-8"), runtime="pwsh 7")
         for path in sorted(root.rglob("*.ps1"))
         if ".git" not in path.parts and "node_modules" not in path.parts
     ]
@@ -216,6 +223,25 @@ class PowerShellStaticTests(unittest.TestCase):
                 failures.append(f"{source.name}:{source.first_line + line_number - 1}: {hazard}")
         self.assertEqual(failures, [])
 
+    def test_windows_powershell_51_sources_do_not_use_dotnet_core_acl_extensions(self):
+        sources = [source for source in powershell_sources()
+                   if source.runtime == "powershell.exe 5.1"]
+        sources.extend((
+            PowerShellSource(
+                "kit/devlane/test_powershell_live.py fixture via powershell.exe 5.1",
+                (ROOT / "kit/devlane/test_powershell_live.py").read_text(encoding="utf-8"),
+                runtime="powershell.exe 5.1",
+            ),
+            PowerShellSource(
+                "kit/devlane/control_python.py ACL check via powershell.exe 5.1",
+                (ROOT / "kit/devlane/control_python.py").read_text(encoding="utf-8"),
+                runtime="powershell.exe 5.1",
+            ),
+        ))
+        failures = [source.name for source in sources
+                    if re.search(r"(?i)System\.IO\.FileSystemAclExtensions", source.text)]
+        self.assertEqual(failures, [])
+
     def test_checker_rejects_line_leading_operators_methods_and_open_constructs(self):
         sample = "if ($x -eq 1)\n    -or $y -eq 2\n| ForEach-Object {}\n.Trim()\nif ($open) {\n$x = @'\nbody\n"
         hazards = {hazard for _line, hazard in syntax_hazards(sample)}
@@ -231,6 +257,7 @@ class PowerShellStaticTests(unittest.TestCase):
         sources = _workflow_powershell_blocks(workflow)
         source = next(item for item in sources
                       if "control-python-deps" in item.text and "Protect-PrivateDirectory" in item.text)
+        self.assertEqual(source.runtime, "pwsh 7")
         script = source.text
         target_assignment = script.index("$cryptoTarget = Join-Path")
         start = script.rfind("try {", 0, target_assignment)

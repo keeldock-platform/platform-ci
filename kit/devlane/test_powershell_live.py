@@ -176,7 +176,7 @@ function Set-PrivateAcl([string]$Path, [bool]$ExtraWriter, [bool]$InheritOnlyWri
         Add-FixtureRule $security $everyone ([Security.AccessControl.FileSystemRights]::Modify) $inheritance `
             ([Security.AccessControl.PropagationFlags]::InheritOnly) 'inherit-only-rule-add' 10
     }
-    try { [System.IO.FileSystemAclExtensions]::SetAccessControl([IO.DirectoryInfo]$Path, $security) }
+    try { ([IO.DirectoryInfo]$Path).SetAccessControl($security) }
     catch { Stop-Fixture $ApplyOperation $ApplyCode $_ }
 }
 Set-PrivateAcl $root $false $true 'apply-root-acl' 11
