@@ -141,6 +141,18 @@ class KitDoesNotDependOnCoreCiTests(unittest.TestCase):
                 with self.subTest(path=name, offset=match.start()):
                     self.assertIsNotNone(REGISTRY_FOLDER_MENTION.match(body, match.start()))
 
+    def test_core_ci_discovery_uses_a_stage_name_outside_the_folder_vocabulary(self):
+        action = text_of(ROOT / "kit/bootstrap/action.yml")
+        match = re.search(
+            r'(?m)^\s*run_source_free_check ([a-z0-9-]+) "\$python_bin" -B -m unittest discover '
+            r'-s "\$CI_ACTION_PATH/\.\./\.\./core-ci" -p "test_\*\.py"$',
+            action,
+        )
+        self.assertIsNotNone(match)
+        stage = match.group(1)
+        self.assertEqual(stage, "quick-tier-unit")
+        self.assertNotIn(FOLDER, stage)
+
     def test_the_registry_mention_pattern_rejects_any_other_path_in_the_folder(self):
         for accepted in (
             "core-ci/linux_quick_return.py", "core-ci/test_linux_quick_return.py",

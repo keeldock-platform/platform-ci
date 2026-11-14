@@ -134,7 +134,7 @@ runs:
             run_source_free_check handoff-dependencies "$python_bin" -m pip install --disable-pip-version-check --no-input --require-hashes --only-binary=:all: --no-deps --target "${RUNNER_TEMP:-/tmp}/kd-pydeps" -r "$CI_ACTION_PATH/../handoff/provider_requirements.txt"
             run_source_free_check handoff-capsule-unit env PYTHONPATH="${RUNNER_TEMP:-/tmp}/kd-pydeps" "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../handoff" -p "test_source_capsule.py"
           fi
-          run_source_free_check core-ci-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../../core-ci" -p "test_*.py"
+          run_source_free_check quick-tier-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../../core-ci" -p "test_*.py"
         fi
         if [[ "${RUNNER_OS:-}" == "macOS" ]]; then
           run_source_free_check macos-selector-unit /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../selector" -p "test_*.py"
