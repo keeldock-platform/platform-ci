@@ -592,7 +592,9 @@ class _Grammar:
         export = ("Add-Content -LiteralPath $env:GITHUB_ENV -Value ('RUN_ROOT=' + $runRoot) -Encoding utf8"
                   if self.job_runner == "windows-2025" else
                   "printf 'RUN_ROOT=%s\\n' \"$RUN_ROOT\" >> \"$GITHUB_ENV\"")
-        return {"RUN_ROOT"} if self.kind == "encrypted" and self.job_key in EXECUTION_JOBS and export in run else set()
+        export_present = (any(line.strip() == export for line in run) if self.job_runner == "windows-2025"
+                          else export in run)
+        return {"RUN_ROOT"} if self.kind == "encrypted" and self.job_key in EXECUTION_JOBS and export_present else set()
 
     def environment_exports_after_step(self, step, output_lines):
         exports = self.environment_exports(step)
@@ -602,7 +604,74 @@ class _Grammar:
         export = ("Add-Content -LiteralPath $env:GITHUB_ENV -Value ('RUN_ROOT=' + $runRoot) -Encoding utf8"
                   if self.job_runner == "windows-2025" else
                   "printf 'RUN_ROOT=%s\\n' \"$RUN_ROOT\" >> \"$GITHUB_ENV\"")
-        export_index = run.index(export)
+        export_index = (next(index for index, line in enumerate(run) if line.strip() == export)
+                        if self.job_runner == "windows-2025" else run.index(export))
+        if self.job_runner == "windows-2025":
+            before_state = "devlane_crypto_state=run-root-not-exported"
+            after_state = "devlane_crypto_state=run-root-exported"
+            checkout_state = "devlane_crypto_state=checkout-complete"
+            states = [line for line in output_lines if line in (before_state, after_state)]
+            checkout_states = output_lines.count(checkout_state)
+            target_refusal = (
+                "devlane_crypto_refusal=crypto-target-invalid" in output_lines
+                and "devlane_deadline_refusal=crypto-dependency-seal-failed" in output_lines
+            )
+            if len(states) != 1 or checkout_states > 1:
+                _refuse()
+            if states[0] == before_state:
+                before_state_indices = [index for index, line in enumerate(run)
+                                        if line.strip() == "Write-Output '" + before_state + "'"]
+                before_target_lines = [index for index, line in enumerate(run)
+                                       if "devlane_crypto_refusal=crypto-target-invalid" in line
+                                       and "Write-Output" in line]
+                before_deadline_lines = [index for index, line in enumerate(run)
+                                         if "devlane_deadline_refusal=crypto-dependency-seal-failed" in line
+                                         and "Write-Output" in line]
+                if (not target_refusal or not before_state_indices or not before_target_lines
+                        or not before_deadline_lines or any(index >= export_index for index in (
+                            before_state_indices[0], before_target_lines[0], before_deadline_lines[0]))
+                        or checkout_states
+                        or output_lines.index(before_state) > output_lines.index(
+                            "devlane_crypto_refusal=crypto-target-invalid")
+                        or output_lines.index("devlane_crypto_refusal=crypto-target-invalid") > output_lines.index(
+                            "devlane_deadline_refusal=crypto-dependency-seal-failed")):
+                    _refuse()
+                return set()
+            after_state_lines = [index for index, line in enumerate(run)
+                                 if line.strip() == "Write-Output '" + after_state + "'"]
+            if not after_state_lines or after_state_lines[0] <= export_index:
+                _refuse()
+            checkout_marker = "devlane_crypto_state=checkout-complete"
+            checkout_source = [index for index, line in enumerate(run)
+                               if line.strip() == "Write-Output '" + checkout_marker + "'"]
+            checkout_path = [index for index, line in enumerate(run)
+                             if line.strip() == "$checkoutMarker = Join-Path $runRoot 'checkout-complete'"]
+            checkout_creation = [index for index, line in enumerate(run)
+                                 if line.strip() == "try { New-Item -ItemType File -Path $checkoutMarker -ErrorAction Stop | Out-Null } catch { exit 1 }"]
+            checkout_verify = [index for index, line in enumerate(run)
+                               if line.strip().startswith("if ($LASTEXITCODE -ne 0 -or $actualSha.Trim() -ne $env:CI_SHA)")]
+            if checkout_states:
+                if (not checkout_source or not checkout_path or not checkout_creation or not checkout_verify
+                        or not checkout_verify[0] < checkout_path[0] < checkout_creation[0] < checkout_source[0]):
+                    _refuse()
+            has_refusal = any(line.partition("=")[0] in (
+                "devlane_crypto_refusal", "devlane_deadline_refusal", "devlane_bootstrap_refusal",
+            ) for line in output_lines)
+            initial_acl_refusal = (
+                output_lines.count("devlane_crypto_refusal=crypto-acl-output-invalid") == 1
+                and output_lines.count("devlane_deadline_refusal=crypto-dependency-seal-failed") == 1
+            )
+            if ((not has_refusal and not checkout_states)
+                    or (has_refusal and not checkout_states and not initial_acl_refusal)):
+                _refuse()
+            if not checkout_states:
+                structured = [line for line in output_lines if line.startswith((
+                    "devlane_crypto_state=", "devlane_crypto_refusal=", "devlane_deadline_refusal=",
+                ))]
+                if structured != [after_state, "devlane_crypto_refusal=crypto-acl-output-invalid",
+                                  "devlane_deadline_refusal=crypto-dependency-seal-failed"]:
+                    _refuse()
+            return exports
         has_crypto_reason = any(line.startswith("devlane_crypto_refusal=") for line in output_lines)
         target_refusal = (
             "devlane_crypto_refusal=crypto-target-invalid" in output_lines
@@ -777,6 +846,20 @@ class _Grammar:
                 public_counts["early_failure_code"] = code
                 return public_counts["early_failure_marker"] == 1
             return True
+        if line.startswith("devlane_crypto_state="):
+            state = line[len("devlane_crypto_state="):]
+            state_keys = {
+                "run-root-not-exported": "crypto_state_before_export",
+                "run-root-exported": "crypto_state_after_export",
+                "checkout-complete": "crypto_state_checkout_complete",
+            }
+            if (self.job_runner != "windows-2025"
+                    or step_name != "Fetch public control and validate dispatch"
+                    or state not in state_keys):
+                return False
+            key = state_keys[state]
+            public_counts[key] = public_counts.get(key, 0) + 1
+            return public_counts[key] == 1
         if uses.startswith("actions/cache/"):
             key = self.expected_cache_key(step)
             return key is not None and any(
@@ -979,13 +1062,56 @@ class _Grammar:
                 },
                 "Decrypt authenticated bundle": {"windows_decrypt=accepted manifest=bound"},
                 "Shred runner-local workspace": {
-                    "windows_sandbox_cleanup=confirmed firewall=removed profile=deleted",
                     "cleanup_receipt=confirmed", "devlane_job=completed public_output=filtered cleanup=confirmed",
                 },
             }
             exact = windows_exact.get(step_name, exact)
-            if step_name == "Shred runner-local workspace" and re.fullmatch(
-                    r"windows_runner_shred=confirmed files=[0-9]+ bytes=[0-9]+ reparse=[0-9]+", line):
+        if self.job_runner == "windows-2025" and step_name == "Shred runner-local workspace":
+            run = (step or {}).get("run") or []
+            cleanup_modes = {
+                "windows_run_root_unowned=confirmed": (
+                    "if ([string]::IsNullOrWhiteSpace($runRoot)) {", "cleanup_mode_unowned",
+                ),
+                "windows_run_root_absent=confirmed": (
+                    "if (-not $rootExists) {", "cleanup_mode_absent",
+                ),
+                "windows_precheckout_cleanup=confirmed": (
+                    "Remove-Item -LiteralPath $runRoot -Recurse -Force -ErrorAction Stop",
+                    "cleanup_mode_precheckout",
+                ),
+                "windows_sandbox_cleanup=confirmed firewall=removed profile=deleted": (
+                    "sandbox_windows.py shred", "cleanup_mode_sandbox",
+                ),
+            }
+            if line in cleanup_modes:
+                evidence, key = cleanup_modes[line]
+                evidence_index = next((index for index, source_line in enumerate(run)
+                                       if evidence in source_line), None)
+                output_index = next((index for index, source_line in enumerate(run)
+                                     if source_line.strip() == "Write-Output '" + line + "'"), None)
+                if (evidence_index is None
+                        or (line != "windows_sandbox_cleanup=confirmed firewall=removed profile=deleted"
+                            and output_index is None)
+                        or (output_index is not None and evidence_index >= output_index)):
+                    return False
+                if line == "windows_precheckout_cleanup=confirmed":
+                    marker_check = next((index for index, source_line in enumerate(run)
+                                         if "Test-Path -LiteralPath $checkoutMarker" in source_line), None)
+                    if marker_check is None or evidence_index <= marker_check:
+                        return False
+                if line == "windows_sandbox_cleanup=confirmed firewall=removed profile=deleted":
+                    marker_check = next((index for index, source_line in enumerate(run)
+                                         if "Test-Path -LiteralPath $checkoutMarker" in source_line), None)
+                    marker_else = next((index for index, source_line in enumerate(run)
+                                        if index > (marker_check if marker_check is not None else len(run))
+                                        and source_line.strip() == "} else {"), None)
+                    if marker_check is None or marker_else is None or evidence_index <= marker_else:
+                        return False
+                public_counts[key] = public_counts.get(key, 0) + 1
+                return public_counts[key] == 1
+            if re.fullmatch(r"windows_runner_shred=confirmed files=[0-9]+ bytes=[0-9]+ reparse=[0-9]+", line):
+                if not any("sandbox_windows.py shred" in source_line for source_line in run):
+                    return False
                 public_counts[line] = public_counts.get(line, 0) + 1
                 return public_counts[line] == 1
         if line in exact:
@@ -1862,6 +1988,40 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         if counts.get(cleanup_line) != 1 or (completed and counts.get(
                 "devlane_job=completed public_output=filtered cleanup=confirmed") != 1):
             _refuse()
+        if windows_job:
+            cleanup_modes = {
+                "unowned": counts.get("cleanup_mode_unowned", 0),
+                "absent": counts.get("cleanup_mode_absent", 0),
+                "precheckout": counts.get("cleanup_mode_precheckout", 0),
+                "sandbox": counts.get("cleanup_mode_sandbox", 0),
+            }
+            if sum(cleanup_modes.values()) != 1:
+                _refuse()
+            shred_receipts = sum(
+                value for key, value in counts.items()
+                if re.fullmatch(r"windows_runner_shred=confirmed files=[0-9]+ bytes=[0-9]+ reparse=[0-9]+", key)
+            )
+            if cleanup_modes["sandbox"]:
+                if shred_receipts != 1:
+                    _refuse()
+            elif shred_receipts:
+                _refuse()
+            if counts.get("crypto_state_before_export"):
+                if (counts.get("crypto_state_before_export") != 1
+                        or counts.get("crypto_state_after_export")
+                        or counts.get("crypto_state_checkout_complete")
+                        or not cleanup_modes["unowned"]):
+                    _refuse()
+            elif counts.get("crypto_state_after_export"):
+                if (counts.get("crypto_state_after_export") != 1
+                        or counts.get("crypto_state_checkout_complete", 0) > 1
+                        or (counts.get("crypto_state_checkout_complete") and not (
+                            cleanup_modes["sandbox"] or cleanup_modes["absent"]))
+                        or (not counts.get("crypto_state_checkout_complete") and not (
+                            cleanup_modes["precheckout"] or cleanup_modes["absent"]))):
+                    _refuse()
+            else:
+                _refuse()
     elif kind == "encrypted":
         if counts.get("dispatch") or counts.get("permit") or records:
             _refuse()

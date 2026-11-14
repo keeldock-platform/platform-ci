@@ -1221,18 +1221,44 @@ jobs:
           try {
             $runRoot = Join-Path -Path $env:RUNNER_TEMP -ChildPath ('devlane-' + $env:CI_RUN_ID) -ErrorAction Stop
             if (Test-Path -LiteralPath $runRoot -ErrorAction Stop) {
+              Write-Output 'devlane_crypto_state=run-root-not-exported'
               Write-Output 'devlane_crypto_refusal=crypto-target-invalid'
               Write-Output 'devlane_deadline_refusal=crypto-dependency-seal-failed'
               exit 1
             }
             New-Item -ItemType Directory -Path $runRoot -ErrorAction Stop | Out-Null
           } catch {
+            Write-Output 'devlane_crypto_state=run-root-not-exported'
             Write-Output 'devlane_crypto_refusal=crypto-target-invalid'
             Write-Output 'devlane_deadline_refusal=crypto-dependency-seal-failed'
             exit 1
           }
           $env:RUN_ROOT = $runRoot
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value ('RUN_ROOT=' + $runRoot) -Encoding utf8
+          try {
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value ('RUN_ROOT=' + $runRoot) -Encoding utf8
+          } catch {
+            $removeFailed = $false
+            try {
+              if (Test-Path -LiteralPath $runRoot -ErrorAction Stop) {
+                $rootItem = Get-Item -LiteralPath $runRoot -Force -ErrorAction Stop
+                if ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                  $removeFailed = $true
+                } else {
+                  $entries = Get-ChildItem -LiteralPath $runRoot -Force -Recurse -ErrorAction Stop
+                  foreach ($entry in $entries) {
+                    if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { $removeFailed = $true }
+                  }
+                  if (-not $removeFailed) {
+                    Remove-Item -LiteralPath $runRoot -Recurse -Force -ErrorAction Stop
+                    $removeFailed = Test-Path -LiteralPath $runRoot -ErrorAction Stop
+                  }
+                }
+              }
+            } catch { $removeFailed = $true }
+            if ($removeFailed) { Write-Output 'devlane_refusal=windows-runner-failed' }
+            exit 1
+          }
+          Write-Output 'devlane_crypto_state=run-root-exported'
           try {
             $runnerSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
             Protect-PrivateDirectory $runRoot $runnerSid
@@ -1261,6 +1287,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           $actualSha = git -C $env:CI_WORKSPACE rev-parse --verify HEAD 2>$null
           if ($LASTEXITCODE -ne 0 -or $actualSha.Trim() -ne $env:CI_SHA) { exit 1 }
+          $checkoutMarker = Join-Path $runRoot 'checkout-complete'
+          try { New-Item -ItemType File -Path $checkoutMarker -ErrorAction Stop | Out-Null } catch { exit 1 }
+          Write-Output 'devlane_crypto_state=checkout-complete'
           python -B kit/devlane/deadline.py create --file (Join-Path $runRoot 'deadline.json') --budget-seconds 8700 --cleanup-reserve-seconds 2100 --job-seconds 10800 --started-at-file $started
           if ($LASTEXITCODE -ne 0) { exit 1 }
           function Refuse-Bootstrap([string]$Code) {
@@ -1518,13 +1547,49 @@ jobs:
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
           $runRoot = $env:RUN_ROOT
-          if ([string]::IsNullOrWhiteSpace($runRoot) -or -not (Test-Path -LiteralPath $runRoot)) {
+          if ([string]::IsNullOrWhiteSpace($runRoot)) {
+            Write-Output 'windows_run_root_unowned=confirmed'
             Write-Output 'cleanup_receipt=confirmed'
             Write-Output 'devlane_job=completed public_output=filtered cleanup=confirmed'
             exit 0
           }
-          python -B kit/devlane/sandbox_windows.py shred --state (Join-Path $runRoot 'state\sandbox.json') --root $runRoot --workspace (Join-Path $runRoot 'workspace\source')
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          try { $rootExists = Test-Path -LiteralPath $runRoot -ErrorAction Stop }
+          catch {
+            Write-Output 'devlane_refusal=windows-runner-failed'
+            exit 1
+          }
+          if (-not $rootExists) {
+            Write-Output 'windows_run_root_absent=confirmed'
+            Write-Output 'cleanup_receipt=confirmed'
+            Write-Output 'devlane_job=completed public_output=filtered cleanup=confirmed'
+            exit 0
+          }
+          try {
+            $expectedRunRoot = Join-Path -Path $env:RUNNER_TEMP -ChildPath ('devlane-' + $env:CI_RUN_ID) -ErrorAction Stop
+            if (-not [string]::Equals([IO.Path]::GetFullPath($runRoot), [IO.Path]::GetFullPath($expectedRunRoot), [StringComparison]::OrdinalIgnoreCase)) { throw }
+            $checkoutMarker = Join-Path $runRoot 'checkout-complete'
+            if (-not (Test-Path -LiteralPath $checkoutMarker -ErrorAction Stop)) {
+              $rootItem = Get-Item -LiteralPath $runRoot -Force -ErrorAction Stop
+              if ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw }
+              $entries = Get-ChildItem -LiteralPath $runRoot -Force -Recurse -ErrorAction Stop
+              foreach ($entry in $entries) {
+                if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw }
+              }
+              Remove-Item -LiteralPath $runRoot -Recurse -Force -ErrorAction Stop
+              if (Test-Path -LiteralPath $runRoot -ErrorAction Stop) { throw }
+            } else {
+              python -B kit/devlane/sandbox_windows.py shred --state (Join-Path $runRoot 'state\sandbox.json') --root $runRoot --workspace (Join-Path $runRoot 'workspace\source')
+              if ($LASTEXITCODE -ne 0) { exit 1 }
+              exit 0
+            }
+          } catch {
+            Write-Output 'devlane_refusal=windows-runner-failed'
+            exit 1
+          }
+          Write-Output 'windows_precheckout_cleanup=confirmed'
+          Write-Output 'cleanup_receipt=confirmed'
+          Write-Output 'devlane_job=completed public_output=filtered cleanup=confirmed'
+          exit 0
   devlane-encrypted-audit:
     name: devlane-encrypted-audit
     if: ${{ always() }}

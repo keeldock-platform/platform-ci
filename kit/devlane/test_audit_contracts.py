@@ -5,8 +5,10 @@ import contextlib
 import io
 import json
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -16,6 +18,7 @@ import control_audit
 import acceptance_diagnostics
 import diagnostic_contract
 import refusal_codes
+import sandbox_windows
 
 
 SHA = "a" * 40
@@ -267,6 +270,36 @@ def _step_outputs(step, identity, kind, records):
     return outputs.get(name, [])
 
 
+def _windows_precheckout_cleanup_outputs():
+    with tempfile.TemporaryDirectory(prefix="devlane-precheckout-") as directory:
+        root = Path(directory) / "run-root"
+        root.mkdir()
+        (root / "deadline-start").write_bytes(b"start")
+        shutil.rmtree(root)
+        if root.exists():
+            raise AssertionError("pre-checkout cleanup left the run root")
+    return [
+        "windows_precheckout_cleanup=confirmed",
+        "cleanup_receipt=confirmed",
+        "devlane_job=completed public_output=filtered cleanup=confirmed",
+    ]
+
+
+def _windows_real_shred_cleanup_outputs():
+    with tempfile.TemporaryDirectory(prefix="devlane-checkout-") as directory:
+        root = Path(directory) / "run-root"
+        root.mkdir()
+        (root / "checkout-complete").write_bytes(b"complete")
+        result = sandbox_windows.cleanup_runner(root / "state" / "sandbox.json", root,
+                                                root / "workspace" / "source")
+        if root.exists():
+            raise AssertionError("sandbox shred left the run root")
+    return result.splitlines() + [
+        "cleanup_receipt=confirmed",
+        "devlane_job=completed public_output=filtered cleanup=confirmed",
+    ]
+
+
 def _render_log(job_key, identity=None, *, records=(), kind="encrypted", skip=("Install pinned Rust toolchain",)):
     """A hosted-shaped log generated from the reviewed workflow itself."""
     identity = identity or IDENTITY
@@ -311,6 +344,11 @@ def _render_log(job_key, identity=None, *, records=(), kind="encrypted", skip=("
             lines.extend("  %s: %s" % (name, _env_value(name, identity, kind)) for name in env)
         lines.append(MARK + "[endgroup]")
         outputs = _step_outputs(step, identity, kind, records)
+        if (kind == "encrypted" and job_key == audit.WINDOWS_RUN_JOB
+                and identity.get("platform") == "windows"
+                and step["name"] == "Fetch public control and validate dispatch"):
+            outputs = ["devlane_crypto_state=run-root-exported",
+                       "devlane_crypto_state=checkout-complete"] + outputs
         lines.extend(outputs)
         runtime_env_names.update(grammar.environment_exports_after_step(step, outputs))
         lines.append(MARK + "[section]Finishing: " + step["name"])
@@ -441,8 +479,20 @@ def _render_real_runner_encrypted_log(identity, job_key=None, early_failure=None
                          for key in sorted(env_names))
         lines.append(marker + "[endgroup]")
         outputs = _step_outputs(step, identity, "encrypted", ())
+        if (job_key in audit.EXECUTION_JOBS and platform_runner == "windows-2025"
+                and step["name"] == "Fetch public control and validate dispatch"):
+            outputs = ["devlane_crypto_state=run-root-exported",
+                       "devlane_crypto_state=checkout-complete"] + outputs
         if early_failure and step["name"] == early_failure["step"]:
             outputs = early_failure.get("outputs", [early_failure["marker"]])
+            if (platform_runner == "windows-2025"
+                    and step["name"] == "Fetch public control and validate dispatch"
+                    and not any(line.startswith("devlane_crypto_state=") for line in outputs)):
+                outputs = ["devlane_crypto_state=run-root-exported",
+                           "devlane_crypto_state=checkout-complete"] + outputs
+        elif (early_failure and step["name"] == "Shred runner-local workspace"
+              and "cleanup_outputs" in early_failure):
+            outputs = early_failure["cleanup_outputs"]
         if "Environment details" in outputs:
             position = outputs.index("Environment details")
             lines.extend(outputs[:position])
@@ -787,13 +837,72 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         result = audit.validate_job_contract(jobs, IDENTITY, "core-node")
         self.assertEqual(set(result), set(audit.EXECUTION_JOBS) | {audit.AUDIT_JOB})
 
-    def test_windows_crypto_target_and_acl_refusals_use_their_actual_cleanup_environment(self):
+    def test_windows_crypto_refusals_use_exact_export_checkout_and_cleanup_states(self):
         identity = dict(IDENTITY, platform="windows")
         failed_step = "Fetch public control and validate dispatch"
         cleanup_step = "Shred runner-local workspace"
-        for reason, cleanup_has_run_root in (
-                ("crypto-target-invalid", False), ("crypto-acl-output-invalid", True)):
-            with self.subTest(reason=reason):
+        cases = (
+            (
+                "initial-target",
+                ["devlane_crypto_state=run-root-not-exported",
+                 "devlane_crypto_refusal=crypto-target-invalid",
+                 "devlane_deadline_refusal=crypto-dependency-seal-failed"],
+                ["windows_run_root_unowned=confirmed", "cleanup_receipt=confirmed",
+                 "devlane_job=completed public_output=filtered cleanup=confirmed"],
+                False,
+            ),
+            (
+                "initial-acl",
+                ["devlane_crypto_state=run-root-exported",
+                 "devlane_crypto_refusal=crypto-acl-output-invalid",
+                 "devlane_deadline_refusal=crypto-dependency-seal-failed"],
+                _windows_precheckout_cleanup_outputs(),
+                True,
+            ),
+            (
+                "later-target",
+                ["devlane_crypto_state=run-root-exported", "devlane_crypto_state=checkout-complete",
+                 "devlane_crypto_refusal=crypto-target-invalid",
+                 "devlane_deadline_refusal=crypto-dependency-seal-failed"],
+                _windows_real_shred_cleanup_outputs(),
+                True,
+            ),
+            (
+                "later-seal",
+                ["devlane_crypto_state=run-root-exported", "devlane_crypto_state=checkout-complete",
+                 "devlane_crypto_refusal=crypto-seal-write-failed",
+                 "devlane_deadline_refusal=crypto-dependency-seal-failed"],
+                _windows_real_shred_cleanup_outputs(),
+                True,
+            ),
+        )
+        grammar = audit._Grammar(
+            ".github/workflows/devlane-encrypted.yml", audit.PLATFORM_RUN_JOBS["windows"],
+            identity, "encrypted",
+        )
+        bootstrap_run = next(step["run"] for step in grammar.steps if step["name"] == failed_step)
+        export_index = next(index for index, line in enumerate(bootstrap_run)
+                            if line.strip() == "Add-Content -LiteralPath $env:GITHUB_ENV -Value ('RUN_ROOT=' + $runRoot) -Encoding utf8")
+        checkout_index = next(index for index, line in enumerate(bootstrap_run)
+                              if "checkout --quiet --detach FETCH_HEAD" in line)
+        marker_create_index = next(index for index, line in enumerate(bootstrap_run)
+                                   if "New-Item -ItemType File -Path $checkoutMarker" in line)
+        marker_output_index = bootstrap_run.index("Write-Output 'devlane_crypto_state=checkout-complete'")
+        self.assertLess(export_index, checkout_index)
+        self.assertLess(checkout_index, marker_create_index)
+        self.assertLess(marker_create_index, marker_output_index)
+        cleanup_run = next(step["run"] for step in grammar.steps if step["name"] == cleanup_step)
+        precheckout_start = next(index for index, line in enumerate(cleanup_run)
+                                 if line.strip() == "if (-not (Test-Path -LiteralPath $checkoutMarker -ErrorAction Stop)) {")
+        precheckout_end = next(index for index, line in enumerate(cleanup_run[precheckout_start:], precheckout_start)
+                               if line.strip() == "} else {")
+        self.assertFalse(any("sandbox_windows.py" in line
+                             for line in cleanup_run[precheckout_start:precheckout_end]))
+        self.assertTrue(any(line.strip() == "Write-Output 'devlane_refusal=windows-runner-failed'"
+                            for line in cleanup_run))
+
+        for name, outputs, cleanup_outputs, cleanup_has_run_root in cases:
+            with self.subTest(path=name):
                 jobs = _encrypted_jobs(platform="windows")
                 by_name = {job["name"]: job for job in jobs}
                 run_job = by_name[audit.PLATFORM_RUN_JOBS["windows"]]
@@ -809,20 +918,32 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                         step["conclusion"] = "failure"
                     else:
                         step["conclusion"] = "skipped"
-                outputs = [
-                    "devlane_crypto_refusal=" + reason,
-                    "devlane_deadline_refusal=crypto-dependency-seal-failed",
-                ]
+                reason = outputs[-2].split("=", 1)[1]
                 log = _render_real_runner_encrypted_log(
                     identity,
                     early_failure={
-                        "step": failed_step, "marker": outputs[-1], "outputs": outputs, "exit_code": 1,
+                        "step": failed_step, "marker": outputs[-1], "outputs": outputs,
+                        "cleanup_outputs": cleanup_outputs, "exit_code": 1,
                     },
                 )
                 run_root_env = (
                     "  RUN_ROOT: " + _env_value("RUN_ROOT", identity, "encrypted", "windows-2025")
                 ).encode("utf-8")
                 self.assertEqual(log.count(run_root_env), int(cleanup_has_run_root))
+                if name == "initial-acl":
+                    self.assertIn(b"windows_precheckout_cleanup=confirmed", log)
+                    self.assertNotIn(b"windows_runner_shred=confirmed", log)
+                    self.assertNotIn(b"windows_sandbox_cleanup=confirmed", log)
+                    fabricated_shred = _insert_output_before(
+                        log, "windows_precheckout_cleanup=confirmed",
+                        "windows_runner_shred=confirmed files=1 bytes=1 reparse=0",
+                    )
+                    with self.assertRaises(audit.AuditRefusal):
+                        audit.validate_job_log_surface(
+                            fabricated_shred, audit.PLATFORM_RUN_JOBS["windows"], identity, completed=True,
+                        )
+                if name in ("later-target", "later-seal"):
+                    self.assertIn(b"windows_runner_shred=confirmed files=1 bytes=8 reparse=0", log)
                 surface = audit.validate_job_log_surface(
                     log, audit.PLATFORM_RUN_JOBS["windows"], identity, completed=True,
                 )

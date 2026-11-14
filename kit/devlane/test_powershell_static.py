@@ -277,6 +277,10 @@ class PowerShellStaticTests(unittest.TestCase):
             protect_block.index("Add-Content -LiteralPath $env:GITHUB_ENV"),
             protect_block.index("Protect-PrivateDirectory $runRoot $runnerSid"),
         )
+        self.assertLess(
+            protect_block.index("Add-Content -LiteralPath $env:GITHUB_ENV"),
+            protect_block.index("Write-Output 'devlane_crypto_state=run-root-exported'"),
+        )
         self.assertIn("Set-Acl -LiteralPath $Path -AclObject $security -ErrorAction Stop", script)
         self.assertRegex(
             protect_block,
@@ -286,8 +290,32 @@ class PowerShellStaticTests(unittest.TestCase):
             ),
         )
         for line in re.findall(r"Write-Output\s+([^\r\n]+)", protect_block):
-            self.assertRegex(line, r"^'devlane_(?:crypto_refusal=crypto-(?:target-invalid|acl-output-invalid)|deadline_refusal=crypto-dependency-seal-failed)'$")
+            self.assertRegex(line, r"^'devlane_(?:crypto_state=run-root-not-exported|crypto_state=run-root-exported|crypto_refusal=crypto-(?:target-invalid|acl-output-invalid)|deadline_refusal=crypto-dependency-seal-failed|refusal=windows-runner-failed)'\s*\}?$")
         self.assertNotRegex(protect_block, r"(?i)\$_|\$PSItem|Write-Error|Write-Host|throw\b")
+        self.assertRegex(
+            protect_block,
+            re.compile(
+                r"try\s*\{\s*Add-Content -LiteralPath \$env:GITHUB_ENV.*?\}\s*catch\s*\{"
+                r".*?Remove-Item -LiteralPath \$runRoot.*?if \(\$removeFailed\) \{\s*"
+                r"Write-Output 'devlane_refusal=windows-runner-failed'\s*\}", re.DOTALL,
+            ),
+        )
+
+        checkout_index = script.index("git -C $env:CI_WORKSPACE checkout --quiet --detach FETCH_HEAD")
+        checkout_marker_index = script.index("New-Item -ItemType File -Path $checkoutMarker")
+        checkout_state_index = script.index("Write-Output 'devlane_crypto_state=checkout-complete'")
+        self.assertLess(checkout_index, checkout_marker_index)
+        self.assertLess(checkout_marker_index, checkout_state_index)
+
+        cleanup_source = next(item for item in sources if "windows_precheckout_cleanup=confirmed" in item.text)
+        cleanup = cleanup_source.text
+        precheckout_start = cleanup.index("if (-not (Test-Path -LiteralPath $checkoutMarker -ErrorAction Stop))")
+        precheckout_end = cleanup.index("} else {", precheckout_start)
+        precheckout = cleanup[precheckout_start:precheckout_end]
+        self.assertIn("Remove-Item -LiteralPath $runRoot -Recurse -Force -ErrorAction Stop", precheckout)
+        self.assertNotIn("sandbox_windows.py", precheckout)
+        self.assertIn("Write-Output 'devlane_refusal=windows-runner-failed'", cleanup)
+        self.assertNotRegex(precheckout, r"(?i)\$_|\$PSItem|Write-Error|Write-Host")
 
 
 if __name__ == "__main__":
