@@ -1576,10 +1576,28 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             + b" run-id=12345 run-attempt=1\ndevlane_permit=consumed run-id=12345 run-attempt=1\ncleanup_receipt=confirmed\n"
         )
         audit.validate_dispatch_marker(log, IDENTITY)
+        audit.validate_dispatch_marker(log.replace(b"\n", b"\r\n"), IDENTITY)
+        marker = (
+            b"KD-DEVLANE-DISPATCH schema=1 wave-id=wave-test-0001 "
+            b"bundle-id=bundle-test-0001 control-sha=" + SHA.encode("ascii")
+            + b" run-id=12345 run-attempt=1"
+        )
         for changed in (log.replace(b"run-attempt=1", b"run-attempt=2"),
-                        log.replace(b"cleanup_receipt=confirmed", b"cleanup_receipt=unconfirmed")):
+                        log.replace(b"cleanup_receipt=confirmed", b"cleanup_receipt=unconfirmed"),
+                        log + b"KD-DEVLANE-DISPATCH \xff\n",
+                        log + marker + b"\xff\n",
+                        log + b"devlane_permit=consumed run-id=12345 run-attempt=1\xff\n",
+                        log + b"cleanup_receipt=confirmed\xff\n",
+                        log + marker + b"\rignored\n",
+                        log.replace(b"KD-DEVLANE-DISPATCH", b"KD-DEVLANE-DISPATCH-MUTATED")
+                        + b"KD-DEVLANE-DISPATCH \xff\n"):
             with self.assertRaises(audit.AuditRefusal):
                 audit.validate_dispatch_marker(changed, IDENTITY)
+        with self.assertRaises(audit.AuditRefusal):
+            audit.validate_dispatch_marker(
+                log.replace(b"KD-DEVLANE-DISPATCH", b"KD-DEVLANE-DISPATCH-MUTATED")
+                + b"KD-DEVLANE-DISPATCH \xff\n", IDENTITY, allow_missing=True,
+            )
 
     RECORDS = (
         _record(code="TS2322", file="file_0001", kind="diagnostic", level="error", line=7, stage="unit"),
@@ -2308,6 +2326,9 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         self.assertEqual(control_audit.windows_acl_live_outcome(
             b"2026-11-14T03:05:16.5060466Z windows_acl_live=pass cases=2\n",
         ), "pass")
+        self.assertEqual(control_audit.windows_acl_live_outcome(
+            b"2026-11-14T03:05:16.5060466Z windows_acl_live=pass cases=2\r\n",
+        ), "pass")
         control_audit.validate_windows_policy_log(b"windows_acl_live=pass cases=2\n")
         for stage in ("powershell-missing", "fixture-create", "protected-run", "protected-parse", "extra-writer-exit"):
             line = (
@@ -2323,9 +2344,19 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             b"windows_acl_live=failed stage=fixture-create exit=6 stderr=private-path stdout=not-sid\n",
             b"windows_acl_live=failed stage=fixture-create exit=6 stderr=present stdout=private-path\n",
             b"windows_acl_live=pass cases=2\nwindows_acl_live=pass cases=2\n",
+            b"windows_acl_live=pass cases=2\n"
+            b"windows_acl_live=failed stage=fixture-create exit=6 stderr=present stdout=not-sid\xff\n",
+            b"windows_acl_live=pass cases=2\rignored\n",
+            b"windows_acl_live=pass cases=2 extra\n",
         ):
             with self.subTest(invalid=invalid), self.assertRaises(control_audit.ControlAuditRefusal):
                 control_audit.windows_acl_live_outcome(invalid)
+        with self.assertRaises(control_audit.ControlAuditRefusal) as refusal:
+            control_audit._under_stage(
+                "windows-policy-log", control_audit.validate_windows_policy_log,
+                b"windows_acl_live=failed stage=fixture-create exit=6 stderr=present stdout=not-sid\n",
+            )
+        self.assertEqual(refusal.exception.stage, "windows-policy-log")
 
     def test_e2e_progress_markers_use_fixed_phase_and_scenario_vocabulary(self):
         root = Path(__file__).resolve().parents[2]
@@ -3469,6 +3500,10 @@ class ControlAuditorMutationTests(unittest.TestCase):
         windows_log = (b"\x1b[36;1munrelated hosted script echo\x1b[0m\r\n"
                        + log.replace(b"\n", b"\r\n"))
         control_audit.validate_control_marker(windows_log, self.identity, "Linux")
+        with self.assertRaises(control_audit.ControlAuditRefusal):
+            control_audit.validate_control_marker(
+                log + b"KD-PLATFORM-CONTROL \xff\n", self.identity, "Linux",
+            )
         with self.assertRaises(control_audit.ControlAuditRefusal):
             control_audit.validate_control_marker(windows_log.replace(b"\x1b[0m", b"\x1b[2J", 1),
                                                   self.identity, "Linux")

@@ -118,6 +118,7 @@ CLEANUP_RECEIPT_MARKER = re.compile(
 DECIMAL = re.compile(r"[1-9][0-9]{0,18}\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 TIME_PREFIX = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z ")
+TIME_PREFIX_BYTES = re.compile(rb"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z ")
 PUBLIC_FILE_ID = re.compile(r"file_[0-9]{4,6}\Z")
 PUBLIC_TEST_ID = re.compile(r"case_[0-9]{4,6}\Z")
 PUBLIC_SUITE_ID = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
@@ -2415,9 +2416,12 @@ def validate_run_record(run, identity):
 def validate_dispatch_marker(log, identity, *, allow_missing=False):
     if type(log) is not bytes or len(log) > MAX_LOG_BYTES or b"::warning::" in log or b"::error::" in log:
         _refuse()
-    matches = list(DISPATCH_MARKER.finditer(log))
+    log = log.replace(b"\r\n", b"\n")
+    matches = _exact_marker_matches(log, b"KD-DEVLANE-DISPATCH ", DISPATCH_MARKER)
+    permit_matches = _exact_marker_matches(log, b"devlane_permit=consumed", PERMIT_MARKER)
+    cleanup_matches = _exact_marker_matches(log, b"cleanup_receipt=", CLEANUP_RECEIPT_MARKER)
     if not matches and allow_missing:
-        if PERMIT_MARKER.search(log) or len(CLEANUP_RECEIPT_MARKER.findall(log)) != 1:
+        if permit_matches or len(cleanup_matches) != 1:
             _refuse()
         return False
     if len(matches) != 1:
@@ -2427,9 +2431,8 @@ def validate_dispatch_marker(log, identity, *, allow_missing=False):
             or control_sha.decode("ascii") != identity["control_sha"]
             or run_id.decode("ascii") != identity["run_id"]):
         _refuse()
-    if len(CLEANUP_RECEIPT_MARKER.findall(log)) != 1:
+    if len(cleanup_matches) != 1:
         _refuse()
-    permit_matches = list(PERMIT_MARKER.finditer(log))
     if len(permit_matches) != 1 or permit_matches[0].group(1).decode("ascii") != identity["run_id"]:
         _refuse()
     return True
@@ -2439,6 +2442,28 @@ def _normalize_audit_log(log):
     if type(log) is not bytes or len(log) > MAX_LOG_BYTES:
         _refuse()
     return log.replace(b"\r\n", b"\n")
+
+
+def _raw_marker_candidates(log, marker_prefix):
+    for row in log.split(b"\n"):
+        timestamp = TIME_PREFIX_BYTES.match(row)
+        content = row[timestamp.end():] if timestamp is not None else row
+        if content.startswith(marker_prefix):
+            yield row
+
+
+def _exact_marker_matches(log, marker_prefix, pattern):
+    matches = []
+    for row in _raw_marker_candidates(log, marker_prefix):
+        try:
+            row.decode("ascii", "strict")
+        except UnicodeError:
+            _refuse()
+        match = pattern.fullmatch(row)
+        if match is None:
+            _refuse()
+        matches.append(match)
+    return matches
 
 
 def _audit_outcome_line(jobs, identity, diagnosed_failure=None):

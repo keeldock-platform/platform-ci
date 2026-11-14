@@ -147,7 +147,7 @@ def _validate_child_steps(name, job, *, require_main=True):
 class ControlAuditRefusal(ValueError):
     STAGES = frozenset({
         "control-graph", "identity", "run-record", "job-graph", "synthetic-log",
-        "policy-marker", "artifacts", "check-runs", "status-post", "internal",
+        "policy-marker", "windows-policy-log", "artifacts", "check-runs", "status-post", "internal",
     })
 
     def __init__(self, stage="control-graph"):
@@ -378,10 +378,17 @@ def validate_control_marker(log, identity, expected_runner):
         log = log.replace(sequence, b"")
     if any(byte < 32 and byte != 10 or byte == 127 for byte in log) or b"\x1b" in log:
         _refuse()
-    matches = list(MARKER.finditer(log))
-    if len(matches) != 1:
+    rows = list(public_audit._raw_marker_candidates(log, b"KD-PLATFORM-CONTROL "))
+    if len(rows) != 1:
         _refuse()
-    wave_id, control_sha, run_id, runner = matches[0].groups()
+    try:
+        rows[0].decode("ascii", "strict")
+    except UnicodeError:
+        _refuse()
+    match = MARKER.fullmatch(rows[0])
+    if match is None:
+        _refuse()
+    wave_id, control_sha, run_id, runner = match.groups()
     if (wave_id.decode("ascii") != identity["wave_id"]
             or control_sha.decode("ascii") != identity["control_sha"]
             or run_id.decode("ascii") != identity["run_id"]
@@ -396,14 +403,12 @@ def windows_acl_live_outcome(log):
     for sequence in public_audit.ANSI_SGR:
         log = log.replace(sequence, b"")
     matches = []
-    for row in log.splitlines():
+    for row in public_audit._raw_marker_candidates(log, b"windows_acl_live="):
         try:
             line = row.decode("ascii", "strict")
         except UnicodeError:
-            continue
+            _refuse()
         line = public_audit.TIME_PREFIX.sub("", line, count=1)
-        if not line.startswith("windows_acl_live="):
-            continue
         match = _WINDOWS_ACL_LIVE_LINE.fullmatch(line)
         if match is None:
             _refuse()
