@@ -53,11 +53,31 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             logs = Path(temporary)
             for error_class in sorted(windows.refusal_codes.WINDOWS_PREPARATION_ERROR_CLASSES - {"other"}):
-                (logs / "npm-debug.log").write_text("npm error code " + error_class + "\n", encoding="ascii")
+                (logs / "npm-debug.log").write_bytes(
+                    ("42 error code " + error_class + "\r\n").encode("ascii")
+                )
                 with self.subTest(error_class=error_class):
                     self.assertEqual(windows._npm_preparation_error_class(logs), error_class)
-            (logs / "npm-debug.log").write_text("unclassified diagnostic\n", encoding="ascii")
-            self.assertEqual(windows._npm_preparation_error_class(logs), "other")
+            log = logs / "npm-debug.log"
+            log.write_bytes(b"12 verbose stack npm error code EACCES\n43 error code ETIMEDOUT\n")
+            self.assertEqual(windows._npm_preparation_error_class(logs), "ETIMEDOUT")
+            for malformed in (
+                b"43 error code ETIMEDOUT extra\r\n",
+                b"43 error code etimedout\n",
+                b"43 error code \n",
+                (b"43 error code E" + b"A" * 256 + b"\r\n"),
+                b"unclassified diagnostic\n",
+            ):
+                with self.subTest(malformed=malformed[:48]):
+                    log.write_bytes(malformed)
+                    self.assertEqual(windows._npm_preparation_error_class(logs), "other")
+
+    def test_npm_debug_log_classifier_reads_only_the_bounded_tail(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            logs = Path(temporary)
+            log = logs / "npm-debug.log"
+            log.write_bytes(b"x" * (1024 * 1024 + 256) + b"\n43 error code ENOTFOUND\r\n")
+            self.assertEqual(windows._npm_preparation_error_class(logs), "ENOTFOUND")
 
     def test_profile_commands_map_only_fixed_workspace_and_scratch_paths(self):
         node = r"C:\hostedtoolcache\windows\node\24.22.1\x64\node.exe"

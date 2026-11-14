@@ -921,6 +921,13 @@ class _Grammar:
         """Fixed output lines, each bound to the step that is allowed to print it."""
         step = next((item for item in self.steps if item["name"] == step_name), None)
         uses = (step or {}).get("uses") or ""
+        if line.startswith("macos_dns_probe"):
+            if (self.job_runner != "macos-15" or step_name != MACOS_PREPARE_STEP
+                    or self.identity.get("platform") != "macos" or self.identity.get("profile") != "core-node"
+                    or re.fullmatch(r"macos_dns_probe unconfined=(?:ok|fail) confined=(?:ok|fail)", line) is None):
+                return False
+            public_counts["macos_dns_probe"] = public_counts.get("macos_dns_probe", 0) + 1
+            return public_counts["macos_dns_probe"] == 1
         if line.startswith("devlane_crypto_acl_failure="):
             if (self.job_runner != "windows-2025"
                     or step_name != "Fetch public control and validate dispatch"

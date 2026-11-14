@@ -604,7 +604,7 @@ def _npm_preparation_error_class(log_root):
         except OSError:
             continue
         text = payload.decode("utf-8", "replace")
-        for match in re.finditer(r"npm (?:error|ERR!) code ([A-Z][A-Z0-9_]+)", text):
+        for match in re.finditer(r"(?m)^[0-9]+ error code ([A-Z][A-Z0-9_]*)\r?$", text):
             if match.group(1) in refusal_codes.WINDOWS_PREPARATION_ERROR_CLASSES:
                 return match.group(1)
     return "other"

@@ -2994,6 +2994,38 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                         other_step, marker, {},
                     ))
 
+    def test_macos_dns_probe_audit_accepts_only_one_fixed_pair_on_prepare(self):
+        identity = dict(IDENTITY, platform="macos", profile="core-node")
+        grammar = audit._Grammar(
+            Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml",
+            audit.MACOS_RUN_JOB, identity, "encrypted",
+        )
+        counts = {}
+        self.assertTrue(grammar.step_output_ok(
+            audit.MACOS_PREPARE_STEP, "macos_dns_probe unconfined=ok confined=fail", counts,
+        ))
+        self.assertEqual(counts["macos_dns_probe"], 1)
+        self.assertFalse(grammar.step_output_ok(
+            audit.MACOS_PREPARE_STEP, "macos_dns_probe unconfined=ok confined=fail", counts,
+        ))
+        for line in (
+            "macos_dns_probe unconfined=okay confined=fail",
+            "macos_dns_probe unconfined=ok confined=fail extra",
+            "macos_dns_probe unconfined=ok confined=fail\r",
+        ):
+            with self.subTest(line=line):
+                self.assertFalse(grammar.step_output_ok(audit.MACOS_PREPARE_STEP, line, {}))
+        self.assertFalse(grammar.step_output_ok(
+            audit.MACOS_PROBE_STEP, "macos_dns_probe unconfined=ok confined=ok", {},
+        ))
+        windows = audit._Grammar(
+            Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml",
+            audit.PLATFORM_RUN_JOBS["windows"], dict(identity, platform="windows"), "encrypted",
+        )
+        self.assertFalse(windows.step_output_ok(
+            audit.WINDOWS_PREPARE_STEP, "macos_dns_probe unconfined=ok confined=ok", {},
+        ))
+
     def test_windows_prepare_refusals_pass_only_the_bound_step_contract(self):
         identity = dict(IDENTITY, platform="windows")
         failed_step = audit.WINDOWS_PREPARE_STEP

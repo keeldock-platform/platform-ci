@@ -584,6 +584,9 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         self.assertIn("(allow sysctl-read)", profile)
         self.assertIn("(deny network-inbound)", profile)
         self.assertNotIn("(allow network*)", profile)
+        self.assertIn('(allow mach-lookup (global-name "com.apple.dnssd.service"))', profile)
+        self.assertIn('(allow file-read* (literal "/opt"))', profile)
+        self.assertNotIn('(allow file-read-metadata (literal "/opt"))', profile)
         self.assertIn('(allow file-write* (subpath "' + PRIVATE_RUN + '/cache")', profile)
         self.assertNotIn('(allow file-write* (subpath "/Users")', profile)
         self.assertIn('(allow process-exec (literal "/usr/bin/xcrun"))', profile)
@@ -595,6 +598,17 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         )
         self.assertEqual(preparation_env["DEVELOPER_DIR"], sandbox.CLT_DEVELOPER_DIRECTORY)
         self.assertEqual(preparation_env["PATH"].split(":")[1], sandbox.CLT_BIN_DIRECTORY)
+        post_cut_profile = sandbox.profile_text(
+            workspace=PRIVATE_RUN + "/workspace", prepared=PRIVATE_RUN + "/prepared",
+            scratch=PRIVATE_RUN + "/scratch", home=PRIVATE_RUN + "/home", control=PRIVATE_RUN + "/control",
+            node="/opt/node/bin/node", developer=sandbox.CLT_DEVELOPER_DIRECTORY,
+            clang=sandbox.CLT_CLANG_PATH,
+            npm_cli=PRIVATE_RUN + "/control-npm/lib/node_modules/npm/bin/npm-cli.js",
+        )
+        self.assertIn("(deny mach-lookup)", post_cut_profile)
+        self.assertNotIn("(allow mach-lookup", post_cut_profile)
+        self.assertIn('(allow sysctl-read (sysctl-name "hw.machine")', post_cut_profile)
+        self.assertNotIn("(allow sysctl-read)\n", post_cut_profile)
         ident = {"uid": 544, "gid": sandbox.WORKER_GROUP, "node": "/opt/node/bin/node",
                  "npm_cli": PRIVATE_RUN + "/control-npm/lib/node_modules/npm/bin/npm-cli.js"}
         command = sandbox._npm_preparation_command(ident)
@@ -618,6 +632,32 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         self.assertEqual(spawn.call_args.kwargs["user"], 544)
         self.assertEqual(spawn.call_args.kwargs["group"], sandbox.WORKER_GROUP)
         self.assertEqual(spawn.call_args.kwargs["extra_groups"], ())
+
+    def test_preparation_dns_probe_emits_one_bounded_fixed_vocabulary_line(self):
+        ident = {"uid": 544, "gid": sandbox.WORKER_GROUP, "node": "/opt/node/bin/node"}
+        results = [mock.Mock(returncode=1), mock.Mock(returncode=0)]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profile = root / "preparation.sb"
+            profile.write_text("(version 1)\n", encoding="ascii")
+            with mock.patch.object(sandbox.subprocess, "run", side_effect=results) as run, \
+                    mock.patch("builtins.print") as output:
+                status = sandbox._preparation_dns_probe(
+                    ident=ident, profile=profile, cwd=root, env={"PATH": "/usr/bin:/bin"},
+                )
+        self.assertEqual(status, ("fail", "ok"))
+        output.assert_called_once_with("macos_dns_probe unconfined=fail confined=ok", flush=True)
+        self.assertEqual(run.call_count, 2)
+        unconfined, confined = (call.args[0] for call in run.call_args_list)
+        self.assertEqual(unconfined[:2], ("/opt/node/bin/node", "-e"))
+        self.assertIn('"registry.npmjs.org"', unconfined[2])
+        self.assertEqual(confined[:3], ("/usr/bin/sandbox-exec", "-f", str(profile)))
+        self.assertEqual(confined[3:], unconfined)
+        for call in run.call_args_list:
+            self.assertLessEqual(call.kwargs["timeout"], 8)
+            self.assertEqual(call.kwargs["stdout"], sandbox.subprocess.DEVNULL)
+            self.assertEqual(call.kwargs["stderr"], sandbox.subprocess.DEVNULL)
+            self.assertEqual(call.kwargs["user"], ident["uid"])
 
     def test_preparation_start_and_npm_failures_have_fixed_codes(self):
         with mock.patch.object(sandbox.subprocess, "Popen", side_effect=PermissionError(1, "denied")):

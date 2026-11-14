@@ -52,6 +52,8 @@ CLT_DEVELOPER_DIRECTORY = "/Library/Developer/CommandLineTools"
 CLT_BIN_DIRECTORY = CLT_DEVELOPER_DIRECTORY + "/usr/bin"
 CLT_CLANG_PATH = CLT_DEVELOPER_DIRECTORY + "/usr/bin/clang"
 CLT_OTOOL_PATH = CLT_DEVELOPER_DIRECTORY + "/usr/bin/otool"
+DNS_PROBE_TIMEOUT_SECONDS = 8
+DNS_LOOKUP_TIMEOUT_MILLISECONDS = 5000
 
 
 DECRYPT_REFUSAL_CODES = frozenset((
@@ -756,6 +758,7 @@ def preparation_profile_text(*, project, prepared, cache, home, temporary, node,
     lines = [
         "(version 1)", "(deny default)", "(allow process-fork)",
         "(allow network-outbound)", "(deny network-inbound)",
+        '(allow mach-lookup (global-name "com.apple.dnssd.service"))',
         "(allow signal (target same-sandbox))", "(allow sysctl-read)",
     ]
     lines.extend("(allow process-exec (literal " + _quote(path) + "))" for path in sorted(executable))
@@ -781,6 +784,35 @@ def _preparation_env(ident, *, home, temporary, cache, prepared):
         "CI": "1", "LC_ALL": "C", "LANG": "C",
         "PLAYWRIGHT_BROWSERS_PATH": str(Path(prepared) / "ms-playwright"),
     }
+
+
+def _preparation_dns_probe(*, ident, profile, cwd, env):
+    resolver_script = (
+        'const dns = require("node:dns"); '
+        'const timer = setTimeout(() => process.exit(1), '
+        + str(DNS_LOOKUP_TIMEOUT_MILLISECONDS)
+        + '); '
+        'dns.lookup("registry.npmjs.org", { all: true }, (error, addresses) => {'
+        ' clearTimeout(timer); process.exit(error || !addresses.length ? 1 : 0); });'
+    )
+    resolver_command = (ident["node"], "-e", resolver_script)
+
+    def probe(command):
+        try:
+            result = subprocess.run(
+                command, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, env=env, close_fds=True, start_new_session=True,
+                timeout=DNS_PROBE_TIMEOUT_SECONDS, user=ident["uid"], group=ident["gid"],
+                extra_groups=(), check=False,
+            )
+        except Exception:
+            return "fail"
+        return "ok" if result.returncode == 0 else "fail"
+
+    unconfined = probe(resolver_command)
+    confined = probe(("/usr/bin/sandbox-exec", "-f", str(profile), *resolver_command))
+    print("macos_dns_probe unconfined=" + unconfined + " confined=" + confined, flush=True)
+    return unconfined, confined
 
 
 def _npm_preparation_command(ident):
@@ -945,6 +977,7 @@ def _prepare(state, projection_path, output_path, profile, control_sha, deadline
     ), encoding="utf-8")
     os.chmod(profile_path, 0o444)
     env = _preparation_env(ident, home=home, temporary=temporary, cache=cache, prepared=prepared)
+    _preparation_dns_probe(ident=ident, profile=profile_path, cwd=project, env=env)
     timeout = min(3600, deadline_budget.remaining(deadline_file))
     with log.open("xb") as output_log:
         code = _run_preparation_process(
