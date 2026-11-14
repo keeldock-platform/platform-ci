@@ -378,6 +378,12 @@ REFUSAL_LINE = re.compile(
     + r"|devlane_windows_preflight_refusal=" + _code_alternative(WINDOWS_PREFLIGHT_REFUSAL_CODES)
     + r")\Z"
 )
+CRYPTO_ACL_FAILURE_LINE = re.compile(
+    r"devlane_crypto_acl_failure=operation=(owner-identity|security-build|acl-protection|owner-rule-add|"
+    r"system-rule-add|administrators-rule-add|apply-run-root-acl|apply-crypto-target-acl|other) "
+    r"exception=(UnauthorizedAccessException|PrivilegeNotHeldException|InvalidOperationException|"
+    r"ArgumentException|IdentityNotMappedException|IOException|other)\Z"
+)
 
 
 def cache_line_patterns(key, temp=TEMP, platform="linux"):
@@ -709,6 +715,10 @@ class _Grammar:
             has_refusal = any(line.partition("=")[0] in (
                 "devlane_crypto_refusal", "devlane_deadline_refusal", "devlane_bootstrap_refusal",
             ) for line in output_lines)
+            acl_diagnostics = [line for line in output_lines if line.startswith("devlane_crypto_acl_failure=")]
+            if (len(acl_diagnostics) > 1
+                    or (acl_diagnostics and "devlane_crypto_refusal=crypto-acl-protection-failed" not in output_lines)):
+                _refuse()
             initial_acl_refusal = (
                 output_lines.count("devlane_crypto_refusal=crypto-acl-protection-failed") == 1
                 and output_lines.count("devlane_deadline_refusal=crypto-dependency-seal-failed") == 1
@@ -898,6 +908,13 @@ class _Grammar:
         """Fixed output lines, each bound to the step that is allowed to print it."""
         step = next((item for item in self.steps if item["name"] == step_name), None)
         uses = (step or {}).get("uses") or ""
+        if line.startswith("devlane_crypto_acl_failure="):
+            if (self.job_runner != "windows-2025"
+                    or step_name != "Fetch public control and validate dispatch"
+                    or CRYPTO_ACL_FAILURE_LINE.fullmatch(line) is None):
+                return False
+            public_counts["crypto_acl_diagnostic"] = public_counts.get("crypto_acl_diagnostic", 0) + 1
+            return public_counts["crypto_acl_diagnostic"] == 1
         if (line.startswith("devlane_supervisor_refusal=") and self.job_runner == "macos-15"
                 and step_name in MACOS_OPERATION_STEP_REFUSALS):
             code = line[len("devlane_supervisor_refusal="):]

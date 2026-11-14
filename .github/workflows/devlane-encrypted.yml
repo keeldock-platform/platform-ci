@@ -1201,21 +1201,64 @@ jobs:
         timeout-minutes: 180
         run: |
           $ErrorActionPreference = 'Stop'
-          function Protect-PrivateDirectory([string]$Path, [Security.Principal.SecurityIdentifier]$OwnerSid) {
-            $security = [Security.AccessControl.DirectorySecurity]::new()
-            $security.SetAccessRuleProtection($true, $false)
-            $security.SetOwner($OwnerSid)
-            $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
-            foreach ($sidText in @($OwnerSid.Value, 'S-1-5-18', 'S-1-5-32-544')) {
-              $sid = [Security.Principal.SecurityIdentifier]::new($sidText)
+          $script:CryptoAclDiagnostic = $null
+          $script:CryptoAclOperations = @(
+            'owner-identity', 'security-build', 'acl-protection', 'owner-rule-add',
+            'system-rule-add', 'administrators-rule-add', 'apply-run-root-acl', 'apply-crypto-target-acl', 'other'
+          )
+          $script:CryptoAclExceptionTypes = @(
+            'UnauthorizedAccessException', 'PrivilegeNotHeldException', 'InvalidOperationException',
+            'ArgumentException', 'IdentityNotMappedException', 'IOException'
+          )
+          function Set-CryptoAclDiagnostic([string]$Operation, [object]$Failure) {
+            if ($script:CryptoAclOperations -cnotcontains $Operation) { $Operation = 'other' }
+            $exception = $Failure.Exception
+            $exceptionType = 'other'
+            for ($depth = 0; $depth -lt 3 -and $null -ne $exception; $depth++) {
+              $name = $exception.GetType().Name
+              if ($script:CryptoAclExceptionTypes -ccontains $name) { $exceptionType = $name; break }
+              $exception = $exception.InnerException
+            }
+            $script:CryptoAclDiagnostic = 'devlane_crypto_acl_failure=operation=' + $Operation + ' exception=' + $exceptionType
+          }
+          function Add-CryptoAclRule(
+            [Security.AccessControl.DirectorySecurity]$Security,
+            [Security.Principal.SecurityIdentifier]$Sid,
+            [Security.AccessControl.InheritanceFlags]$Inheritance,
+            [string]$Operation
+          ) {
+            try {
               $rule = [Security.AccessControl.FileSystemAccessRule]::new(
-                $sid, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance,
+                $Sid, [Security.AccessControl.FileSystemRights]::FullControl, $Inheritance,
                 [Security.AccessControl.PropagationFlags]::None,
                 [Security.AccessControl.AccessControlType]::Allow
               )
-              [void]$security.AddAccessRule($rule)
+              [void]$Security.AddAccessRule($rule)
+              return $true
+            } catch { Set-CryptoAclDiagnostic $Operation $_; return $false }
+          }
+          function Protect-PrivateDirectory([string]$Path, [Security.Principal.SecurityIdentifier]$OwnerSid, [string]$Role) {
+            try { $security = [Security.AccessControl.DirectorySecurity]::new() }
+            catch { Set-CryptoAclDiagnostic 'security-build' $_; return $false }
+            try { [void]$security.SetAccessRuleProtection($true, $false) }
+            catch { Set-CryptoAclDiagnostic 'acl-protection' $_; return $false }
+            $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+            if (-not (Add-CryptoAclRule $security $OwnerSid $inheritance 'owner-rule-add')) { return $false }
+            try { $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18') }
+            catch { Set-CryptoAclDiagnostic 'system-rule-add' $_; return $false }
+            if (-not (Add-CryptoAclRule $security $system $inheritance 'system-rule-add')) { return $false }
+            try { $administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544') }
+            catch { Set-CryptoAclDiagnostic 'administrators-rule-add' $_; return $false }
+            if (-not (Add-CryptoAclRule $security $administrators $inheritance 'administrators-rule-add')) { return $false }
+            $applyOperation = switch -CaseSensitive ($Role) {
+              'run-root' { 'apply-run-root-acl' }
+              'crypto-target' { 'apply-crypto-target-acl' }
+              default { 'other' }
             }
-            Set-Acl -LiteralPath $Path -AclObject $security -ErrorAction Stop
+            try {
+              [System.IO.FileSystemAclExtensions]::SetAccessControl([IO.DirectoryInfo]$Path, $security)
+              return $true
+            } catch { Set-CryptoAclDiagnostic $applyOperation $_; return $false }
           }
           try {
             $runRoot = Join-Path -Path $env:RUNNER_TEMP -ChildPath ('devlane-' + $env:CI_RUN_ID) -ErrorAction Stop
@@ -1258,10 +1301,16 @@ jobs:
             exit 1
           }
           Write-Output 'devlane_crypto_state=run-root-exported'
-          try {
-            $runnerSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
-            Protect-PrivateDirectory $runRoot $runnerSid
-          } catch {
+          try { $runnerSid = [Security.Principal.WindowsIdentity]::GetCurrent().User }
+          catch {
+            Set-CryptoAclDiagnostic 'owner-identity' $_
+            Write-Output $script:CryptoAclDiagnostic
+            Write-Output 'devlane_crypto_refusal=crypto-acl-protection-failed'
+            Write-Output 'devlane_deadline_refusal=crypto-dependency-seal-failed'
+            exit 1
+          }
+          if (-not (Protect-PrivateDirectory $runRoot $runnerSid 'run-root')) {
+            Write-Output $script:CryptoAclDiagnostic
             Write-Output 'devlane_crypto_refusal=crypto-acl-protection-failed'
             Write-Output 'devlane_deadline_refusal=crypto-dependency-seal-failed'
             exit 1
@@ -1341,9 +1390,8 @@ jobs:
             Write-Output 'devlane_crypto_refusal=crypto-target-invalid'
             Refuse-Bootstrap 'crypto-dependency-seal-failed'
           }
-          try {
-            Protect-PrivateDirectory $cryptoTarget $runnerSid
-          } catch {
+          if (-not (Protect-PrivateDirectory $cryptoTarget $runnerSid 'crypto-target')) {
+            Write-Output $script:CryptoAclDiagnostic
             Write-Output 'devlane_crypto_refusal=crypto-acl-protection-failed'
             Refuse-Bootstrap 'crypto-dependency-seal-failed'
           }

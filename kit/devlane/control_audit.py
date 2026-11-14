@@ -79,11 +79,22 @@ LINUX_POLICY_STEP_NAMES = ("Fetch public candidate", "Run unprivileged source-fr
 LINUX_HARNESS_STEP_NAMES = ("Fetch public candidate", "Run Linux namespace harness fixtures")
 WINDOWS_POLICY_STEP_NAMES = ("Fetch public candidate", "Run unprivileged source-free checks")
 WINDOWS_POLICY_JOB = "windows-confinement / windows-policy"
+_WINDOWS_ACL_FIXTURE_OPERATIONS = (
+    "owner-identity|protected-directory-create|extra-writer-directory-create|security-build|acl-protection|"
+    "owner-rule-add|system-rule-add|administrators-rule-add|everyone-rule-add|inherit-only-rule-add|"
+    "apply-root-acl|apply-protected-acl|apply-extra-writer-acl|other"
+)
+_WINDOWS_ACL_EXCEPTION_TYPES = (
+    "UnauthorizedAccessException|PrivilegeNotHeldException|InvalidOperationException|ArgumentException|"
+    "IdentityNotMappedException|IOException|other"
+)
 _WINDOWS_ACL_LIVE_LINE = re.compile(
     r"windows_acl_live=(pass cases=2|skipped platform|failed stage="
     r"(powershell-missing|fixture-create|protected-run|protected-parse|extra-writer-exit) "
     r"exit=(0|[1-9]|1[0-5]|other) stderr=(present|empty) "
-    r"stdout=(empty|multiple-lines|not-sid|bom-or-whitespace|sid))\Z"
+    r"(?:stdout=(empty|multiple-lines|not-sid|bom-or-whitespace|sid) operation=none exception=none|"
+    r"stdout=fixture-diagnostic operation=(" + _WINDOWS_ACL_FIXTURE_OPERATIONS + ") exception=("
+    + _WINDOWS_ACL_EXCEPTION_TYPES + r")))\Z"
 )
 WINDOWS_NATIVE_STEP_NAMES = (
     "Fetch public candidate", "Parse every PowerShell file under kit", "Compile native confinement module",
@@ -410,7 +421,10 @@ def windows_acl_live_outcome(log):
             _refuse()
         line = public_audit.TIME_PREFIX.sub("", line, count=1)
         match = _WINDOWS_ACL_LIVE_LINE.fullmatch(line)
-        if match is None:
+        if (match is None
+                or (line.startswith("windows_acl_live=failed ")
+                    and "stdout=fixture-diagnostic" in line
+                    and "stage=fixture-create " not in line)):
             _refuse()
         value = match.group(1)
         matches.append("pass" if value == "pass cases=2" else

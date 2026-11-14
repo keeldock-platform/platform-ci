@@ -970,6 +970,7 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             (
                 "initial-acl",
                 ["devlane_crypto_state=run-root-exported",
+                 "devlane_crypto_acl_failure=operation=apply-run-root-acl exception=PrivilegeNotHeldException",
                  "devlane_crypto_refusal=crypto-acl-protection-failed",
                  "devlane_deadline_refusal=crypto-dependency-seal-failed"],
                 _windows_precheckout_cleanup_outputs(),
@@ -987,6 +988,15 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 "later-acl",
                 ["devlane_crypto_state=run-root-exported", "devlane_crypto_state=checkout-complete",
                  "devlane_crypto_refusal=crypto-acl-stdout-bom-or-whitespace",
+                 "devlane_deadline_refusal=crypto-dependency-seal-failed"],
+                _windows_real_shred_cleanup_outputs(),
+                True,
+            ),
+            (
+                "later-acl-protection",
+                ["devlane_crypto_state=run-root-exported", "devlane_crypto_state=checkout-complete",
+                 "devlane_crypto_acl_failure=operation=apply-crypto-target-acl exception=IOException",
+                 "devlane_crypto_refusal=crypto-acl-protection-failed",
                  "devlane_deadline_refusal=crypto-dependency-seal-failed"],
                 _windows_real_shred_cleanup_outputs(),
                 True,
@@ -2332,20 +2342,29 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         control_audit.validate_windows_policy_log(b"windows_acl_live=pass cases=2\n")
         for stage in ("powershell-missing", "fixture-create", "protected-run", "protected-parse", "extra-writer-exit"):
             line = (
-                "windows_acl_live=failed stage=%s exit=6 stderr=present stdout=bom-or-whitespace\n" % stage
+                "windows_acl_live=failed stage=%s exit=6 stderr=present "
+                "stdout=bom-or-whitespace operation=none exception=none\n" % stage
             ).encode("ascii")
             with self.subTest(stage=stage):
                 self.assertEqual(control_audit.windows_acl_live_outcome(line), "failed")
                 with self.assertRaises(control_audit.ControlAuditRefusal):
                     control_audit.validate_windows_policy_log(line)
+        diagnosed = (
+            b"windows_acl_live=failed stage=fixture-create exit=12 stderr=present "
+            b"stdout=fixture-diagnostic operation=apply-protected-acl exception=PrivilegeNotHeldException\n"
+        )
+        self.assertEqual(control_audit.windows_acl_live_outcome(diagnosed), "failed")
         for invalid in (
-            b"windows_acl_live=failed stage=private-path exit=6 stderr=present stdout=not-sid\n",
-            b"windows_acl_live=failed stage=fixture-create exit=16 stderr=present stdout=not-sid\n",
-            b"windows_acl_live=failed stage=fixture-create exit=6 stderr=private-path stdout=not-sid\n",
-            b"windows_acl_live=failed stage=fixture-create exit=6 stderr=present stdout=private-path\n",
+            b"windows_acl_live=failed stage=private-path exit=6 stderr=present stdout=not-sid operation=none exception=none\n",
+            b"windows_acl_live=failed stage=fixture-create exit=16 stderr=present stdout=not-sid operation=none exception=none\n",
+            b"windows_acl_live=failed stage=fixture-create exit=6 stderr=private-path stdout=not-sid operation=none exception=none\n",
+            b"windows_acl_live=failed stage=fixture-create exit=6 stderr=present stdout=private-path operation=none exception=none\n",
+            b"windows_acl_live=failed stage=fixture-create exit=12 stderr=present stdout=fixture-diagnostic operation=private-path exception=IOException\n",
+            b"windows_acl_live=failed stage=fixture-create exit=12 stderr=present stdout=fixture-diagnostic operation=apply-root-acl exception=private-type\n",
+            b"windows_acl_live=failed stage=protected-run exit=12 stderr=present stdout=fixture-diagnostic operation=apply-root-acl exception=IOException\n",
             b"windows_acl_live=pass cases=2\nwindows_acl_live=pass cases=2\n",
             b"windows_acl_live=pass cases=2\n"
-            b"windows_acl_live=failed stage=fixture-create exit=6 stderr=present stdout=not-sid\xff\n",
+            b"windows_acl_live=failed stage=fixture-create exit=6 stderr=present stdout=not-sid operation=none exception=none\xff\n",
             b"windows_acl_live=pass cases=2\rignored\n",
             b"windows_acl_live=pass cases=2 extra\n",
         ):
@@ -2354,7 +2373,8 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         with self.assertRaises(control_audit.ControlAuditRefusal) as refusal:
             control_audit._under_stage(
                 "windows-policy-log", control_audit.validate_windows_policy_log,
-                b"windows_acl_live=failed stage=fixture-create exit=6 stderr=present stdout=not-sid\n",
+                b"windows_acl_live=failed stage=fixture-create exit=6 stderr=present "
+                b"stdout=not-sid operation=none exception=none\n",
             )
         self.assertEqual(refusal.exception.stage, "windows-policy-log")
 
@@ -2740,6 +2760,29 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                                 and step_name == "Fetch public control and validate dispatch"
                                 and code in accepted_codes)
                     self.assertEqual(accepted, expected, (platform_name, step_name, code, "crypto-reason"))
+
+    def test_windows_crypto_acl_diagnostics_are_fixed_and_step_scoped(self):
+        root = Path(__file__).resolve().parents[2]
+        grammar = audit._Grammar(
+            root / ".github/workflows/devlane-encrypted.yml", audit.WINDOWS_RUN_JOB,
+            dict(IDENTITY, platform="windows"), "encrypted",
+        )
+        valid = "devlane_crypto_acl_failure=operation=apply-crypto-target-acl exception=IOException"
+        self.assertTrue(grammar.step_output_ok(
+            "Fetch public control and validate dispatch", valid, {},
+        ))
+        self.assertFalse(grammar.step_output_ok(
+            "Prepare hosted Windows isolation state", valid, {},
+        ))
+        for invalid in (
+            "devlane_crypto_acl_failure=operation=private-path exception=IOException",
+            "devlane_crypto_acl_failure=operation=apply-crypto-target-acl exception=private-type",
+            "devlane_crypto_acl_failure=operation=apply-crypto-target-acl exception=IOException message=x",
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertFalse(grammar.step_output_ok(
+                    "Fetch public control and validate dispatch", invalid, {},
+                ))
 
     def test_macos_startup_refusals_pass_the_complete_log_and_metadata_contract(self):
         new_start_codes = sorted(audit.MACOS_SUPERVISOR_START_REFUSAL_CODES)

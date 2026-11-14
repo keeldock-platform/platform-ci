@@ -230,24 +230,22 @@ class PowerShellStaticTests(unittest.TestCase):
         workflow = ROOT / ".github/workflows/devlane-encrypted.yml"
         sources = _workflow_powershell_blocks(workflow)
         source = next(item for item in sources
-                      if "control-python-deps" in item.text and "Set-Acl -LiteralPath $Path" in item.text)
+                      if "control-python-deps" in item.text and "Protect-PrivateDirectory" in item.text)
         script = source.text
         target_assignment = script.index("$cryptoTarget = Join-Path")
         start = script.rfind("try {", 0, target_assignment)
         end = script.index("$sealOutput =", target_assignment)
         target_block = script[start:end]
         catches = re.findall(r"catch\s*\{([^{}]*)\}", target_block)
-        self.assertEqual(len(catches), 2)
+        self.assertEqual(len(catches), 1)
         self.assertEqual(
             [[line.strip() for line in body.splitlines() if line.strip()] for body in catches],
             [
                 ["Write-Output 'devlane_crypto_refusal=crypto-target-invalid'",
                  "Refuse-Bootstrap 'crypto-dependency-seal-failed'"],
-                ["Write-Output 'devlane_crypto_refusal=crypto-acl-protection-failed'",
-                 "Refuse-Bootstrap 'crypto-dependency-seal-failed'"],
             ],
         )
-        self.assertNotRegex(target_block, r"(?i)\$_|\$PSItem|Write-Error|Write-Host|throw\b")
+        self.assertNotRegex(target_block, r"(?i)Write-Error|Write-Host|throw\b")
         self.assertIn("Join-Path -Path $runRoot -ChildPath 'control-python-deps' -ErrorAction Stop", target_block)
         self.assertIn("New-Item -ItemType Directory -Path $cryptoTarget -ErrorAction Stop", target_block)
 
@@ -281,17 +279,25 @@ class PowerShellStaticTests(unittest.TestCase):
             protect_block.index("Add-Content -LiteralPath $env:GITHUB_ENV"),
             protect_block.index("Write-Output 'devlane_crypto_state=run-root-exported'"),
         )
-        self.assertIn("Set-Acl -LiteralPath $Path -AclObject $security -ErrorAction Stop", script)
+        self.assertIn(
+            "[System.IO.FileSystemAclExtensions]::SetAccessControl([IO.DirectoryInfo]$Path, $security)",
+            script,
+        )
+        self.assertNotIn("Set-Acl -LiteralPath $Path", script)
+        self.assertNotIn("$security.SetOwner(", script)
+        self.assertIn("devlane_crypto_acl_failure=operation=", script)
         self.assertRegex(
             protect_block,
             re.compile(
-                r"try\s*\{\s*\$runnerSid\s*=.*?Protect-PrivateDirectory \$runRoot \$runnerSid"
-                r"\s*\}\s*catch\s*\{", re.DOTALL,
+                r"try\s*\{\s*\$runnerSid\s*=.*?\}\s*catch\s*\{", re.DOTALL,
             ),
         )
+        self.assertIn("if (-not (Protect-PrivateDirectory $runRoot $runnerSid 'run-root'))", protect_block)
         for line in re.findall(r"Write-Output\s+([^\r\n]+)", protect_block):
-            self.assertRegex(line, r"^'devlane_(?:crypto_state=run-root-not-exported|crypto_state=run-root-exported|crypto_refusal=crypto-(?:target-invalid|acl-protection-failed)|deadline_refusal=crypto-dependency-seal-failed|refusal=windows-runner-failed)'\s*\}?$")
-        self.assertNotRegex(protect_block, r"(?i)\$_|\$PSItem|Write-Error|Write-Host|throw\b")
+            self.assertRegex(line, r"^(?:'devlane_(?:crypto_state=run-root-not-exported|crypto_state=run-root-exported|crypto_refusal=crypto-(?:target-invalid|acl-protection-failed)|deadline_refusal=crypto-dependency-seal-failed|refusal=windows-runner-failed)'|\$script:CryptoAclDiagnostic)\s*\}?$")
+        self.assertNotRegex(protect_block, r"(?i)Write-Error|Write-Host|throw\b")
+        self.assertIn("$Failure.Exception", script)
+        self.assertNotIn("$Failure.Exception.Message", script)
         self.assertRegex(
             protect_block,
             re.compile(
