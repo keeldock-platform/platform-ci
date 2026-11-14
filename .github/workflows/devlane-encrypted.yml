@@ -1645,7 +1645,7 @@ jobs:
           }
           try { $rootExists = Test-Path -LiteralPath $runRoot -ErrorAction Stop }
           catch {
-            Write-Output 'devlane_refusal=windows-runner-failed'
+            Write-Output 'devlane_refusal=windows-cleanup-root-check-failed'
             exit 1
           }
           if (-not $rootExists) {
@@ -1673,7 +1673,7 @@ jobs:
               exit 0
             }
           } catch {
-            Write-Output 'devlane_refusal=windows-runner-failed'
+            Write-Output 'devlane_refusal=windows-cleanup-precheckout-remove-failed'
             exit 1
           }
           Write-Output 'windows_precheckout_cleanup=confirmed'

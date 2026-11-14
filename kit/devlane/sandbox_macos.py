@@ -51,6 +51,7 @@ MACOS_ROOT_DIRECTORY = chr(47) + "private" + chr(47) + "var" + chr(47) + "root"
 CLT_DEVELOPER_DIRECTORY = "/Library/Developer/CommandLineTools"
 CLT_BIN_DIRECTORY = CLT_DEVELOPER_DIRECTORY + "/usr/bin"
 CLT_CLANG_PATH = CLT_DEVELOPER_DIRECTORY + "/usr/bin/clang"
+CLT_OTOOL_PATH = CLT_DEVELOPER_DIRECTORY + "/usr/bin/otool"
 
 
 DECRYPT_REFUSAL_CODES = frozenset((
@@ -643,6 +644,90 @@ def _validate_prepare_run_root(state, ident):
         _refuse("prepare-run-root-invalid")
 
 
+def _macos_node_runtime_read_roots(node):
+    if sys.platform != "darwin" or not Path(node).is_file():
+        return set()
+    otool = Path(CLT_OTOOL_PATH)
+    if not otool.is_file():
+        _refuse("tool-runtime-dependencies-invalid")
+    try:
+        executable = Path(node).resolve(strict=True)
+    except (OSError, RuntimeError):
+        _refuse("tool-runtime-dependencies-invalid")
+    pending = [executable]
+    visited = set()
+    roots = {executable.parent, executable.parent.parent}
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        if len(visited) > 256:
+            _refuse("tool-runtime-dependencies-invalid")
+        try:
+            linked = subprocess.run(
+                [str(otool), "-L", str(current)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=15, check=False,
+            )
+            loaded = subprocess.run(
+                [str(otool), "-l", str(current)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=15, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            _refuse("tool-runtime-dependencies-invalid")
+        if (linked.returncode != 0 or loaded.returncode != 0
+                or len(linked.stdout) > 2 * 1024 * 1024 or len(loaded.stdout) > 2 * 1024 * 1024):
+            _refuse("tool-runtime-dependencies-invalid")
+        dependencies = []
+        for line in linked.stdout.decode("utf-8", "replace").splitlines()[1:]:
+            value = line.strip().split(" (compatibility version", 1)[0]
+            if value.startswith(("/usr/lib/", "/System/Library/")):
+                continue
+            if value:
+                dependencies.append(value)
+        rpaths = []
+        lines = loaded.stdout.decode("utf-8", "replace").splitlines()
+        for index, line in enumerate(lines):
+            if line.strip() == "cmd LC_RPATH":
+                for detail in lines[index + 1:index + 4]:
+                    match = re.match(r"\s*path\s+(.+?)\s+\(offset [0-9]+\)\s*\Z", detail)
+                    if match:
+                        rpaths.append(match.group(1))
+                        break
+        search_paths = []
+        for value in rpaths:
+            expanded = value.replace("@loader_path", str(current.parent)).replace(
+                "@executable_path", str(executable.parent)
+            )
+            if "@rpath" not in expanded:
+                path = Path(expanded)
+                if path.is_absolute():
+                    search_paths.append(path)
+        search_paths.extend((current.parent, executable.parent, executable.parent.parent / "lib"))
+        for dependency in dependencies:
+            if dependency.startswith("@loader_path/"):
+                candidates = [current.parent / dependency[len("@loader_path/"):]]
+            elif dependency.startswith("@executable_path/"):
+                candidates = [executable.parent / dependency[len("@executable_path/"):]]
+            elif dependency.startswith("@rpath/"):
+                suffix = dependency[len("@rpath/"):]
+                candidates = [base / suffix for base in search_paths]
+            else:
+                candidates = [Path(dependency)]
+            existing = next((candidate for candidate in candidates if candidate.is_file()), None)
+            if existing is None:
+                _refuse("tool-runtime-dependencies-invalid")
+            roots.add(existing.parent)
+            try:
+                resolved = existing.resolve(strict=True)
+            except OSError:
+                _refuse("tool-runtime-dependencies-invalid")
+            roots.add(resolved.parent)
+            if not str(resolved).startswith(("/usr/lib/", "/System/Library/")):
+                pending.append(resolved)
+    return roots
+
+
 def preparation_profile_text(*, project, prepared, cache, home, temporary, node, npm_cli):
     node_root = Path(node).parent
     npm_root = Path(npm_cli).parent.parent
@@ -651,6 +736,18 @@ def preparation_profile_text(*, project, prepared, cache, home, temporary, node,
         "/usr/bin", "/bin", "/dev", CLT_DEVELOPER_DIRECTORY, str(node_root), str(npm_root), str(project),
         str(prepared), str(cache), str(home), str(temporary),
     }
+    readable.update(str(path) for path in _macos_node_runtime_read_roots(node))
+    runtime_config_files = {
+        Path("/etc/ssl/openssl.cnf"), Path("/etc/openssl/openssl.cnf"),
+        Path("/usr/local/etc/openssl@3/openssl.cnf"), Path("/opt/homebrew/etc/openssl@3/openssl.cnf"),
+    }
+    runtime_config_files = {path for path in runtime_config_files if path.is_file()}
+    ancestors = {Path("/")}
+    for directory in readable:
+        current = Path(directory)
+        while current != current.parent:
+            ancestors.add(current)
+            current = current.parent
     executable = {
         "/bin/sh", "/bin/bash", "/usr/bin/env", "/usr/bin/sandbox-exec", "/usr/bin/xcrun",
         CLT_CLANG_PATH, str(node),
@@ -659,10 +756,12 @@ def preparation_profile_text(*, project, prepared, cache, home, temporary, node,
     lines = [
         "(version 1)", "(deny default)", "(allow process-fork)",
         "(allow network-outbound)", "(deny network-inbound)",
-        "(allow signal (target same-sandbox))",
+        "(allow signal (target same-sandbox))", "(allow sysctl-read)",
     ]
     lines.extend("(allow process-exec (literal " + _quote(path) + "))" for path in sorted(executable))
     lines.extend("(allow file-read* (subpath " + _quote(path) + "))" for path in sorted(readable))
+    lines.extend("(allow file-read* (literal " + _quote(str(path)) + "))" for path in sorted(ancestors))
+    lines.extend("(allow file-read* (literal " + _quote(str(path)) + "))" for path in sorted(runtime_config_files))
     lines.extend("(allow file-write* (subpath " + _quote(path) + "))" for path in sorted(writable))
     lines.extend((
         "(allow file-read* (literal \"/dev/null\") (literal \"/dev/urandom\") "
@@ -691,27 +790,30 @@ def _npm_preparation_command(ident):
     )
 
 
-_NPM_PREPARATION_ERROR_CLASSES = frozenset((
-    "EPERM", "EACCES", "ENOTFOUND", "ECONNREFUSED", "E403", "E404", "EINTEGRITY", "ENOENT",
-    "sandbox-deny", "other",
-))
+_NPM_PREPARATION_ERROR_CLASSES = refusal_codes.MACOS_NPM_PREPARATION_ERROR_CLASSES
 
 
-def _npm_preparation_error_class(log_path):
+def _npm_preparation_error_class(log_path, return_code=None):
+    signal_class = "other"
+    if type(return_code) is int and return_code < 0:
+        candidate = "killed-by-signal-" + str(-return_code)
+        signal_class = candidate if candidate in _NPM_PREPARATION_ERROR_CLASSES else "killed-by-signal-other"
     try:
         with Path(log_path).open("rb") as stream:
             payload = stream.read(MAX_LOG_BYTES + 1)
     except OSError:
-        return "other"
+        return signal_class
     if len(payload) > MAX_LOG_BYTES:
-        return "other"
+        return signal_class
     text = payload.decode("utf-8", "replace")
-    if re.search(r"(?:Sandbox:|sandbox-exec:).*\bdeny\b", text, re.IGNORECASE):
+    if re.search(r"(?:Sandbox:|sandbox-exec:).*\bdeny\b|blocked by sandbox|Operation not permitted|LowLevelAlloc.*arithmetic overflow", text, re.IGNORECASE):
         return "sandbox-deny"
-    for match in re.finditer(r"npm (?:error|ERR!) code ([A-Z][A-Z0-9]+)", text):
+    if re.search(r"Library not loaded:|dyld\[[0-9]+\]:", text):
+        return "node-start-failed"
+    for match in re.finditer(r"npm (?:error|ERR!) code ([A-Z][A-Z0-9_]+)", text):
         if match.group(1) in _NPM_PREPARATION_ERROR_CLASSES:
             return match.group(1)
-    return "other"
+    return signal_class
 
 
 def _run_preparation_process(argv, *, ident, profile, cwd, env, output, timeout):
@@ -852,7 +954,7 @@ def _prepare(state, projection_path, output_path, profile, control_sha, deadline
     if log.stat().st_size > MAX_LOG_BYTES:
         _refuse("log-too-large")
     if code != 0:
-        _refuse("npm-failed-" + _npm_preparation_error_class(log))
+        _refuse("npm-failed-" + _npm_preparation_error_class(log, code))
     if projection["playwright"]:
         candidates = (
             project / "node_modules" / "playwright" / "cli.js",

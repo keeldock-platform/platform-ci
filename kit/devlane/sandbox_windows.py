@@ -16,6 +16,7 @@ from pathlib import Path, PureWindowsPath
 import bundle
 import fetch
 import filter as output_filter
+import refusal_codes
 
 
 WINDOWS_IMAGE = "windows-2025"
@@ -29,7 +30,7 @@ SAFE_ENVIRONMENT = frozenset((
     "PATH", "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOME", "CI",
     "SystemRoot", "WINDIR", "ComSpec",
     "NPM_CONFIG_CACHE", "NPM_CONFIG_IGNORE_SCRIPTS", "NPM_CONFIG_AUDIT", "NPM_CONFIG_FUND",
-    "NPM_CONFIG_OFFLINE", "NPM_CONFIG_UPDATE_NOTIFIER", "NPM_CONFIG_USERCONFIG",
+    "NPM_CONFIG_OFFLINE", "NPM_CONFIG_UPDATE_NOTIFIER", "NPM_CONFIG_USERCONFIG", "NPM_CONFIG_LOGS_DIR",
     "PLAYWRIGHT_BROWSERS_PATH", "PLAYWRIGHT_JSON_OUTPUT_FILE",
     "NO_COLOR", "TERM", "PYTHONDONTWRITEBYTECODE",
 ))
@@ -387,7 +388,7 @@ def _extract_windows_archive(archive_bytes, destination, expected):
     return manifest
 
 
-def _run_powershell(mode, state_path, request_path=None, timeout=MAX_CHILD_SECONDS + 300):
+def _run_powershell(mode, state_path, request_path=None, timeout=MAX_CHILD_SECONDS + 300, failure_prefix=None):
     script = Path(__file__).with_name("sandbox_windows.ps1").resolve(strict=True)
     argv = ["pwsh", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script),
             "-Mode", mode, "-StateFile", str(Path(state_path).resolve())]
@@ -400,20 +401,24 @@ def _run_powershell(mode, state_path, request_path=None, timeout=MAX_CHILD_SECON
         result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, timeout=timeout, check=False,
                                 env=child_environment)
-    except (OSError, subprocess.SubprocessError):
+    except subprocess.TimeoutExpired:
+        _refuse((failure_prefix or "windows") + "-powershell-timeout")
+    except OSError:
+        _refuse((failure_prefix or "windows") + "-powershell-start-failed")
+    except subprocess.SubprocessError:
         _refuse("powershell-unavailable")
     if result.returncode != 0 or len(result.stdout) > 8192:
-        _refuse("native-boundary-failed")
+        _refuse((failure_prefix or "windows") + "-powershell-nonzero")
     try:
         return result.stdout.decode("utf-8", "strict").strip()
     except UnicodeError:
         _refuse("native-boundary-output")
 
 
-def create_profile(state_path):
+def create_profile(state_path, *, failure_prefix=None):
     if sys.platform != "win32":
         _refuse("windows-host-required")
-    _run_powershell("create", state_path, timeout=30)
+    _run_powershell("create", state_path, timeout=30, failure_prefix=failure_prefix)
     state = _read_json(state_path, 4096)
     if (type(state) is not dict or set(state) != {"schema", "profile_name", "package_sid", "firewall_rule", "acl_grants"}
             or state["schema"] != 1 or not PROFILE_PATTERN.fullmatch(state["profile_name"])
@@ -436,7 +441,7 @@ def remove_firewall(state_path):
     return line + "\n"
 
 
-def _native_run(state_path, request, run_root):
+def _native_run(state_path, request, run_root, *, failure_prefix=None):
     state = _read_json(state_path, 4096)
     validate_profile_name(state.get("profile_name"))
     validate_package_sid(state.get("package_sid"))
@@ -462,7 +467,9 @@ def _native_run(state_path, request, run_root):
         output.flush()
         os.fsync(output.fileno())
     try:
-        stdout = _run_powershell("run", state_path, request_path, timeout=request["timeout_milliseconds"] // 1000 + 30)
+        stdout = _run_powershell("run", state_path, request_path,
+                                 timeout=request["timeout_milliseconds"] // 1000 + 30,
+                                 failure_prefix=failure_prefix)
     finally:
         try:
             request_path.unlink()
@@ -473,10 +480,13 @@ def _native_run(state_path, request, run_root):
     except bundle.Refusal:
         _refuse("native-result")
     if (type(result) is not dict or set(result) != {"status", "exit_code", "token", "job"}
-            or result.get("status") not in ("pass", "fail", "timeout")
+            or result.get("status") not in ("pass", "fail", "timeout", "process-start-failed")
             or type(result.get("exit_code")) is not int
-            or not str(result.get("token", "")).startswith("lpac=verified")
-            or not str(result.get("job", "")).startswith("assigned kill_on_close=enabled breakaway=disabled")):
+            or (result.get("status") != "process-start-failed" and
+                (not str(result.get("token", "")).startswith("lpac=verified")
+                 or not str(result.get("job", "")).startswith("assigned kill_on_close=enabled breakaway=disabled")))
+            or (result.get("status") == "process-start-failed"
+                and (result.get("exit_code") != 0 or result.get("token") or result.get("job")))):
         _refuse("native-result")
     return result
 
@@ -555,20 +565,49 @@ def _npm_tools():
     node_text = shutil.which("node")
     npm_text = shutil.which("npm") or shutil.which("npm.cmd")
     if not node_text or not npm_text:
-        _refuse("node-toolchain-missing")
+        _refuse("windows-prepare-toolchain-unavailable")
     node = Path(node_text).resolve(strict=True)
     npm_launcher = Path(npm_text)
     npm_cli = npm_launcher.parent / "node_modules" / "npm" / "bin" / "npm-cli.js"
     if not npm_cli.is_file() or npm_cli.is_symlink():
-        _refuse("npm-toolchain-missing")
-    node_result = subprocess.run([str(node), "--version"], stdin=subprocess.DEVNULL,
-                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15, check=False)
-    npm_result = subprocess.run([str(node), str(npm_cli), "--version"], stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30, check=False)
+        _refuse("windows-prepare-toolchain-unavailable")
+    try:
+        node_result = subprocess.run([str(node), "--version"], stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15, check=False)
+        npm_result = subprocess.run([str(node), str(npm_cli), "--version"], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30, check=False)
+    except subprocess.TimeoutExpired:
+        _refuse("windows-prepare-toolchain-process-timeout")
+    except OSError:
+        _refuse("windows-prepare-toolchain-process-start-failed")
     if (node_result.returncode != 0 or node_result.stdout.strip() != b"v24.22.1"
             or npm_result.returncode != 0 or npm_result.stdout.strip() != b"11.19.1"):
-        _refuse("node-toolchain-version")
+        _refuse("windows-prepare-toolchain-version-invalid")
     return node, npm_cli
+
+
+def _npm_preparation_error_class(log_root):
+    root = Path(log_root)
+    try:
+        candidates = sorted(root.glob("*.log"), key=lambda path: path.stat().st_mtime_ns, reverse=True)
+    except OSError:
+        return "other"
+    for path in candidates[:8]:
+        try:
+            metadata = path.lstat()
+            if not path.is_file() or path.is_symlink():
+                continue
+            with path.open("rb") as stream:
+                if metadata.st_size > 1024 * 1024:
+                    stream.seek(metadata.st_size - 1024 * 1024)
+                payload = stream.read(1024 * 1024 + 1)
+        except OSError:
+            continue
+        text = payload.decode("utf-8", "replace")
+        for match in re.finditer(r"npm (?:error|ERR!) code ([A-Z][A-Z0-9_]+)", text):
+            if match.group(1) in refusal_codes.WINDOWS_PREPARATION_ERROR_CLASSES:
+                return match.group(1)
+    return "other"
 
 
 def prepare_dependencies(projection_path, output_root, deadline_file, state_path):
@@ -578,25 +617,28 @@ def prepare_dependencies(projection_path, output_root, deadline_file, state_path
         projection_bytes = Path(projection_path).read_bytes()
         projection = fetch.validate_projection(projection_bytes, "core-node")
     except (OSError, fetch.Refusal):
-        _refuse("projection-invalid")
+        _refuse("windows-prepare-projection-invalid")
     node, npm_cli = _npm_tools()
     root = Path(output_root)
     if root.exists() or root.is_symlink():
-        _refuse("prepared-output-exists")
+        _refuse("windows-prepare-output-invalid")
     project = root / "project"
     prepared = root / "prepared"
-    project.mkdir(mode=0o700, parents=True)
-    prepared.mkdir(mode=0o700)
-    browser_root = prepared / "ms-playwright"
-    browser_root.mkdir(mode=0o700)
-    (project / "package.json").write_bytes(bundle.canonical_json(projection["npm_package"]) + b"\n")
-    (project / "package-lock.json").write_bytes(bundle.canonical_json(projection["npm_lock"]) + b"\n")
-    (project / ".npmrc").write_text(
-        "ignore-scripts=true\naudit=false\nfund=false\nupdate-notifier=false\nregistry=https://registry.npmjs.org/\n",
-        encoding="ascii",
-    )
     cache = root / "npm-cache"
-    cache.mkdir(mode=0o700)
+    try:
+        project.mkdir(mode=0o700, parents=True)
+        prepared.mkdir(mode=0o700)
+        browser_root = prepared / "ms-playwright"
+        browser_root.mkdir(mode=0o700)
+        (project / "package.json").write_bytes(bundle.canonical_json(projection["npm_package"]) + b"\n")
+        (project / "package-lock.json").write_bytes(bundle.canonical_json(projection["npm_lock"]) + b"\n")
+        (project / ".npmrc").write_text(
+            "ignore-scripts=true\naudit=false\nfund=false\nupdate-notifier=false\nregistry=https://registry.npmjs.org/\n",
+            encoding="ascii",
+        )
+        cache.mkdir(mode=0o700)
+    except OSError:
+        _refuse("windows-prepare-output-invalid")
     system_root = Path(os.environ.get("SystemRoot", "C:\\Windows"))
     environment = [
         "PATH=" + str(node.parent) + os.pathsep + str(system_root / "System32"),
@@ -607,13 +649,21 @@ def prepare_dependencies(projection_path, output_root, deadline_file, state_path
         "NPM_CONFIG_CACHE=" + str(cache), "NPM_CONFIG_IGNORE_SCRIPTS=true",
         "NPM_CONFIG_AUDIT=false", "NPM_CONFIG_FUND=false", "NPM_CONFIG_OFFLINE=false",
         "NPM_CONFIG_UPDATE_NOTIFIER=false", "NPM_CONFIG_USERCONFIG=" + str(project / ".npmrc"),
+        "NPM_CONFIG_LOGS_DIR=" + str(cache / "_logs"),
         "PLAYWRIGHT_BROWSERS_PATH=" + str(browser_root), "PYTHONDONTWRITEBYTECODE=1",
         "NO_COLOR=1", "TERM=dumb",
     ]
     runner_root = Path(state_path).resolve().parents[1]
     created_profile = False
     try:
-        create_profile(state_path)
+        try:
+            create_profile(state_path, failure_prefix="windows-prepare")
+        except WindowsBoundaryRefusal as error:
+            if error.code not in (
+                    "windows-prepare-powershell-start-failed", "windows-prepare-powershell-timeout",
+                    "windows-prepare-powershell-nonzero"):
+                _refuse("windows-prepare-profile-create-failed")
+            raise
         created_profile = True
         remaining = max(1, int(_deadline_remaining(deadline_file)))
         request = {
@@ -623,9 +673,14 @@ def prepare_dependencies(projection_path, output_root, deadline_file, state_path
             "write_paths": [str(project), str(cache), str(browser_root)],
             "timeout_milliseconds": min(3_600_000, max(1000, int(remaining * 1000))), "internet_client": True,
         }
-        result = _native_run(state_path, request, runner_root)
-        if result["status"] != "pass":
-            _refuse("dependency-preparation-failed")
+        result = _native_run(state_path, request, runner_root, failure_prefix="windows-prepare")
+        if result["status"] == "process-start-failed":
+            _refuse("windows-prepare-npm-process-start-failed")
+        if result["status"] == "timeout":
+            _refuse("windows-prepare-npm-child-timeout-3600s" if request["timeout_milliseconds"] == 3_600_000
+                    else "windows-prepare-npm-work-deadline")
+        if result["status"] == "fail":
+            _refuse("windows-prepare-npm-failed-" + _npm_preparation_error_class(cache / "_logs"))
         if projection["playwright"]:
             candidates = (
                 project / "node_modules" / "playwright" / "cli.js",
@@ -633,28 +688,43 @@ def prepare_dependencies(projection_path, output_root, deadline_file, state_path
             )
             cli = next((item for item in candidates if item.is_file() and not item.is_symlink()), None)
             if cli is None:
-                _refuse("playwright-cli-missing")
+                _refuse("windows-prepare-playwright-cli-missing")
             remaining = max(1, int(_deadline_remaining(deadline_file)))
             request.update({
                 "arguments": [str(cli), "install", *projection["playwright"]],
                 "working_directory": str(project),
                 "timeout_milliseconds": min(1_800_000, max(1000, int(remaining * 1000))),
             })
-            result = _native_run(state_path, request, runner_root)
-            if result["status"] != "pass":
-                _refuse("browser-preparation-failed")
+            result = _native_run(state_path, request, runner_root, failure_prefix="windows-prepare")
+            if result["status"] == "process-start-failed":
+                _refuse("windows-prepare-playwright-process-start-failed")
+            if result["status"] == "timeout":
+                _refuse("windows-prepare-playwright-child-timeout-1800s"
+                        if request["timeout_milliseconds"] == 1_800_000
+                        else "windows-prepare-playwright-work-deadline")
+            if result["status"] == "fail":
+                _refuse("windows-prepare-playwright-failed-other")
     except (OSError, subprocess.SubprocessError):
-        _refuse("dependency-preparation-failed")
+        _refuse("windows-prepare-internal")
     finally:
         if created_profile:
-            delete_profile(state_path)
+            try:
+                delete_profile(state_path)
+            except Exception:
+                _refuse("windows-prepare-profile-cleanup-failed")
     node_modules = project / "node_modules"
-    _reject_reparse_tree(node_modules)
-    shutil.copytree(node_modules, prepared / "node_modules", symlinks=False)
-    _write_private_json(prepared / "projection.json", projection)
-    _write_private_json(prepared / "toolchain.json", {
-        "node": str(node), "npm_cli": str(npm_cli),
-    })
+    try:
+        _reject_reparse_tree(node_modules)
+        shutil.copytree(node_modules, prepared / "node_modules", symlinks=False)
+    except Exception:
+        _refuse("windows-prepare-workspace-copy-failed")
+    try:
+        _write_private_json(prepared / "projection.json", projection)
+        _write_private_json(prepared / "toolchain.json", {
+            "node": str(node), "npm_cli": str(npm_cli),
+        })
+    except OSError:
+        _refuse("windows-prepare-output-invalid")
     return prepared, node, npm_cli
 
 
@@ -1038,14 +1108,16 @@ def run_profile(context_path, manifest_path, source_root, prepared_root, scratch
 def shred_tree(root, plaintext_root=None, overwrite_limit=1024 * 1024 * 1024):
     root = Path(root)
     if root.is_symlink() or not root.is_dir():
-        _refuse("cleanup-root")
+        _refuse("shred-root-invalid")
     plaintext_root = Path(plaintext_root) if plaintext_root else None
     total = 0
     files = []
     directory_paths = []
     reparse_entries = []
     failures = []
-    for current, child_directories, names in os.walk(root, topdown=True, followlinks=False):
+    def walk_error(_error):
+        failures.append("shred-enumerate-failed")
+    for current, child_directories, names in os.walk(root, topdown=True, followlinks=False, onerror=walk_error):
         for name in list(child_directories):
             path = Path(current) / name
             try:
@@ -1054,7 +1126,7 @@ def shred_tree(root, plaintext_root=None, overwrite_limit=1024 * 1024 * 1024):
                 reparse = is_symlink or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
             except OSError:
                 child_directories.remove(name)
-                failures.append(path)
+                failures.append("shred-entry-inspection-failed")
                 continue
             if reparse:
                 child_directories.remove(name)
@@ -1068,12 +1140,12 @@ def shred_tree(root, plaintext_root=None, overwrite_limit=1024 * 1024 * 1024):
                 is_symlink = path.is_symlink()
                 reparse = is_symlink or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
             except OSError:
-                failures.append(path)
+                failures.append("shred-entry-inspection-failed")
                 continue
             if reparse:
                 reparse_entries.append((path, False, is_symlink))
             elif not path.is_file():
-                failures.append(path)
+                failures.append("shred-entry-inspection-failed")
             else:
                 size = metadata.st_size
                 total += size
@@ -1089,10 +1161,10 @@ def shred_tree(root, plaintext_root=None, overwrite_limit=1024 * 1024 * 1024):
                 path.unlink()
             cleaned += 1
         except OSError:
-            failures.append(path)
+            failures.append("shred-reparse-remove-failed")
     for path, size in files:
-        try:
-            if size <= overwrite_limit:
+        if size <= overwrite_limit:
+            try:
                 remaining = size
                 with path.open("r+b", buffering=0) as output:
                     while remaining:
@@ -1101,25 +1173,30 @@ def shred_tree(root, plaintext_root=None, overwrite_limit=1024 * 1024 * 1024):
                         remaining -= len(chunk)
                     output.flush()
                     os.fsync(output.fileno())
+            except OSError:
+                failures.append("shred-overwrite-failed")
+                try:
+                    path.unlink()
+                    cleaned += 1
+                except OSError:
+                    failures.append("shred-file-remove-failed")
+                continue
+        try:
             path.unlink()
             cleaned += 1
         except OSError:
-            failures.append(path)
-            try:
-                path.unlink()
-            except OSError:
-                pass
+            failures.append("shred-file-remove-failed")
     for path in reversed(directory_paths):
         try:
             path.rmdir()
         except OSError:
-            failures.append(path)
+            failures.append("shred-directory-remove-failed")
     try:
         root.rmdir()
     except OSError:
-        failures.append(root)
+        failures.append("shred-root-remove-failed")
     if failures:
-        _refuse("cleanup-incomplete")
+        _refuse(failures[0])
     return "windows_runner_shred=confirmed files=%d bytes=%d reparse=%d\n" % (cleaned, total, len(reparse_entries))
 
 
@@ -1130,18 +1207,20 @@ def cleanup_runner(state_path, root, plaintext_root=None):
         try:
             remove_firewall(state)
         except Exception:
-            errors.append("firewall")
+            errors.append("windows-cleanup-firewall-failed")
         try:
             delete_profile(state)
         except Exception:
-            errors.append("profile")
+            errors.append("windows-cleanup-profile-failed")
     shred_receipt = None
     try:
         shred_receipt = shred_tree(root, plaintext_root=plaintext_root)
+    except WindowsBoundaryRefusal as error:
+        errors.append("windows-cleanup-" + error.code)
     except Exception:
-        errors.append("plaintext-tree")
+        errors.append("windows-cleanup-shred-internal")
     if errors:
-        _refuse("cleanup-incomplete")
+        _refuse(errors[0])
     return "windows_sandbox_cleanup=confirmed firewall=removed profile=deleted\n" + shred_receipt
 
 
@@ -1169,7 +1248,7 @@ def remove_tree(root):
 def delete_profile(state_path):
     if sys.platform != "win32":
         _refuse("windows-host-required")
-    line = _run_powershell("delete", state_path, timeout=90)
+    line = _run_powershell("delete", state_path, timeout=90, failure_prefix="windows-cleanup")
     try:
         Path(state_path).unlink(missing_ok=True)
     except OSError:
@@ -1274,6 +1353,12 @@ def main(argv=None):
                       else _public_decrypt_refusal(error))
             print("devlane_supervisor_refusal=decrypt-rejected", file=sys.stderr)
             print("decrypt_refusal=" + reason, file=sys.stderr)
+        elif args.operation == "prepare":
+            code = error.code if error.code in refusal_codes.WINDOWS_PREPARE_REFUSAL_CODES else "windows-prepare-internal"
+            print("devlane_refusal=" + code, file=sys.stderr)
+        elif args.operation == "shred":
+            code = error.code if error.code in refusal_codes.WINDOWS_SHRED_REFUSAL_CODES else "windows-cleanup-internal"
+            print("devlane_refusal=" + code, file=sys.stderr)
         else:
             print("devlane_refusal=windows-runner-failed", file=sys.stderr)
         return 1
@@ -1281,6 +1366,10 @@ def main(argv=None):
         if args.operation == "decrypt":
             print("devlane_supervisor_refusal=decrypt-rejected", file=sys.stderr)
             print("decrypt_refusal=archive-invalid", file=sys.stderr)
+        elif args.operation == "prepare":
+            print("devlane_refusal=windows-prepare-internal", file=sys.stderr)
+        elif args.operation == "shred":
+            print("devlane_refusal=windows-cleanup-internal", file=sys.stderr)
         else:
             print("devlane_refusal=boundary", file=sys.stderr)
         return 1

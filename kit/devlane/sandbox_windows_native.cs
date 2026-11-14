@@ -14,6 +14,7 @@ namespace KeelDock.Platform.DevLaneWindows
         public uint ExitCode;
         public string AppContainer;
         public string Job;
+        public string Failure;
     }
 
     public static class Boundary
@@ -380,7 +381,10 @@ namespace KeelDock.Platform.DevLaneWindows
                 uint flags = ExtendedStartupInfoPresent | CreateSuspended | CreateUnicodeEnvironment;
                 if (!CreateProcessW(executable, commandLine, IntPtr.Zero, IntPtr.Zero, true, flags,
                         environmentBlock, workingDirectory, ref startup, out information))
-                    throw new InvalidOperationException("process_create");
+                {
+                    result.Failure = "process-start-failed";
+                    return result;
+                }
                 process = information.Process;
                 thread = information.Thread;
                 result.Created = true;

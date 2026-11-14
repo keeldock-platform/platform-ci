@@ -127,6 +127,11 @@ try {
         $result = [KeelDock.Platform.DevLaneWindows.Boundary]::Run(
             [string]$state.profile_name, [string]$state.package_sid, [string]$request.executable,
             $arguments, [string]$request.working_directory, $environment, [int]$request.timeout_milliseconds, $internetClient)
+        if ($result.Failure -eq 'process-start-failed') {
+            [ordered]@{ status = 'process-start-failed'; exit_code = [uint32]0; token = ''; job = '' } |
+                ConvertTo-Json -Compress
+            exit 0
+        }
         if (-not $result.Created -or -not $result.Exited -or $result.AppContainer -notlike 'lpac=verified*' -or
             $result.Job -notlike 'assigned kill_on_close=enabled breakaway=disabled*') { throw }
         $status = if ($result.TimedOut) { 'timeout' } elseif ($result.ExitCode -eq 0) { 'pass' } else { 'fail' }

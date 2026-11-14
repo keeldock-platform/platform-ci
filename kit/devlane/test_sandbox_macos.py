@@ -581,6 +581,7 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         )
         self.assertIn("(deny default)", profile)
         self.assertIn("(allow network-outbound)", profile)
+        self.assertIn("(allow sysctl-read)", profile)
         self.assertIn("(deny network-inbound)", profile)
         self.assertNotIn("(allow network*)", profile)
         self.assertIn('(allow file-write* (subpath "' + PRIVATE_RUN + '/cache")', profile)
@@ -634,12 +635,22 @@ class MacRoundOneRegressionTests(unittest.TestCase):
                 ("npm error code ENOTFOUND\n", "ENOTFOUND"),
                 ("npm ERR! code EACCES\n", "EACCES"),
                 ("Sandbox: node deny(1) file-write-data /tmp/package\n", "sandbox-deny"),
-                ("npm error code EAI_AGAIN\n", "other"),
+                ("npm error code EAI_AGAIN\n", "EAI_AGAIN"),
+                ("npm error code ETIMEDOUT\n", "ETIMEDOUT"),
+                ("npm error code ENOTCACHED\n", "ENOTCACHED"),
+                ("npm error code ECONNRESET\n", "ECONNRESET"),
+                ("npm error code E401\n", "E401"),
+                ("dyld[42]: Library not loaded: @rpath/libnode.dylib\n", "node-start-failed"),
+                ("dyld: tried: /opt/libfoo.dylib (blocked by sandbox)\n", "sandbox-deny"),
+                ("[low_level_alloc.cc : 466] RAW: Check sum >= a failed: LowLevelAlloc arithmetic overflow\n", "sandbox-deny"),
             )
             for content, expected in cases:
                 with self.subTest(expected=expected):
                     log.write_text(content, encoding="utf-8")
                     self.assertEqual(sandbox._npm_preparation_error_class(log), expected)
+            log.write_text("", encoding="utf-8")
+            self.assertEqual(sandbox._npm_preparation_error_class(log, -6), "killed-by-signal-6")
+            self.assertEqual(sandbox._npm_preparation_error_class(log, -2), "killed-by-signal-other")
 
     def test_npm_preparation_error_class_reads_only_the_log_limit_plus_one(self):
         reader = mock.mock_open(read_data=b"npm error code EACCES\n")

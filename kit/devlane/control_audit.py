@@ -93,7 +93,7 @@ _WINDOWS_ACL_CHECK_OPERATIONS = "|".join(
 _WINDOWS_ACL_LIVE_LINE = re.compile(
     r"windows_acl_live=(pass cases=2|skipped platform|failed stage="
     r"(powershell-missing|fixture-create|protected-run|protected-parse|extra-writer-exit) "
-    r"exit=(0|[1-9]|1[0-9]|2[0-9]|31|other) stderr=(present|empty) "
+    r"exit=(0|[1-9]|1[0-9]|2[0-9]|3[01]|other) stderr=(present|empty) "
     r"(?:stdout=(empty|multiple-lines|not-sid|bom-or-whitespace|sid) operation=none exception=none hresult=none|"
     r"stdout=fixture-diagnostic operation=(" + _WINDOWS_ACL_FIXTURE_OPERATIONS + ") exception=("
     + _WINDOWS_ACL_EXCEPTION_TYPE + r") hresult=(" + _WINDOWS_ACL_HRESULT + r")|stdout=check-diagnostic operation=("

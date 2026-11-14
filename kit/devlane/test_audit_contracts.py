@@ -1032,7 +1032,9 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                                if line.strip() == "} else {")
         self.assertFalse(any("sandbox_windows.py" in line
                              for line in cleanup_run[precheckout_start:precheckout_end]))
-        self.assertTrue(any(line.strip() == "Write-Output 'devlane_refusal=windows-runner-failed'"
+        self.assertTrue(any(line.strip() == "Write-Output 'devlane_refusal=windows-cleanup-root-check-failed'"
+                            for line in cleanup_run))
+        self.assertTrue(any(line.strip() == "Write-Output 'devlane_refusal=windows-cleanup-precheckout-remove-failed'"
                             for line in cleanup_run))
 
         for name, outputs, cleanup_outputs, cleanup_has_run_root in cases:
@@ -2376,6 +2378,14 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             b"2026-11-14T03:05:16.5060466Z windows_acl_live=pass cases=2\r\n",
         ), "pass")
         control_audit.validate_windows_policy_log(b"windows_acl_live=pass cases=2\n")
+        for operation, exit_code in control_audit.refusal_codes.WINDOWS_ACL_CHECK_OPERATIONS:
+            line = (
+                "windows_acl_live=failed stage=protected-run exit=%d stderr=empty "
+                "stdout=check-diagnostic operation=%s exception=IOException hresult=0x80070005\n"
+                % (exit_code, operation)
+            ).encode("ascii")
+            with self.subTest(operation=operation, exit_code=exit_code):
+                self.assertEqual(control_audit.windows_acl_live_outcome(line), "failed")
         for stage in ("powershell-missing", "fixture-create", "protected-run", "protected-parse", "extra-writer-exit"):
             line = (
                 "windows_acl_live=failed stage=%s exit=6 stderr=present "
@@ -2983,6 +2993,89 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                     self.assertFalse(grammar.step_output_ok(
                         other_step, marker, {},
                     ))
+
+    def test_windows_prepare_refusals_pass_only_the_bound_step_contract(self):
+        identity = dict(IDENTITY, platform="windows")
+        failed_step = audit.WINDOWS_PREPARE_STEP
+        expected_outcome = (
+            "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed "
+            "disposition=run-failed-at-windows-prepare"
+        )
+        for code in sorted(audit.WINDOWS_PREPARE_REFUSAL_CODES):
+            with self.subTest(code=code):
+                jobs = _encrypted_jobs(platform="windows")
+                run_job = next(job for job in jobs if job["name"] == audit.PLATFORM_RUN_JOBS["windows"])
+                run_job["conclusion"] = "failure"
+                names = [step["name"] for step in run_job["steps"]]
+                failed_index = names.index(failed_step)
+                for index, step in enumerate(run_job["steps"]):
+                    if step["name"] == "Shred runner-local workspace":
+                        step["conclusion"] = "success"
+                    elif step["name"] in ("Install pinned Rust toolchain", "Install Tauri Linux build dependencies"):
+                        step["conclusion"] = "skipped"
+                    elif index < failed_index:
+                        step["conclusion"] = "success"
+                    elif index == failed_index:
+                        step["conclusion"] = "failure"
+                    else:
+                        step["conclusion"] = "skipped"
+                marker = "devlane_refusal=" + code
+                log = _render_real_runner_encrypted_log(
+                    identity, early_failure={"step": failed_step, "marker": marker, "exit_code": 1},
+                )
+                surface = audit.validate_job_log_surface(log, audit.PLATFORM_RUN_JOBS["windows"], identity,
+                                                         completed=True)
+                self.assertEqual(surface["early_failure"], failed_step)
+                self.assertEqual(surface["early_failure_code"], code)
+                audit.validate_job_contract(jobs, identity, "core-node")
+                audit.validate_job_log_metadata_binding(surface, run_job, identity)
+                audit.validate_dispatch_marker(log, identity, allow_missing=False)
+                self.assertEqual(audit._audit_outcome_line(jobs, identity), expected_outcome)
+
+                grammar = audit._Grammar(
+                    Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml",
+                    audit.PLATFORM_RUN_JOBS["windows"], identity, "encrypted",
+                )
+                self.assertFalse(grammar.refusal_line_ok("Shred runner-local workspace", marker))
+                linux = audit._Grammar(
+                    Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml",
+                    audit.PLATFORM_RUN_JOBS["linux"], dict(IDENTITY, platform="linux"), "encrypted",
+                )
+                self.assertFalse(linux.refusal_line_ok(failed_step, marker))
+
+                wrong_exit = _render_real_runner_encrypted_log(
+                    identity, early_failure={"step": failed_step, "marker": marker, "exit_code": 2},
+                )
+                with self.assertRaises(audit.AuditRefusal):
+                    audit.validate_job_log_surface(
+                        wrong_exit, audit.PLATFORM_RUN_JOBS["windows"], identity, completed=True,
+                    )
+
+                if code == min(audit.WINDOWS_PREPARE_REFUSAL_CODES):
+                    changed = copy.deepcopy(jobs)
+                    changed_run = next(job for job in changed if job["name"] == audit.PLATFORM_RUN_JOBS["windows"])
+                    changed_steps = {step["name"]: step for step in changed_run["steps"]}
+                    changed_steps["Probe isolation before decryption"]["conclusion"] = "success"
+                    with self.assertRaises(audit.AuditRefusal):
+                        audit.validate_job_contract(changed, identity, "core-node")
+                    changed = copy.deepcopy(run_job)
+                    changed_steps = {step["name"]: step for step in changed["steps"]}
+                    changed_steps["Shred runner-local workspace"]["conclusion"] = "failure"
+                    with self.assertRaises(audit.AuditRefusal):
+                        audit.validate_job_log_metadata_binding(surface, changed, identity)
+
+    def test_windows_cleanup_refusals_name_only_the_shred_step(self):
+        identity = dict(IDENTITY, platform="windows")
+        grammar = audit._Grammar(
+            Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml",
+            audit.PLATFORM_RUN_JOBS["windows"], identity, "encrypted",
+        )
+        for code in sorted(audit.WINDOWS_SHRED_REFUSAL_CODES - audit.WINDOWS_RUNNER_REFUSAL_CODES):
+            line = "devlane_refusal=" + code
+            with self.subTest(code=code):
+                self.assertIsNotNone(audit.REFUSAL_LINE.fullmatch(line))
+                self.assertTrue(grammar.refusal_line_ok("Shred runner-local workspace", line))
+                self.assertFalse(grammar.refusal_line_ok(audit.WINDOWS_PREPARE_STEP, line))
 
     def test_shared_probe_and_execute_failures_keep_the_base_platform_contracts(self):
         cases = (

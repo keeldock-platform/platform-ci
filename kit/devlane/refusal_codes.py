@@ -121,6 +121,38 @@ WINDOWS_ACL_CHECK_OPERATIONS = (
     ("rule-identity-read", 27), ("rule-writer-compare", 28), ("rule-rights-read", 29),
     ("rule-rights-compare", 30), ("owner-output", 31),
 )
+WINDOWS_PREPARATION_ERROR_CLASSES = frozenset((
+    "EPERM", "EACCES", "ENOTFOUND", "ECONNREFUSED", "ECONNRESET", "EAI_AGAIN", "ETIMEDOUT",
+    "ENOTCACHED", "E401", "E403", "E404", "E408", "E429", "EINTEGRITY", "ENOENT", "ENOTDIR",
+    "EISDIR", "ENOSPC", "other",
+))
+WINDOWS_PREPARE_REFUSAL_CODES = frozenset((
+    "windows-prepare-powershell-start-failed", "windows-prepare-powershell-timeout",
+    "windows-prepare-powershell-nonzero", "windows-prepare-npm-process-start-failed",
+    "windows-prepare-npm-child-timeout-3600s", "windows-prepare-npm-work-deadline",
+    "windows-prepare-playwright-process-start-failed", "windows-prepare-playwright-child-timeout-1800s",
+    "windows-prepare-playwright-work-deadline", "windows-prepare-playwright-cli-missing",
+    "windows-prepare-toolchain-unavailable", "windows-prepare-toolchain-process-start-failed",
+    "windows-prepare-toolchain-process-timeout", "windows-prepare-toolchain-version-invalid",
+    "windows-prepare-profile-create-failed", "windows-prepare-profile-cleanup-failed",
+    "windows-prepare-workspace-copy-failed", "windows-prepare-output-invalid",
+    "windows-prepare-projection-invalid", "windows-prepare-toolchain-invalid",
+    "windows-prepare-internal",
+)) | frozenset(
+    "windows-prepare-" + phase + "-failed-" + error_class
+    for phase in ("npm", "playwright") for error_class in WINDOWS_PREPARATION_ERROR_CLASSES
+)
+WINDOWS_SHRED_REFUSAL_CODES = frozenset((
+    "windows-cleanup-powershell-start-failed", "windows-cleanup-powershell-timeout",
+    "windows-cleanup-powershell-nonzero", "windows-cleanup-firewall-failed",
+    "windows-cleanup-root-check-failed", "windows-cleanup-precheckout-remove-failed",
+    "windows-cleanup-profile-failed", "windows-cleanup-shred-root-invalid",
+    "windows-cleanup-shred-enumerate-failed", "windows-cleanup-shred-entry-inspection-failed",
+    "windows-cleanup-shred-reparse-remove-failed", "windows-cleanup-shred-overwrite-failed",
+    "windows-cleanup-shred-file-remove-failed", "windows-cleanup-shred-directory-remove-failed",
+    "windows-cleanup-shred-root-remove-failed", "windows-cleanup-shred-internal",
+    "windows-cleanup-internal",
+))
 CRYPTO_CONTROL_REFUSAL_CODES = frozenset((
     "crypto-target-invalid", "crypto-acl-powershell-unavailable", "crypto-acl-reparse-point",
     "crypto-acl-owner-unresolved", "crypto-acl-owner-untrusted", "crypto-acl-writer-untrusted",
@@ -150,6 +182,7 @@ MACOS_OPERATION_RAW_REFUSALS = {
         "prepare-run-root-invalid", "prepared-output-invalid", "prepared-output-path-invalid",
         "prepared-output-exists", "preparation-path-invalid", "profile-config-invalid",
         "process-start-failed", "process-wait-failed", "log-too-large", "playwright-failed",
+        "tool-runtime-dependencies-invalid",
         "process-cleanup-incomplete", "prepared-file-count",
         "prepared-link-invalid", "prepared-tree-size", "prepared-member-type", "prepared-input-invalid",
         "cleanup-incomplete",
@@ -182,8 +215,12 @@ MACOS_OPERATION_RAW_REFUSALS = {
     )),
 }
 MACOS_NPM_PREPARATION_ERROR_CLASSES = frozenset((
-    "EPERM", "EACCES", "ENOTFOUND", "ECONNREFUSED", "E403", "E404", "EINTEGRITY", "ENOENT",
-    "sandbox-deny", "other",
+    "EPERM", "EACCES", "ENOTFOUND", "ECONNREFUSED", "ECONNRESET", "EAI_AGAIN", "ETIMEDOUT",
+    "ENOTCACHED", "E401", "E403", "E404", "E408", "E429", "EINTEGRITY", "ENOENT", "ENOTDIR",
+    "EISDIR", "ENOSPC", "sandbox-deny", "node-start-failed", "killed-by-signal-4",
+    "killed-by-signal-5", "killed-by-signal-6", "killed-by-signal-9", "killed-by-signal-10",
+    "killed-by-signal-11", "killed-by-signal-15", "killed-by-signal-24", "killed-by-signal-25",
+    "killed-by-signal-other", "other",
 ))
 MACOS_OPERATION_RAW_REFUSALS["prepare"] |= frozenset(
     "npm-failed-" + error_class for error_class in MACOS_NPM_PREPARATION_ERROR_CLASSES

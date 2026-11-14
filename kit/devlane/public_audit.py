@@ -327,6 +327,7 @@ AUDIT_OUTCOME_LINES = frozenset((
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-bootstrap",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-macos-preflight",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-windows-preflight",
+    "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-windows-prepare",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-asset-fetch",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-macos-supervisor-start",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-macos-prepare",
@@ -342,6 +343,9 @@ DECRYPT_FAILURE_CODES = frozenset((
     "decrypt-key-unavailable", "decrypt-manifest-unavailable", "decrypt-rejected", "decrypt-timeout",
 ))
 WINDOWS_RUNNER_REFUSAL_CODES = frozenset(("windows-runner-failed", "boundary"))
+WINDOWS_PREPARE_STEP = "Prepare dependencies before the cut"
+WINDOWS_PREPARE_REFUSAL_CODES = refusal_codes.WINDOWS_PREPARE_REFUSAL_CODES
+WINDOWS_SHRED_REFUSAL_CODES = refusal_codes.WINDOWS_SHRED_REFUSAL_CODES
 FETCH_REFUSAL_CODES = refusal_codes.DOWNLOAD_REFUSAL_CODES | frozenset(("fetch-failed",))
 SUPERVISOR_START_REFUSAL_CODES = (
     refusal_codes.STARTUP_REFUSAL_CODES | refusal_codes.STARTUP_DIAGNOSTIC_CODES
@@ -365,7 +369,10 @@ def _code_alternative(codes):
 
 
 REFUSAL_LINE = re.compile(
-    r"(?:devlane_refusal=" + _code_alternative(FETCH_REFUSAL_CODES | WINDOWS_RUNNER_REFUSAL_CODES)
+    r"(?:devlane_refusal=" + _code_alternative(
+        FETCH_REFUSAL_CODES | WINDOWS_RUNNER_REFUSAL_CODES
+        | WINDOWS_PREPARE_REFUSAL_CODES | WINDOWS_SHRED_REFUSAL_CODES
+    )
     + r"|devlane_supervisor_refusal=" + _code_alternative(
         refusal_codes.REFUSAL_CODES | SUPERVISOR_START_REFUSAL_CODES | SUPERVISOR_CLEANUP_REFUSAL_CODES
         | MACOS_DECRYPT_SUPERVISOR_REFUSAL_CODES | refusal_codes.MACOS_OPERATION_REFUSAL_CODES
@@ -869,10 +876,14 @@ class _Grammar:
             if (step_name == "Fetch ciphertext and sanitized dependency projection"
                     and code in FETCH_REFUSAL_CODES):
                 return True
+            if step_name == WINDOWS_PREPARE_STEP:
+                return self.job_runner == "windows-2025" and code in WINDOWS_PREPARE_REFUSAL_CODES
+            if step_name == "Shred runner-local workspace" and self.job_runner == "windows-2025":
+                return code in (WINDOWS_RUNNER_REFUSAL_CODES | WINDOWS_SHRED_REFUSAL_CODES)
             windows_steps = {
-                "Prepare dependencies before the cut", "Prove public connectivity before the cut",
+                "Prove public connectivity before the cut",
                 "Cut network and start the isolated supervisor", "Probe isolation before decryption",
-                "Execute offline profile and filter public summary", "Shred runner-local workspace",
+                "Execute offline profile and filter public summary",
             }
             return (self.job_runner == "windows-2025" and step_name in windows_steps
                     and code in WINDOWS_RUNNER_REFUSAL_CODES)
@@ -1259,6 +1270,14 @@ class _Grammar:
             if line.startswith("KD-DEVLANE-DISPATCH "):
                 public_counts["dispatch"] = public_counts.get("dispatch", 0) + 1
                 return True
+        if line.startswith("devlane_refusal=") and step_name == WINDOWS_PREPARE_STEP:
+            code = line[len("devlane_refusal="):]
+            if self.job_runner != "windows-2025" or code not in WINDOWS_PREPARE_REFUSAL_CODES:
+                return False
+            public_counts["early_failure_marker"] = public_counts.get("early_failure_marker", 0) + 1
+            public_counts["early_failure_step"] = step_name
+            public_counts["early_failure_code"] = code
+            return public_counts["early_failure_marker"] == 1
         if self.refusal_line_ok(step_name, line) or line == "devlane_permit=refused":
             return True
         return False
@@ -2004,7 +2023,8 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         if counts.get("early_failure_marker"):
             early_failure = counts.get("early_failure_step")
             dispatch_bound_failure = early_failure in (
-                "Fetch ciphertext and sanitized dependency projection", *MACOS_DIAGNOSED_FAILURE_STEPS,
+                "Fetch ciphertext and sanitized dependency projection", WINDOWS_PREPARE_STEP,
+                *MACOS_DIAGNOSED_FAILURE_STEPS,
             )
             if (counts.get("early_failure_marker") != 1 or counts.get("early_failure_exit") not in (1, 2)
                     or counts.get("early_failed_step") != early_failure
@@ -2015,7 +2035,7 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
                     or counts.get("windows_decrypt=accepted manifest=bound") or counts.get("decrypt_failure_marker")
                     or counts.get("decrypt_refusal_detail")):
                 _refuse()
-            if early_failure in (MACOS_PREPARE_STEP, MACOS_SUPERVISOR_START_STEP):
+            if early_failure in (MACOS_PREPARE_STEP, MACOS_SUPERVISOR_START_STEP, WINDOWS_PREPARE_STEP):
                 if ("Probe isolation before decryption" in seen_steps
                         or "Decrypt authenticated bundle" in seen_steps
                         or "Execute offline profile and filter public summary" in seen_steps
@@ -2038,10 +2058,13 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
                   or "Execute offline profile and filter public summary" in seen_steps
                   or counts.get("network_cut_probe=pass") or counts.get("authenticated_decryption=pass")):
                 _refuse()
-            if (early_failure in MACOS_DIAGNOSED_FAILURE_STEPS
-                    and (identity.get("platform") != "macos"
-                         or counts.get("early_failure_code") not in MACOS_OPERATION_STEP_REFUSALS[early_failure]
+            if (early_failure in MACOS_DIAGNOSED_FAILURE_STEPS and identity.get("platform") == "macos"
+                    and (counts.get("early_failure_code") not in MACOS_OPERATION_STEP_REFUSALS[early_failure]
                          or counts.get("early_failure_exit") != 2)):
+                _refuse()
+            if (early_failure == WINDOWS_PREPARE_STEP and identity.get("platform") == "windows"
+                    and (counts.get("early_failure_code") not in WINDOWS_PREPARE_REFUSAL_CODES
+                         or counts.get("early_failure_exit") != 1)):
                 _refuse()
         elif counts.get("dispatch") != 1 or counts.get("permit") != 1:
             _refuse()
@@ -2307,7 +2330,8 @@ def validate_job_contract(jobs, identity, profile, *, surface=None):
             "linux": {"Fetch public control and validate dispatch"},
             "macos": {"Fetch public control and validate dispatch", "Prepare hosted runner isolation state",
                       MACOS_PREPARE_STEP, MACOS_SUPERVISOR_START_STEP},
-            "windows": {"Fetch public control and validate dispatch", "Prepare hosted Windows isolation state"},
+            "windows": {"Fetch public control and validate dispatch", "Prepare hosted Windows isolation state",
+                        WINDOWS_PREPARE_STEP},
         }.get(platform, set())
         if candidate in platform_early_steps:
             early_failure_step = candidate
@@ -2506,6 +2530,10 @@ def _audit_outcome_line(jobs, identity, diagnosed_failure=None):
                 or diagnosed_failure not in MACOS_DIAGNOSED_FAILURE_DISPOSITIONS):
             _refuse()
         disposition = MACOS_DIAGNOSED_FAILURE_DISPOSITIONS[diagnosed_failure]
+    elif failed == WINDOWS_PREPARE_STEP:
+        if identity.get("platform") != "windows":
+            _refuse()
+        disposition = "windows-prepare"
     else:
         disposition = EARLY_FAILURE_STEP_IDS.get(failed)
     if disposition is not None:
@@ -2547,6 +2575,9 @@ def validate_job_log_metadata_binding(surface, run_job, identity):
             )
         elif early_failure == "Prepare hosted Windows isolation state":
             allowed = (identity.get("platform") == "windows" and code in WINDOWS_PREFLIGHT_REFUSAL_CODES)
+        elif early_failure == WINDOWS_PREPARE_STEP and identity.get("platform") == "windows":
+            allowed = (identity.get("platform") == "windows" and code in WINDOWS_PREPARE_REFUSAL_CODES
+                       and surface.get("early_failure_exit") == 1)
         elif early_failure == "Prepare hosted runner isolation state":
             allowed = (identity.get("platform") == "macos" and code in MACOS_PREFLIGHT_REFUSAL_CODES)
         elif early_failure in MACOS_DIAGNOSED_FAILURE_DISPOSITIONS:
@@ -2580,10 +2611,13 @@ def validate_job_log_metadata_binding(surface, run_job, identity):
             downstream = step_by_name[name]
             if downstream.get("status") != "completed" or downstream.get("conclusion") != "skipped":
                 _refuse()
-        diagnosed_failure = (early_failure if early_failure in MACOS_DIAGNOSED_FAILURE_DISPOSITIONS else None)
+        diagnosed_failure = (early_failure if identity.get("platform") == "macos"
+                             and early_failure in MACOS_DIAGNOSED_FAILURE_DISPOSITIONS else None)
         outcome = _audit_outcome_line([run_job], identity, diagnosed_failure=diagnosed_failure)
         disposition = (MACOS_DIAGNOSED_FAILURE_DISPOSITIONS.get(early_failure)
-                       if diagnosed_failure is not None else EARLY_FAILURE_STEP_IDS.get(early_failure))
+                       if diagnosed_failure is not None else
+                       "windows-prepare" if early_failure == WINDOWS_PREPARE_STEP else
+                       EARLY_FAILURE_STEP_IDS.get(early_failure))
         expected_disposition = "disposition=run-failed-at-" + str(disposition)
         if (disposition is None or expected_disposition not in outcome
                 or outcome == "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed"):

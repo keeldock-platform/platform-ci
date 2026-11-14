@@ -369,7 +369,8 @@ class PowerShellStaticTests(unittest.TestCase):
         precheckout = cleanup[precheckout_start:precheckout_end]
         self.assertIn("Remove-Item -LiteralPath $runRoot -Recurse -Force -ErrorAction Stop", precheckout)
         self.assertNotIn("sandbox_windows.py", precheckout)
-        self.assertIn("Write-Output 'devlane_refusal=windows-runner-failed'", cleanup)
+        self.assertIn("Write-Output 'devlane_refusal=windows-cleanup-root-check-failed'", cleanup)
+        self.assertIn("Write-Output 'devlane_refusal=windows-cleanup-precheckout-remove-failed'", cleanup)
         self.assertNotRegex(precheckout, r"(?i)\$_|\$PSItem|Write-Error|Write-Host")
 
 

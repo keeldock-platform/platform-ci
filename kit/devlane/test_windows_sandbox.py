@@ -49,6 +49,16 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(windows.WindowsBoundaryRefusal):
                 windows.validate_environment(bad)
 
+    def test_npm_preparation_error_class_uses_bounded_fixed_log_vocabulary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            logs = Path(temporary)
+            for error_class in sorted(windows.refusal_codes.WINDOWS_PREPARATION_ERROR_CLASSES - {"other"}):
+                (logs / "npm-debug.log").write_text("npm error code " + error_class + "\n", encoding="ascii")
+                with self.subTest(error_class=error_class):
+                    self.assertEqual(windows._npm_preparation_error_class(logs), error_class)
+            (logs / "npm-debug.log").write_text("unclassified diagnostic\n", encoding="ascii")
+            self.assertEqual(windows._npm_preparation_error_class(logs), "other")
+
     def test_profile_commands_map_only_fixed_workspace_and_scratch_paths(self):
         node = r"C:\hostedtoolcache\windows\node\24.22.1\x64\node.exe"
         npm = r"C:\hostedtoolcache\windows\node\24.22.1\x64\node_modules\npm\bin\npm-cli.js"
@@ -117,8 +127,9 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             with mock.patch.object(windows, "remove_firewall", side_effect=windows.WindowsBoundaryRefusal()), \
                     mock.patch.object(windows, "delete_profile", side_effect=windows.WindowsBoundaryRefusal()), \
                     mock.patch.object(windows, "shred_tree", return_value="wiped\n") as wipe, \
-                    self.assertRaisesRegex(windows.WindowsBoundaryRefusal, "cleanup-incomplete"):
+                    self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
                 windows.cleanup_runner(state, root)
+            self.assertEqual(caught.exception.code, "windows-cleanup-firewall-failed")
             wipe.assert_called_once_with(root, plaintext_root=None)
 
     def test_windows_archive_names_reject_aliases_and_path_escapes(self):
@@ -163,7 +174,7 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             npm.write_text("", encoding="ascii")
             requests = []
 
-            def isolated(_state, request, _run_root):
+            def isolated(_state, request, _run_root, **_kwargs):
                 requests.append(dict(request))
                 project = Path(request["working_directory"])
                 modules = project / "node_modules"
@@ -192,7 +203,76 @@ class WindowsSandboxValidationTests(unittest.TestCase):
                 self.assertEqual(request["environment"][0].startswith("PATH="), True)
                 self.assertIn("NPM_CONFIG_IGNORE_SCRIPTS=true", request["environment"])
                 self.assertIn("NPM_CONFIG_OFFLINE=false", request["environment"])
+                self.assertIn("NPM_CONFIG_LOGS_DIR=" + str(output / "npm-cache" / "_logs"), request["environment"])
             self.assertTrue((output / "prepared" / "toolchain.json").is_file())
+
+    def test_prepare_maps_native_process_start_and_timeout_to_distinct_fixed_codes(self):
+        for status, expected in (
+            ("process-start-failed", "windows-prepare-npm-process-start-failed"),
+            ("timeout", "windows-prepare-npm-work-deadline"),
+        ):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "run"
+                state = root / "state" / "sandbox.json"
+                state.parent.mkdir(parents=True)
+                projection = root / "projection.json"
+                projection.write_text("{}", encoding="ascii")
+                node = root / "node.exe"
+                npm = root / "npm-cli.js"
+                node.write_text("", encoding="ascii")
+                npm.write_text("", encoding="ascii")
+                with mock.patch.object(windows.sys, "platform", "win32"), \
+                        mock.patch.object(windows.fetch, "validate_projection", return_value={
+                            "npm_package": {}, "npm_lock": {}, "playwright": [],
+                        }), \
+                        mock.patch.object(windows, "_npm_tools", return_value=(node, npm)), \
+                        mock.patch.object(windows, "_deadline_remaining", return_value=120), \
+                        mock.patch.object(windows, "create_profile", return_value={}), \
+                        mock.patch.object(windows, "delete_profile"), \
+                        mock.patch.object(windows, "_native_run", return_value={
+                            "status": status, "exit_code": 0, "token": "", "job": "",
+                        }):
+                    with self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
+                        windows.prepare_dependencies(projection, root / "prepared", root / "deadline", state)
+                self.assertEqual(caught.exception.code, expected)
+
+    def test_prepare_reports_projection_output_and_profile_creation_sites(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run"
+            state = root / "state" / "sandbox.json"
+            state.parent.mkdir(parents=True)
+            projection = root / "projection.json"
+            projection.write_text("{}", encoding="ascii")
+            node = root / "node.exe"
+            npm = root / "npm-cli.js"
+            node.write_text("", encoding="ascii")
+            npm.write_text("", encoding="ascii")
+            with mock.patch.object(windows.sys, "platform", "win32"), \
+                    mock.patch.object(windows.fetch, "validate_projection", side_effect=windows.fetch.Refusal("invalid")):
+                with self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
+                    windows.prepare_dependencies(projection, root / "projection-failed", root / "deadline", state)
+            self.assertEqual(caught.exception.code, "windows-prepare-projection-invalid")
+
+            existing = root / "existing-output"
+            existing.mkdir()
+            with mock.patch.object(windows.sys, "platform", "win32"), \
+                    mock.patch.object(windows.fetch, "validate_projection", return_value={
+                        "npm_package": {}, "npm_lock": {}, "playwright": [],
+                    }), \
+                    mock.patch.object(windows, "_npm_tools", return_value=(node, npm)):
+                with self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
+                    windows.prepare_dependencies(projection, existing, root / "deadline", state)
+            self.assertEqual(caught.exception.code, "windows-prepare-output-invalid")
+
+            with mock.patch.object(windows.sys, "platform", "win32"), \
+                    mock.patch.object(windows.fetch, "validate_projection", return_value={
+                        "npm_package": {}, "npm_lock": {}, "playwright": [],
+                    }), \
+                    mock.patch.object(windows, "_npm_tools", return_value=(node, npm)), \
+                    mock.patch.object(windows, "create_profile", side_effect=windows.WindowsBoundaryRefusal("profile-state")):
+                with self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
+                    windows.prepare_dependencies(projection, root / "profile-failed", root / "deadline", state)
+            self.assertEqual(caught.exception.code, "windows-prepare-profile-create-failed")
 
     def test_filtered_summary_carries_diagnostic_test_and_browser_records(self):
         manifest = {
