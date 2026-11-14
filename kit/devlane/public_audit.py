@@ -198,8 +198,9 @@ WINDOWS_CRYPTO_ACL_OUTPUT_REFUSAL_CODES = frozenset((
     "crypto-acl-stdout-multiple-lines", "crypto-acl-stdout-not-sid",
     "crypto-acl-stdout-bom-or-whitespace",
 )) | frozenset(
-    "crypto-acl-exit-" + str(code) for code in range(1, 16) if code not in (3, 4, 5, 6)
-)
+    "crypto-acl-exit-" + str(code) for code in range(1, 32) if code not in (3, 4, 5, 6)
+) | frozenset("crypto-acl-check-" + operation
+             for operation, _code in refusal_codes.WINDOWS_ACL_CHECK_OPERATIONS)
 MACOS_CRYPTO_CONTROL_REFUSAL_CODES = CRYPTO_CONTROL_REFUSAL_CODES - WINDOWS_CRYPTO_ACL_OUTPUT_REFUSAL_CODES
 WINDOWS_CRYPTO_ACL_REFUSAL_CODES = frozenset((
     "crypto-acl-powershell-unavailable", "crypto-acl-reparse-point", "crypto-acl-owner-unresolved",
@@ -208,8 +209,9 @@ WINDOWS_CRYPTO_ACL_REFUSAL_CODES = frozenset((
     "crypto-acl-stdout-non-ascii", "crypto-acl-stdout-empty", "crypto-acl-stdout-multiple-lines",
     "crypto-acl-stdout-not-sid", "crypto-acl-stdout-bom-or-whitespace",
 )) | frozenset(
-    "crypto-acl-exit-" + str(code) for code in range(1, 16) if code not in (3, 4, 5, 6)
-)
+    "crypto-acl-exit-" + str(code) for code in range(1, 32) if code not in (3, 4, 5, 6)
+) | frozenset("crypto-acl-check-" + operation
+             for operation, _code in refusal_codes.WINDOWS_ACL_CHECK_OPERATIONS)
 CRYPTO_SEAL_REFUSAL_CODES = CRYPTO_CONTROL_REFUSAL_CODES - frozenset((
     "crypto-tree-mismatch", "crypto-import-invalid", "crypto-key-present", "crypto-script-invalid",
 ))
@@ -1218,6 +1220,10 @@ class _Grammar:
                 return public_counts["acceptance_refused"] == 1
             if (diagnostic_contract.is_vendor_node_diagnostic(line)
                     and (self.kind != "synthetic" or self.job_runner != "ubuntu-24.04")):
+                return False
+            if (diagnostic_contract.is_node_version_spawn_diagnostic(line)
+                    and (self.kind != "synthetic" or self.platform != "linux"
+                         or self.job_runner != "ubuntu-24.04")):
                 return False
             if self.kind == "synthetic":
                 if diagnostic_contract.public_e2e_vitest_diagnostic(line):

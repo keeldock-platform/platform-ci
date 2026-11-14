@@ -215,7 +215,7 @@ class ControlPythonPortableTests(unittest.TestCase):
                 self.assertEqual(control_python._powershell_acl_exit_reason(exit_code), reason)
         self.assertIsNone(control_python._powershell_acl_exit_reason(0))
         self.assertEqual(control_python._powershell_acl_exit_reason(7), "crypto-acl-exit-7")
-        self.assertEqual(control_python._powershell_acl_exit_reason(16), "crypto-acl-exit-other")
+        self.assertEqual(control_python._powershell_acl_exit_reason(16), "crypto-acl-exit-16")
 
     def test_windows_acl_output_parser_accepts_only_one_sid_line_and_normalizes_bom_crlf(self):
         self.assertEqual(
@@ -253,8 +253,13 @@ class ControlPythonPortableTests(unittest.TestCase):
             (mock.Mock(returncode=0, stdout=b"S-1-5-21-100\nextra\n", stderr=b""), "crypto-acl-stdout-multiple-lines"),
             (mock.Mock(returncode=0, stdout=b"S-1-5-21-100\n", stderr=b"warning\n"), "crypto-acl-stderr-nonempty"),
             (mock.Mock(returncode=0, stdout=b"\xff", stderr=b""), "crypto-acl-stdout-non-ascii"),
+            (mock.Mock(
+                returncode=16,
+                stdout=b"windows_acl_check_failure=operation=child-enumerate exception=IOException\n",
+                stderr=b"",
+            ), "crypto-acl-check-child-enumerate"),
             (mock.Mock(returncode=7, stdout=b"", stderr=b""), "crypto-acl-exit-7"),
-            (mock.Mock(returncode=28, stdout=b"", stderr=b""), "crypto-acl-exit-other"),
+            (mock.Mock(returncode=28, stdout=b"", stderr=b""), "crypto-acl-exit-28"),
         ):
             with self.subTest(reason=reason, returncode=result.returncode), \
                     mock.patch.object(Path, "is_file", return_value=True), \
@@ -263,11 +268,38 @@ class ControlPythonPortableTests(unittest.TestCase):
                 control_python._powershell_acl_owner(Path("D:/run/control-python-deps"))
             self.assertEqual(caught.exception.reason, reason)
 
+    def test_windows_acl_check_failure_requires_the_matching_fixed_exit_and_operation(self):
+        for exit_code, (operation, reason) in control_python._POWERSHELL_ACL_CHECK_EXIT_REASONS.items():
+            diagnostic = ("windows_acl_check_failure=operation=%s exception=IOException\n" % operation).encode("ascii")
+            with self.subTest(operation=operation), \
+                    mock.patch.object(Path, "is_file", return_value=True), \
+                    mock.patch.object(control_python.subprocess, "run", return_value=mock.Mock(
+                        returncode=exit_code, stdout=diagnostic, stderr=b"",
+                    )), self.assertRaises(control_python.CryptoRefusal) as caught:
+                control_python._powershell_acl_owner(Path("D:/run/control-python-deps"))
+            self.assertEqual(caught.exception.reason, reason)
+
+        diagnostic = b"windows_acl_check_failure=operation=child-enumerate exception=IOException\n"
+        for result in (
+            mock.Mock(returncode=17, stdout=diagnostic, stderr=b""),
+            mock.Mock(returncode=16, stdout=diagnostic, stderr=b"private error"),
+        ):
+            with mock.patch.object(Path, "is_file", return_value=True), \
+                    mock.patch.object(control_python.subprocess, "run", return_value=result), \
+                    self.assertRaises(control_python.CryptoRefusal) as caught:
+                control_python._powershell_acl_owner(Path("D:/run/control-python-deps"))
+            self.assertNotEqual(caught.exception.reason, "crypto-acl-check-child-enumerate")
+
     def test_windows_acl_powershell_command_is_quiet_and_text_formatted(self):
         command = control_python._powershell_acl_command(Path("D:/run/control-python-deps"), Path("pwsh.exe"))
         self.assertEqual(command[1:7], ["-NoLogo", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-EncodedCommand"])
         script = base64.b64decode(command[-1]).decode("utf-16le")
         self.assertIn("$ProgressPreference = 'SilentlyContinue'", script)
+        self.assertIn("$items = @()", script)
+        self.assertIn("Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop", script)
+        self.assertIn("Get-Acl -LiteralPath $item.FullName -ErrorAction Stop", script)
+        self.assertIn("windows_acl_check_failure=operation=", script)
+        self.assertEqual(script.count("catch { Stop-AclCheck"), 26)
         self.assertEqual(script.count("[Console]::Out.WriteLine($ownerSid)"), 1)
 
     def test_windows_crypto_acl_bootstrap_is_protected_before_install(self):

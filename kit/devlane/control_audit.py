@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "confinement"))
 from macos_public_audit import GitHubAPI, _read_annotations
 import permit
 import public_audit
+import refusal_codes
 
 
 REPOSITORY = "keeldock-platform/platform-ci"
@@ -88,13 +89,17 @@ _WINDOWS_ACL_EXCEPTION_TYPES = (
     "UnauthorizedAccessException|PrivilegeNotHeldException|InvalidOperationException|ArgumentException|"
     "IdentityNotMappedException|IOException|other"
 )
+_WINDOWS_ACL_CHECK_OPERATIONS = "|".join(
+    re.escape(operation) for operation, _code in refusal_codes.WINDOWS_ACL_CHECK_OPERATIONS
+)
 _WINDOWS_ACL_LIVE_LINE = re.compile(
     r"windows_acl_live=(pass cases=2|skipped platform|failed stage="
     r"(powershell-missing|fixture-create|protected-run|protected-parse|extra-writer-exit) "
-    r"exit=(0|[1-9]|1[0-5]|other) stderr=(present|empty) "
+    r"exit=(0|[1-9]|1[0-9]|2[0-9]|31|other) stderr=(present|empty) "
     r"(?:stdout=(empty|multiple-lines|not-sid|bom-or-whitespace|sid) operation=none exception=none|"
     r"stdout=fixture-diagnostic operation=(" + _WINDOWS_ACL_FIXTURE_OPERATIONS + ") exception=("
-    + _WINDOWS_ACL_EXCEPTION_TYPES + r")))\Z"
+    + _WINDOWS_ACL_EXCEPTION_TYPES + r")|stdout=check-diagnostic operation=("
+    + _WINDOWS_ACL_CHECK_OPERATIONS + ") exception=(" + _WINDOWS_ACL_EXCEPTION_TYPES + r")))\Z"
 )
 WINDOWS_NATIVE_STEP_NAMES = (
     "Fetch public candidate", "Parse every PowerShell file under kit", "Compile native confinement module",
@@ -421,10 +426,25 @@ def windows_acl_live_outcome(log):
             _refuse()
         line = public_audit.TIME_PREFIX.sub("", line, count=1)
         match = _WINDOWS_ACL_LIVE_LINE.fullmatch(line)
+        check_diagnostic = "stdout=check-diagnostic" in line
+        fixture_diagnostic = "stdout=fixture-diagnostic" in line
+        check_operation = None
+        if match is not None and check_diagnostic:
+            check_operation = match.group(8)
+            exit_value = match.group(3)
+            expected_exit = dict((operation, code)
+                                 for operation, code in refusal_codes.WINDOWS_ACL_CHECK_OPERATIONS).get(
+                                     check_operation,
+                                 )
         if (match is None
-                or (line.startswith("windows_acl_live=failed ")
-                    and "stdout=fixture-diagnostic" in line
-                    and "stage=fixture-create " not in line)):
+                or (fixture_diagnostic and "stage=fixture-create " not in line)
+                or (check_diagnostic and not any(
+                    "stage=" + stage + " " in line for stage in ("protected-run", "extra-writer-exit")
+                ))
+                or (check_diagnostic and (exit_value == "other" or int(exit_value) != expected_exit))
+                or (line.startswith("windows_acl_live=failed ") and not check_diagnostic
+                    and match.group(3) not in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+                                               "10", "11", "12", "13", "14", "15", "other"))):
             _refuse()
         value = match.group(1)
         matches.append("pass" if value == "pass cases=2" else

@@ -2332,6 +2332,42 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         ))
         self.assertEqual(len(diagnostic_contract.VENDOR_NODE_PATH_CODES), 45)
 
+    def test_node_version_spawn_diagnostics_are_linux_synthetic_version_checks_only(self):
+        line = (
+            "devlane_production_e2e=refused stage=prepare-node-version-verification "
+            "exception=node-version-mount-noexec"
+        )
+        self.assertTrue(diagnostic_contract.public_preparation_diagnostic(line))
+        self.assertEqual(
+            acceptance_diagnostics.failure_tail("production-path-e2e", (line + "\n").encode("ascii")),
+            [line],
+        )
+        linux = audit._Grammar(
+            Path(__file__).resolve().parents[2] / ".github/workflows/devlane-synthetic.yml",
+            "devlane-synthetic", {"run_id": "12345", "control_sha": SHA, "platform": "linux"}, "synthetic",
+        )
+        windows = audit._Grammar(
+            Path(__file__).resolve().parents[2] / ".github/workflows/devlane-synthetic.yml",
+            "devlane-synthetic", {"run_id": "12345", "control_sha": SHA, "platform": "windows"}, "synthetic",
+        )
+        for code in diagnostic_contract.NODE_VERSION_SPAWN_CHECK_CODES:
+            candidate = (
+                "devlane_production_e2e=refused stage=prepare-node-version-verification exception=" + code
+            )
+            self.assertTrue(diagnostic_contract.public_preparation_diagnostic(candidate))
+            self.assertTrue(linux.step_output_ok(
+                "Run full source-free production-path acceptance", candidate, {},
+            ))
+            self.assertFalse(windows.step_output_ok(
+                "Run full source-free production-path acceptance", candidate, {},
+            ))
+        self.assertFalse(diagnostic_contract.public_preparation_diagnostic(
+            line.replace("prepare-node-version-verification", "prepare-node-toolchain-validation"),
+        ))
+        self.assertFalse(diagnostic_contract.public_preparation_diagnostic(
+            line.replace("node-version-mount-noexec", "node-version-parent-search-33"),
+        ))
+
     def test_windows_acl_live_log_audits_only_fixed_shapes(self):
         self.assertEqual(control_audit.windows_acl_live_outcome(
             b"2026-11-14T03:05:16.5060466Z windows_acl_live=pass cases=2\n",
@@ -2354,6 +2390,14 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             b"stdout=fixture-diagnostic operation=apply-protected-acl exception=PrivilegeNotHeldException\n"
         )
         self.assertEqual(control_audit.windows_acl_live_outcome(diagnosed), "failed")
+        check_diagnosed = (
+            b"windows_acl_live=failed stage=protected-run exit=16 stderr=empty "
+            b"stdout=check-diagnostic operation=child-enumerate exception=UnauthorizedAccessException\n"
+        )
+        self.assertEqual(control_audit.windows_acl_live_outcome(check_diagnosed), "failed")
+        self.assertEqual(control_audit.windows_acl_live_outcome(
+            check_diagnosed.replace(b"stage=protected-run", b"stage=extra-writer-exit"),
+        ), "failed")
         for invalid in (
             b"windows_acl_live=failed stage=private-path exit=6 stderr=present stdout=not-sid operation=none exception=none\n",
             b"windows_acl_live=failed stage=fixture-create exit=16 stderr=present stdout=not-sid operation=none exception=none\n",
@@ -2362,6 +2406,11 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             b"windows_acl_live=failed stage=fixture-create exit=12 stderr=present stdout=fixture-diagnostic operation=private-path exception=IOException\n",
             b"windows_acl_live=failed stage=fixture-create exit=12 stderr=present stdout=fixture-diagnostic operation=apply-root-acl exception=private-type\n",
             b"windows_acl_live=failed stage=protected-run exit=12 stderr=present stdout=fixture-diagnostic operation=apply-root-acl exception=IOException\n",
+            b"windows_acl_live=failed stage=fixture-create exit=16 stderr=empty stdout=check-diagnostic operation=child-enumerate exception=UnauthorizedAccessException\n",
+            b"windows_acl_live=failed stage=protected-parse exit=16 stderr=empty stdout=check-diagnostic operation=child-enumerate exception=UnauthorizedAccessException\n",
+            b"windows_acl_live=failed stage=protected-run exit=17 stderr=empty stdout=check-diagnostic operation=child-enumerate exception=UnauthorizedAccessException\n",
+            b"windows_acl_live=failed stage=protected-run exit=16 stderr=empty stdout=check-diagnostic operation=private-path exception=UnauthorizedAccessException\n",
+            b"windows_acl_live=failed stage=protected-run exit=16 stderr=empty stdout=check-diagnostic operation=child-enumerate exception=private-type\n",
             b"windows_acl_live=pass cases=2\nwindows_acl_live=pass cases=2\n",
             b"windows_acl_live=pass cases=2\n"
             b"windows_acl_live=failed stage=fixture-create exit=6 stderr=present stdout=not-sid operation=none exception=none\xff\n",

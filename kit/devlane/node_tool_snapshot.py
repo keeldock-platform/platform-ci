@@ -16,7 +16,7 @@ import node_vendor_source
 
 PREPARATION_ID = node_vendor_source.PREPARATION_ID
 SHARED_TOOLCHAIN_ANCHOR = Path("/opt")
-PROTECTED_SNAPSHOT_BASE = Path("/run/platform-ci-devlane/node-tools")
+PROTECTED_SNAPSHOT_BASE = Path("/var/lib/platform-ci-devlane/node-tools")
 DEFAULT_SNAPSHOT_BASE = PROTECTED_SNAPSHOT_BASE
 MANIFEST_NAME = ".devlane-node-snapshot.json"
 MANIFEST_INVALID_SITES = frozenset((

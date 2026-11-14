@@ -19,7 +19,7 @@ def _powershell_command(script, powershell):
             "-EncodedCommand", encoded]
 
 
-_SAFE_EXIT_CODES = frozenset((0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15))
+_SAFE_EXIT_CODES = frozenset(range(32))
 _SAFE_FAILURE_STAGES = frozenset((
     "powershell-missing", "fixture-create", "protected-run", "protected-parse", "extra-writer-exit",
 ))
@@ -29,10 +29,7 @@ _SAFE_FIXTURE_OPERATIONS = frozenset((
     "administrators-rule-add", "everyone-rule-add", "inherit-only-rule-add",
     "apply-root-acl", "apply-protected-acl", "apply-extra-writer-acl", "other",
 ))
-_SAFE_EXCEPTION_TYPES = frozenset((
-    "UnauthorizedAccessException", "PrivilegeNotHeldException", "InvalidOperationException",
-    "ArgumentException", "IdentityNotMappedException", "IOException", "other",
-))
+_SAFE_EXCEPTION_TYPES = control_python._POWERSHELL_ACL_EXCEPTION_TYPES
 _SID = re.compile(rb"S-1-(?:[0-9]+-)*[0-9]+\Z")
 _FIXTURE_DIAGNOSTIC = re.compile(
     rb"windows_acl_fixture_failure=operation=([a-z-]+) exception=([A-Za-z]+)\Z"
@@ -63,6 +60,8 @@ def _stdout_shape(payload):
         return "empty"
     if _fixture_diagnostic(payload) is not None:
         return "fixture-diagnostic"
+    if control_python._powershell_acl_check_diagnostic(payload) is not None:
+        return "check-diagnostic"
     if b"\xef\xbb\xbf" in payload:
         return "bom-or-whitespace"
     try:
@@ -93,6 +92,8 @@ def _failure(stage, result=None):
     stdout = getattr(result, "stdout", b"")
     stderr_text = "present" if type(stderr) is bytes and stderr else "empty"
     diagnostic = _fixture_diagnostic(stdout) if stage == "fixture-create" else None
+    if diagnostic is None and stage in ("protected-run", "extra-writer-exit"):
+        diagnostic = control_python._powershell_acl_check_diagnostic(stdout)
     operation, exception_type = diagnostic if diagnostic is not None else ("none", "none")
     print("windows_acl_live=failed stage=%s exit=%s stderr=%s stdout=%s operation=%s exception=%s" % (
         stage, exit_text, stderr_text, _stdout_shape(stdout), operation, exception_type,
@@ -287,6 +288,36 @@ class LiveDiagnosticTests(unittest.TestCase):
             output.getvalue(),
             "windows_acl_live=failed stage=fixture-create exit=11 stderr=present "
             "stdout=fixture-diagnostic operation=apply-protected-acl exception=IOException\n",
+        )
+
+    def test_acl_check_diagnostic_is_exact_and_maps_only_known_exit_operations(self):
+        payload = b"windows_acl_check_failure=operation=child-enumerate exception=UnauthorizedAccessException\r\n"
+        self.assertEqual(control_python._powershell_acl_check_diagnostic(payload),
+                         ("child-enumerate", "UnauthorizedAccessException"))
+        self.assertEqual(control_python._powershell_acl_exit_reason(
+            16, payload, b"",
+        ), "crypto-acl-check-child-enumerate")
+        self.assertEqual(control_python._powershell_acl_exit_reason(
+            17, payload, b"",
+        ), "crypto-acl-exit-17")
+        self.assertIsNone(control_python._powershell_acl_check_diagnostic(
+            b"windows_acl_check_failure=operation=private-path exception=IOException\n",
+        ))
+        self.assertIsNone(control_python._powershell_acl_check_diagnostic(
+            b"windows_acl_check_failure=operation=acl-read exception=private-type\n",
+        ))
+        self.assertIsNone(control_python._powershell_acl_check_diagnostic(
+            payload + b"extra\n",
+        ))
+        output = StringIO()
+        with redirect_stdout(output):
+            _failure("protected-run", SimpleNamespace(
+                returncode=16, stdout=payload, stderr=b"private path and identity",
+            ))
+        self.assertEqual(
+            output.getvalue(),
+            "windows_acl_live=failed stage=protected-run exit=16 stderr=present "
+            "stdout=check-diagnostic operation=child-enumerate exception=UnauthorizedAccessException\n",
         )
 
 

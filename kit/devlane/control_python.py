@@ -32,14 +32,49 @@ _POWERSHELL_ACL_EXIT_REASONS = {
     5: "crypto-acl-owner-untrusted",
     6: "crypto-acl-writer-untrusted",
 }
+_POWERSHELL_ACL_CHECK_EXIT_REASONS = {
+    code: (operation, "crypto-acl-check-" + operation)
+    for operation, code in refusal_codes.WINDOWS_ACL_CHECK_OPERATIONS
+}
+_POWERSHELL_ACL_EXCEPTION_TYPES = frozenset((
+    "UnauthorizedAccessException", "PrivilegeNotHeldException", "InvalidOperationException",
+    "ArgumentException", "IdentityNotMappedException", "IOException", "other",
+))
+_POWERSHELL_ACL_CHECK_DIAGNOSTIC = re.compile(
+    rb"windows_acl_check_failure=operation=([a-z-]+) exception=([A-Za-z]+)\Z"
+)
 
 
-def _powershell_acl_exit_reason(exit_code):
+def _powershell_acl_check_diagnostic(payload):
+    if type(payload) is not bytes:
+        return None
+    normalized = payload.replace(b"\r\n", b"\n")
+    if normalized.endswith(b"\n"):
+        normalized = normalized[:-1]
+    if b"\r" in normalized or b"\n" in normalized:
+        return None
+    match = _POWERSHELL_ACL_CHECK_DIAGNOSTIC.fullmatch(normalized)
+    if match is None:
+        return None
+    operation, exception_type = (part.decode("ascii") for part in match.groups())
+    if (exception_type not in _POWERSHELL_ACL_EXCEPTION_TYPES
+            or operation not in {pair[0] for pair in _POWERSHELL_ACL_CHECK_EXIT_REASONS.values()}):
+        return None
+    return operation, exception_type
+
+
+def _powershell_acl_exit_reason(exit_code, stdout=b"", stderr=b""):
+    diagnostic = _powershell_acl_check_diagnostic(stdout)
+    if diagnostic is not None and not stderr:
+        operation, _exception_type = diagnostic
+        for expected_exit, (expected_operation, reason) in _POWERSHELL_ACL_CHECK_EXIT_REASONS.items():
+            if expected_exit == exit_code and expected_operation == operation:
+                return reason
     if exit_code == 0:
         return None
     if exit_code in _POWERSHELL_ACL_EXIT_REASONS:
         return _POWERSHELL_ACL_EXIT_REASONS[exit_code]
-    if type(exit_code) is int and 1 <= exit_code <= 15:
+    if type(exit_code) is int and 1 <= exit_code <= 31:
         return "crypto-acl-exit-" + str(exit_code)
     return "crypto-acl-exit-other"
 
@@ -81,33 +116,106 @@ def _powershell_acl_script(root):
     return r'''
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$root = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__ROOT__'))
-$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$ownerSid = $identity.User.Value
-$tokenOwnerSid = $identity.Owner.Value
-$trustedOwners = @($ownerSid, $tokenOwnerSid, 'S-1-5-18', 'S-1-5-32-544')
-$trustedWriters = @($ownerSid, $tokenOwnerSid, 'S-1-5-18', 'S-1-5-32-544')
-$writeMask = [long]0x40000000 -bor [long]0x00000116 -bor [long]0x00010000 -bor `
-             [long]0x00000040 -bor [long]0x00040000 -bor [long]0x00080000
-$items = @((Get-Item -LiteralPath (Split-Path -Parent $root)))
-$items += Get-Item -LiteralPath $root
-$items += Get-ChildItem -LiteralPath $root -Force -Recurse
-foreach ($item in $items) {
-    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { exit 3 }
-    $acl = Get-Acl -LiteralPath $item.FullName
-    try { $itemOwner = ([Security.Principal.NTAccount]$acl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value }
-    catch { exit 4 }
-    if ($trustedOwners -notcontains $itemOwner) { exit 5 }
-    $rules = $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
+function Stop-AclCheck([string]$Operation, [int]$Code, [object]$Failure) {
+    $exception = $Failure.Exception
+    $exceptionType = 'other'
+    for ($depth = 0; $depth -lt 3 -and $null -ne $exception; $depth++) {
+        $name = $exception.GetType().Name
+        if (@('UnauthorizedAccessException', 'PrivilegeNotHeldException', 'InvalidOperationException',
+              'ArgumentException', 'IdentityNotMappedException', 'IOException') -ccontains $name) {
+            $exceptionType = $name
+            break
+        }
+        $exception = $exception.InnerException
+    }
+    if (@('root-decode', 'owner-identity', 'owner-user-read', 'owner-token-read', 'trusted-sid-build',
+          'write-mask-build', 'parent-resolve', 'parent-item', 'root-item', 'child-enumerate',
+          'item-reparse-check', 'acl-read', 'acl-owner-read', 'acl-owner-translate', 'acl-owner-compare',
+          'acl-rules-read', 'rule-propagation-read', 'rule-propagation-compare', 'rule-type-read',
+          'rule-type-compare', 'rule-identity-read', 'rule-writer-compare', 'rule-rights-read',
+          'rule-rights-compare', 'owner-output') -cnotcontains $Operation) {
+        $Operation = 'owner-output'
+        $Code = 31
+    }
+    Write-Output ('windows_acl_check_failure=operation=' + $Operation + ' exception=' + $exceptionType)
+    exit $Code
+}
+try {
+try { $root = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__ROOT__')) }
+catch { Stop-AclCheck 'root-decode' 7 $_ }
+try { $identity = [Security.Principal.WindowsIdentity]::GetCurrent() }
+catch { Stop-AclCheck 'owner-identity' 8 $_ }
+try { $ownerSid = $identity.User.Value; if ([string]::IsNullOrWhiteSpace($ownerSid)) { throw [InvalidOperationException]::new() } }
+catch { Stop-AclCheck 'owner-user-read' 9 $_ }
+try { $tokenOwnerSid = $identity.Owner.Value; if ([string]::IsNullOrWhiteSpace($tokenOwnerSid)) { throw [InvalidOperationException]::new() } }
+catch { Stop-AclCheck 'owner-token-read' 10 $_ }
+try {
+    $trustedOwners = @($ownerSid, $tokenOwnerSid, 'S-1-5-18', 'S-1-5-32-544')
+    $trustedWriters = @($ownerSid, $tokenOwnerSid, 'S-1-5-18', 'S-1-5-32-544')
+} catch { Stop-AclCheck 'trusted-sid-build' 11 $_ }
+try {
+    $writeMask = [long]0x40000000 -bor [long]0x00000116 -bor [long]0x00010000 -bor `
+                 [long]0x00000040 -bor [long]0x00040000 -bor [long]0x00080000
+} catch { Stop-AclCheck 'write-mask-build' 12 $_ }
+try { $parentPath = Split-Path -Parent $root }
+catch { Stop-AclCheck 'parent-resolve' 13 $_ }
+$items = @()
+try {
+    $parentItems = @(Get-Item -LiteralPath $parentPath -ErrorAction Stop)
+    if ($parentItems.Count -ne 1) { throw [InvalidOperationException]::new() }
+    $items += $parentItems
+} catch { Stop-AclCheck 'parent-item' 14 $_ }
+try {
+    $rootItems = @(Get-Item -LiteralPath $root -ErrorAction Stop)
+    if ($rootItems.Count -ne 1) { throw [InvalidOperationException]::new() }
+    $items += $rootItems
+} catch { Stop-AclCheck 'root-item' 15 $_ }
+try { $children = @(Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop); $items += $children }
+catch { Stop-AclCheck 'child-enumerate' 16 $_ }
+foreach ($item in @($items)) {
+    try { $isReparsePoint = (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) }
+    catch { Stop-AclCheck 'item-reparse-check' 17 $_ }
+    if ($isReparsePoint) { exit 3 }
+    try { $acl = Get-Acl -LiteralPath $item.FullName -ErrorAction Stop }
+    catch { Stop-AclCheck 'acl-read' 18 $_ }
+    try {
+        $ownerReference = $acl.GetOwner([Security.Principal.SecurityIdentifier])
+        if ($null -eq $ownerReference) { throw [InvalidOperationException]::new() }
+    } catch { Stop-AclCheck 'acl-owner-read' 19 $_ }
+    try { $itemOwner = $ownerReference.Value }
+    catch { Stop-AclCheck 'acl-owner-translate' 20 $_ }
+    if ([string]::IsNullOrWhiteSpace($itemOwner)) { exit 4 }
+    try { $ownerTrusted = $trustedOwners -ccontains $itemOwner }
+    catch { Stop-AclCheck 'acl-owner-compare' 21 $_ }
+    if (-not $ownerTrusted) { exit 5 }
+    try { $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) }
+    catch { Stop-AclCheck 'acl-rules-read' 22 $_ }
     foreach ($rule in $rules) {
-        if (($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
-        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
-        $sid = $rule.IdentityReference.Value
-        if ($trustedWriters -contains $sid) { continue }
-        if (([long]$rule.FileSystemRights -band $writeMask) -ne 0) { exit 6 }
+        try { $propagation = $rule.PropagationFlags }
+        catch { Stop-AclCheck 'rule-propagation-read' 23 $_ }
+        try { $inheritOnly = (($propagation -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) }
+        catch { Stop-AclCheck 'rule-propagation-compare' 24 $_ }
+        if ($inheritOnly) { continue }
+        try { $ruleType = $rule.AccessControlType }
+        catch { Stop-AclCheck 'rule-type-read' 25 $_ }
+        try { $isAllow = ($ruleType -eq [Security.AccessControl.AccessControlType]::Allow) }
+        catch { Stop-AclCheck 'rule-type-compare' 26 $_ }
+        if (-not $isAllow) { continue }
+        try { $sid = $rule.IdentityReference.Value }
+        catch { Stop-AclCheck 'rule-identity-read' 27 $_ }
+        try { $trustedWriter = $trustedWriters -ccontains $sid }
+        catch { Stop-AclCheck 'rule-writer-compare' 28 $_ }
+        if ($trustedWriter) { continue }
+        try { $rights = [long]$rule.FileSystemRights }
+        catch { Stop-AclCheck 'rule-rights-read' 29 $_ }
+        try { $hasWriteRights = (($rights -band $writeMask) -ne 0) }
+        catch { Stop-AclCheck 'rule-rights-compare' 30 $_ }
+        if ($hasWriteRights) { exit 6 }
     }
 }
-[Console]::Out.WriteLine($ownerSid)
+try { [Console]::Out.WriteLine($ownerSid) }
+catch { Stop-AclCheck 'owner-output' 31 $_ }
+} catch { Stop-AclCheck 'owner-output' 31 $_ }
 '''.replace("__ROOT__", encoded_root)
 
 
@@ -172,7 +280,7 @@ def _powershell_acl_owner(root):
     except (subprocess.SubprocessError, UnicodeError, ValueError):
         _refuse("crypto-acl-process-failed")
     if result.returncode != 0:
-        _refuse(_powershell_acl_exit_reason(result.returncode))
+        _refuse(_powershell_acl_exit_reason(result.returncode, result.stdout, result.stderr))
     if result.stderr:
         _refuse("crypto-acl-stderr-nonempty")
     return _powershell_acl_stdout_sid(result.stdout)

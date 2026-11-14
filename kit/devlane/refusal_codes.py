@@ -110,6 +110,17 @@ REFUSAL_CODES = frozenset((
     "tool-version-unavailable", "total-deadline-exhausted", "total-deadline-unavailable",
     "typescript-report-incomplete",
 ))
+WINDOWS_ACL_CHECK_OPERATIONS = (
+    ("root-decode", 7), ("owner-identity", 8), ("owner-user-read", 9),
+    ("owner-token-read", 10), ("trusted-sid-build", 11), ("write-mask-build", 12),
+    ("parent-resolve", 13), ("parent-item", 14), ("root-item", 15),
+    ("child-enumerate", 16), ("item-reparse-check", 17), ("acl-read", 18),
+    ("acl-owner-read", 19), ("acl-owner-translate", 20), ("acl-owner-compare", 21),
+    ("acl-rules-read", 22), ("rule-propagation-read", 23),
+    ("rule-propagation-compare", 24), ("rule-type-read", 25), ("rule-type-compare", 26),
+    ("rule-identity-read", 27), ("rule-writer-compare", 28), ("rule-rights-read", 29),
+    ("rule-rights-compare", 30), ("owner-output", 31),
+)
 CRYPTO_CONTROL_REFUSAL_CODES = frozenset((
     "crypto-target-invalid", "crypto-acl-powershell-unavailable", "crypto-acl-reparse-point",
     "crypto-acl-owner-unresolved", "crypto-acl-owner-untrusted", "crypto-acl-writer-untrusted",
@@ -121,7 +132,9 @@ CRYPTO_CONTROL_REFUSAL_CODES = frozenset((
     "crypto-manifest-invalid", "crypto-seal-write-failed", "crypto-tree-mismatch",
     "crypto-import-invalid", "crypto-key-present", "crypto-script-invalid",
     "crypto-control-invalid",
-)) | frozenset("crypto-acl-exit-" + str(code) for code in range(1, 16) if code not in (3, 4, 5, 6))
+)) | frozenset("crypto-acl-exit-" + str(code) for code in range(1, 32) if code not in (3, 4, 5, 6)) | frozenset(
+    "crypto-acl-check-" + operation for operation, _code in WINDOWS_ACL_CHECK_OPERATIONS
+)
 MACOS_SUPERVISOR_START_REFUSAL_CODES = frozenset((
     "macos-root-required", "dispatch-context-invalid", "input-unavailable", "input-size",
     "projection-invalid", "positive-control-failed", "tool-version-mismatch",

@@ -330,11 +330,49 @@ def node_version_commands(validated):
     }
 
 
+def _node_version_spawn_preflight(executable):
+    if not sys.platform.startswith("linux"):
+        return
+    parent_search_max = 32
+    parent_search_codes = diagnostic_contract.NODE_VERSION_PARENT_SEARCH_CODES
+    try:
+        candidate = Path(executable)
+        if not candidate.is_absolute():
+            refuse("node-version-access-check-other")
+        resolved = candidate.resolve(strict=True)
+        checked_parents = set()
+        parent_index = 0
+        for path in (candidate, resolved):
+            for parent in reversed(path.parents):
+                marker = str(parent)
+                if marker in checked_parents:
+                    continue
+                checked_parents.add(marker)
+                parent_index += 1
+                if parent_index > parent_search_max:
+                    refuse("node-version-access-check-other")
+                if not os.access(marker, os.X_OK):
+                    code = "node-version-parent-search-%02d" % parent_index
+                    refuse(code if code in parent_search_codes else "node-version-access-check-other")
+        mount = os.statvfs(str(resolved))
+        noexec_flag = getattr(os, "ST_NOEXEC", 8)
+        if type(noexec_flag) is not int or type(mount.f_flag) is not int:
+            refuse("node-version-access-check-other")
+        if mount.f_flag & noexec_flag:
+            refuse("node-version-mount-noexec")
+        if not os.access(str(resolved), os.X_OK):
+            refuse("node-version-file-exec")
+    except bundle.Refusal:
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError):
+        refuse("node-version-access-check-other")
+
+
 def run_node_versions(validated, run):
-    results = {
-        name: run(argv, env=dict(NODE_VERSION_ENVIRONMENT))
-        for name, argv in node_version_commands(validated).items()
-    }
+    results = {}
+    for name, argv in node_version_commands(validated).items():
+        _node_version_spawn_preflight(argv[0])
+        results[name] = run(argv, env=dict(NODE_VERSION_ENVIRONMENT))
     return results
 
 

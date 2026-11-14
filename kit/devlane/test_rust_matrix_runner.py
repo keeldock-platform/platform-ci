@@ -1484,6 +1484,59 @@ class RustMatrixRunnerTests(unittest.TestCase):
                     snapshot_id, str(deadline_path), snapshot_base=snapshot_base, owner_uid=os.getuid(),
                 )
 
+    def test_node_version_spawn_preflight_reports_fixed_file_parent_mount_and_other_codes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            executable = root / "snapshot" / "bin" / "node"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"fixture")
+            executable.chmod(0o555)
+            preparation = supervisor.node_tool_prepare
+            parent_order = list(reversed(executable.resolve(strict=True).parents))
+            denied_parent = executable.resolve(strict=True).parent
+            expected_parent = "node-version-parent-search-%02d" % (parent_order.index(denied_parent) + 1)
+            scenarios = (
+                ("parent-search", lambda target, _mode: str(target) != str(denied_parent),
+                 SimpleNamespace(f_flag=0), expected_parent),
+                ("file-exec", lambda target, _mode: str(target) != str(executable.resolve()),
+                 SimpleNamespace(f_flag=0), "node-version-file-exec"),
+                ("mount-noexec", lambda _target, _mode: True,
+                 SimpleNamespace(f_flag=8), "node-version-mount-noexec"),
+            )
+            for label, access, mount, expected in scenarios:
+                with self.subTest(check=label), \
+                        patch.object(preparation.sys, "platform", "linux"), \
+                        patch.object(preparation.os, "ST_NOEXEC", 8, create=True), \
+                        patch.object(preparation.os, "access", side_effect=access), \
+                        patch.object(preparation.os, "statvfs", return_value=mount):
+                    runner = Mock()
+                    with self.assertRaises(preparation.bundle.Refusal) as caught:
+                        preparation.run_node_versions({
+                            "node": str(executable),
+                            "npm_cli": str(root / "snapshot" / "npm-cli.js"),
+                        }, runner)
+                    self.assertEqual(caught.exception.args, (expected,))
+                    runner.assert_not_called()
+            with self.subTest(check="other"), \
+                    patch.object(preparation.sys, "platform", "linux"), \
+                    patch.object(preparation.os, "ST_NOEXEC", 8, create=True), \
+                    patch.object(preparation.os, "access", return_value=True), \
+                    patch.object(preparation.os, "statvfs", side_effect=PermissionError()):
+                runner = Mock()
+                with self.assertRaises(preparation.bundle.Refusal) as caught:
+                    preparation.run_node_versions({
+                        "node": str(executable),
+                        "npm_cli": str(root / "snapshot" / "npm-cli.js"),
+                    }, runner)
+                self.assertEqual(caught.exception.args, ("node-version-access-check-other",))
+                runner.assert_not_called()
+
+    def test_protected_node_snapshot_uses_executable_var_lib_base(self):
+        self.assertEqual(
+            node_tool_snapshot.PROTECTED_SNAPSHOT_BASE,
+            Path("/var/lib/platform-ci-devlane/node-tools"),
+        )
+
     def test_prepare_main_parser_uses_snapshot_for_both_version_checks_before_mount_setup(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

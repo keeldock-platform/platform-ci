@@ -64,6 +64,12 @@ VENDOR_NODE_PATH_CODES = frozenset(
 )
 VENDOR_NODE_DIAGNOSTIC_CODES = VENDOR_NODE_LAYOUT_CODES | VENDOR_NODE_PATH_CODES
 VENDOR_NODE_DIAGNOSTIC_STAGE = "prepare-node-vendor-acquisition"
+NODE_VERSION_PARENT_SEARCH_CODES = frozenset(
+    "node-version-parent-search-%02d" % index for index in range(1, 33)
+)
+NODE_VERSION_SPAWN_CHECK_CODES = frozenset((
+    "node-version-file-exec", "node-version-mount-noexec", "node-version-access-check-other",
+)) | NODE_VERSION_PARENT_SEARCH_CODES
 
 PREPARATION_REFUSAL_CODES = frozenset((
     "preparation-control-size", "preparation-control-type", "projection-baseline-constraints",
@@ -132,7 +138,7 @@ PREPARATION_REFUSAL_CODES = frozenset((
     "run-attempt", "rust-tool-layout", "rust-toolchain-missing", "rust-toolchain-path",
     "rust-toolchain-version", "total-deadline-exhausted", "total-deadline-unavailable",
     "toolchain-version", "playwright-browsers-missing", "playwright-cli-missing", "cleanup-incomplete",
-)) | refusal_codes.DOWNLOAD_REFUSAL_CODES | VENDOR_NODE_DIAGNOSTIC_CODES
+)) | refusal_codes.DOWNLOAD_REFUSAL_CODES | VENDOR_NODE_DIAGNOSTIC_CODES | NODE_VERSION_SPAWN_CHECK_CODES
 
 PREPARATION_EXCEPTION_LABELS = frozenset((
     "assertion-error", "attribute-error", "file-exists", "file-not-found", "index-error",
@@ -512,6 +518,8 @@ def public_preparation_diagnostic(line):
         return False
     if category in VENDOR_NODE_DIAGNOSTIC_CODES and stage != VENDOR_NODE_DIAGNOSTIC_STAGE:
         return False
+    if category in NODE_VERSION_SPAWN_CHECK_CODES and stage != "prepare-node-version-verification":
+        return False
     if category in NETWORK_PROBE_E2E_CATEGORIES and stage not in NETWORK_PROBE_E2E_STAGES:
         return False
     if route_detail is not None and (
@@ -539,6 +547,14 @@ def is_vendor_node_diagnostic(line):
         return False
     match = _E2E_REFUSAL.fullmatch(line)
     return match is not None and match.group(2) in VENDOR_NODE_DIAGNOSTIC_CODES
+
+
+def is_node_version_spawn_diagnostic(line):
+    if type(line) is not str or len(line.encode("ascii", "ignore")) > MAX_PUBLIC_DIAGNOSTIC_BYTES:
+        return False
+    match = _E2E_REFUSAL.fullmatch(line)
+    return bool(match and match.group(1) == "prepare-node-version-verification"
+                and match.group(2) in NODE_VERSION_SPAWN_CHECK_CODES)
 
 
 def public_e2e_runtime_diagnostic(line):
