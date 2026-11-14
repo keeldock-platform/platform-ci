@@ -284,10 +284,27 @@ namespace KeelDock.Platform.DevLaneWindows
             finally { LocalFree(sid); }
         }
 
-        public static bool DeleteProfile(string name)
+        public static string DeleteProfile(string name)
         {
-            int status = DeleteAppContainerProfile(name);
-            return status == 0 || unchecked((uint)status) == 0x80070002;
+            for (int attempt = 0; attempt < 4; attempt++)
+            {
+                int status = DeleteAppContainerProfile(name);
+                if (status == 0 || unchecked((uint)status) == 0x80070002) return "deleted";
+                string reason = CleanupReason(status);
+                if (reason != "sharing-violation" || attempt == 3) return reason;
+                System.Threading.Thread.Sleep(50 << attempt);
+            }
+            return "other";
+        }
+
+        private static string CleanupReason(int status)
+        {
+            uint value = unchecked((uint)status);
+            uint code = (value & 0xffff0000U) == 0x80070000U ? value & 0xffffU : value;
+            if (code == 32U || code == 33U) return "sharing-violation";
+            if (code == 5U) return "access-denied";
+            if (code == 2U || code == 3U) return "not-found";
+            return "other";
         }
 
         public static RunResult Run(string profileName, string appContainerSid, string executable, string[] arguments,

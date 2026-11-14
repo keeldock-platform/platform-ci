@@ -1,6 +1,7 @@
 """Hosted Windows LPAC boundary and core-node adapter for encrypted devlane runs."""
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -45,13 +46,36 @@ BROWSER_MEDIA_SUFFIXES = frozenset((".avif", ".bmp", ".gif", ".har", ".jpeg", ".
 
 
 class WindowsBoundaryRefusal(ValueError):
-    def __init__(self, code="windows-boundary"):
+    def __init__(self, code="windows-boundary", reason="other"):
         super().__init__(code)
         self.code = code
+        self.reason = reason if reason in refusal_codes.WINDOWS_CLEANUP_REASON_CLASSES else "other"
 
 
-def _refuse(code="windows-boundary"):
-    raise WindowsBoundaryRefusal(code)
+def _refuse(code="windows-boundary", reason="other"):
+    raise WindowsBoundaryRefusal(code, reason)
+
+
+def _windows_cleanup_error_reason(error):
+    winerror = getattr(error, "winerror", None)
+    error_number = getattr(error, "errno", None)
+    if winerror in (32, 33):
+        return "sharing-violation"
+    if winerror == 5 or error_number in (errno.EACCES, errno.EPERM):
+        return "access-denied"
+    if winerror in (2, 3) or error_number == errno.ENOENT:
+        return "not-found"
+    return "other"
+
+
+def _retry_windows_cleanup(operation):
+    for attempt in range(4):
+        try:
+            return operation()
+        except OSError as error:
+            if (_windows_cleanup_error_reason(error) != "sharing-violation" or attempt == 3):
+                raise
+            time.sleep((0.05, 0.1, 0.2)[attempt])
 
 
 def validate_profile(profile):
@@ -408,6 +432,18 @@ def _run_powershell(mode, state_path, request_path=None, timeout=MAX_CHILD_SECON
     except subprocess.SubprocessError:
         _refuse("powershell-unavailable")
     if result.returncode != 0 or len(result.stdout) > 8192:
+        if mode == "delete" and len(result.stdout) <= 8192:
+            match = re.fullmatch(
+                rb"(?:windows_cleanup_reason=(sharing-violation|access-denied|not-found|other)\r?\n)?"
+                rb"windows_sandbox=refused code=boundary\r?\n?",
+                result.stdout,
+            )
+            if match is not None and match.group(1) is not None:
+                reason = match.group(1).decode("ascii")
+                marker = ("windows_prepare_cleanup_reason=" if failure_prefix == "windows-prepare"
+                          else "windows_profile_cleanup_reason=")
+                print(marker + reason, flush=True)
+                _refuse((failure_prefix or "windows") + "-powershell-nonzero", reason=reason)
         _refuse((failure_prefix or "windows") + "-powershell-nonzero")
     try:
         return result.stdout.decode("utf-8", "strict").strip()
@@ -665,6 +701,7 @@ def prepare_dependencies(projection_path, output_root, deadline_file, state_path
                 _refuse("windows-prepare-profile-create-failed")
             raise
         created_profile = True
+        print("windows_prepare_stage=none", flush=True)
         remaining = max(1, int(_deadline_remaining(deadline_file)))
         request = {
             "executable": str(node), "arguments": [str(npm_cli), *NPM_INSTALL_ARGUMENTS],
@@ -674,6 +711,7 @@ def prepare_dependencies(projection_path, output_root, deadline_file, state_path
             "timeout_milliseconds": min(3_600_000, max(1000, int(remaining * 1000))), "internet_client": True,
         }
         result = _native_run(state_path, request, runner_root, failure_prefix="windows-prepare")
+        print("windows_prepare_job=empty", flush=True)
         if result["status"] == "process-start-failed":
             _refuse("windows-prepare-npm-process-start-failed")
         if result["status"] == "timeout":
@@ -681,6 +719,7 @@ def prepare_dependencies(projection_path, output_root, deadline_file, state_path
                     else "windows-prepare-npm-work-deadline")
         if result["status"] == "fail":
             _refuse("windows-prepare-npm-failed-" + _npm_preparation_error_class(cache / "_logs"))
+        print("windows_prepare_stage=npm-ci", flush=True)
         if projection["playwright"]:
             candidates = (
                 project / "node_modules" / "playwright" / "cli.js",
@@ -696,6 +735,7 @@ def prepare_dependencies(projection_path, output_root, deadline_file, state_path
                 "timeout_milliseconds": min(1_800_000, max(1000, int(remaining * 1000))),
             })
             result = _native_run(state_path, request, runner_root, failure_prefix="windows-prepare")
+            print("windows_prepare_job=empty", flush=True)
             if result["status"] == "process-start-failed":
                 _refuse("windows-prepare-playwright-process-start-failed")
             if result["status"] == "timeout":
@@ -704,12 +744,14 @@ def prepare_dependencies(projection_path, output_root, deadline_file, state_path
                         else "windows-prepare-playwright-work-deadline")
             if result["status"] == "fail":
                 _refuse("windows-prepare-playwright-failed-other")
+            print("windows_prepare_stage=playwright", flush=True)
+        print("windows_prepare_stage=done", flush=True)
     except (OSError, subprocess.SubprocessError):
         _refuse("windows-prepare-internal")
     finally:
         if created_profile:
             try:
-                delete_profile(state_path)
+                delete_profile(state_path, failure_prefix="windows-prepare")
             except Exception:
                 _refuse("windows-prepare-profile-cleanup-failed")
     node_modules = project / "node_modules"
@@ -1115,8 +1157,14 @@ def shred_tree(root, plaintext_root=None, overwrite_limit=1024 * 1024 * 1024):
     directory_paths = []
     reparse_entries = []
     failures = []
-    def walk_error(_error):
-        failures.append("shred-enumerate-failed")
+    failure_reasons = []
+
+    def record_failure(code, error=None):
+        failures.append(code)
+        failure_reasons.append(_windows_cleanup_error_reason(error) if error is not None else "other")
+
+    def walk_error(error):
+        record_failure("shred-enumerate-failed", error)
     for current, child_directories, names in os.walk(root, topdown=True, followlinks=False, onerror=walk_error):
         for name in list(child_directories):
             path = Path(current) / name
@@ -1124,9 +1172,9 @@ def shred_tree(root, plaintext_root=None, overwrite_limit=1024 * 1024 * 1024):
                 metadata = path.stat(follow_symlinks=False)
                 is_symlink = path.is_symlink()
                 reparse = is_symlink or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
-            except OSError:
+            except OSError as error:
                 child_directories.remove(name)
-                failures.append("shred-entry-inspection-failed")
+                record_failure("shred-entry-inspection-failed", error)
                 continue
             if reparse:
                 child_directories.remove(name)
@@ -1139,13 +1187,13 @@ def shred_tree(root, plaintext_root=None, overwrite_limit=1024 * 1024 * 1024):
                 metadata = path.stat(follow_symlinks=False)
                 is_symlink = path.is_symlink()
                 reparse = is_symlink or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
-            except OSError:
-                failures.append("shred-entry-inspection-failed")
+            except OSError as error:
+                record_failure("shred-entry-inspection-failed", error)
                 continue
             if reparse:
                 reparse_entries.append((path, False, is_symlink))
             elif not path.is_file():
-                failures.append("shred-entry-inspection-failed")
+                record_failure("shred-entry-inspection-failed")
             else:
                 size = metadata.st_size
                 total += size
@@ -1155,72 +1203,84 @@ def shred_tree(root, plaintext_root=None, overwrite_limit=1024 * 1024 * 1024):
     cleaned = 0
     for path, is_directory, is_symlink in reparse_entries:
         try:
-            if is_directory and not is_symlink:
-                path.rmdir()
-            else:
-                path.unlink()
+            _retry_windows_cleanup(lambda: path.rmdir() if is_directory and not is_symlink else path.unlink())
             cleaned += 1
-        except OSError:
-            failures.append("shred-reparse-remove-failed")
+        except OSError as error:
+            record_failure("shred-reparse-remove-failed", error)
     for path, size in files:
         if size <= overwrite_limit:
             try:
-                remaining = size
-                with path.open("r+b", buffering=0) as output:
-                    while remaining:
-                        chunk = os.urandom(min(1024 * 1024, remaining))
-                        output.write(chunk)
-                        remaining -= len(chunk)
-                    output.flush()
-                    os.fsync(output.fileno())
-            except OSError:
-                failures.append("shred-overwrite-failed")
+                def overwrite_file():
+                    remaining = size
+                    with path.open("r+b", buffering=0) as output:
+                        while remaining:
+                            chunk = os.urandom(min(1024 * 1024, remaining))
+                            output.write(chunk)
+                            remaining -= len(chunk)
+                        output.flush()
+                        os.fsync(output.fileno())
+                _retry_windows_cleanup(overwrite_file)
+            except OSError as error:
+                record_failure("shred-overwrite-failed", error)
                 try:
-                    path.unlink()
+                    _retry_windows_cleanup(path.unlink)
                     cleaned += 1
-                except OSError:
-                    failures.append("shred-file-remove-failed")
+                except OSError as retry_error:
+                    record_failure("shred-file-remove-failed", retry_error)
                 continue
         try:
-            path.unlink()
+            _retry_windows_cleanup(path.unlink)
             cleaned += 1
-        except OSError:
-            failures.append("shred-file-remove-failed")
+        except OSError as error:
+            record_failure("shred-file-remove-failed", error)
     for path in reversed(directory_paths):
         try:
-            path.rmdir()
-        except OSError:
-            failures.append("shred-directory-remove-failed")
+            _retry_windows_cleanup(path.rmdir)
+        except OSError as error:
+            record_failure("shred-directory-remove-failed", error)
     try:
-        root.rmdir()
-    except OSError:
-        failures.append("shred-root-remove-failed")
+        _retry_windows_cleanup(root.rmdir)
+    except OSError as error:
+        record_failure("shred-root-remove-failed", error)
     if failures:
-        _refuse(failures[0])
+        reason = failure_reasons[0] if failure_reasons else "other"
+        print("windows_cleanup_reason=" + reason, flush=True)
+        _refuse(failures[0], reason=reason)
     return "windows_runner_shred=confirmed files=%d bytes=%d reparse=%d\n" % (cleaned, total, len(reparse_entries))
 
 
 def cleanup_runner(state_path, root, plaintext_root=None):
     errors = []
+    error_reasons = []
     state = Path(state_path)
     if state.is_file():
         try:
             remove_firewall(state)
+        except WindowsBoundaryRefusal as error:
+            errors.append("windows-cleanup-firewall-failed")
+            error_reasons.append(error.reason)
         except Exception:
             errors.append("windows-cleanup-firewall-failed")
+            error_reasons.append("other")
         try:
             delete_profile(state)
+        except WindowsBoundaryRefusal as error:
+            errors.append("windows-cleanup-profile-failed")
+            error_reasons.append(error.reason)
         except Exception:
             errors.append("windows-cleanup-profile-failed")
+            error_reasons.append("other")
     shred_receipt = None
     try:
         shred_receipt = shred_tree(root, plaintext_root=plaintext_root)
     except WindowsBoundaryRefusal as error:
         errors.append("windows-cleanup-" + error.code)
+        error_reasons.append(error.reason)
     except Exception:
         errors.append("windows-cleanup-shred-internal")
+        error_reasons.append("other")
     if errors:
-        _refuse(errors[0])
+        _refuse(errors[0], reason=error_reasons[0])
     return "windows_sandbox_cleanup=confirmed firewall=removed profile=deleted\n" + shred_receipt
 
 
@@ -1245,14 +1305,18 @@ def remove_tree(root):
         _refuse("cleanup-remove")
 
 
-def delete_profile(state_path):
+def delete_profile(state_path, *, failure_prefix="windows-cleanup"):
     if sys.platform != "win32":
         _refuse("windows-host-required")
-    line = _run_powershell("delete", state_path, timeout=90, failure_prefix="windows-cleanup")
+    line = _run_powershell("delete", state_path, timeout=90, failure_prefix=failure_prefix)
     try:
-        Path(state_path).unlink(missing_ok=True)
-    except OSError:
-        _refuse("profile-cleanup")
+        _retry_windows_cleanup(lambda: Path(state_path).unlink(missing_ok=True))
+    except OSError as error:
+        reason = _windows_cleanup_error_reason(error)
+        marker = ("windows_prepare_cleanup_reason=" if failure_prefix == "windows-prepare"
+                  else "windows_profile_cleanup_reason=")
+        print(marker + reason, flush=True)
+        _refuse("profile-cleanup", reason=reason)
     return line + "\n"
 
 
@@ -1358,6 +1422,10 @@ def main(argv=None):
             print("devlane_refusal=" + code, file=sys.stderr)
         elif args.operation == "shred":
             code = error.code if error.code in refusal_codes.WINDOWS_SHRED_REFUSAL_CODES else "windows-cleanup-internal"
+            if code.startswith("windows-cleanup-shred-"):
+                print("windows_sandbox_cleanup=failed stage=shred")
+                print("cleanup_receipt=failed stage=windows-shred reason=" + error.reason)
+                print("devlane_job=completed public_output=filtered cleanup=failed")
             print("devlane_refusal=" + code, file=sys.stderr)
         else:
             print("devlane_refusal=windows-runner-failed", file=sys.stderr)

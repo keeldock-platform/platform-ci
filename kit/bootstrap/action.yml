@@ -69,78 +69,95 @@ runs:
         CI_POOL: ${{ inputs.pool }}
         PYTHONDONTWRITEBYTECODE: "1"
       run: |
-        set +e
-        set -uo pipefail
+        set -euo pipefail
         suite_failed=0
-        trap 'suite_failed=1' ERR
+        suite_failure_stage=none
+        run_source_free_check() {
+          local stage="$1"
+          shift
+          if "$@"; then
+            return 0
+          fi
+          if [[ "$suite_failed" == 0 ]]; then
+            suite_failure_stage="$stage"
+          fi
+          suite_failed=1
+        }
+        finish_source_free_checks() {
+          if [[ "$suite_failed" != 0 ]]; then
+            printf 'source-free-policy=refused stage=%s\n' "$suite_failure_stage"
+            return 1
+          fi
+          printf 'source-free-policy=accepted\n'
+        }
         if command -v python3 >/dev/null 2>&1; then
           python_bin="$(command -v python3)"
         elif command -v python >/dev/null 2>&1; then
           python_bin="$(command -v python)"
         else
+          printf '%s\n' 'source-free-policy=refused stage=python-unavailable'
           exit 1
         fi
-        "$python_bin" -B "$CI_ACTION_PATH/test_policy.py"
-        "$python_bin" -B "$CI_ACTION_PATH/test_public_tree.py"
-        "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_audit_contracts.py"
-        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../promotion" -p "test_*.py"
-        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../selector" -p "test_*.py"
-        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../ci" -p "test_*.py"
-        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_capsule_frame.py"
-        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_native_loopback_profile.py"
-        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../cache" -p "test_*.py"
-        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH" -p "test_api_controls.py"
-        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_macos*.py"
-        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_confinement*.py"
-        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_source_bundle_preflight.py"
-        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_log_canary.py"
-        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_cargo_lock_parser.py"
-        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_release_build_verify.py"
-        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_release_evidence.py"
-        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_release_tool_ledger.py"
-        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../baselines" -p "test_baselines_prepare.py"
-        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_role_signer.py"
-        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_confinement_gate_table.py"
-        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_windows_source_run.py"
+        run_source_free_check policy-unit "$python_bin" -B "$CI_ACTION_PATH/test_policy.py"
+        run_source_free_check public-tree-unit "$python_bin" -B "$CI_ACTION_PATH/test_public_tree.py"
+        run_source_free_check audit-contract-unit "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_audit_contracts.py"
+        run_source_free_check promotion-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../promotion" -p "test_*.py"
+        run_source_free_check selector-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../selector" -p "test_*.py"
+        run_source_free_check ci-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../ci" -p "test_*.py"
+        run_source_free_check capsule-frame-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_capsule_frame.py"
+        run_source_free_check loopback-profile-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_native_loopback_profile.py"
+        run_source_free_check cache-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../cache" -p "test_*.py"
+        run_source_free_check api-controls-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH" -p "test_api_controls.py"
+        run_source_free_check macos-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_macos*.py"
+        run_source_free_check confinement-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_confinement*.py"
+        run_source_free_check source-bundle-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_source_bundle_preflight.py"
+        run_source_free_check log-canary-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_log_canary.py"
+        run_source_free_check cargo-lock-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_cargo_lock_parser.py"
+        run_source_free_check release-build-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_release_build_verify.py"
+        run_source_free_check release-evidence-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_release_evidence.py"
+        run_source_free_check release-ledger-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_release_tool_ledger.py"
+        run_source_free_check baselines-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../baselines" -p "test_baselines_prepare.py"
+        run_source_free_check role-signer-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_role_signer.py"
+        run_source_free_check gate-table-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_confinement_gate_table.py"
+        run_source_free_check windows-source-run-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_windows_source_run.py"
         if [[ "${RUNNER_OS:-}" == "Linux" ]]; then
-          "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_deadline.py"
-          "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_network_probe.py"
-          "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_rust_matrix_runner.py"
-          "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_rust_public_audit.py"
-          "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_rust_test_runner.py"
-          "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_rust_report.py"
-          "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_acceptance.py"
-          "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_coordinator.py"
-          "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_linux_source_build.py"
+          run_source_free_check deadline-unit "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_deadline.py"
+          run_source_free_check network-probe-unit "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_network_probe.py"
+          run_source_free_check rust-matrix-unit "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_rust_matrix_runner.py"
+          run_source_free_check rust-audit-unit "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_rust_public_audit.py"
+          run_source_free_check rust-test-unit "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_rust_test_runner.py"
+          run_source_free_check rust-report-unit "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_rust_report.py"
+          run_source_free_check acceptance-unit "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_acceptance.py"
+          run_source_free_check coordinator-unit "$python_bin" -B "$CI_ACTION_PATH/../devlane/test_coordinator.py"
+          run_source_free_check linux-source-build-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_linux_source_build.py"
           if [[ "${CI_POOL:-}" == "platform" ]]; then
-            "$python_bin" -m pip install --disable-pip-version-check --no-input --require-hashes --only-binary=:all: --no-deps --target "${RUNNER_TEMP:-/tmp}/kd-pydeps" -r "$CI_ACTION_PATH/../handoff/provider_requirements.txt"
-            PYTHONPATH="${RUNNER_TEMP:-/tmp}/kd-pydeps" "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../handoff" -p "test_source_capsule.py"
+            run_source_free_check handoff-dependencies "$python_bin" -m pip install --disable-pip-version-check --no-input --require-hashes --only-binary=:all: --no-deps --target "${RUNNER_TEMP:-/tmp}/kd-pydeps" -r "$CI_ACTION_PATH/../handoff/provider_requirements.txt"
+            run_source_free_check handoff-capsule-unit env PYTHONPATH="${RUNNER_TEMP:-/tmp}/kd-pydeps" "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../handoff" -p "test_source_capsule.py"
           fi
-          "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../../core-ci" -p "test_*.py"
+          run_source_free_check core-ci-unit "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../../core-ci" -p "test_*.py"
         fi
         if [[ "${RUNNER_OS:-}" == "macOS" ]]; then
-          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../selector" -p "test_*.py"
-          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../ci" -p "test_*.py"
-          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_capsule_frame.py"
-          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_native_loopback_profile.py"
-          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../cache" -p "test_*.py"
-          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH" -p "test_api_controls.py"
-          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_macos*.py"
-          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_confinement*.py"
-          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_source_bundle_preflight.py"
-          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_log_canary.py"
-          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_cargo_lock_parser.py"
-          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_release_build_verify.py"
-          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_release_evidence.py"
-          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_release_tool_ledger.py"
-          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../baselines" -p "test_baselines_prepare.py"
-          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_role_signer.py"
-          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_confinement_gate_table.py"
-          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_windows_source_run.py"
+          run_source_free_check macos-selector-unit /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../selector" -p "test_*.py"
+          run_source_free_check macos-ci-unit /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../ci" -p "test_*.py"
+          run_source_free_check macos-capsule-frame-unit /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_capsule_frame.py"
+          run_source_free_check macos-loopback-profile-unit /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_native_loopback_profile.py"
+          run_source_free_check macos-cache-unit /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../cache" -p "test_*.py"
+          run_source_free_check macos-api-controls-unit /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH" -p "test_api_controls.py"
+          run_source_free_check macos-confinement-unit /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_macos*.py"
+          run_source_free_check macos-confinement-protocol-unit /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_confinement*.py"
+          run_source_free_check macos-source-bundle-unit /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_source_bundle_preflight.py"
+          run_source_free_check macos-log-canary-unit /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_log_canary.py"
+          run_source_free_check macos-cargo-lock-unit /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_cargo_lock_parser.py"
+          run_source_free_check macos-release-build-unit /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_release_build_verify.py"
+          run_source_free_check macos-release-evidence-unit /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_release_evidence.py"
+          run_source_free_check macos-release-ledger-unit /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_release_tool_ledger.py"
+          run_source_free_check macos-baselines-unit /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../baselines" -p "test_baselines_prepare.py"
+          run_source_free_check macos-role-signer-unit /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_role_signer.py"
+          run_source_free_check macos-gate-table-unit /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_confinement_gate_table.py"
+          run_source_free_check macos-windows-source-run-unit /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_windows_source_run.py"
         fi
-        "$python_bin" -B "$CI_ACTION_PATH/check_candidate.py" --root "$CI_WORKSPACE" --pool "$CI_POOL" --sha "$CI_SHA"
-        trap - ERR
-        [[ "$suite_failed" == 0 ]]
+        run_source_free_check candidate-check "$python_bin" -B "$CI_ACTION_PATH/check_candidate.py" --root "$CI_WORKSPACE" --pool "$CI_POOL" --sha "$CI_SHA"
+        finish_source_free_checks
     - name: ci.rate-budget shadow report
       if: ${{ inputs.ledger_path != '' }}
       shell: bash

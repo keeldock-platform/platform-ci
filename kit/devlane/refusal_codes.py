@@ -142,6 +142,9 @@ WINDOWS_PREPARE_REFUSAL_CODES = frozenset((
     "windows-prepare-" + phase + "-failed-" + error_class
     for phase in ("npm", "playwright") for error_class in WINDOWS_PREPARATION_ERROR_CLASSES
 )
+WINDOWS_CLEANUP_REASON_CLASSES = frozenset((
+    "sharing-violation", "access-denied", "not-found", "other",
+))
 WINDOWS_SHRED_REFUSAL_CODES = frozenset((
     "windows-cleanup-powershell-start-failed", "windows-cleanup-powershell-timeout",
     "windows-cleanup-powershell-nonzero", "windows-cleanup-firewall-failed",

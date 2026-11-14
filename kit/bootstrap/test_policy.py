@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import textwrap
 import types
 import unittest
 from pathlib import Path
@@ -376,11 +377,11 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIn("uses: ./kit/bootstrap\n", self._platform_workflow())
         action = PLATFORM_ACTION.read_text(encoding="utf-8")
         current = (
-            '        "$python_bin" -B -m unittest discover -s '
+            '        run_source_free_check release-build-unit "$python_bin" -B -m unittest discover -s '
             '"$CI_ACTION_PATH/../confinement" -p "test_release_build_verify.py"\n'
         )
         pinned = (
-            "          /Library/Developer/CommandLineTools/Library/Frameworks/"
+            "          run_source_free_check macos-release-build-unit /Library/Developer/CommandLineTools/Library/Frameworks/"
             "Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest "
             'discover -s "$CI_ACTION_PATH/../confinement" '
             '-p "test_release_build_verify.py"\n'
@@ -390,6 +391,37 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(action.count(pinned), 1)
         self.assertLess(action.index(current), action.index(macos_branch))
         self.assertLess(action.index(macos_branch), action.index(pinned))
+
+    def test_source_free_action_reports_the_first_failed_check_after_candidate_output(self):
+        action = PLATFORM_ACTION.read_text(encoding="utf-8")
+        run_function = re.search(
+            r"(?ms)^        run_source_free_check\(\) \{\n.*?^        \}\n",
+            action,
+        )
+        finish_function = re.search(
+            r"(?ms)^        finish_source_free_checks\(\) \{\n.*?^        \}\n",
+            action,
+        )
+        self.assertIsNotNone(run_function)
+        self.assertIsNotNone(finish_function)
+        script = "\n".join((
+            "set -euo pipefail",
+            "suite_failed=0",
+            "suite_failure_stage=none",
+            textwrap.dedent(run_function.group(0)),
+            textwrap.dedent(finish_function.group(0)),
+            "run_source_free_check deadline-unit bash -c 'exit 17'",
+            "run_source_free_check later-suite bash -c 'exit 0'",
+            "run_source_free_check candidate-check bash -c 'echo candidate-policy=accepted'",
+            "finish_source_free_checks",
+        ))
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(
+            result.stdout,
+            "candidate-policy=accepted\nsource-free-policy=refused stage=deadline-unit\n",
+        )
+        self.assertEqual(result.stderr, "")
 
     def test_node_lock_smoke_workflow_is_closed_source_free_and_cross_platform(self):
         workflow = NODE_LOCK_SMOKE_WORKFLOW.read_text(encoding="utf-8")

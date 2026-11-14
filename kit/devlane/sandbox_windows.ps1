@@ -8,6 +8,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$cleanupReason = $null
 try {
     Add-Type -Path (Join-Path $scriptRoot 'sandbox_windows_native.cs') -ErrorAction Stop
     $statePath = [IO.Path]::GetFullPath($StateFile)
@@ -155,13 +156,20 @@ try {
             $acl.RemoveAccessRuleSpecific($rule)
             Set-Acl -LiteralPath $path -AclObject $acl
         }
-        if (-not [KeelDock.Platform.DevLaneWindows.Boundary]::DeleteProfile([string]$state.profile_name)) { throw }
+        $deleteResult = [KeelDock.Platform.DevLaneWindows.Boundary]::DeleteProfile([string]$state.profile_name)
+        if ($deleteResult -ne 'deleted') {
+            $cleanupReason = [string]$deleteResult
+            throw
+        }
         Remove-Item -LiteralPath $statePath -Force
         Write-Output 'windows_sandbox_cleanup=confirmed firewall=removed profile=deleted'
         exit 0
     }
     throw
 } catch {
+    if ($Mode -eq 'delete' -and $cleanupReason -in @('sharing-violation', 'access-denied', 'not-found', 'other')) {
+        Write-Output ('windows_cleanup_reason=' + $cleanupReason)
+    }
     Write-Output 'windows_sandbox=refused code=boundary'
     exit 1
 }

@@ -3109,6 +3109,73 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 self.assertTrue(grammar.refusal_line_ok("Shred runner-local workspace", line))
                 self.assertFalse(grammar.refusal_line_ok(audit.WINDOWS_PREPARE_STEP, line))
 
+    def test_windows_prepare_and_shred_cleanup_failures_form_auditable_terminal_contract(self):
+        identity = dict(IDENTITY, platform="windows")
+        jobs = _encrypted_jobs(platform="windows")
+        run_job = next(job for job in jobs if job["name"] == audit.PLATFORM_RUN_JOBS["windows"])
+        run_job["conclusion"] = "failure"
+        steps = run_job["steps"]
+        failed_index = next(index for index, step in enumerate(steps)
+                            if step["name"] == audit.WINDOWS_PREPARE_STEP)
+        for index, step in enumerate(steps):
+            if step["name"] == "Install pinned Rust toolchain":
+                step["conclusion"] = "skipped"
+            elif step["name"] == "Shred runner-local workspace":
+                step["conclusion"] = "failure"
+            elif index < failed_index:
+                step["conclusion"] = "success"
+            elif index == failed_index:
+                step["conclusion"] = "failure"
+            else:
+                step["conclusion"] = "skipped"
+        cleanup_code = "windows-cleanup-shred-overwrite-failed"
+        log = _render_real_runner_encrypted_log(
+            identity,
+            early_failure={
+                "step": audit.WINDOWS_PREPARE_STEP,
+                "marker": "devlane_refusal=windows-prepare-profile-cleanup-failed",
+                "exit_code": 1,
+                "outputs": [
+                    "windows_prepare_stage=none", "windows_prepare_job=empty",
+                    "windows_prepare_stage=npm-ci", "windows_prepare_job=empty",
+                    "windows_prepare_stage=playwright", "windows_prepare_stage=done",
+                    "windows_prepare_cleanup_reason=sharing-violation",
+                    "devlane_refusal=windows-prepare-profile-cleanup-failed",
+                ],
+                "cleanup_outputs": [
+                    "windows_cleanup_reason=sharing-violation",
+                    "windows_sandbox_cleanup=failed stage=shred",
+                    "cleanup_receipt=failed stage=windows-shred reason=sharing-violation",
+                    "devlane_job=completed public_output=filtered cleanup=failed",
+                    "devlane_refusal=" + cleanup_code,
+                ],
+            },
+        )
+        surface = audit.validate_job_log_surface(
+            log, audit.PLATFORM_RUN_JOBS["windows"], identity, completed=True,
+        )
+        self.assertEqual(surface["early_failure"], audit.WINDOWS_PREPARE_STEP)
+        self.assertEqual(surface["early_failure_code"], "windows-prepare-profile-cleanup-failed")
+        self.assertEqual(surface["cleanup_failure_code"], cleanup_code)
+        self.assertEqual(surface["cleanup_failure_reason"], "sharing-violation")
+        audit.validate_dispatch_marker(log, identity, allow_missing=False)
+        audit.validate_job_contract(jobs, identity, "core-node", surface=surface)
+        audit.validate_job_log_metadata_binding(surface, run_job, identity)
+        expected_outcome = (
+            "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=failed "
+            "disposition=run-failed-at-windows-prepare"
+        )
+        self.assertEqual(audit._audit_outcome_line(jobs, identity), expected_outcome)
+        self.assertEqual(_run_audit_with_log(identity, jobs, log), expected_outcome)
+
+        changed = copy.deepcopy(jobs)
+        changed_run = next(job for job in changed if job["name"] == audit.PLATFORM_RUN_JOBS["windows"])
+        changed_steps = {step["name"]: step for step in changed_run["steps"]}
+        changed_steps["Probe isolation before decryption"]["conclusion"] = "success"
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.validate_job_contract(changed, identity, "core-node")
+        self.assertEqual(caught.exception.reason, "job-contract")
+
     def test_shared_probe_and_execute_failures_keep_the_base_platform_contracts(self):
         cases = (
             ("linux", "Probe isolation before decryption", "Probe isolation before decryption",

@@ -113,7 +113,8 @@ DISPATCH_MARKER = re.compile(
 )
 CLEANUP_RECEIPT_MARKER = re.compile(
     rb"(?m)^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z )?"
-    rb"cleanup_receipt=confirmed$"
+    rb"(?:cleanup_receipt=confirmed|cleanup_receipt=failed stage=windows-shred reason="
+    rb"(?:sharing-violation|access-denied|not-found|other))$"
 )
 DECIMAL = re.compile(r"[1-9][0-9]{0,18}\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
@@ -328,6 +329,7 @@ AUDIT_OUTCOME_LINES = frozenset((
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-macos-preflight",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-windows-preflight",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-windows-prepare",
+    "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=failed disposition=run-failed-at-windows-prepare",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-asset-fetch",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-macos-supervisor-start",
     "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=run-failed-at-macos-prepare",
@@ -346,6 +348,8 @@ WINDOWS_RUNNER_REFUSAL_CODES = frozenset(("windows-runner-failed", "boundary"))
 WINDOWS_PREPARE_STEP = "Prepare dependencies before the cut"
 WINDOWS_PREPARE_REFUSAL_CODES = refusal_codes.WINDOWS_PREPARE_REFUSAL_CODES
 WINDOWS_SHRED_REFUSAL_CODES = refusal_codes.WINDOWS_SHRED_REFUSAL_CODES
+WINDOWS_CLEANUP_REASON_CLASSES = refusal_codes.WINDOWS_CLEANUP_REASON_CLASSES
+WINDOWS_PREPARE_STAGES = ("none", "npm-ci", "playwright", "done")
 FETCH_REFUSAL_CODES = refusal_codes.DOWNLOAD_REFUSAL_CODES | frozenset(("fetch-failed",))
 SUPERVISOR_START_REFUSAL_CODES = (
     refusal_codes.STARTUP_REFUSAL_CODES | refusal_codes.STARTUP_DIAGNOSTIC_CODES
@@ -921,6 +925,68 @@ class _Grammar:
         """Fixed output lines, each bound to the step that is allowed to print it."""
         step = next((item for item in self.steps if item["name"] == step_name), None)
         uses = (step or {}).get("uses") or ""
+        if line.startswith("windows_prepare_stage="):
+            stage = line.removeprefix("windows_prepare_stage=")
+            if (self.job_runner != "windows-2025" or step_name != WINDOWS_PREPARE_STEP
+                    or stage not in WINDOWS_PREPARE_STAGES):
+                return False
+            index = WINDOWS_PREPARE_STAGES.index(stage)
+            previous = public_counts.get("windows_prepare_stage_index", -1)
+            if index <= previous:
+                return False
+            public_counts["windows_prepare_stage_index"] = index
+            public_counts["windows_prepare_stage_" + stage] = 1
+            return True
+        if line == "windows_prepare_job=empty":
+            if self.job_runner != "windows-2025" or step_name != WINDOWS_PREPARE_STEP:
+                return False
+            public_counts["windows_prepare_job_empty"] = public_counts.get("windows_prepare_job_empty", 0) + 1
+            return public_counts["windows_prepare_job_empty"] <= 2
+        if line.startswith("windows_prepare_cleanup_reason="):
+            reason = line.removeprefix("windows_prepare_cleanup_reason=")
+            if (self.job_runner != "windows-2025" or step_name != WINDOWS_PREPARE_STEP
+                    or reason not in WINDOWS_CLEANUP_REASON_CLASSES):
+                return False
+            public_counts["windows_prepare_cleanup_reason"] = public_counts.get(
+                "windows_prepare_cleanup_reason", 0,
+            ) + 1
+            public_counts["windows_prepare_cleanup_reason_value"] = reason
+            return public_counts["windows_prepare_cleanup_reason"] == 1
+        if line.startswith("windows_cleanup_reason="):
+            reason = line.removeprefix("windows_cleanup_reason=")
+            if (self.job_runner != "windows-2025" or step_name != "Shred runner-local workspace"
+                    or reason not in WINDOWS_CLEANUP_REASON_CLASSES):
+                return False
+            public_counts["windows_cleanup_reason"] = public_counts.get("windows_cleanup_reason", 0) + 1
+            public_counts["windows_cleanup_reason_value"] = reason
+            return public_counts["windows_cleanup_reason"] == 1
+        if line.startswith("windows_profile_cleanup_reason="):
+            reason = line.removeprefix("windows_profile_cleanup_reason=")
+            if (self.job_runner != "windows-2025" or step_name != "Shred runner-local workspace"
+                    or reason not in WINDOWS_CLEANUP_REASON_CLASSES):
+                return False
+            public_counts["windows_profile_cleanup_reason"] = public_counts.get(
+                "windows_profile_cleanup_reason", 0,
+            ) + 1
+            return public_counts["windows_profile_cleanup_reason"] == 1
+        failed_receipt = re.fullmatch(
+            r"cleanup_receipt=failed stage=windows-shred reason="
+            r"(sharing-violation|access-denied|not-found|other)", line,
+        )
+        if failed_receipt is not None:
+            if (self.job_runner != "windows-2025" or step_name != "Shred runner-local workspace"
+                    or public_counts.get("windows_cleanup_reason") != 1
+                    or public_counts.get("windows_cleanup_reason_value") != failed_receipt.group(1)):
+                return False
+            public_counts["cleanup_receipt_failed"] = public_counts.get("cleanup_receipt_failed", 0) + 1
+            public_counts["cleanup_receipt_failed_reason"] = failed_receipt.group(1)
+            return public_counts["cleanup_receipt_failed"] == 1
+        if line == "devlane_job=completed public_output=filtered cleanup=failed":
+            if (self.job_runner != "windows-2025" or step_name != "Shred runner-local workspace"
+                    or public_counts.get("cleanup_receipt_failed") != 1):
+                return False
+            public_counts["cleanup_failure_completion"] = public_counts.get("cleanup_failure_completion", 0) + 1
+            return public_counts["cleanup_failure_completion"] == 1
         if line.startswith("macos_dns_probe"):
             if (self.job_runner != "macos-15" or step_name != MACOS_PREPARE_STEP
                     or self.identity.get("platform") != "macos" or self.identity.get("profile") != "core-node"
@@ -1184,6 +1250,9 @@ class _Grammar:
                 "windows_sandbox_cleanup=confirmed firewall=removed profile=deleted": (
                     "sandbox_windows.py shred", "cleanup_mode_sandbox",
                 ),
+                "windows_sandbox_cleanup=failed stage=shred": (
+                    "sandbox_windows.py shred", "cleanup_mode_sandbox_failed",
+                ),
             }
             if line in cleanup_modes:
                 evidence, key = cleanup_modes[line]
@@ -1192,7 +1261,8 @@ class _Grammar:
                 output_index = next((index for index, source_line in enumerate(run)
                                      if source_line.strip() == "Write-Output '" + line + "'"), None)
                 if (evidence_index is None
-                        or (line != "windows_sandbox_cleanup=confirmed firewall=removed profile=deleted"
+                        or (line not in ("windows_sandbox_cleanup=confirmed firewall=removed profile=deleted",
+                                         "windows_sandbox_cleanup=failed stage=shred")
                             and output_index is None)
                         or (output_index is not None and evidence_index >= output_index)):
                     return False
@@ -1201,7 +1271,8 @@ class _Grammar:
                                          if "Test-Path -LiteralPath $checkoutMarker" in source_line), None)
                     if marker_check is None or evidence_index <= marker_check:
                         return False
-                if line == "windows_sandbox_cleanup=confirmed firewall=removed profile=deleted":
+                if line in ("windows_sandbox_cleanup=confirmed firewall=removed profile=deleted",
+                            "windows_sandbox_cleanup=failed stage=shred"):
                     marker_check = next((index for index, source_line in enumerate(run)
                                          if "Test-Path -LiteralPath $checkoutMarker" in source_line), None)
                     marker_else = next((index for index, source_line in enumerate(run)
@@ -1285,6 +1356,16 @@ class _Grammar:
             public_counts["early_failure_step"] = step_name
             public_counts["early_failure_code"] = code
             return public_counts["early_failure_marker"] == 1
+        if line.startswith("devlane_refusal=") and step_name == "Shred runner-local workspace":
+            code = line.removeprefix("devlane_refusal=")
+            if (self.job_runner != "windows-2025" or code not in WINDOWS_SHRED_REFUSAL_CODES
+                    or not self.refusal_line_ok(step_name, line)):
+                return False
+            if code.startswith("windows-cleanup-shred-"):
+                public_counts["cleanup_failure_refusal"] = public_counts.get("cleanup_failure_refusal", 0) + 1
+                public_counts["cleanup_failure_code"] = code
+                return public_counts["cleanup_failure_refusal"] == 1
+            return True
         if self.refusal_line_ok(step_name, line) or line == "devlane_permit=refused":
             return True
         return False
@@ -2112,8 +2193,30 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
             if counts.get("decrypt_refusal_detail", 0) > 1:
                 _refuse()
         cleanup_line = "cleanup_receipt=confirmed"
-        if counts.get(cleanup_line) != 1 or (completed and counts.get(
-                "devlane_job=completed public_output=filtered cleanup=confirmed") != 1):
+        cleanup_failure_receipts = counts.get("cleanup_receipt_failed", 0)
+        if cleanup_failure_receipts:
+            failure_code = counts.get("cleanup_failure_code")
+            if (not windows_job or counts.get(cleanup_line) or cleanup_failure_receipts != 1
+                    or counts.get("cleanup_failure_completion") != 1
+                    or counts.get("cleanup_failure_refusal") != 1
+                    or failure_code not in WINDOWS_SHRED_REFUSAL_CODES
+                    or not failure_code.startswith("windows-cleanup-shred-")
+                    or counts.get("windows_cleanup_reason") != 1
+                    or counts.get("windows_cleanup_reason_value") != counts.get("cleanup_receipt_failed_reason")
+                    or counts.get("early_failure_step") != WINDOWS_PREPARE_STEP
+                    or counts.get("early_failure_code") != "windows-prepare-profile-cleanup-failed"
+                    or counts.get("windows_prepare_stage_done") != 1
+                    or (completed and counts.get("devlane_job=completed public_output=filtered cleanup=confirmed"))):
+                _refuse()
+        elif (counts.get(cleanup_line) != 1 or counts.get("cleanup_failure_refusal")
+              or counts.get("cleanup_failure_completion")
+              or counts.get("windows_cleanup_reason")
+              or (completed and counts.get("devlane_job=completed public_output=filtered cleanup=confirmed") != 1)):
+            _refuse()
+        if (counts.get("windows_prepare_cleanup_reason", 0) > 1
+                or (counts.get("windows_prepare_cleanup_reason")
+                    and (counts.get("early_failure_step") != WINDOWS_PREPARE_STEP
+                         or counts.get("early_failure_code") != "windows-prepare-profile-cleanup-failed"))):
             _refuse()
         if windows_job:
             cleanup_modes = {
@@ -2121,6 +2224,7 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
                 "absent": counts.get("cleanup_mode_absent", 0),
                 "precheckout": counts.get("cleanup_mode_precheckout", 0),
                 "sandbox": counts.get("cleanup_mode_sandbox", 0),
+                "sandbox_failed": counts.get("cleanup_mode_sandbox_failed", 0),
             }
             if sum(cleanup_modes.values()) != 1:
                 _refuse()
@@ -2130,6 +2234,9 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
             )
             if cleanup_modes["sandbox"]:
                 if shred_receipts != 1:
+                    _refuse()
+            elif cleanup_modes["sandbox_failed"]:
+                if shred_receipts or not cleanup_failure_receipts:
                     _refuse()
             elif shred_receipts:
                 _refuse()
@@ -2143,7 +2250,7 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
                 if (counts.get("crypto_state_after_export") != 1
                         or counts.get("crypto_state_checkout_complete", 0) > 1
                         or (counts.get("crypto_state_checkout_complete") and not (
-                            cleanup_modes["sandbox"] or cleanup_modes["absent"]))
+                            cleanup_modes["sandbox"] or cleanup_modes["sandbox_failed"] or cleanup_modes["absent"]))
                         or (not counts.get("crypto_state_checkout_complete") and not (
                             cleanup_modes["precheckout"] or cleanup_modes["absent"]))):
                     _refuse()
@@ -2185,6 +2292,8 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
     return {"records": [record.encode("ascii") for record in records], "early_failure": early_failure,
             "early_failure_code": counts.get("early_failure_code"),
             "early_failure_exit": counts.get("early_failure_exit"), "failure_stage": failure_stage,
+            "cleanup_failure_code": counts.get("cleanup_failure_code"),
+            "cleanup_failure_reason": counts.get("cleanup_receipt_failed_reason"),
             "crypto_refusal_reason": counts.get("crypto_refusal_reason_code"),
             "counts": counts if job_name == AUDIT_JOB else None}
 
@@ -2308,8 +2417,6 @@ def validate_job_contract(jobs, identity, profile, *, surface=None):
         and (profile != "desktop" or platform != "linux") else None
     )
     cleanup_step = step_by_name["Shred runner-local workspace"]
-    if cleanup_step.get("status") != "completed" or cleanup_step.get("conclusion") != "success":
-        _refuse()
     probe_failure = step_by_name["Probe isolation before decryption"]
     decrypt_step = step_by_name["Decrypt authenticated bundle"]
     execute_step = step_by_name["Execute offline profile and filter public summary"]
@@ -2342,6 +2449,13 @@ def validate_job_contract(jobs, identity, profile, *, surface=None):
         }.get(platform, set())
         if candidate in platform_early_steps:
             early_failure_step = candidate
+    windows_prepare_cleanup_failure = (
+        platform == "windows" and early_failure_step == WINDOWS_PREPARE_STEP
+        and cleanup_step.get("status") == "completed" and cleanup_step.get("conclusion") == "failure"
+    )
+    if (cleanup_step.get("status") != "completed"
+            or cleanup_step.get("conclusion") != "success" and not windows_prepare_cleanup_failure):
+        _refuse()
     cancelled = run_job["conclusion"] in ("cancelled", "timed_out")
     for name, step in step_by_name.items():
         if ((skipped_tool_step is not None and name == skipped_tool_step)
@@ -2353,7 +2467,8 @@ def validate_job_contract(jobs, identity, profile, *, surface=None):
             index = expected_names.index(name)
             failed_index = expected_names.index(early_failure_step)
             if name == "Shred runner-local workspace":
-                if step.get("status") != "completed" or step.get("conclusion") != "success":
+                expected_cleanup = "failure" if windows_prepare_cleanup_failure else "success"
+                if step.get("status") != "completed" or step.get("conclusion") != expected_cleanup:
                     _refuse()
             elif index < failed_index:
                 if step.get("status") != "completed" or step.get("conclusion") != "success":
@@ -2530,6 +2645,9 @@ def _audit_outcome_line(jobs, identity, diagnosed_failure=None):
         disposition = "run-cancelled" if run_job["conclusion"] == "cancelled" else "run-timed-out"
         return "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=" + disposition
     steps = {step.get("name"): step for step in _steps(run_job)}
+    cleanup = steps.get("Shred runner-local workspace")
+    cleanup_state = ("failed" if identity.get("platform") == "windows" and type(cleanup) is dict
+                     and cleanup.get("conclusion") == "failure" else "confirmed")
     failed = next((name for name, step in steps.items()
                    if step.get("status") == "completed" and step.get("conclusion") == "failure"), None)
     if diagnosed_failure is not None:
@@ -2553,7 +2671,7 @@ def _audit_outcome_line(jobs, identity, diagnosed_failure=None):
         suffix = "during-execution"
     else:
         _refuse()
-    return ("devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed "
+    return ("devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=" + cleanup_state + " "
             "disposition=run-failed-" + suffix)
 
 
@@ -2600,7 +2718,21 @@ def validate_job_log_metadata_binding(surface, run_job, identity):
         else:
             allowed = False
         failed_step = step_by_name.get(early_failure)
-        if (not allowed or conclusion != "failure" or failed != [early_failure]
+        cleanup_failure = surface.get("cleanup_failure_code")
+        cleanup_reason = surface.get("cleanup_failure_reason")
+        cleanup_step = step_by_name.get("Shred runner-local workspace")
+        expected_failed = [early_failure]
+        if cleanup_failure is not None:
+            if (early_failure != WINDOWS_PREPARE_STEP or identity.get("platform") != "windows"
+                    or code != "windows-prepare-profile-cleanup-failed"
+                    or cleanup_failure not in WINDOWS_SHRED_REFUSAL_CODES
+                    or not cleanup_failure.startswith("windows-cleanup-shred-")
+                    or cleanup_reason not in WINDOWS_CLEANUP_REASON_CLASSES
+                    or cleanup_step is None or cleanup_step.get("status") != "completed"
+                    or cleanup_step.get("conclusion") != "failure"):
+                _refuse()
+            expected_failed.append("Shred runner-local workspace")
+        if (not allowed or conclusion != "failure" or failed != expected_failed
                 or type(surface.get("early_failure_exit")) is not int
                 or surface["early_failure_exit"] not in (1, 2)
                 or type(failed_step) is not dict or failed_step.get("status") != "completed"
@@ -2609,8 +2741,9 @@ def validate_job_log_metadata_binding(surface, run_job, identity):
         names = [step.get("name") for step in steps]
         failed_index = names.index(early_failure)
         cleanup = step_by_name.get("Shred runner-local workspace")
+        expected_cleanup = "failure" if cleanup_failure is not None else "success"
         if (type(cleanup) is not dict or cleanup.get("status") != "completed"
-                or cleanup.get("conclusion") != "success"):
+                or cleanup.get("conclusion") != expected_cleanup):
             _refuse()
         for name in names[failed_index + 1:]:
             if name == "Shred runner-local workspace":
@@ -2626,7 +2759,9 @@ def validate_job_log_metadata_binding(surface, run_job, identity):
                        "windows-prepare" if early_failure == WINDOWS_PREPARE_STEP else
                        EARLY_FAILURE_STEP_IDS.get(early_failure))
         expected_disposition = "disposition=run-failed-at-" + str(disposition)
+        expected_cleanup_line = "cleanup=" + ("failed" if cleanup_failure is not None else "confirmed")
         if (disposition is None or expected_disposition not in outcome
+                or expected_cleanup_line not in outcome
                 or outcome == "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed"):
             _refuse()
         return
@@ -2746,7 +2881,8 @@ def run_audit(api, identity):
         if annotations:
             _refuse()
     diagnosed_failure = (surface["early_failure"]
-                         if surface["early_failure"] in MACOS_DIAGNOSED_FAILURE_DISPOSITIONS else None)
+                         if identity.get("platform") == "macos"
+                         and surface["early_failure"] in MACOS_DIAGNOSED_FAILURE_DISPOSITIONS else None)
     return _audit_outcome_line(list(jobs.values()), identity, diagnosed_failure=diagnosed_failure)
 
 

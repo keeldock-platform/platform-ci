@@ -1,6 +1,8 @@
 """Mac-runnable validation for the hosted Windows adapter's fixed inputs."""
 
 import json
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -117,7 +119,77 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         source = (Path(windows.__file__).with_name("sandbox_windows_native.cs")).read_text(encoding="utf-8")
         self.assertIn("TerminateProcess(process, JobExitCode)", source)
         self.assertIn("WaitForSingleObject(process, 10000) != WaitObject0", source)
+        self.assertIn("JobObjectLimitKillOnJobClose", source)
+        self.assertIn("WaitForEmptyJob(job, 10000)", source)
+        self.assertIn("System.Threading.Thread.Sleep(50 << attempt)", source)
+        self.assertIn("for (int attempt = 0; attempt < 4; attempt++)", source)
+        self.assertIn("private static string CleanupReason(int status)", source)
+        self.assertLess(source.index("TerminateJobObject(job, JobExitCode);\n                if (!WaitForEmptyJob(job, 10000))"),
+                        source.index("return result;", source.index("TerminateJobObject(job, JobExitCode);\n                if (!WaitForEmptyJob(job, 10000)")))
         self.assertLess(source.index("TerminateProcess(process, JobExitCode)"), source.index("Close(process)"))
+
+    def test_profile_cleanup_reason_is_emitted_from_only_the_bounded_native_vocabulary(self):
+        result = mock.Mock(returncode=1, stdout=(
+            b"windows_cleanup_reason=sharing-violation\nwindows_sandbox=refused code=boundary\n"
+        ))
+        with mock.patch.object(windows.subprocess, "run", return_value=result), \
+                mock.patch("builtins.print") as output:
+            with self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
+                windows._run_powershell("delete", "sandbox.json", failure_prefix="windows-prepare")
+        self.assertEqual(caught.exception.code, "windows-prepare-powershell-nonzero")
+        self.assertEqual(caught.exception.reason, "sharing-violation")
+        output.assert_called_once_with("windows_prepare_cleanup_reason=sharing-violation", flush=True)
+
+    def test_shred_failure_prints_a_fixed_failed_cleanup_receipt(self):
+        output = io.StringIO()
+        errors = io.StringIO()
+        with mock.patch.object(windows, "cleanup_runner", side_effect=windows.WindowsBoundaryRefusal(
+                "windows-cleanup-shred-overwrite-failed", reason="sharing-violation")), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            result = windows.main(["shred", "--state", "state.json", "--root", "run-root", "--workspace", "source"])
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), (
+            "windows_sandbox_cleanup=failed stage=shred\n"
+            "cleanup_receipt=failed stage=windows-shred reason=sharing-violation\n"
+            "devlane_job=completed public_output=filtered cleanup=failed\n"
+        ))
+        self.assertEqual(errors.getvalue(), "devlane_refusal=windows-cleanup-shred-overwrite-failed\n")
+
+    def test_cleanup_retry_is_bounded_and_retries_only_sharing_violations(self):
+        sharing = OSError("sharing")
+        sharing.winerror = 32
+        with mock.patch.object(windows.time, "sleep") as sleep:
+            operation = mock.Mock(side_effect=[sharing, sharing, "done"])
+            self.assertEqual(windows._retry_windows_cleanup(operation), "done")
+        self.assertEqual(operation.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.05, 0.1])
+        access_denied = PermissionError(13, "denied")
+        with mock.patch.object(windows.time, "sleep") as sleep:
+            operation = mock.Mock(side_effect=access_denied)
+            with self.assertRaises(PermissionError):
+                windows._retry_windows_cleanup(operation)
+        operation.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_cleanup_error_classes_are_fixed_and_shred_reports_the_final_class(self):
+        self.assertEqual(windows._windows_cleanup_error_reason(PermissionError(13, "denied")), "access-denied")
+        self.assertEqual(windows._windows_cleanup_error_reason(FileNotFoundError(2, "missing")), "not-found")
+        self.assertEqual(windows._windows_cleanup_error_reason(OSError(95, "other")), "other")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run"
+            root.mkdir()
+            file = root / "private.txt"
+            file.write_text("private", encoding="ascii")
+            sharing = OSError("sharing")
+            sharing.winerror = 32
+            with mock.patch.object(Path, "open", side_effect=sharing), \
+                    mock.patch.object(windows.time, "sleep"), \
+                    mock.patch("builtins.print") as output:
+                with self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
+                    windows.shred_tree(root)
+            self.assertEqual(caught.exception.code, "shred-overwrite-failed")
+            self.assertEqual(caught.exception.reason, "sharing-violation")
+            output.assert_called_once_with("windows_cleanup_reason=sharing-violation", flush=True)
 
     def test_shred_tree_removes_oversize_and_reparse_entries_after_plaintext(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -211,7 +283,8 @@ class WindowsSandboxValidationTests(unittest.TestCase):
                     mock.patch.object(windows, "_deadline_remaining", return_value=600), \
                     mock.patch.object(windows, "create_profile", return_value={}), \
                     mock.patch.object(windows, "delete_profile"), \
-                    mock.patch.object(windows, "_native_run", side_effect=isolated):
+                    mock.patch.object(windows, "_native_run", side_effect=isolated), \
+                    mock.patch("builtins.print") as stage_output:
                 windows.prepare_dependencies(projection, output, root / "deadline.json", state)
 
             self.assertEqual(len(requests), 2)
@@ -225,6 +298,11 @@ class WindowsSandboxValidationTests(unittest.TestCase):
                 self.assertIn("NPM_CONFIG_OFFLINE=false", request["environment"])
                 self.assertIn("NPM_CONFIG_LOGS_DIR=" + str(output / "npm-cache" / "_logs"), request["environment"])
             self.assertTrue((output / "prepared" / "toolchain.json").is_file())
+            self.assertEqual(
+                [call.args[0] for call in stage_output.call_args_list],
+                ["windows_prepare_stage=none", "windows_prepare_job=empty", "windows_prepare_stage=npm-ci",
+                 "windows_prepare_job=empty", "windows_prepare_stage=playwright", "windows_prepare_stage=done"],
+            )
 
     def test_prepare_maps_native_process_start_and_timeout_to_distinct_fixed_codes(self):
         for status, expected in (
