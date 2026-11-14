@@ -350,6 +350,17 @@ WINDOWS_PREPARE_REFUSAL_CODES = refusal_codes.WINDOWS_PREPARE_REFUSAL_CODES
 WINDOWS_SHRED_REFUSAL_CODES = refusal_codes.WINDOWS_SHRED_REFUSAL_CODES
 WINDOWS_CLEANUP_REASON_CLASSES = refusal_codes.WINDOWS_CLEANUP_REASON_CLASSES
 WINDOWS_PREPARE_STAGES = ("none", "npm-ci", "playwright", "done")
+WINDOWS_PREPARE_START_STAGES = ("profile-create", "npm-ci", "playwright", "profile-cleanup", "copy")
+WINDOWS_PREPARE_PROCESS_CLASSES = frozenset(("node", "npm", "cmd", "powershell", "git", "esbuild", "playwright", "other"))
+WINDOWS_PREPARE_TIMEOUT_LIMITS = frozenset(("npm-child", "playwright-child", "work-deadline", "powershell"))
+MACOS_DNS_VARIANTS = ("base", "configd", "resolver-files", "mdnsresponder-socket", "networkd", "all")
+MACOS_DNS_DENIAL_OPERATIONS = frozenset((
+    "file-read-data", "file-read-metadata", "file-read*", "mach-lookup", "network-outbound", "system-socket",
+))
+MACOS_DNS_DENIAL_TARGETS = frozenset((
+    "com.apple.SystemConfiguration.configd", "com.apple.networkd", "com.apple.nesessionmanager",
+    "etc", "var-run", "library-prefs", "mach-other", "other",
+))
 FETCH_REFUSAL_CODES = refusal_codes.DOWNLOAD_REFUSAL_CODES | frozenset(("fetch-failed",))
 SUPERVISOR_START_REFUSAL_CODES = (
     refusal_codes.STARTUP_REFUSAL_CODES | refusal_codes.STARTUP_DIAGNOSTIC_CODES
@@ -937,6 +948,48 @@ class _Grammar:
             public_counts["windows_prepare_stage_index"] = index
             public_counts["windows_prepare_stage_" + stage] = 1
             return True
+        if line.startswith("windows_prepare_stage_start="):
+            stage = line.removeprefix("windows_prepare_stage_start=")
+            if (self.job_runner != "windows-2025" or step_name != WINDOWS_PREPARE_STEP
+                    or stage not in WINDOWS_PREPARE_START_STAGES):
+                return False
+            index = WINDOWS_PREPARE_START_STAGES.index(stage)
+            previous = public_counts.get("windows_prepare_start_stage_index", -1)
+            if index <= previous:
+                return False
+            public_counts["windows_prepare_start_stage_index"] = index
+            public_counts["windows_prepare_start_stage_" + stage] = 1
+            return True
+        heartbeat = re.fullmatch(
+            r"windows_prepare_heartbeat stage=(profile-create|npm-ci|playwright|profile-cleanup) "
+            r"elapsed=([1-9][0-9]{0,4}) "
+            r"children=([0-9]{1,3}) top=(node|npm|cmd|powershell|git|esbuild|playwright|other)", line,
+        )
+        if heartbeat is not None:
+            stage, elapsed, children, _top = heartbeat.groups()
+            if (self.job_runner != "windows-2025" or step_name != WINDOWS_PREPARE_STEP
+                    or public_counts.get("windows_prepare_start_stage_" + stage) != 1
+                    or int(elapsed) < 60 or int(elapsed) > 10800 or int(children) > 256):
+                return False
+            last_elapsed = public_counts.get("windows_prepare_heartbeat_last_" + stage, 0)
+            if int(elapsed) <= last_elapsed:
+                return False
+            count = public_counts.get("windows_prepare_heartbeat_count", 0) + 1
+            if count > 180:
+                return False
+            public_counts["windows_prepare_heartbeat_last_" + stage] = int(elapsed)
+            public_counts["windows_prepare_heartbeat_count"] = count
+            return True
+        timeout_line = re.fullmatch(
+            r"windows_prepare_timeout limit=(npm-child|playwright-child|work-deadline|powershell) "
+            r"seconds=([1-9][0-9]{0,4})", line,
+        )
+        if timeout_line is not None:
+            if (self.job_runner != "windows-2025" or step_name != WINDOWS_PREPARE_STEP
+                    or int(timeout_line.group(2)) > 10800):
+                return False
+            public_counts["windows_prepare_timeout"] = public_counts.get("windows_prepare_timeout", 0) + 1
+            return public_counts["windows_prepare_timeout"] == 1
         if line == "windows_prepare_job=empty":
             if self.job_runner != "windows-2025" or step_name != WINDOWS_PREPARE_STEP:
                 return False
@@ -987,6 +1040,45 @@ class _Grammar:
                 return False
             public_counts["cleanup_failure_completion"] = public_counts.get("cleanup_failure_completion", 0) + 1
             return public_counts["cleanup_failure_completion"] == 1
+        variant_line = re.fullmatch(
+            r"macos_dns_probe_variant name=(base|configd|resolver-files|mdnsresponder-socket|networkd|all) "
+            r"result=(ok|fail)", line,
+        )
+        if variant_line is not None:
+            if (self.job_runner != "macos-15" or step_name != MACOS_PREPARE_STEP
+                    or self.identity.get("platform") != "macos" or self.identity.get("profile") != "core-node"):
+                return False
+            variant = variant_line.group(1)
+            index = MACOS_DNS_VARIANTS.index(variant)
+            previous = public_counts.get("macos_dns_probe_variant_index", -1)
+            if index <= previous:
+                return False
+            public_counts["macos_dns_probe_variant_index"] = index
+            public_counts["macos_dns_probe_variant_" + variant] = variant_line.group(2)
+            return True
+        if line.startswith("macos_sandbox_denial "):
+            denial = re.fullmatch(r"macos_sandbox_denial op=([a-z][a-z0-9*-]*) target=([A-Za-z0-9_.-]+)", line)
+            if (self.job_runner != "macos-15" or step_name != MACOS_PREPARE_STEP
+                    or self.identity.get("platform") != "macos" or self.identity.get("profile") != "core-node"
+                    or denial is None or denial.group(1) not in MACOS_DNS_DENIAL_OPERATIONS
+                    or denial.group(2) not in MACOS_DNS_DENIAL_TARGETS):
+                return False
+            if denial.group(1) == "mach-lookup":
+                if denial.group(2) not in {
+                    "com.apple.SystemConfiguration.configd", "com.apple.networkd",
+                    "com.apple.nesessionmanager", "mach-other",
+                }:
+                    return False
+            elif denial.group(2) in {
+                "com.apple.SystemConfiguration.configd", "com.apple.networkd", "com.apple.nesessionmanager",
+                "mach-other",
+            }:
+                return False
+            seen = public_counts.setdefault("macos_sandbox_denials", [])
+            if denial.group(0) in seen or len(seen) >= 20:
+                return False
+            seen.append(denial.group(0))
+            return True
         if line.startswith("macos_dns_probe"):
             if (self.job_runner != "macos-15" or step_name != MACOS_PREPARE_STEP
                     or self.identity.get("platform") != "macos" or self.identity.get("profile") != "core-node"

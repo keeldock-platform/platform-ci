@@ -3026,6 +3026,100 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             audit.WINDOWS_PREPARE_STEP, "macos_dns_probe unconfined=ok confined=ok", {},
         ))
 
+    def test_macos_dns_variants_and_sandbox_denials_have_fixed_prepare_only_grammar(self):
+        identity = dict(IDENTITY, platform="macos", profile="core-node")
+        grammar = audit._Grammar(
+            Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml",
+            audit.MACOS_RUN_JOB, identity, "encrypted",
+        )
+        counts = {}
+        for variant in audit.MACOS_DNS_VARIANTS:
+            line = "macos_dns_probe_variant name=" + variant + " result=fail"
+            self.assertTrue(grammar.step_output_ok(audit.MACOS_PREPARE_STEP, line, counts))
+        self.assertFalse(grammar.step_output_ok(
+            audit.MACOS_PREPARE_STEP,
+            "macos_dns_probe_variant name=base result=fail", counts,
+        ))
+        denial = "macos_sandbox_denial op=mach-lookup target=com.apple.SystemConfiguration.configd"
+        self.assertTrue(grammar.step_output_ok(audit.MACOS_PREPARE_STEP, denial, counts))
+        self.assertFalse(grammar.step_output_ok(audit.MACOS_PREPARE_STEP, denial, counts))
+        for invalid in (
+            "macos_dns_probe_variant name=private result=ok",
+            "macos_dns_probe_variant name=all result=okay",
+            "macos_sandbox_denial op=raw-operation target=other",
+            "macos_sandbox_denial op=mach-lookup target=/secret",
+            "macos_sandbox_denial op=file-read-data target=com.apple.networkd",
+            "macos_sandbox_denial op=file-read-data target=private-path",
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertFalse(grammar.step_output_ok(audit.MACOS_PREPARE_STEP, invalid, {}))
+        self.assertFalse(grammar.step_output_ok(audit.MACOS_PROBE_STEP, denial, {}))
+        windows = audit._Grammar(
+            Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml",
+            audit.PLATFORM_RUN_JOBS["windows"], dict(IDENTITY, platform="windows"), "encrypted",
+        )
+        self.assertFalse(windows.step_output_ok(audit.WINDOWS_PREPARE_STEP, denial, {}))
+
+    def test_windows_prepare_progress_and_timeout_lines_are_fixed_to_prepare_step(self):
+        identity = dict(IDENTITY, platform="windows")
+        grammar = audit._Grammar(
+            Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml",
+            audit.PLATFORM_RUN_JOBS["windows"], identity, "encrypted",
+        )
+        counts = {}
+        starts = ("profile-create", "npm-ci", "playwright", "profile-cleanup", "copy")
+        for stage in starts:
+            self.assertTrue(grammar.step_output_ok(
+                audit.WINDOWS_PREPARE_STEP, "windows_prepare_stage_start=" + stage, counts,
+            ))
+        self.assertTrue(grammar.step_output_ok(
+            audit.WINDOWS_PREPARE_STEP,
+            "windows_prepare_heartbeat stage=profile-create elapsed=60 children=1 top=powershell", counts,
+        ))
+        self.assertTrue(grammar.step_output_ok(
+            audit.WINDOWS_PREPARE_STEP,
+            "windows_prepare_heartbeat stage=npm-ci elapsed=60 children=3 top=node", counts,
+        ))
+        self.assertTrue(grammar.step_output_ok(
+            audit.WINDOWS_PREPARE_STEP,
+            "windows_prepare_heartbeat stage=npm-ci elapsed=120 children=2 top=git", counts,
+        ))
+        self.assertTrue(grammar.step_output_ok(
+            audit.WINDOWS_PREPARE_STEP,
+            "windows_prepare_heartbeat stage=profile-cleanup elapsed=60 children=1 top=powershell", counts,
+        ))
+        self.assertTrue(grammar.step_output_ok(
+            audit.WINDOWS_PREPARE_STEP, "windows_prepare_timeout limit=npm-child seconds=3600", counts,
+        ))
+        for invalid in (
+            "windows_prepare_stage_start=unknown",
+            "windows_prepare_heartbeat stage=npm-ci elapsed=59 children=0 top=other",
+            "windows_prepare_heartbeat stage=npm-ci elapsed=180 children=257 top=node",
+            "windows_prepare_heartbeat stage=npm-ci elapsed=240 children=1 top=private.exe",
+            "windows_prepare_timeout limit=external seconds=960",
+            "windows_prepare_timeout limit=powershell seconds=0",
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertFalse(grammar.step_output_ok(audit.WINDOWS_PREPARE_STEP, invalid, {}))
+        self.assertFalse(grammar.step_output_ok(
+            "Shred runner-local workspace", "windows_prepare_stage_start=copy", {},
+        ))
+        bounded = {}
+        for stage in ("profile-create", "npm-ci"):
+            self.assertTrue(grammar.step_output_ok(
+                audit.WINDOWS_PREPARE_STEP, "windows_prepare_stage_start=" + stage, bounded,
+            ))
+        for index in range(1, 181):
+            self.assertTrue(grammar.step_output_ok(
+                audit.WINDOWS_PREPARE_STEP,
+                "windows_prepare_heartbeat stage=npm-ci elapsed=" + str(index * 60)
+                + " children=1 top=node", bounded,
+            ))
+        self.assertFalse(grammar.step_output_ok(
+            audit.WINDOWS_PREPARE_STEP,
+            "windows_prepare_heartbeat stage=npm-ci elapsed=10860 children=1 top=node", bounded,
+        ))
+
     def test_windows_prepare_refusals_pass_only_the_bound_step_contract(self):
         identity = dict(IDENTITY, platform="windows")
         failed_step = audit.WINDOWS_PREPARE_STEP

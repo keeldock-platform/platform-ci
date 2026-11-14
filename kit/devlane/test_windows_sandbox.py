@@ -51,6 +51,11 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(windows.WindowsBoundaryRefusal):
                 windows.validate_environment(bad)
 
+    def test_prepare_process_snapshot_reduces_image_names_to_fixed_classes(self):
+        with mock.patch.object(windows.sys, "platform", "win32"), \
+                mock.patch.object(windows.ctypes, "WinDLL", side_effect=OSError, create=True):
+            self.assertEqual(windows._windows_process_summary(123), (0, "other"))
+
     def test_npm_preparation_error_class_uses_bounded_fixed_log_vocabulary(self):
         with tempfile.TemporaryDirectory() as temporary:
             logs = Path(temporary)
@@ -297,12 +302,78 @@ class WindowsSandboxValidationTests(unittest.TestCase):
                 self.assertIn("NPM_CONFIG_IGNORE_SCRIPTS=true", request["environment"])
                 self.assertIn("NPM_CONFIG_OFFLINE=false", request["environment"])
                 self.assertIn("NPM_CONFIG_LOGS_DIR=" + str(output / "npm-cache" / "_logs"), request["environment"])
+                self.assertIn("NPM_CONFIG_PREFIX=" + str(output / "project"), request["environment"])
+                self.assertIn("NPM_CONFIG_YES=true", request["environment"])
+                self.assertIn("NPM_CONFIG_PROMPT=false", request["environment"])
+                self.assertIn("GIT_TERMINAL_PROMPT=0", request["environment"])
+                if request["arguments"][0] == str(npm):
+                    self.assertIn("--yes", request["arguments"])
             self.assertTrue((output / "prepared" / "toolchain.json").is_file())
             self.assertEqual(
                 [call.args[0] for call in stage_output.call_args_list],
-                ["windows_prepare_stage=none", "windows_prepare_job=empty", "windows_prepare_stage=npm-ci",
-                 "windows_prepare_job=empty", "windows_prepare_stage=playwright", "windows_prepare_stage=done"],
+                ["windows_prepare_stage_start=profile-create", "windows_prepare_stage=none",
+                 "windows_prepare_stage_start=npm-ci", "windows_prepare_job=empty",
+                 "windows_prepare_stage=npm-ci", "windows_prepare_stage_start=playwright",
+                 "windows_prepare_job=empty", "windows_prepare_stage=playwright", "windows_prepare_stage=done",
+                 "windows_prepare_stage_start=profile-cleanup", "windows_prepare_stage_start=copy"],
             )
+
+    def test_prepare_timeout_emits_the_selected_child_limit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run"
+            state = root / "state" / "sandbox.json"
+            state.parent.mkdir(parents=True)
+            projection = root / "projection.json"
+            projection.write_text("{}", encoding="ascii")
+            node = root / "node.exe"
+            npm = root / "npm-cli.js"
+            node.write_text("", encoding="ascii")
+            npm.write_text("", encoding="ascii")
+            with mock.patch.object(windows.sys, "platform", "win32"), \
+                    mock.patch.object(windows.fetch, "validate_projection", return_value={
+                        "npm_package": {}, "npm_lock": {}, "playwright": [],
+                    }), \
+                    mock.patch.object(windows, "_npm_tools", return_value=(node, npm)), \
+                    mock.patch.object(windows, "_deadline_remaining", return_value=7200), \
+                    mock.patch.object(windows, "create_profile", return_value={}), \
+                    mock.patch.object(windows, "delete_profile"), \
+                    mock.patch.object(windows, "_native_run", return_value={
+                        "status": "timeout", "exit_code": 0, "token": "", "job": "",
+                    }), \
+                    mock.patch("builtins.print") as output:
+                with self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
+                    windows.prepare_dependencies(projection, root / "prepared", root / "deadline", state)
+            self.assertEqual(caught.exception.code, "windows-prepare-npm-child-timeout-3600s")
+            output.assert_any_call("windows_prepare_timeout limit=npm-child seconds=3600", flush=True)
+
+    def test_prepare_powershell_monitor_reports_allowlisted_heartbeat_and_timeout(self):
+        process = mock.Mock(pid=123, returncode=0)
+        process.communicate.side_effect = [
+            windows.subprocess.TimeoutExpired("pwsh", 0.01), (b"{\"status\":\"pass\"}", None),
+        ]
+        with mock.patch.object(windows.subprocess, "Popen", return_value=process), \
+                mock.patch.object(windows, "_windows_process_summary", return_value=(2, "node")), \
+                mock.patch.object(windows.time, "monotonic", side_effect=(0, 60.1, 60.1, 60.1)), \
+                mock.patch("builtins.print") as output:
+            result = windows._run_powershell(
+                "run", "sandbox.json", timeout=600, failure_prefix="windows-prepare", monitor_stage="npm-ci",
+            )
+        self.assertEqual(result, '{"status":"pass"}')
+        output.assert_called_once_with(
+            "windows_prepare_heartbeat stage=npm-ci elapsed=60 children=2 top=node", flush=True,
+        )
+
+        hung = mock.Mock(pid=456)
+        hung.communicate.return_value = (b"", None)
+        with mock.patch.object(windows.subprocess, "Popen", return_value=hung), \
+                mock.patch.object(windows.time, "monotonic", side_effect=(0, 1.1)), \
+                mock.patch("builtins.print") as output:
+            with self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
+                windows._run_powershell(
+                    "run", "sandbox.json", timeout=1, failure_prefix="windows-prepare", monitor_stage="npm-ci",
+                )
+        self.assertEqual(caught.exception.code, "windows-prepare-powershell-timeout")
+        output.assert_called_once_with("windows_prepare_timeout limit=powershell seconds=1", flush=True)
 
     def test_prepare_maps_native_process_start_and_timeout_to_distinct_fixed_codes(self):
         for status, expected in (

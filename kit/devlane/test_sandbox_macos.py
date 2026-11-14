@@ -585,12 +585,39 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         self.assertIn("(deny network-inbound)", profile)
         self.assertNotIn("(allow network*)", profile)
         self.assertIn('(allow mach-lookup (global-name "com.apple.dnssd.service"))', profile)
+        self.assertNotIn("com.apple.SystemConfiguration.configd", profile)
+        self.assertNotIn("mDNSResponder", profile)
         self.assertIn('(allow file-read* (literal "/opt"))', profile)
         self.assertNotIn('(allow file-read-metadata (literal "/opt"))', profile)
         self.assertIn('(allow file-write* (subpath "' + PRIVATE_RUN + '/cache")', profile)
         self.assertNotIn('(allow file-write* (subpath "/Users")', profile)
         self.assertIn('(allow process-exec (literal "/usr/bin/xcrun"))', profile)
         self.assertIn('(allow file-read* (subpath "' + sandbox.CLT_DEVELOPER_DIRECTORY + '"))', profile)
+        variants = {
+            name: sandbox.preparation_profile_text(
+                project=PRIVATE_RUN + "/preparation-project", prepared=PRIVATE_RUN + "/prepared",
+                cache=PRIVATE_RUN + "/cache", home=PRIVATE_RUN + "/home", temporary=PRIVATE_RUN + "/tmp",
+                node="/opt/node/bin/node", npm_cli="/opt/node/lib/node_modules/npm/bin/npm-cli.js", variant=name,
+            )
+            for name in sandbox.MACOS_DNS_VARIANTS
+        }
+        self.assertIn("com.apple.SystemConfiguration.configd", variants["configd"])
+        private_root = chr(47) + "private"
+        self.assertIn(private_root + "/etc/resolv.conf", variants["resolver-files"])
+        self.assertIn('/Library/Preferences/SystemConfiguration', variants["resolver-files"])
+        self.assertIn("(socket-domain AF_UNIX)", variants["mdnsresponder-socket"])
+        self.assertIn('(remote unix-socket (path-literal "' + private_root + '/var/run/mDNSResponder"))',
+                      variants["mdnsresponder-socket"])
+        self.assertIn("com.apple.networkd", variants["networkd"])
+        self.assertIn("com.apple.nesessionmanager", variants["networkd"])
+        self.assertIn("com.apple.SystemConfiguration.configd", variants["all"])
+        self.assertIn("com.apple.nesessionmanager", variants["all"])
+        with self.assertRaisesRegex(sandbox.Refusal, "profile-config-invalid"):
+            sandbox.preparation_profile_text(
+                project=PRIVATE_RUN + "/preparation-project", prepared=PRIVATE_RUN + "/prepared",
+                cache=PRIVATE_RUN + "/cache", home=PRIVATE_RUN + "/home", temporary=PRIVATE_RUN + "/tmp",
+                node="/opt/node/bin/node", npm_cli="/opt/node/lib/node_modules/npm/bin/npm-cli.js", variant="unknown",
+            )
         preparation_env = sandbox._preparation_env(
             {"node": "/opt/node/bin/node"}, home=PRIVATE_RUN + "/home",
             temporary=PRIVATE_RUN + "/tmp", cache=PRIVATE_RUN + "/cache",
@@ -633,31 +660,82 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         self.assertEqual(spawn.call_args.kwargs["group"], sandbox.WORKER_GROUP)
         self.assertEqual(spawn.call_args.kwargs["extra_groups"], ())
 
-    def test_preparation_dns_probe_emits_one_bounded_fixed_vocabulary_line(self):
+    def test_preparation_dns_probe_runs_every_candidate_and_selects_the_first_success(self):
         ident = {"uid": 544, "gid": sandbox.WORKER_GROUP, "node": "/opt/node/bin/node"}
-        results = [mock.Mock(returncode=1), mock.Mock(returncode=0)]
+        return_codes = [1, 1, 0, 1, 1, 1, 0]
+        processes = []
+        for pid, return_code in enumerate(return_codes, 400):
+            process = mock.Mock(pid=pid)
+            process.wait.return_value = return_code
+            processes.append(process)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            profile = root / "preparation.sb"
-            profile.write_text("(version 1)\n", encoding="ascii")
-            with mock.patch.object(sandbox.subprocess, "run", side_effect=results) as run, \
+            profiles = {}
+            for variant in sandbox.MACOS_DNS_VARIANTS:
+                candidate = root / (variant + ".sb")
+                candidate.write_text("(version 1)\n", encoding="ascii")
+                profiles[variant] = candidate
+            with mock.patch.object(sandbox.subprocess, "Popen", side_effect=processes) as spawn, \
+                    mock.patch.object(sandbox, "_collect_macos_sandbox_denials") as denials, \
                     mock.patch("builtins.print") as output:
                 status = sandbox._preparation_dns_probe(
-                    ident=ident, profile=profile, cwd=root, env={"PATH": "/usr/bin:/bin"},
+                    ident=ident, profiles=profiles, cwd=root, env={"PATH": "/usr/bin:/bin"},
                 )
-        self.assertEqual(status, ("fail", "ok"))
-        output.assert_called_once_with("macos_dns_probe unconfined=fail confined=ok", flush=True)
-        self.assertEqual(run.call_count, 2)
-        unconfined, confined = (call.args[0] for call in run.call_args_list)
+        self.assertEqual(status, ("fail", "ok", "configd"))
+        self.assertEqual(
+            [call.args[0] for call in output.call_args_list],
+            ["macos_dns_probe_variant name=base result=fail",
+             "macos_dns_probe_variant name=configd result=ok",
+             "macos_dns_probe_variant name=resolver-files result=fail",
+             "macos_dns_probe_variant name=mdnsresponder-socket result=fail",
+             "macos_dns_probe_variant name=networkd result=fail",
+             "macos_dns_probe_variant name=all result=ok",
+             "macos_dns_probe unconfined=fail confined=ok"],
+        )
+        self.assertEqual(spawn.call_count, 7)
+        self.assertEqual(denials.call_count, 4)
+        unconfined = spawn.call_args_list[0].args[0]
         self.assertEqual(unconfined[:2], ("/opt/node/bin/node", "-e"))
         self.assertIn('"registry.npmjs.org"', unconfined[2])
-        self.assertEqual(confined[:3], ("/usr/bin/sandbox-exec", "-f", str(profile)))
-        self.assertEqual(confined[3:], unconfined)
-        for call in run.call_args_list:
-            self.assertLessEqual(call.kwargs["timeout"], 8)
+        for variant, call in zip(sandbox.MACOS_DNS_VARIANTS, spawn.call_args_list[1:]):
+            confined = call.args[0]
+            self.assertEqual(confined[:3], ("/usr/bin/sandbox-exec", "-f", str(profiles[variant])))
+            self.assertEqual(confined[3:], unconfined)
             self.assertEqual(call.kwargs["stdout"], sandbox.subprocess.DEVNULL)
             self.assertEqual(call.kwargs["stderr"], sandbox.subprocess.DEVNULL)
             self.assertEqual(call.kwargs["user"], ident["uid"])
+            self.assertEqual(call.kwargs["group"], ident["gid"])
+            self.assertEqual(call.kwargs["extra_groups"], ())
+            self.assertTrue(call.kwargs["start_new_session"])
+            self.assertEqual(call.args[0][0], "/usr/bin/sandbox-exec")
+        for call in spawn.call_args_list:
+            self.assertEqual(call.kwargs["stdout"], sandbox.subprocess.DEVNULL)
+            self.assertEqual(call.kwargs["stderr"], sandbox.subprocess.DEVNULL)
+            self.assertEqual(call.kwargs["user"], ident["uid"])
+
+    def test_macos_sandbox_denials_are_reduced_to_allowlisted_classes(self):
+        private_root = chr(47) + "private"
+        raw = (
+            b"Sandbox: node(451) deny(1) mach-lookup com.apple.SystemConfiguration.configd\n"
+            + ("Sandbox: node(451) deny(1) file-read-data " + private_root + "/etc/resolv.conf\n").encode()
+            + ("Sandbox: node(451) deny(1) network-outbound " + private_root + "/var/run/mDNSResponder\n").encode()
+            + b"Sandbox: node(451) deny(1) mach-lookup com.apple.private.secret\n"
+        )
+        emitted = set()
+        with mock.patch.object(sandbox.subprocess, "run", return_value=mock.Mock(
+                returncode=0, stdout=raw)) as run, mock.patch("builtins.print") as output:
+            sandbox._collect_macos_sandbox_denials(451, emitted)
+        self.assertEqual(
+            [call.args[0] for call in output.call_args_list],
+            ["macos_sandbox_denial op=mach-lookup target=com.apple.SystemConfiguration.configd",
+             "macos_sandbox_denial op=file-read-data target=etc",
+             "macos_sandbox_denial op=network-outbound target=var-run",
+             "macos_sandbox_denial op=mach-lookup target=mach-other"],
+        )
+        self.assertTrue(all(b"/private" not in call.args[0].encode("ascii")
+                            for call in output.call_args_list))
+        self.assertEqual(run.call_args.args[0][0:3], ("/usr/bin/log", "show", "--last"))
+        self.assertIn("451", run.call_args.args[0])
 
     def test_preparation_start_and_npm_failures_have_fixed_codes(self):
         with mock.patch.object(sandbox.subprocess, "Popen", side_effect=PermissionError(1, "denied")):

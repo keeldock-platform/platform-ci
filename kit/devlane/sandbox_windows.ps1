@@ -143,7 +143,57 @@ try {
     if ($Mode -eq 'delete') {
         Remove-NetFirewallRule -Name $state.firewall_rule -ErrorAction SilentlyContinue
         if (@(Get-NetFirewallRule -Name $state.firewall_rule -ErrorAction SilentlyContinue).Count -ne 0) { throw }
+        function Get-CleanupReason([object]$Failure) {
+            if ($null -eq $Failure -or $null -eq $Failure.Exception) { return 'other' }
+            $code = ([int]$Failure.Exception.HResult) -band 65535
+            if ($code -in @(32, 33)) { return 'sharing-violation' }
+            if ($code -eq 5) { return 'access-denied' }
+            if ($code -in @(2, 3)) { return 'not-found' }
+            return 'other'
+        }
+        function Restore-RunnerAccessTree([string]$Root) {
+            if (-not (Test-Path -LiteralPath $Root)) { return }
+            $takeown = Join-Path $env:SystemRoot 'System32\takeown.exe'
+            $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
+            $pending = [Collections.Generic.Stack[string]]::new()
+            $pending.Push($Root)
+            $visited = [Collections.Generic.List[string]]::new()
+            while ($pending.Count -gt 0) {
+                $path = $pending.Pop()
+                if ($visited.Count -ge 250000) { throw }
+                $item = Get-Item -LiteralPath $path -Force
+                if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw }
+                & $takeown '/F' $path '/A' *> $null
+                if ($LASTEXITCODE -ne 0) { $script:cleanupReason = 'other'; throw }
+                & $icacls $path '/reset' '/C' '/Q' *> $null
+                if ($LASTEXITCODE -ne 0) { $script:cleanupReason = 'other'; throw }
+                $grant = if ($item.PSIsContainer) { '*S-1-5-32-544:(OI)(CI)F' } else { '*S-1-5-32-544:F' }
+                & $icacls $path '/grant:r' $grant '/C' '/Q' *> $null
+                if ($LASTEXITCODE -ne 0) { $script:cleanupReason = 'other'; throw }
+                $visited.Add($path)
+                if ($item.PSIsContainer) {
+                    foreach ($entry in Get-ChildItem -LiteralPath $path -Force) { $pending.Push($entry.FullName) }
+                }
+            }
+        }
+        function Clear-AppContainerStorage([string]$PackageSid, [string]$ProfileName) {
+            $actual = [IO.Path]::GetFullPath([KeelDock.Platform.DevLaneWindows.Boundary]::GetProfileFolderPath($PackageSid))
+            $packages = [IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Packages'))
+            $expected = [IO.Path]::GetFullPath((Join-Path (Join-Path $packages $ProfileName) 'AC'))
+            if (-not [string]::Equals($actual, $expected, [StringComparison]::OrdinalIgnoreCase)) { throw }
+            if (-not (Test-Path -LiteralPath $actual)) { return }
+            Restore-RunnerAccessTree $actual
+            Remove-Item -LiteralPath $actual -Recurse -Force
+        }
         $sid = [Security.Principal.SecurityIdentifier]::new([string]$state.package_sid)
+        $runnerRoot = [IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $statePath)))
+        $runnerPrefix = $runnerRoot.TrimEnd([char]92) + [IO.Path]::DirectorySeparatorChar
+        $modifiedPaths = @($state.acl_grants | Where-Object { $_.rights -eq 'Modify' } | ForEach-Object { [string]$_.path })
+        foreach ($modifiedPath in $modifiedPaths) {
+            $fullPath = [IO.Path]::GetFullPath($modifiedPath)
+            if (-not $fullPath.StartsWith($runnerPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw }
+            Restore-RunnerAccessTree $fullPath
+        }
         foreach ($grant in @($state.acl_grants)) {
             $path = [string]$grant.path
             if (-not (Test-Path -LiteralPath $path)) { continue }
@@ -156,6 +206,11 @@ try {
             $acl.RemoveAccessRuleSpecific($rule)
             Set-Acl -LiteralPath $path -AclObject $acl
         }
+        try { Clear-AppContainerStorage ([string]$state.package_sid) ([string]$state.profile_name) }
+        catch {
+            if ($null -eq $cleanupReason) { $cleanupReason = Get-CleanupReason $_ }
+            throw
+        }
         $deleteResult = [KeelDock.Platform.DevLaneWindows.Boundary]::DeleteProfile([string]$state.profile_name)
         if ($deleteResult -ne 'deleted') {
             $cleanupReason = [string]$deleteResult
@@ -167,6 +222,13 @@ try {
     }
     throw
 } catch {
+    if ($Mode -eq 'delete' -and $null -eq $cleanupReason) {
+        $code = ([int]$_.Exception.HResult) -band 65535
+        if ($code -in @(32, 33)) { $cleanupReason = 'sharing-violation' }
+        elseif ($code -eq 5) { $cleanupReason = 'access-denied' }
+        elseif ($code -in @(2, 3)) { $cleanupReason = 'not-found' }
+        else { $cleanupReason = 'other' }
+    }
     if ($Mode -eq 'delete' -and $cleanupReason -in @('sharing-violation', 'access-denied', 'not-found', 'other')) {
         Write-Output ('windows_cleanup_reason=' + $cleanupReason)
     }

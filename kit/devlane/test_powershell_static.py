@@ -373,6 +373,26 @@ class PowerShellStaticTests(unittest.TestCase):
         self.assertIn("Write-Output 'devlane_refusal=windows-cleanup-precheckout-remove-failed'", cleanup)
         self.assertNotRegex(precheckout, r"(?i)\$_|\$PSItem|Write-Error|Write-Host")
 
+    def test_windows_profile_cleanup_is_admin_scoped_to_the_generated_appcontainer_folder(self):
+        sources = powershell_sources()
+        script = next(item.text for item in sources if item.name == "kit/devlane/sandbox_windows.ps1")
+        native = (ROOT / "kit/devlane/sandbox_windows_native.cs").read_text(encoding="utf-8")
+        self.assertIn("GetAppContainerFolderPath", native)
+        self.assertIn("GetProfileFolderPath", native)
+        self.assertIn("CoTaskMemFree(path)", native)
+        self.assertIn("function Clear-AppContainerStorage", script)
+        self.assertIn("GetProfileFolderPath($PackageSid)", script)
+        self.assertIn("[StringComparison]::OrdinalIgnoreCase", script)
+        self.assertIn("'/F' $path '/A'", script)
+        self.assertIn("$path '/reset' '/C' '/Q'", script)
+        self.assertIn("'*S-1-5-32-544:(OI)(CI)F'", script)
+        self.assertIn("[IO.FileAttributes]::ReparsePoint", script)
+        cleanup = script.split("if ($Mode -eq 'delete') {", 1)[1].split("\n    throw\n} catch {", 1)[0]
+        self.assertLess(cleanup.index("Clear-AppContainerStorage"), cleanup.index("DeleteProfile"))
+        self.assertNotIn("'/T'", cleanup)
+        self.assertIn("Restore-RunnerAccessTree $fullPath", cleanup)
+        self.assertIn("windows_cleanup_reason=", script)
+
 
 if __name__ == "__main__":
     unittest.main()

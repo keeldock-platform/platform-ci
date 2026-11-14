@@ -171,6 +171,12 @@ namespace KeelDock.Platform.DevLaneWindows
         [DllImport("userenv.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern int DeleteAppContainerProfile(string appContainerName);
 
+        [DllImport("userenv.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern int GetAppContainerFolderPath(string appContainerSid, out IntPtr path);
+
+        [DllImport("ole32.dll")]
+        private static extern void CoTaskMemFree(IntPtr memory);
+
         [DllImport("advapi32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool IsValidSid(IntPtr sid);
@@ -295,6 +301,22 @@ namespace KeelDock.Platform.DevLaneWindows
                 System.Threading.Thread.Sleep(50 << attempt);
             }
             return "other";
+        }
+
+        public static string GetProfileFolderPath(string packageSid)
+        {
+            if (String.IsNullOrEmpty(packageSid)) throw new InvalidOperationException("profile_sid");
+            IntPtr path = IntPtr.Zero;
+            int status = GetAppContainerFolderPath(packageSid, out path);
+            if (status != 0) Marshal.ThrowExceptionForHR(status);
+            if (path == IntPtr.Zero) throw new InvalidOperationException("profile_path");
+            try
+            {
+                string value = Marshal.PtrToStringUni(path);
+                if (String.IsNullOrEmpty(value)) throw new InvalidOperationException("profile_path");
+                return value;
+            }
+            finally { CoTaskMemFree(path); }
         }
 
         private static string CleanupReason(int status)

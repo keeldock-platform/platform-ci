@@ -54,6 +54,17 @@ CLT_CLANG_PATH = CLT_DEVELOPER_DIRECTORY + "/usr/bin/clang"
 CLT_OTOOL_PATH = CLT_DEVELOPER_DIRECTORY + "/usr/bin/otool"
 DNS_PROBE_TIMEOUT_SECONDS = 8
 DNS_LOOKUP_TIMEOUT_MILLISECONDS = 5000
+MACOS_DNS_VARIANTS = (
+    "base", "configd", "resolver-files", "mdnsresponder-socket", "networkd", "all",
+)
+MACOS_DNS_MACH_SERVICES = frozenset((
+    "com.apple.SystemConfiguration.configd", "com.apple.networkd", "com.apple.nesessionmanager",
+))
+MACOS_DNS_DENIAL_OPERATIONS = frozenset((
+    "file-read-data", "file-read-metadata", "file-read*", "mach-lookup", "network-outbound",
+    "system-socket",
+))
+MACOS_PRIVATE_ROOT = chr(47) + "private"
 
 
 DECRYPT_REFUSAL_CODES = frozenset((
@@ -730,7 +741,9 @@ def _macos_node_runtime_read_roots(node):
     return roots
 
 
-def preparation_profile_text(*, project, prepared, cache, home, temporary, node, npm_cli):
+def preparation_profile_text(*, project, prepared, cache, home, temporary, node, npm_cli, variant="base"):
+    if variant not in MACOS_DNS_VARIANTS:
+        _refuse("profile-config-invalid")
     node_root = Path(node).parent
     npm_root = Path(npm_cli).parent.parent
     readable = {
@@ -761,6 +774,31 @@ def preparation_profile_text(*, project, prepared, cache, home, temporary, node,
         '(allow mach-lookup (global-name "com.apple.dnssd.service"))',
         "(allow signal (target same-sandbox))", "(allow sysctl-read)",
     ]
+    variant_additions = {
+        "configd": (
+            '(allow mach-lookup (global-name "com.apple.SystemConfiguration.configd"))',
+        ),
+        "resolver-files": (
+            '(allow file-read* (literal "' + MACOS_PRIVATE_ROOT + '/etc/resolv.conf") '
+            '(literal "' + MACOS_PRIVATE_ROOT + '/var/run/resolv.conf") (literal "/etc/hosts") '
+            '(literal "' + MACOS_PRIVATE_ROOT + '/etc/services"))',
+            '(allow file-read* (subpath "/Library/Preferences/SystemConfiguration"))',
+        ),
+        "mdnsresponder-socket": (
+            "(allow system-socket (socket-domain AF_UNIX))",
+            '(allow network-outbound (remote unix-socket '
+            '(path-literal "' + MACOS_PRIVATE_ROOT + '/var/run/mDNSResponder")))',
+        ),
+        "networkd": (
+            '(allow mach-lookup (global-name "com.apple.networkd"))',
+            '(allow mach-lookup (global-name "com.apple.nesessionmanager"))',
+        ),
+    }
+    if variant == "all":
+        for name in ("configd", "resolver-files", "mdnsresponder-socket", "networkd"):
+            lines.extend(variant_additions[name])
+    elif variant != "base":
+        lines.extend(variant_additions[variant])
     lines.extend("(allow process-exec (literal " + _quote(path) + "))" for path in sorted(executable))
     lines.extend("(allow file-read* (subpath " + _quote(path) + "))" for path in sorted(readable))
     lines.extend("(allow file-read* (literal " + _quote(str(path)) + "))" for path in sorted(ancestors))
@@ -786,7 +824,54 @@ def _preparation_env(ident, *, home, temporary, cache, prepared):
     }
 
 
-def _preparation_dns_probe(*, ident, profile, cwd, env):
+def _macos_dns_denial_target(operation, remainder):
+    if operation == "mach-lookup":
+        match = re.search(r"com\.apple\.[A-Za-z0-9_.-]+", remainder)
+        service = match.group(0) if match else ""
+        return service if service in MACOS_DNS_MACH_SERVICES else "mach-other"
+    path_match = re.search(r'(?:"([^"]+)"|\'([^\']+)\'|(/[^\s,;]+))', remainder)
+    path = next((value for value in path_match.groups() if value), "") if path_match else ""
+    if path.startswith((MACOS_PRIVATE_ROOT + "/etc/", "/etc/")):
+        return "etc"
+    if path.startswith((MACOS_PRIVATE_ROOT + "/var/run/", "/var/run/")):
+        return "var-run"
+    if path.startswith("/Library/Preferences/SystemConfiguration/"):
+        return "library-prefs"
+    return "other"
+
+
+def _collect_macos_sandbox_denials(pid, emitted):
+    if type(pid) is not int or pid <= 0 or len(emitted) >= 20:
+        return
+    try:
+        result = subprocess.run(
+            ("/usr/bin/log", "show", "--last", "2m", "--style", "compact", "--process", str(pid),
+             "--predicate", 'sender == "Sandbox"'),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=5, check=False, close_fds=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    if result.returncode != 0 or len(result.stdout) > 1024 * 1024:
+        return
+    for raw_line in result.stdout.decode("utf-8", "replace").splitlines():
+        match = re.search(r"deny\([0-9]+\)\s+([a-z][a-z0-9*-]*)\s+(.+)$", raw_line)
+        if match is None:
+            continue
+        operation = match.group(1)
+        if operation not in MACOS_DNS_DENIAL_OPERATIONS:
+            continue
+        target = _macos_dns_denial_target(operation, match.group(2))
+        line = "macos_sandbox_denial op=" + operation + " target=" + target
+        if line in emitted:
+            continue
+        emitted.add(line)
+        print(line, flush=True)
+        if len(emitted) >= 20:
+            return
+
+
+def _preparation_dns_probe(*, ident, profiles, cwd, env):
     resolver_script = (
         'const dns = require("node:dns"); '
         'const timer = setTimeout(() => process.exit(1), '
@@ -799,20 +884,36 @@ def _preparation_dns_probe(*, ident, profile, cwd, env):
 
     def probe(command):
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 command, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, env=env, close_fds=True, start_new_session=True,
-                timeout=DNS_PROBE_TIMEOUT_SECONDS, user=ident["uid"], group=ident["gid"],
-                extra_groups=(), check=False,
+                user=ident["uid"], group=ident["gid"], extra_groups=(),
             )
+            try:
+                return ("ok" if process.wait(timeout=DNS_PROBE_TIMEOUT_SECONDS) == 0 else "fail"), process.pid
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    process.kill()
+                process.wait(timeout=2)
+                return "fail", process.pid
         except Exception:
-            return "fail"
-        return "ok" if result.returncode == 0 else "fail"
+            return "fail", None
 
-    unconfined = probe(resolver_command)
-    confined = probe(("/usr/bin/sandbox-exec", "-f", str(profile), *resolver_command))
+    unconfined, _unconfined_pid = probe(resolver_command)
+    emitted_denials = set()
+    results = {}
+    for variant in MACOS_DNS_VARIANTS:
+        confined, pid = probe(("/usr/bin/sandbox-exec", "-f", str(profiles[variant]), *resolver_command))
+        results[variant] = confined
+        print("macos_dns_probe_variant name=" + variant + " result=" + confined, flush=True)
+        if confined == "fail":
+            _collect_macos_sandbox_denials(pid, emitted_denials)
+    selected = next((variant for variant in MACOS_DNS_VARIANTS if results[variant] == "ok"), "all")
+    confined = results[selected]
     print("macos_dns_probe unconfined=" + unconfined + " confined=" + confined, flush=True)
-    return unconfined, confined
+    return unconfined, confined, selected
 
 
 def _npm_preparation_command(ident):
@@ -946,11 +1047,11 @@ def _prepare(state, projection_path, output_path, profile, control_sha, deadline
     cache = root / "preparation-npm-cache"
     home = root / "preparation-home"
     temporary = root / "preparation-tmp"
-    profile_path = root / "preparation.sb"
+    profile_paths = {variant: root / ("preparation-" + variant + ".sb") for variant in MACOS_DNS_VARIANTS}
     log = root / "preparation.log"
     if output != prepared:
         _refuse("prepared-output-invalid")
-    for path in (project, prepared, cache, profile_path, log):
+    for path in (project, prepared, cache, log, *profile_paths.values()):
         if path.exists() or path.is_symlink():
             _refuse("prepared-output-exists")
     for path in (home, temporary):
@@ -971,13 +1072,17 @@ def _prepare(state, projection_path, output_path, profile, control_sha, deadline
     )
     for path in (project, prepared, cache, home, temporary):
         _chown_tree(path, ident["uid"], ident["gid"])
-    profile_path.write_text(preparation_profile_text(
-        project=project, prepared=prepared, cache=cache, home=home, temporary=temporary,
-        node=ident["node"], npm_cli=ident["npm_cli"],
-    ), encoding="utf-8")
-    os.chmod(profile_path, 0o444)
+    for variant, candidate_path in profile_paths.items():
+        candidate_path.write_text(preparation_profile_text(
+            project=project, prepared=prepared, cache=cache, home=home, temporary=temporary,
+            node=ident["node"], npm_cli=ident["npm_cli"], variant=variant,
+        ), encoding="utf-8")
+        os.chmod(candidate_path, 0o444)
     env = _preparation_env(ident, home=home, temporary=temporary, cache=cache, prepared=prepared)
-    _preparation_dns_probe(ident=ident, profile=profile_path, cwd=project, env=env)
+    _unconfined, _confined, selected_variant = _preparation_dns_probe(
+        ident=ident, profiles=profile_paths, cwd=project, env=env,
+    )
+    profile_path = profile_paths[selected_variant]
     timeout = min(3600, deadline_budget.remaining(deadline_file))
     with log.open("xb") as output_log:
         code = _run_preparation_process(
@@ -1020,7 +1125,8 @@ def _prepare(state, projection_path, output_path, profile, control_sha, deadline
         shutil.rmtree(cache)
         shutil.rmtree(home)
         shutil.rmtree(temporary)
-        profile_path.unlink()
+        for candidate_path in profile_paths.values():
+            candidate_path.unlink(missing_ok=True)
         log.unlink()
     except OSError:
         _refuse("cleanup-incomplete")
