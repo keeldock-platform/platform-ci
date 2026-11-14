@@ -242,6 +242,28 @@ class PowerShellStaticTests(unittest.TestCase):
                     if re.search(r"(?i)System\.IO\.FileSystemAclExtensions", source.text)]
         self.assertEqual(failures, [])
 
+    def test_windows_acl_check_and_fixture_use_powershell_51_instance_acl_api(self):
+        sources = (
+            PowerShellSource(
+                "kit/devlane/test_powershell_live.py fixture via powershell.exe 5.1",
+                (ROOT / "kit/devlane/test_powershell_live.py").read_text(encoding="utf-8"),
+                runtime="powershell.exe 5.1",
+            ),
+            PowerShellSource(
+                "kit/devlane/control_python.py ACL check via powershell.exe 5.1",
+                (ROOT / "kit/devlane/control_python.py").read_text(encoding="utf-8"),
+                runtime="powershell.exe 5.1",
+            ),
+        )
+        failures = [source.name for source in sources
+                    if re.search(r"(?i)\bGet-Acl\b|System\.IO\.FileSystemAclExtensions", source.text)]
+        self.assertEqual(failures, [])
+        product = sources[1].text
+        self.assertIn("([IO.DirectoryInfo]$item.FullName).GetAccessControl($aclSections)", product)
+        self.assertIn("([IO.FileInfo]$item.FullName).GetAccessControl($aclSections)", product)
+        self.assertIn("[Security.AccessControl.AccessControlSections]::Owner", product)
+        self.assertIn("[Security.AccessControl.AccessControlSections]::Access", product)
+
     def test_checker_rejects_line_leading_operators_methods_and_open_constructs(self):
         sample = "if ($x -eq 1)\n    -or $y -eq 2\n| ForEach-Object {}\n.Trim()\nif ($open) {\n$x = @'\nbody\n"
         hazards = {hazard for _line, hazard in syntax_hazards(sample)}

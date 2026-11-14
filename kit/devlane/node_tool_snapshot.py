@@ -1105,18 +1105,52 @@ def remove_snapshot(snapshot_id, deadline_file, *, snapshot_base=None, control_u
             return True
         raise
     try:
+        stage_prefix = ".stage-" + snapshot_id + "-"
+        stage_pattern = re.compile(r"\.stage-" + re.escape(snapshot_id) + r"-[a-f0-9]{16}\Z")
+
+        def staging_names():
+            names = []
+            for name in _bounded_names(
+                    base_fd, deadline_file, cleanup=True,
+                    read_error="node-snapshot-cleanup-incomplete"):
+                if not name.startswith(stage_prefix):
+                    continue
+                if stage_pattern.fullmatch(name) is None:
+                    _refuse("node-snapshot-cleanup-incomplete")
+                names.append(name)
+            return names
+
+        final_present = True
         try:
             os.stat(snapshot_id, dir_fd=base_fd, follow_symlinks=False)
         except FileNotFoundError:
-            return True
-        validate_snapshot(snapshot_id, deadline_file, snapshot_base=base, control_uid=control_uid,
-                          owner_uid=owner_uid, cleanup=True)
-        _remove_tree_at(base_fd, snapshot_id, control_uid, deadline_file, cleanup=True)
+            final_present = False
+        except OSError:
+            _refuse("node-snapshot-cleanup-incomplete")
+        if final_present:
+            validate_snapshot(snapshot_id, deadline_file, snapshot_base=base, control_uid=control_uid,
+                              owner_uid=owner_uid, cleanup=True)
+        for stage_name in staging_names():
+            try:
+                metadata = os.stat(stage_name, dir_fd=base_fd, follow_symlinks=False)
+            except OSError:
+                _refuse("node-snapshot-cleanup-incomplete")
+            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != control_uid:
+                _refuse("node-snapshot-cleanup-owner")
+            _remove_tree_at(base_fd, stage_name, control_uid, deadline_file, cleanup=True)
+        if final_present:
+            _remove_tree_at(base_fd, snapshot_id, control_uid, deadline_file, cleanup=True)
         try:
             os.stat(snapshot_id, dir_fd=base_fd, follow_symlinks=False)
         except FileNotFoundError:
-            return True
-        _refuse("node-snapshot-cleanup-incomplete")
+            pass
+        except OSError:
+            _refuse("node-snapshot-cleanup-incomplete")
+        else:
+            _refuse("node-snapshot-cleanup-incomplete")
+        if staging_names():
+            _refuse("node-snapshot-cleanup-incomplete")
+        return True
     finally:
         _close_chain(chain)
 

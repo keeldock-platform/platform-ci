@@ -2379,7 +2379,7 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
         for stage in ("powershell-missing", "fixture-create", "protected-run", "protected-parse", "extra-writer-exit"):
             line = (
                 "windows_acl_live=failed stage=%s exit=6 stderr=present "
-                "stdout=bom-or-whitespace operation=none exception=none\n" % stage
+                "stdout=bom-or-whitespace operation=none exception=none hresult=none\n" % stage
             ).encode("ascii")
             with self.subTest(stage=stage):
                 self.assertEqual(control_audit.windows_acl_live_outcome(line), "failed")
@@ -2387,33 +2387,34 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                     control_audit.validate_windows_policy_log(line)
         diagnosed = (
             b"windows_acl_live=failed stage=fixture-create exit=12 stderr=present "
-            b"stdout=fixture-diagnostic operation=apply-protected-acl exception=PrivilegeNotHeldException\n"
+            b"stdout=fixture-diagnostic operation=apply-protected-acl exception=PrivilegeNotHeldException hresult=0x80070005\n"
         )
         self.assertEqual(control_audit.windows_acl_live_outcome(diagnosed), "failed")
         check_diagnosed = (
             b"windows_acl_live=failed stage=protected-run exit=16 stderr=empty "
-            b"stdout=check-diagnostic operation=child-enumerate exception=UnauthorizedAccessException\n"
+            b"stdout=check-diagnostic operation=child-enumerate exception=AclReadError_2 hresult=0x80070005\n"
         )
         self.assertEqual(control_audit.windows_acl_live_outcome(check_diagnosed), "failed")
         self.assertEqual(control_audit.windows_acl_live_outcome(
             check_diagnosed.replace(b"stage=protected-run", b"stage=extra-writer-exit"),
         ), "failed")
         for invalid in (
-            b"windows_acl_live=failed stage=private-path exit=6 stderr=present stdout=not-sid operation=none exception=none\n",
-            b"windows_acl_live=failed stage=fixture-create exit=16 stderr=present stdout=not-sid operation=none exception=none\n",
-            b"windows_acl_live=failed stage=fixture-create exit=6 stderr=private-path stdout=not-sid operation=none exception=none\n",
-            b"windows_acl_live=failed stage=fixture-create exit=6 stderr=present stdout=private-path operation=none exception=none\n",
-            b"windows_acl_live=failed stage=fixture-create exit=12 stderr=present stdout=fixture-diagnostic operation=private-path exception=IOException\n",
-            b"windows_acl_live=failed stage=fixture-create exit=12 stderr=present stdout=fixture-diagnostic operation=apply-root-acl exception=private-type\n",
-            b"windows_acl_live=failed stage=protected-run exit=12 stderr=present stdout=fixture-diagnostic operation=apply-root-acl exception=IOException\n",
-            b"windows_acl_live=failed stage=fixture-create exit=16 stderr=empty stdout=check-diagnostic operation=child-enumerate exception=UnauthorizedAccessException\n",
-            b"windows_acl_live=failed stage=protected-parse exit=16 stderr=empty stdout=check-diagnostic operation=child-enumerate exception=UnauthorizedAccessException\n",
-            b"windows_acl_live=failed stage=protected-run exit=17 stderr=empty stdout=check-diagnostic operation=child-enumerate exception=UnauthorizedAccessException\n",
-            b"windows_acl_live=failed stage=protected-run exit=16 stderr=empty stdout=check-diagnostic operation=private-path exception=UnauthorizedAccessException\n",
-            b"windows_acl_live=failed stage=protected-run exit=16 stderr=empty stdout=check-diagnostic operation=child-enumerate exception=private-type\n",
+            b"windows_acl_live=failed stage=private-path exit=6 stderr=present stdout=not-sid operation=none exception=none hresult=none\n",
+            b"windows_acl_live=failed stage=fixture-create exit=16 stderr=present stdout=not-sid operation=none exception=none hresult=none\n",
+            b"windows_acl_live=failed stage=fixture-create exit=6 stderr=private-path stdout=not-sid operation=none exception=none hresult=none\n",
+            b"windows_acl_live=failed stage=fixture-create exit=6 stderr=present stdout=private-path operation=none exception=none hresult=none\n",
+            b"windows_acl_live=failed stage=fixture-create exit=12 stderr=present stdout=fixture-diagnostic operation=private-path exception=IOException hresult=0x80070005\n",
+            b"windows_acl_live=failed stage=fixture-create exit=12 stderr=present stdout=fixture-diagnostic operation=apply-root-acl exception=private-type hresult=0x80070005\n",
+            b"windows_acl_live=failed stage=protected-run exit=12 stderr=present stdout=fixture-diagnostic operation=apply-root-acl exception=IOException hresult=0x80070005\n",
+            b"windows_acl_live=failed stage=fixture-create exit=16 stderr=empty stdout=check-diagnostic operation=child-enumerate exception=UnauthorizedAccessException hresult=0x80070005\n",
+            b"windows_acl_live=failed stage=protected-parse exit=16 stderr=empty stdout=check-diagnostic operation=child-enumerate exception=UnauthorizedAccessException hresult=0x80070005\n",
+            b"windows_acl_live=failed stage=protected-run exit=17 stderr=empty stdout=check-diagnostic operation=child-enumerate exception=UnauthorizedAccessException hresult=0x80070005\n",
+            b"windows_acl_live=failed stage=protected-run exit=16 stderr=empty stdout=check-diagnostic operation=private-path exception=UnauthorizedAccessException hresult=0x80070005\n",
+            b"windows_acl_live=failed stage=protected-run exit=16 stderr=empty stdout=check-diagnostic operation=child-enumerate exception=private-type hresult=0x80070005\n",
+            b"windows_acl_live=failed stage=protected-run exit=16 stderr=empty stdout=check-diagnostic operation=child-enumerate exception=IOException hresult=0x8007000f\n",
             b"windows_acl_live=pass cases=2\nwindows_acl_live=pass cases=2\n",
             b"windows_acl_live=pass cases=2\n"
-            b"windows_acl_live=failed stage=fixture-create exit=6 stderr=present stdout=not-sid operation=none exception=none\xff\n",
+            b"windows_acl_live=failed stage=fixture-create exit=6 stderr=present stdout=not-sid operation=none exception=none hresult=none\xff\n",
             b"windows_acl_live=pass cases=2\rignored\n",
             b"windows_acl_live=pass cases=2 extra\n",
         ):
@@ -2423,7 +2424,7 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             control_audit._under_stage(
                 "windows-policy-log", control_audit.validate_windows_policy_log,
                 b"windows_acl_live=failed stage=fixture-create exit=6 stderr=present "
-                b"stdout=not-sid operation=none exception=none\n",
+                b"stdout=not-sid operation=none exception=none hresult=none\n",
             )
         self.assertEqual(refusal.exception.stage, "windows-policy-log")
 

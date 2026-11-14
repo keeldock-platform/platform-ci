@@ -255,7 +255,7 @@ class ControlPythonPortableTests(unittest.TestCase):
             (mock.Mock(returncode=0, stdout=b"\xff", stderr=b""), "crypto-acl-stdout-non-ascii"),
             (mock.Mock(
                 returncode=16,
-                stdout=b"windows_acl_check_failure=operation=child-enumerate exception=IOException\n",
+                stdout=b"windows_acl_check_failure=operation=child-enumerate exception=IOException hresult=0x80070005\n",
                 stderr=b"",
             ), "crypto-acl-check-child-enumerate"),
             (mock.Mock(returncode=7, stdout=b"", stderr=b""), "crypto-acl-exit-7"),
@@ -270,7 +270,7 @@ class ControlPythonPortableTests(unittest.TestCase):
 
     def test_windows_acl_check_failure_requires_the_matching_fixed_exit_and_operation(self):
         for exit_code, (operation, reason) in control_python._POWERSHELL_ACL_CHECK_EXIT_REASONS.items():
-            diagnostic = ("windows_acl_check_failure=operation=%s exception=IOException\n" % operation).encode("ascii")
+            diagnostic = ("windows_acl_check_failure=operation=%s exception=IOException hresult=0x80070005\n" % operation).encode("ascii")
             with self.subTest(operation=operation), \
                     mock.patch.object(Path, "is_file", return_value=True), \
                     mock.patch.object(control_python.subprocess, "run", return_value=mock.Mock(
@@ -279,7 +279,7 @@ class ControlPythonPortableTests(unittest.TestCase):
                 control_python._powershell_acl_owner(Path("D:/run/control-python-deps"))
             self.assertEqual(caught.exception.reason, reason)
 
-        diagnostic = b"windows_acl_check_failure=operation=child-enumerate exception=IOException\n"
+        diagnostic = b"windows_acl_check_failure=operation=child-enumerate exception=IOException hresult=0x80070005\n"
         for result in (
             mock.Mock(returncode=17, stdout=diagnostic, stderr=b""),
             mock.Mock(returncode=16, stdout=diagnostic, stderr=b"private error"),
@@ -297,7 +297,12 @@ class ControlPythonPortableTests(unittest.TestCase):
         self.assertIn("$ProgressPreference = 'SilentlyContinue'", script)
         self.assertIn("$items = @()", script)
         self.assertIn("Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop", script)
-        self.assertIn("Get-Acl -LiteralPath $item.FullName -ErrorAction Stop", script)
+        self.assertNotIn("Get-Acl -LiteralPath", script)
+        self.assertIn("([IO.DirectoryInfo]$item.FullName).GetAccessControl($aclSections)", script)
+        self.assertIn("([IO.FileInfo]$item.FullName).GetAccessControl($aclSections)", script)
+        self.assertIn("[Security.AccessControl.AccessControlSections]::Owner", script)
+        self.assertIn("[Security.AccessControl.AccessControlSections]::Access", script)
+        self.assertIn("hresult=0x", script)
         self.assertIn("windows_acl_check_failure=operation=", script)
         self.assertEqual(script.count("catch { Stop-AclCheck"), 26)
         self.assertEqual(script.count("[Console]::Out.WriteLine($ownerSid)"), 1)

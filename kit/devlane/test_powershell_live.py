@@ -29,10 +29,10 @@ _SAFE_FIXTURE_OPERATIONS = frozenset((
     "administrators-rule-add", "everyone-rule-add", "inherit-only-rule-add",
     "apply-root-acl", "apply-protected-acl", "apply-extra-writer-acl", "other",
 ))
-_SAFE_EXCEPTION_TYPES = control_python._POWERSHELL_ACL_EXCEPTION_TYPES
 _SID = re.compile(rb"S-1-(?:[0-9]+-)*[0-9]+\Z")
 _FIXTURE_DIAGNOSTIC = re.compile(
-    rb"windows_acl_fixture_failure=operation=([a-z-]+) exception=([A-Za-z]+)\Z"
+    rb"windows_acl_fixture_failure=operation=([a-z-]+) exception=([A-Za-z][A-Za-z0-9_]{0,63}) "
+    rb"hresult=(0x[A-F0-9]{8})\Z"
 )
 
 
@@ -49,10 +49,10 @@ def _fixture_diagnostic(payload):
     match = _FIXTURE_DIAGNOSTIC.fullmatch(normalized)
     if match is None:
         return None
-    operation, exception_type = (part.decode("ascii") for part in match.groups())
-    if operation not in _SAFE_FIXTURE_OPERATIONS or exception_type not in _SAFE_EXCEPTION_TYPES:
+    operation, exception_type, hresult = (part.decode("ascii") for part in match.groups())
+    if operation not in _SAFE_FIXTURE_OPERATIONS:
         return None
-    return operation, exception_type
+    return operation, exception_type, hresult
 
 
 def _stdout_shape(payload):
@@ -94,9 +94,9 @@ def _failure(stage, result=None):
     diagnostic = _fixture_diagnostic(stdout) if stage == "fixture-create" else None
     if diagnostic is None and stage in ("protected-run", "extra-writer-exit"):
         diagnostic = control_python._powershell_acl_check_diagnostic(stdout)
-    operation, exception_type = diagnostic if diagnostic is not None else ("none", "none")
-    print("windows_acl_live=failed stage=%s exit=%s stderr=%s stdout=%s operation=%s exception=%s" % (
-        stage, exit_text, stderr_text, _stdout_shape(stdout), operation, exception_type,
+    operation, exception_type, hresult = diagnostic if diagnostic is not None else ("none", "none", "none")
+    print("windows_acl_live=failed stage=%s exit=%s stderr=%s stdout=%s operation=%s exception=%s hresult=%s" % (
+        stage, exit_text, stderr_text, _stdout_shape(stdout), operation, exception_type, hresult,
     ))
     return 1
 
@@ -113,22 +113,26 @@ $script:FixtureOperations = @(
     'administrators-rule-add', 'everyone-rule-add', 'inherit-only-rule-add',
     'apply-root-acl', 'apply-protected-acl', 'apply-extra-writer-acl', 'other'
 )
-$script:FixtureExceptionTypes = @(
-    'UnauthorizedAccessException', 'PrivilegeNotHeldException', 'InvalidOperationException',
-    'ArgumentException', 'IdentityNotMappedException', 'IOException'
-)
-function Get-FixtureExceptionType([object]$Failure) {
+function Get-FixtureExceptionDiagnostic([object]$Failure) {
     $exception = $Failure.Exception
-    for ($depth = 0; $depth -lt 3 -and $null -ne $exception; $depth++) {
-        $name = $exception.GetType().Name
-        if ($script:FixtureExceptionTypes -ccontains $name) { return $name }
-        $exception = $exception.InnerException
+    $exceptionType = 'other'
+    $exceptionHResult = 0
+    for ($depth = 0; $depth -lt 4 -and $null -ne $exception; $depth++) {
+        try { $name = [string]$exception.GetType().Name }
+        catch { $name = '' }
+        if ($name -cmatch '^[A-Za-z][A-Za-z0-9_]{0,63}$') {
+            $exceptionType = $name
+            try { $exceptionHResult = [int]$exception.HResult }
+            catch { $exceptionHResult = 0 }
+        }
+        try { $exception = $exception.InnerException }
+        catch { $exception = $null }
     }
-    return 'other'
+    return $exceptionType + ' hresult=0x' + (('{0:x8}' -f $exceptionHResult).ToUpperInvariant())
 }
 function Stop-Fixture([string]$Operation, [int]$Code, [object]$Failure) {
     if ($script:FixtureOperations -cnotcontains $Operation) { $Operation = 'other' }
-    Write-Output ('windows_acl_fixture_failure=operation=' + $Operation + ' exception=' + (Get-FixtureExceptionType $Failure))
+    Write-Output ('windows_acl_fixture_failure=operation=' + $Operation + ' exception=' + (Get-FixtureExceptionDiagnostic $Failure))
     exit $Code
 }
 function Add-FixtureRule(
@@ -263,21 +267,24 @@ class LiveDiagnosticTests(unittest.TestCase):
             ), 1)
         self.assertEqual(
             output.getvalue(),
-            "windows_acl_live=failed stage=protected-parse exit=2 stderr=present stdout=not-sid operation=none exception=none\n",
+            "windows_acl_live=failed stage=protected-parse exit=2 stderr=present stdout=not-sid operation=none exception=none hresult=none\n",
         )
 
     def test_fixture_diagnostic_is_exact_and_allowlisted_before_emission(self):
-        payload = b"windows_acl_fixture_failure=operation=apply-protected-acl exception=IOException\r\n"
-        self.assertEqual(_fixture_diagnostic(payload), ("apply-protected-acl", "IOException"))
+        payload = b"windows_acl_fixture_failure=operation=apply-protected-acl exception=IOException hresult=0x80070005\r\n"
+        self.assertEqual(_fixture_diagnostic(payload), ("apply-protected-acl", "IOException", "0x80070005"))
         self.assertEqual(_stdout_shape(payload), "fixture-diagnostic")
         self.assertIsNone(_fixture_diagnostic(
-            b"windows_acl_fixture_failure=operation=private-path exception=IOException\n",
+            b"windows_acl_fixture_failure=operation=private-path exception=IOException hresult=0x80070005\n",
         ))
         self.assertIsNone(_fixture_diagnostic(
-            b"windows_acl_fixture_failure=operation=apply-root-acl exception=private-type\n",
+            b"windows_acl_fixture_failure=operation=apply-root-acl exception=private-type hresult=0x80070005\n",
         ))
         self.assertIsNone(_fixture_diagnostic(
-            b"windows_acl_fixture_failure=operation=apply-root-acl exception=IOException\nextra\n",
+            b"windows_acl_fixture_failure=operation=apply-root-acl exception=IOException hresult=0x80070005\nextra\n",
+        ))
+        self.assertIsNone(_fixture_diagnostic(
+            b"windows_acl_fixture_failure=operation=apply-root-acl exception=IOException hresult=0x8007000f\n",
         ))
         output = StringIO()
         with redirect_stdout(output):
@@ -287,13 +294,13 @@ class LiveDiagnosticTests(unittest.TestCase):
         self.assertEqual(
             output.getvalue(),
             "windows_acl_live=failed stage=fixture-create exit=11 stderr=present "
-            "stdout=fixture-diagnostic operation=apply-protected-acl exception=IOException\n",
+            "stdout=fixture-diagnostic operation=apply-protected-acl exception=IOException hresult=0x80070005\n",
         )
 
     def test_acl_check_diagnostic_is_exact_and_maps_only_known_exit_operations(self):
-        payload = b"windows_acl_check_failure=operation=child-enumerate exception=UnauthorizedAccessException\r\n"
+        payload = b"windows_acl_check_failure=operation=child-enumerate exception=AclReadError_2 hresult=0x80070005\r\n"
         self.assertEqual(control_python._powershell_acl_check_diagnostic(payload),
-                         ("child-enumerate", "UnauthorizedAccessException"))
+                         ("child-enumerate", "AclReadError_2", "0x80070005"))
         self.assertEqual(control_python._powershell_acl_exit_reason(
             16, payload, b"",
         ), "crypto-acl-check-child-enumerate")
@@ -301,10 +308,13 @@ class LiveDiagnosticTests(unittest.TestCase):
             17, payload, b"",
         ), "crypto-acl-exit-17")
         self.assertIsNone(control_python._powershell_acl_check_diagnostic(
-            b"windows_acl_check_failure=operation=private-path exception=IOException\n",
+            b"windows_acl_check_failure=operation=private-path exception=IOException hresult=0x80070005\n",
         ))
         self.assertIsNone(control_python._powershell_acl_check_diagnostic(
-            b"windows_acl_check_failure=operation=acl-read exception=private-type\n",
+            b"windows_acl_check_failure=operation=acl-read exception=private-type hresult=0x80070005\n",
+        ))
+        self.assertIsNone(control_python._powershell_acl_check_diagnostic(
+            b"windows_acl_check_failure=operation=acl-read exception=IOException hresult=0x8007000f\n",
         ))
         self.assertIsNone(control_python._powershell_acl_check_diagnostic(
             payload + b"extra\n",
@@ -317,7 +327,7 @@ class LiveDiagnosticTests(unittest.TestCase):
         self.assertEqual(
             output.getvalue(),
             "windows_acl_live=failed stage=protected-run exit=16 stderr=present "
-            "stdout=check-diagnostic operation=child-enumerate exception=UnauthorizedAccessException\n",
+            "stdout=check-diagnostic operation=child-enumerate exception=AclReadError_2 hresult=0x80070005\n",
         )
 
 

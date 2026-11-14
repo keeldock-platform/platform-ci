@@ -85,10 +85,8 @@ _WINDOWS_ACL_FIXTURE_OPERATIONS = (
     "owner-rule-add|system-rule-add|administrators-rule-add|everyone-rule-add|inherit-only-rule-add|"
     "apply-root-acl|apply-protected-acl|apply-extra-writer-acl|other"
 )
-_WINDOWS_ACL_EXCEPTION_TYPES = (
-    "UnauthorizedAccessException|PrivilegeNotHeldException|InvalidOperationException|ArgumentException|"
-    "IdentityNotMappedException|IOException|other"
-)
+_WINDOWS_ACL_EXCEPTION_TYPE = r"[A-Za-z][A-Za-z0-9_]{0,63}"
+_WINDOWS_ACL_HRESULT = r"0x[A-F0-9]{8}"
 _WINDOWS_ACL_CHECK_OPERATIONS = "|".join(
     re.escape(operation) for operation, _code in refusal_codes.WINDOWS_ACL_CHECK_OPERATIONS
 )
@@ -96,10 +94,11 @@ _WINDOWS_ACL_LIVE_LINE = re.compile(
     r"windows_acl_live=(pass cases=2|skipped platform|failed stage="
     r"(powershell-missing|fixture-create|protected-run|protected-parse|extra-writer-exit) "
     r"exit=(0|[1-9]|1[0-9]|2[0-9]|31|other) stderr=(present|empty) "
-    r"(?:stdout=(empty|multiple-lines|not-sid|bom-or-whitespace|sid) operation=none exception=none|"
+    r"(?:stdout=(empty|multiple-lines|not-sid|bom-or-whitespace|sid) operation=none exception=none hresult=none|"
     r"stdout=fixture-diagnostic operation=(" + _WINDOWS_ACL_FIXTURE_OPERATIONS + ") exception=("
-    + _WINDOWS_ACL_EXCEPTION_TYPES + r")|stdout=check-diagnostic operation=("
-    + _WINDOWS_ACL_CHECK_OPERATIONS + ") exception=(" + _WINDOWS_ACL_EXCEPTION_TYPES + r")))\Z"
+    + _WINDOWS_ACL_EXCEPTION_TYPE + r") hresult=(" + _WINDOWS_ACL_HRESULT + r")|stdout=check-diagnostic operation=("
+    + _WINDOWS_ACL_CHECK_OPERATIONS + ") exception=(" + _WINDOWS_ACL_EXCEPTION_TYPE + r") hresult=("
+    + _WINDOWS_ACL_HRESULT + r")))\Z"
 )
 WINDOWS_NATIVE_STEP_NAMES = (
     "Fetch public candidate", "Parse every PowerShell file under kit", "Compile native confinement module",
@@ -430,7 +429,7 @@ def windows_acl_live_outcome(log):
         fixture_diagnostic = "stdout=fixture-diagnostic" in line
         check_operation = None
         if match is not None and check_diagnostic:
-            check_operation = match.group(8)
+            check_operation = match.group(9)
             exit_value = match.group(3)
             expected_exit = dict((operation, code)
                                  for operation, code in refusal_codes.WINDOWS_ACL_CHECK_OPERATIONS).get(

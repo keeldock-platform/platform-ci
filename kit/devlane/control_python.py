@@ -36,12 +36,9 @@ _POWERSHELL_ACL_CHECK_EXIT_REASONS = {
     code: (operation, "crypto-acl-check-" + operation)
     for operation, code in refusal_codes.WINDOWS_ACL_CHECK_OPERATIONS
 }
-_POWERSHELL_ACL_EXCEPTION_TYPES = frozenset((
-    "UnauthorizedAccessException", "PrivilegeNotHeldException", "InvalidOperationException",
-    "ArgumentException", "IdentityNotMappedException", "IOException", "other",
-))
 _POWERSHELL_ACL_CHECK_DIAGNOSTIC = re.compile(
-    rb"windows_acl_check_failure=operation=([a-z-]+) exception=([A-Za-z]+)\Z"
+    rb"windows_acl_check_failure=operation=([a-z-]+) exception=([A-Za-z][A-Za-z0-9_]{0,63}) "
+    rb"hresult=(0x[A-F0-9]{8})\Z"
 )
 
 
@@ -56,17 +53,16 @@ def _powershell_acl_check_diagnostic(payload):
     match = _POWERSHELL_ACL_CHECK_DIAGNOSTIC.fullmatch(normalized)
     if match is None:
         return None
-    operation, exception_type = (part.decode("ascii") for part in match.groups())
-    if (exception_type not in _POWERSHELL_ACL_EXCEPTION_TYPES
-            or operation not in {pair[0] for pair in _POWERSHELL_ACL_CHECK_EXIT_REASONS.values()}):
+    operation, exception_type, hresult = (part.decode("ascii") for part in match.groups())
+    if operation not in {pair[0] for pair in _POWERSHELL_ACL_CHECK_EXIT_REASONS.values()}:
         return None
-    return operation, exception_type
+    return operation, exception_type, hresult
 
 
 def _powershell_acl_exit_reason(exit_code, stdout=b"", stderr=b""):
     diagnostic = _powershell_acl_check_diagnostic(stdout)
     if diagnostic is not None and not stderr:
-        operation, _exception_type = diagnostic
+        operation, _exception_type, _hresult = diagnostic
         for expected_exit, (expected_operation, reason) in _POWERSHELL_ACL_CHECK_EXIT_REASONS.items():
             if expected_exit == exit_code and expected_operation == operation:
                 return reason
@@ -116,18 +112,24 @@ def _powershell_acl_script(root):
     return r'''
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-function Stop-AclCheck([string]$Operation, [int]$Code, [object]$Failure) {
+function Get-AclExceptionDiagnostic([object]$Failure) {
     $exception = $Failure.Exception
     $exceptionType = 'other'
-    for ($depth = 0; $depth -lt 3 -and $null -ne $exception; $depth++) {
-        $name = $exception.GetType().Name
-        if (@('UnauthorizedAccessException', 'PrivilegeNotHeldException', 'InvalidOperationException',
-              'ArgumentException', 'IdentityNotMappedException', 'IOException') -ccontains $name) {
+    $exceptionHResult = 0
+    for ($depth = 0; $depth -lt 4 -and $null -ne $exception; $depth++) {
+        try { $name = [string]$exception.GetType().Name }
+        catch { $name = '' }
+        if ($name -cmatch '^[A-Za-z][A-Za-z0-9_]{0,63}$') {
             $exceptionType = $name
-            break
+            try { $exceptionHResult = [int]$exception.HResult }
+            catch { $exceptionHResult = 0 }
         }
-        $exception = $exception.InnerException
+        try { $exception = $exception.InnerException }
+        catch { $exception = $null }
     }
+    return $exceptionType + ' hresult=0x' + (('{0:x8}' -f $exceptionHResult).ToUpperInvariant())
+}
+function Stop-AclCheck([string]$Operation, [int]$Code, [object]$Failure) {
     if (@('root-decode', 'owner-identity', 'owner-user-read', 'owner-token-read', 'trusted-sid-build',
           'write-mask-build', 'parent-resolve', 'parent-item', 'root-item', 'child-enumerate',
           'item-reparse-check', 'acl-read', 'acl-owner-read', 'acl-owner-translate', 'acl-owner-compare',
@@ -137,7 +139,8 @@ function Stop-AclCheck([string]$Operation, [int]$Code, [object]$Failure) {
         $Operation = 'owner-output'
         $Code = 31
     }
-    Write-Output ('windows_acl_check_failure=operation=' + $Operation + ' exception=' + $exceptionType)
+    $exceptionDiagnostic = Get-AclExceptionDiagnostic $Failure
+    Write-Output ('windows_acl_check_failure=operation=' + $Operation + ' exception=' + $exceptionDiagnostic)
     exit $Code
 }
 try {
@@ -176,7 +179,15 @@ foreach ($item in @($items)) {
     try { $isReparsePoint = (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) }
     catch { Stop-AclCheck 'item-reparse-check' 17 $_ }
     if ($isReparsePoint) { exit 3 }
-    try { $acl = Get-Acl -LiteralPath $item.FullName -ErrorAction Stop }
+    try {
+        $aclSections = [Security.AccessControl.AccessControlSections]::Owner -bor `
+            [Security.AccessControl.AccessControlSections]::Access
+        if ($item -is [IO.DirectoryInfo]) {
+            $acl = ([IO.DirectoryInfo]$item.FullName).GetAccessControl($aclSections)
+        } else {
+            $acl = ([IO.FileInfo]$item.FullName).GetAccessControl($aclSections)
+        }
+    }
     catch { Stop-AclCheck 'acl-read' 18 $_ }
     try {
         $ownerReference = $acl.GetOwner([Security.Principal.SecurityIdentifier])

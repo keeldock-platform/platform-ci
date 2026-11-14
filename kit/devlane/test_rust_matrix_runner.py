@@ -2362,6 +2362,39 @@ class RustMatrixRunnerTests(unittest.TestCase):
             self.assertEqual(sentinel.read_text(encoding="ascii"), "preserve")
             self.assertEqual(stat.S_IMODE(sentinel.stat().st_mode), before_mode)
 
+    def test_node_snapshot_cleanup_recovers_an_interrupted_copy_stage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            fixture = self._write_node_toolchain_fixture(root / "node-fixture")
+            deadline_path = root / "deadline.json"
+            deadline_budget.create(deadline_path, 120, 10, 130)
+            snapshot_base = root / "snapshot-base"
+            snapshot_id = "test-interrupted-copy"
+
+            def interrupt_after_copy(phase):
+                if phase == "after-copy":
+                    raise KeyboardInterrupt()
+
+            with self._node_fixture_policy(fixture), self.assertRaises(KeyboardInterrupt):
+                node_tool_snapshot.create_snapshot(
+                    fixture["paths"], snapshot_id, os.getuid(), str(deadline_path),
+                    snapshot_base=snapshot_base, source_cache_root=fixture["cache"],
+                    source_node_root=fixture["node_root"],
+                    source_anchors=((fixture["anchor"], os.getuid()),),
+                    test_checkpoint=interrupt_after_copy,
+                )
+            stages = sorted(snapshot_base.glob(".stage-" + snapshot_id + "-*"))
+            self.assertEqual(len(stages), 1)
+            self.assertTrue(any(stages[0].iterdir()))
+            self.assertFalse((snapshot_base / snapshot_id).exists())
+
+            self.assertTrue(node_tool_snapshot.remove_snapshot(
+                snapshot_id, str(deadline_path), snapshot_base=snapshot_base,
+                owner_uid=os.getuid(),
+            ))
+            self.assertFalse((snapshot_base / snapshot_id).exists())
+            self.assertEqual(list(snapshot_base.glob(".stage-" + snapshot_id + "-*")), [])
+
     def test_node_snapshot_cleanup_confirms_safely_absent_base_without_creating_it(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
