@@ -22,26 +22,26 @@
   },
   "candidate": {
     "identity": "authenticated candidate transfer",
-    "source_revision": "9d6cc9e68694e17857d7702e83654131804a1bda",
-    "source_tree": "958e13e531d1b2601f241a91a9f80a44ac04d889",
-    "full_git_tree_map_sha256_before_transfer": "d6ef344e2129babea26ac39c04bacf7eb4cbd3d770acb8416b2fe11a1c334eab",
-    "selected_transfer_map_sha256_before_offline_lock_generation": "ca99e9c82c8ea07bc4a1d73d881da673dc5f71194c0db4c61c179da5d248b6b3",
-    "selected_transfer_file_count_before_offline_lock_generation": 2636,
-    "selected_transfer_bytes_before_offline_lock_generation": 16619832,
+    "source_revision": "8d0750cb3bd8694f45a6142314b0679b34152c88",
+    "source_tree": "be3665d91f7c9cf2c7c28e8580653321ff2511f4",
+    "full_git_tree_map_sha256_before_transfer": "d537ce9c87f29d650ba8ae89ec6f1eb5ffc463e38b735bc2a91ff391f9b1ad3c",
+    "selected_transfer_map_sha256_before_offline_lock_generation": "0d6635303fce6788ded9526ea69a95396ac68ba5b2d4d3bf1072280fbfe5f6f0",
+    "selected_transfer_file_count_before_offline_lock_generation": 3082,
+    "selected_transfer_bytes_before_offline_lock_generation": 21671750,
     "excluded_paths": [
       ".npmrc"
     ],
     "runtime_root": "/workspace/source/runtime",
     "version": "0.2.0",
-    "runtime_semantic_file_count_excluding_cargo_lock": 1260,
-    "runtime_semantic_map_sha256_excluding_cargo_lock": "6242bb393a8b4b70c76efd9eaae4ad3f7b1ba831b380868a3dd5da3b79ad6f73",
-    "runtime_manifest_sha256": "6696df8536d6b4c3ea8ae8ccf7e812cf516833f10302bcf277f3ff4e69aa7d20",
-    "runtime_lock_sha256_at_frozen_capture_provisional_observation_only": "c27ae91fdf892945084cbb063197ee0c22ff40b0cfaeb67ba069e3f581379c5a",
-    "full_git_file_count_before_transfer": 2637,
+    "runtime_semantic_file_count_excluding_cargo_lock": 1600,
+    "runtime_semantic_map_sha256_excluding_cargo_lock": "64f6ebc61dd812b6b6ccdd5c8ddeadbd4a3a380c82f5e586e858775a80ae9045",
+    "runtime_manifest_sha256": "ac9bb61feda88448f9b31e6b10f7fa1af80d2c05c40ac670bbdd2af3243bc922",
+    "runtime_lock_sha256_at_frozen_capture_provisional_observation_only": "a753da9def8da47d1cc66c962244ac9cd94bcc3ba30e33ba11b2c6077be681ea",
+    "full_git_file_count_before_transfer": 3083,
     "selected_manifest_sha256": {
-      "Cargo.toml": "98202cdbb1ce4a75cba138acaf6911de65430ba183640b0a45155ab7f8d5530a",
-      "fuzz/Cargo.toml": "053fb43372e34b20cfeb9bdc9f7f63e2c8fadfd5f8dbd10af9f0f76e75d797d0",
-      "runtime/Cargo.toml": "6696df8536d6b4c3ea8ae8ccf7e812cf516833f10302bcf277f3ff4e69aa7d20"
+      "Cargo.toml": "add05050cea1178279e85f54917cba535d0eea0e4a934c0adc7fbcde0e49a310",
+      "fuzz/Cargo.toml": "47d0967e14b0fbe7009e32c8122cc877ad83ab9479a3cf512ff2faa1cf393850",
+      "runtime/Cargo.toml": "ac9bb61feda88448f9b31e6b10f7fa1af80d2c05c40ac670bbdd2af3243bc922"
     }
   },
   "offline_cache": {

@@ -2,9 +2,13 @@
 
 import json
 import contextlib
+import ctypes
 import io
 import os
 import re
+import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -176,6 +180,12 @@ class WindowsSandboxValidationTests(unittest.TestCase):
                 self.assertIn('Phase("' + phase + '")', source)
         self.assertIn("TerminateProcess(process, JobExitCode)", source)
         self.assertIn("WaitForSingleObject(process, 10000) != WaitObject0", source)
+        self.assertRegex(
+            source,
+            r'\[DllImport\("kernel32\.dll", EntryPoint = "CreateJobObjectW", CharSet = CharSet\.Unicode,\s*'
+            r'ExactSpelling = true, SetLastError = true\)\]\s*private static extern IntPtr CreateJobObjectW',
+        )
+        self.assertIn("RunNamedCleanupJobLifecycleFixture(string profileName, string packageSid)", source)
         self.assertIn("JobObjectLimitKillOnJobClose", source)
         self.assertIn("WaitForEmptyJob(job, 10000)", source)
         self.assertIn("System.Threading.Thread.Sleep(50 << attempt)", source)
@@ -313,8 +323,10 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         self.assertIn("[IO.File]::SetAttributes($entry.Path, $writableAttributes)", cleanup)
         self.assertIn("Boundary]::AssertCleanupQuiescent(", cleanup)
         self.assertLess(cleanup.index("AssertCleanupQuiescent"), cleanup.index("Remove-NetFirewallRule"))
-        self.assertLess(cleanup.index("AssertCleanupQuiescent", cleanup.index("Clear-AppContainerStorage")),
-                        cleanup.index("DeleteProfile"))
+        self.assertEqual(cleanup.count("AssertCleanupQuiescent"), 1)
+        self.assertLess(cleanup.index("AssertCleanupQuiescent"), cleanup.index("Clear-AppContainerStorage"))
+        self.assertNotIn("Remove-Item -LiteralPath $statePath", cleanup)
+        self.assertIn("if ($Mode -eq 'quiesce')", script)
         self.assertIn("$state.job_state = 'pending'", run)
         self.assertIn("$state.job_state = 'terminated-empty'", run)
         self.assertIn("empty=confirmed", run)
@@ -347,7 +359,7 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         self.assertIn("if (!requireDirectory && information.NumberOfLinks != 1)", native)
         self.assertIn("$script:WindowsCleanupEntries -ge 250000", script)
         self.assertIn("$PendingCount -ge 250000", script)
-        self.assertIn("$script:WindowsCleanupTimer.ElapsedMilliseconds -gt 600000", script)
+        self.assertIn("$script:WindowsCleanupTimer.ElapsedMilliseconds -gt 300000", script)
         self.assertIn("[void](Clear-AppContainerStorage", cleanup)
         python_source = Path(windows.__file__).read_text(encoding="utf-8")
         self.assertIn("timeout=WINDOWS_PROFILE_CLEANUP_TIMEOUT_SECONDS", python_source)
@@ -458,28 +470,178 @@ class WindowsSandboxValidationTests(unittest.TestCase):
         check = native.split("public static void AssertCleanupQuiescent", 1)[1].split(
             "private static bool IsProcessGone", 1,
         )[0]
-        self.assertIn('jobState != "none" && jobState != "terminated-empty"', check)
+        self.assertIn('jobState != "none" && jobState != "pending" && jobState != "terminated-empty"', check)
+        self.assertIn("TerminateCleanupJob(profileName)", check)
+        self.assertIn("VerifyCleanupJobEmpty(profileName)", check)
         self.assertIn("Process.GetProcesses()", check)
+        self.assertGreaterEqual(check.count("totalTimer.ElapsedMilliseconds > CleanupDeadlineMilliseconds"), 3)
         self.assertIn("item.SessionId", check)
         self.assertIn("GetProcessInformation(process, ProcessProtectionLevelInfo", check)
         self.assertIn("ClassifyCleanupProcessFixture", check)
         self.assertIn("OpenProcessToken(process, TokenQuery, out token)", check)
         self.assertIn("EqualSid(Marshal.ReadIntPtr(app), expectedSid)", check)
         self.assertIn('throw new InvalidOperationException("cleanup_process_alive")', check)
+        self.assertIn("TerminateAndReapCleanupProcess(process)", check)
+        self.assertIn('throw new InvalidOperationException("cleanup_process_terminate")', native)
+        self.assertIn('throw new InvalidOperationException("cleanup_process_reap")', native)
         self.assertLess(delete.index("AssertCleanupQuiescent"), delete.index("Remove-NetFirewallRule"))
         self.assertIn("WaitForEmptyJob(job, 10000)", native)
+        self.assertIn("WaitForEmptyJob(job, 0, 10)", native)
+        wait_empty = native.split("private static bool WaitForEmptyJob", 1)[1].split(
+            "private static uint WaitForProcess", 1,
+        )[0]
+        self.assertIn("if (!firstQuery && timer.ElapsedMilliseconds > timeoutMilliseconds) return false;", wait_empty)
+        self.assertIn("if (Marshal.ReadInt32(buffer, 4) == 0) return true;", wait_empty)
         self.assertIn('result.Job += " terminated=confirmed empty=confirmed"', native)
+        self.assertIn('"Local\\\\KeelDock.DevLane."', native)
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary) / "sandbox.json"
             state.write_text(json.dumps({
-                "schema": 1, "owned_roots": [], "acl_grants": [], "integrity_grants": [], "job_state": "pending",
+                "schema": 1, "profile_name": "KDDevLane" + "a" * 32,
+                "package_sid": "S-1-15-2-1-2-3-4-5-6-7", "firewall_rule": "KD-DevLane-123",
+                "owned_roots": [], "acl_grants": [], "integrity_grants": [], "job_state": "pending",
             }), encoding="ascii")
             with mock.patch.object(windows.sys, "platform", "win32"), \
-                    mock.patch.object(windows, "_run_powershell") as powershell:
-                with self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
-                    windows.delete_profile(state)
-            self.assertEqual(caught.exception.reason, "other")
-            powershell.assert_not_called()
+                    mock.patch.object(windows, "_run_powershell",
+                                      return_value="windows_processes=terminated verified=empty") as powershell:
+                self.assertEqual(windows.quiesce_run(state),
+                                 "windows_processes=terminated verified=empty\n")
+                powershell.assert_called_once()
+                self.assertEqual(powershell.call_args.args[0], "quiesce")
+
+    def test_waited_process_handles_request_synchronize_and_separate_wait_failure_from_timeout(self):
+        native = Path(windows.__file__).with_name("sandbox_windows_native.cs").read_text(encoding="utf-8")
+        check = native.split("public static void AssertCleanupQuiescent", 1)[1].split(
+            "private static bool IsProcessGone", 1,
+        )[0]
+        process_open = native.split("private static IntPtr OpenCleanupProcessHandle", 1)[1].split(
+            "public static string RunCleanupProcessHandleFixture", 1,
+        )[0]
+        wait = native.split("private static uint WaitForProcess", 1)[1].split(
+            "private static string VerifyToken", 1,
+        )[0]
+        self.assertIn("private const uint ProcessSynchronize = 0x00100000", native)
+        self.assertIn("OpenCleanupProcessHandle(processId, verificationPass)", check)
+        self.assertRegex(
+            process_open,
+            r"uint access = ProcessQueryLimitedInformation\s*\| ProcessSynchronize\s*"
+            r"\| \(verificationPass \? 0U : ProcessTerminate\)",
+        )
+        self.assertIn("RunCleanupProcessHandleFixture()", native)
+        self.assertIn("OpenCleanupProcessHandle(child.ProcessId, false)", native)
+        self.assertIn("RequireCleanupProcessReaped(child.Process, 0)", native)
+        self.assertIn("WaitForProcess(IntPtr.Zero, 0)", native)
+        self.assertIn("OpenCleanupProcessHandle(4, false)", native)
+        self.assertIn("private const uint WaitFailed = UInt32.MaxValue", native)
+        self.assertIn('throw new InvalidOperationException("cleanup_process_wait_failed")', wait)
+        self.assertIn("result != WaitObject0 && result != WaitTimeout", wait)
+        self.assertIn("RequireCleanupProcessReaped(process, 10000)", native)
+        self.assertIn('throw new InvalidOperationException("cleanup_process_reap")', native)
+
+    @unittest.skipUnless(sys.platform == "win32", "requires native Windows process and job APIs")
+    def test_native_named_job_is_reopened_terminated_and_reaped(self):
+        native = Path(windows.__file__).with_name("sandbox_windows_native.cs")
+        profile_name = "KDDevLane" + "e" * 32
+        package_sid = "S-1-15-2-1-2-3-4-5-6-7"
+        command = (
+            "$ErrorActionPreference='Stop'; "
+            "Add-Type -Path $env:DEVLANE_NATIVE_CS; "
+            "$process = [KeelDock.Platform.DevLaneWindows.Boundary]::RunCleanupProcessHandleFixture(); "
+            "if ($process -notmatch 'wait-failed=refused inaccessible=refused unreaped=refused terminated=reaped') { throw 'native-process-lifecycle-incomplete' }; "
+            "$process; "
+            "[KeelDock.Platform.DevLaneWindows.Boundary]::RunNamedCleanupJobLifecycleFixture("
+            "$env:DEVLANE_FIXTURE_NAME, $env:DEVLANE_FIXTURE_SID)"
+        )
+        environment = os.environ.copy()
+        environment.update({
+            "DEVLANE_NATIVE_CS": str(native),
+            "DEVLANE_FIXTURE_NAME": profile_name,
+            "DEVLANE_FIXTURE_SID": package_sid,
+        })
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=45, check=False, env=environment,
+        )
+        self.assertEqual(result.returncode, 0, (result.stdout + result.stderr).decode("utf-8", "replace"))
+        self.assertIn(b"windows_native_process_wait=synchronize timeout-distinguished wait-failed=refused "
+                      b"inaccessible=refused unreaped=refused terminated=reaped", result.stdout)
+        self.assertIn(b"windows_native_job_lifecycle=created empty-first-query-delayed pending reopened terminated reaped",
+                      result.stdout)
+
+    @unittest.skipUnless(sys.platform == "win32", "requires native Windows process and job APIs")
+    def test_native_quiescence_refusal_preserves_state_and_prevents_shredding(self):
+        native = Path(windows.__file__).with_name("sandbox_windows_native.cs")
+        command = (
+            "$ErrorActionPreference='Stop'; "
+            "Add-Type -Path $env:DEVLANE_NATIVE_CS; "
+            "[KeelDock.Platform.DevLaneWindows.Boundary]::RunCleanupProcessHandleFixture()"
+        )
+        environment = os.environ.copy()
+        environment["DEVLANE_NATIVE_CS"] = str(native)
+
+        native_results = []
+
+        def native_refusal(state_path):
+            native_results.append(subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=45, check=False, env=environment,
+            ))
+            raise windows.WindowsBoundaryRefusal("windows-cleanup-profile-failed", reason="other")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run"
+            root.mkdir()
+            marker = root / "private.bin"
+            marker.write_bytes(b"private")
+            outside = Path(temporary) / "outside-canary.bin"
+            outside.write_bytes(b"outside-stays")
+            state = root / "state.json"
+            state.write_text("{}", encoding="ascii")
+            with mock.patch.object(windows, "quiesce_run", side_effect=native_refusal) as quiesce, \
+                    mock.patch.object(windows, "delete_profile") as delete_profile, \
+                    mock.patch.object(windows, "shred_tree") as shred:
+                with self.assertRaises(windows.WindowsBoundaryRefusal):
+                    windows.cleanup_runner(state, root)
+            quiesce.assert_called_once_with(state)
+            self.assertEqual(len(native_results), 1, "native Windows probe did not run")
+            native_result = native_results[0]
+            self.assertEqual(
+                native_result.returncode, 0,
+                (native_result.stdout + native_result.stderr).decode("utf-8", "replace"),
+            )
+            self.assertIn(
+                b"windows_native_process_wait=synchronize timeout-distinguished wait-failed=refused "
+                b"inaccessible=refused unreaped=refused terminated=reaped",
+                native_result.stdout,
+            )
+            delete_profile.assert_not_called()
+            shred.assert_not_called()
+            self.assertTrue(state.exists())
+            self.assertEqual(marker.read_bytes(), b"private")
+            self.assertEqual(outside.read_bytes(), b"outside-stays")
+
+    @unittest.skipUnless(sys.platform == "win32", "requires native Windows file cleanup APIs")
+    def test_native_shred_removes_readonly_file_and_directory_on_nonoverwrite_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run"
+            readonly_directory = root / "readonly-directory"
+            readonly_directory.mkdir(parents=True)
+            readonly_file = root / "readonly-large-file.bin"
+            readonly_file.write_bytes(b"private")
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.GetFileAttributesW.argtypes = (ctypes.c_wchar_p,)
+            kernel.GetFileAttributesW.restype = ctypes.c_uint32
+            kernel.SetFileAttributesW.argtypes = (ctypes.c_wchar_p, ctypes.c_uint32)
+            kernel.SetFileAttributesW.restype = ctypes.c_int
+            for path in (readonly_file, readonly_directory):
+                attributes = kernel.GetFileAttributesW(str(path))
+                self.assertNotEqual(attributes, 0xffffffff)
+                self.assertTrue(kernel.SetFileAttributesW(str(path), attributes | 0x1))
+            receipt = windows.shred_tree(root, overwrite_limit=0)
+            self.assertIn("files=1 bytes=7", receipt)
+            self.assertFalse(root.exists())
 
     def test_cleanup_uses_bounded_reparse_refusal_and_noninheriting_path_mutations(self):
         native = Path(windows.__file__).with_name("sandbox_windows_native.cs").read_text(encoding="utf-8")
@@ -585,6 +747,7 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             "ErrorMoreData": "234",
             "WaitObject0": "0",
             "WaitTimeout": "0x00000102",
+            "WaitFailed": "UInt32.MaxValue",
             "JobExitCode": "0x4b44574b",
             "ProcessMemoryLimit": "4294967296UL",
             "JobMemoryLimit": "12884901888UL",
@@ -602,6 +765,10 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             "FileAttributeDirectory": "0x00000010",
             "FileAttributeReparsePoint": "0x00000400",
             "ProcessQueryLimitedInformation": "0x1000",
+            "ProcessTerminate": "0x0001",
+            "ProcessSynchronize": "0x00100000",
+            "JobObjectQueryAccess": "0x0004",
+            "JobObjectTerminateAccess": "0x0008",
             "TokenAdjustPrivileges": "0x0020",
             "SePrivilegeEnabled": "0x00000002",
             "UnprotectedDaclSecurityInformation": "0x20000000",
@@ -610,11 +777,12 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             "ErrorInvalidParameter": "87",
             "ErrorAccessDenied": "5",
             "ErrorNotFound": "1168",
+            "ErrorAlreadyExists": "183",
             "ErrorFileNotFound": "2",
             "ErrorPathNotFound": "3",
             "ErrorNotAllAssigned": "1300",
             "CleanupEntryLimit": "250000",
-            "CleanupDeadlineMilliseconds": "600000",
+            "CleanupDeadlineMilliseconds": "300000",
             "SecurityEnabled": "0x00000004",
         }
         self.assertEqual(observed, expected)
@@ -683,7 +851,8 @@ class WindowsSandboxValidationTests(unittest.TestCase):
     def test_profile_cleanup_child_cap_leaves_the_shred_reserve_inside_the_step(self):
         self.assertEqual(windows.WINDOWS_CLEANUP_STEP_SECONDS, 900)
         self.assertEqual(windows.WINDOWS_SHRED_RESERVE_SECONDS, 300)
-        self.assertEqual(windows.WINDOWS_PROFILE_CLEANUP_TIMEOUT_SECONDS, 600)
+        self.assertEqual(windows.WINDOWS_QUIESCE_TIMEOUT_SECONDS, 120)
+        self.assertEqual(windows.WINDOWS_PROFILE_CLEANUP_TIMEOUT_SECONDS, 360)
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary) / "sandbox.json"
             state.write_text(json.dumps({
@@ -692,7 +861,7 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             with mock.patch.object(windows.sys, "platform", "win32"), \
                     mock.patch.object(windows, "_run_powershell", return_value="removed") as powershell:
                 windows.delete_profile(state)
-            self.assertEqual(powershell.call_args.kwargs["timeout"], 600)
+            self.assertEqual(powershell.call_args.kwargs["timeout"], 360)
 
     def test_shred_failure_prints_a_fixed_failed_cleanup_receipt(self):
         output = io.StringIO()
@@ -736,7 +905,8 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             file.write_text("private", encoding="ascii")
             sharing = OSError("sharing")
             sharing.winerror = 32
-            with mock.patch.object(Path, "open", side_effect=sharing), \
+            with mock.patch.object(windows, "_windows_cleanup_identity", side_effect=self._portable_cleanup_identity), \
+                    mock.patch.object(windows, "_windows_remove_entry", side_effect=sharing) as remove, \
                     mock.patch.object(windows.time, "sleep"), \
                     mock.patch("builtins.print") as output:
                 with self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
@@ -744,6 +914,8 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "shred-overwrite-failed")
             self.assertEqual(caught.exception.reason, "sharing-violation")
             output.assert_called_once_with("windows_cleanup_reason=sharing-violation", flush=True)
+            self.assertTrue(file.exists())
+            self.assertTrue(any(call.kwargs.get("overwrite") is True for call in remove.call_args_list))
 
     def test_shred_tree_removes_oversize_and_reparse_entries_after_plaintext(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -759,24 +931,271 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             with huge.open("wb") as output:
                 output.truncate(1024 * 1024 * 1024 + 1)
             (scratch / "outside-link").symlink_to(clear)
-            receipt = windows.shred_tree(root, plaintext_root=source, overwrite_limit=1024)
+            with mock.patch.object(windows, "_windows_cleanup_identity", side_effect=self._portable_cleanup_identity), \
+                    mock.patch.object(windows, "_windows_remove_entry",
+                                      side_effect=self._portable_cleanup_remove):
+                receipt = windows.shred_tree(root, plaintext_root=source, overwrite_limit=1024)
             self.assertIn("reparse=1", receipt)
             self.assertFalse(root.exists())
             self.assertEqual(clear.read_text(encoding="ascii"), "preserve")
 
-    def test_cleanup_attempts_plaintext_wipe_after_firewall_and_profile_failures(self):
+    def test_cleanup_shreds_after_profile_failure_only_when_quiescence_is_verified(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "run"
             root.mkdir()
             state = root / "state.json"
             state.write_text("{}", encoding="ascii")
-            with mock.patch.object(windows, "remove_firewall", side_effect=windows.WindowsBoundaryRefusal()), \
-                    mock.patch.object(windows, "delete_profile", side_effect=windows.WindowsBoundaryRefusal()), \
+            with mock.patch.object(windows, "delete_profile", side_effect=windows.WindowsBoundaryRefusal()), \
+                    mock.patch.object(windows, "quiesce_run",
+                                      return_value="windows_processes=terminated verified=empty\n") as quiesce, \
                     mock.patch.object(windows, "shred_tree", return_value="wiped\n") as wipe, \
                     self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
                 windows.cleanup_runner(state, root)
-            self.assertEqual(caught.exception.code, "windows-cleanup-firewall-failed")
+            self.assertEqual(caught.exception.code, "windows-cleanup-profile-failed")
+            self.assertEqual(quiesce.call_count, 2)
+            self.assertEqual([call.args[0] for call in quiesce.call_args_list], [state, state])
             wipe.assert_called_once_with(root, plaintext_root=None)
+
+    def test_failed_job_termination_preserves_state_and_never_shreds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run"
+            root.mkdir()
+            marker = root / "private.bin"
+            marker.write_bytes(b"private")
+            outside = Path(temporary) / "outside-canary.bin"
+            outside.write_bytes(b"outside-stays")
+            state = root / "state.json"
+            state.write_text(json.dumps({
+                "schema": 1, "profile_name": "KDDevLane" + "b" * 32,
+                "package_sid": "S-1-15-2-1-2-3-4-5-6-7", "firewall_rule": "KD-DevLane-123",
+                "owned_roots": [], "acl_grants": [], "integrity_grants": [], "job_state": "pending",
+            }), encoding="ascii")
+            refusal = windows.WindowsBoundaryRefusal("windows-cleanup-profile-failed", reason="other")
+            with mock.patch.object(windows, "delete_profile") as delete_profile, \
+                    mock.patch.object(windows, "quiesce_run", side_effect=refusal) as quiesce, \
+                    mock.patch.object(windows, "shred_tree") as shred:
+                with self.assertRaises(windows.WindowsBoundaryRefusal):
+                    windows.cleanup_runner(state, root)
+            quiesce.assert_called_once_with(state)
+            delete_profile.assert_not_called()
+            shred.assert_not_called()
+            self.assertTrue(state.exists())
+            self.assertEqual(marker.read_bytes(), b"private")
+            self.assertEqual(outside.read_bytes(), b"outside-stays")
+
+    def test_live_matching_appcontainer_refusal_preserves_outside_data(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run"
+            root.mkdir()
+            marker = root / "private.bin"
+            marker.write_bytes(b"private")
+            outside = Path(temporary) / "outside-canary.bin"
+            outside.write_bytes(b"outside-stays")
+            state = root / "state.json"
+            state.write_text(json.dumps({
+                "schema": 1, "profile_name": "KDDevLane" + "c" * 32,
+                "package_sid": "S-1-15-2-1-2-3-4-5-6-7", "firewall_rule": "KD-DevLane-456",
+                "owned_roots": [], "acl_grants": [], "integrity_grants": [], "job_state": "pending",
+            }), encoding="ascii")
+            refusal = windows.WindowsBoundaryRefusal(
+                "windows-cleanup-profile-failed", reason="process-alive",
+            )
+            with mock.patch.object(windows, "delete_profile") as delete_profile, \
+                    mock.patch.object(windows, "quiesce_run", side_effect=refusal) as quiesce, \
+                    mock.patch.object(windows, "shred_tree") as shred:
+                with self.assertRaises(windows.WindowsBoundaryRefusal):
+                    windows.cleanup_runner(state, root)
+            quiesce.assert_called_once_with(state)
+            delete_profile.assert_not_called()
+            shred.assert_not_called()
+            self.assertTrue(state.exists())
+            self.assertEqual(marker.read_bytes(), b"private")
+            self.assertEqual(outside.read_bytes(), b"outside-stays")
+
+    @staticmethod
+    def _portable_cleanup_identity(path, *, require_directory=False, allow_reparse=False):
+        path = Path(path)
+        metadata = path.lstat()
+        reparse = stat.S_ISLNK(metadata.st_mode)
+        directory = stat.S_ISDIR(metadata.st_mode) or (reparse and path.is_dir())
+        identity = {
+            "volume": metadata.st_dev, "file_id": metadata.st_ino, "size": metadata.st_size,
+            "links": metadata.st_nlink, "attributes": 0, "directory": directory, "reparse": reparse,
+        }
+        if (require_directory and not directory) or (reparse and not allow_reparse):
+            raise windows.WindowsBoundaryRefusal("shred-entry-inspection-failed")
+        return identity
+
+    @classmethod
+    def _portable_cleanup_remove(cls, path, expected, ancestors, *, overwrite=False, allow_reparse=False):
+        path = Path(path)
+        for parent, parent_identity in ancestors:
+            actual_parent = cls._portable_cleanup_identity(parent, require_directory=True)
+            if not windows._same_windows_identity(actual_parent, parent_identity, directory=True):
+                raise windows.WindowsBoundaryRefusal("shred-entry-inspection-failed")
+        actual = cls._portable_cleanup_identity(path, allow_reparse=True)
+        if not windows._same_windows_identity(
+                actual, expected, directory=bool(expected["directory"] or actual["directory"])):
+            raise windows.WindowsBoundaryRefusal("shred-entry-inspection-failed")
+        if actual["reparse"]:
+            path.unlink()
+            return
+        if actual["directory"]:
+            path.rmdir()
+            return
+        if actual["links"] != 1:
+            raise windows.WindowsBoundaryRefusal("shred-hardlink-refused")
+        if overwrite:
+            with path.open("r+b") as handle:
+                handle.write(os.urandom(actual["size"]))
+                handle.flush()
+                os.fsync(handle.fileno())
+        path.unlink()
+
+    def test_native_remove_handle_requests_write_attributes_for_readonly_file_and_directory(self):
+        class NativeCall:
+            def __init__(self, function):
+                self.function = function
+
+            def __call__(self, *arguments):
+                return self.function(*arguments)
+
+        for name, is_directory, size, attributes in (
+            ("large-readonly-file", False, 1024 * 1024 * 1024 + 1, 0x81),
+            ("readonly-directory", True, 0, 0x11),
+        ):
+            with self.subTest(name=name):
+                parent = Path(r"C:\run")
+                path = parent / name
+                parent_identity = {
+                    "volume": 7, "file_id": 10, "size": 0, "links": 1,
+                    "attributes": 0x10, "directory": True, "reparse": False,
+                }
+                entry_identity = {
+                    "volume": 7, "file_id": 11, "size": size, "links": 1,
+                    "attributes": attributes, "directory": is_directory, "reparse": False,
+                }
+                handles = {}
+                access_by_handle = {}
+                cleared_attributes = []
+                next_handle = [100]
+
+                def create_file(_name, access, _share, _security, _creation, _flags, _template):
+                    handle = next_handle[0]
+                    next_handle[0] += 1
+                    identity = parent_identity if not handles else entry_identity
+                    handles[handle] = identity
+                    access_by_handle[handle] = access
+                    return handle
+
+                def get_information(handle, information_pointer):
+                    identity = handles[handle]
+                    information = ctypes.cast(
+                        information_pointer, ctypes.POINTER(windows._CleanupByHandleInfo),
+                    ).contents
+                    information.attributes = identity["attributes"]
+                    information.volume = identity["volume"]
+                    information.size_high = identity["size"] >> 32
+                    information.size_low = identity["size"] & 0xffffffff
+                    information.links = identity["links"]
+                    information.file_high = identity["file_id"] >> 32
+                    information.file_low = identity["file_id"] & 0xffffffff
+                    return 1
+
+                def set_information(handle, information_class, information_pointer, _size):
+                    access = access_by_handle[handle]
+                    if information_class == 0:
+                        if not access & windows._WINDOWS_FILE_WRITE_ATTRIBUTES:
+                            return 0
+                        basic = ctypes.cast(
+                            information_pointer, ctypes.POINTER(windows._CleanupBasicInfo),
+                        ).contents
+                        cleared_attributes.append(basic.attributes)
+                        return int((basic.attributes & 0x1) == 0)
+                    if information_class == 4:
+                        return int(bool(access & windows._WINDOWS_DELETE))
+                    return 0
+
+                kernel = type("FakeKernel", (), {})()
+                kernel.CreateFileW = NativeCall(create_file)
+                kernel.GetFileInformationByHandle = NativeCall(get_information)
+                kernel.SetFileInformationByHandle = NativeCall(set_information)
+                kernel.WriteFile = NativeCall(lambda *_arguments: 1)
+                kernel.FlushFileBuffers = NativeCall(lambda *_arguments: 1)
+                kernel.CloseHandle = NativeCall(lambda *_arguments: 1)
+                with mock.patch.object(windows.sys, "platform", "win32"), \
+                        mock.patch.object(windows.ctypes, "WinDLL", return_value=kernel, create=True):
+                    windows._windows_remove_entry(
+                        path, entry_identity, [(parent, parent_identity)], overwrite=False,
+                    )
+                entry_handle = max(access_by_handle)
+                self.assertTrue(access_by_handle[entry_handle] & windows._WINDOWS_FILE_WRITE_ATTRIBUTES)
+                self.assertTrue(access_by_handle[entry_handle] & windows._WINDOWS_DELETE)
+                self.assertEqual(len(cleared_attributes), 1)
+                self.assertFalse(cleared_attributes[0] & 0x1)
+
+    def test_shred_refuses_external_hardlink_before_any_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run"
+            root.mkdir()
+            outside = Path(temporary) / "outside.bin"
+            outside.write_bytes(b"outside-stays")
+            (root / "linked.bin").hardlink_to(outside)
+            with mock.patch.object(windows, "_windows_cleanup_identity", side_effect=self._portable_cleanup_identity), \
+                    mock.patch.object(windows, "_windows_remove_entry",
+                                      side_effect=self._portable_cleanup_remove) as remove:
+                with self.assertRaises(windows.WindowsBoundaryRefusal) as caught:
+                    windows.shred_tree(root)
+            self.assertEqual(caught.exception.code, "shred-hardlink-refused")
+            remove.assert_not_called()
+            self.assertEqual(outside.read_bytes(), b"outside-stays")
+            self.assertEqual((root / "linked.bin").read_bytes(), b"outside-stays")
+
+    def test_shred_unlinks_junction_without_following_external_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run"
+            root.mkdir()
+            outside = Path(temporary) / "outside"
+            outside.mkdir()
+            canary = outside / "canary.txt"
+            canary.write_text("preserve", encoding="ascii")
+            (root / "junction").symlink_to(outside, target_is_directory=True)
+            with mock.patch.object(windows, "_windows_cleanup_identity", side_effect=self._portable_cleanup_identity), \
+                    mock.patch.object(windows, "_windows_remove_entry",
+                                      side_effect=self._portable_cleanup_remove):
+                receipt = windows.shred_tree(root)
+            self.assertIn("reparse=1", receipt)
+            self.assertFalse(root.exists())
+            self.assertEqual(canary.read_text(encoding="ascii"), "preserve")
+
+    def test_shred_rejects_junction_substitution_by_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run"
+            root.mkdir()
+            outside = Path(temporary) / "outside"
+            outside.mkdir()
+            canary = outside / "canary.txt"
+            canary.write_text("preserve", encoding="ascii")
+            junction = root / "junction"
+            junction.symlink_to(outside, target_is_directory=True)
+            original_remove = self._portable_cleanup_remove
+            substituted = [False]
+
+            def substitute_then_remove(path, expected, ancestors, **kwargs):
+                if Path(path) == junction and not substituted[0]:
+                    junction.unlink()
+                    replacement = Path(temporary) / "replacement"
+                    replacement.mkdir()
+                    junction.symlink_to(replacement, target_is_directory=True)
+                    substituted[0] = True
+                return original_remove(path, expected, ancestors, **kwargs)
+
+            with mock.patch.object(windows, "_windows_cleanup_identity", side_effect=self._portable_cleanup_identity), \
+                    mock.patch.object(windows, "_windows_remove_entry", side_effect=substitute_then_remove):
+                with self.assertRaises(windows.WindowsBoundaryRefusal):
+                    windows.shred_tree(root)
+            self.assertTrue(substituted[0])
+            self.assertEqual(canary.read_text(encoding="ascii"), "preserve")
 
     def test_windows_archive_names_reject_aliases_and_path_escapes(self):
         self.assertEqual(windows._windows_archive_name("packages/core/src/index.js"),

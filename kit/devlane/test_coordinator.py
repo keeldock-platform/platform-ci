@@ -899,6 +899,153 @@ class TimedRevocationTests(unittest.TestCase):
 class SingleDispatchOwnerTests(unittest.TestCase):
     """The install/dispatch/reconcile interval is one fail-closed coordinator operation."""
 
+    @staticmethod
+    def _source_admission_fixture(temporary, *, signed=True, signer="trusted", revoked=False,
+                                  policy_changed=False, substitute_signer=False, intermediate=False):
+        module = coordinator.source_admission
+        root = Path(temporary)
+        source = root / "source"
+        control = root / "control"
+        keys = root / "keys"
+        home = root / "home"
+        keys.mkdir()
+        home.mkdir()
+        env = os.environ.copy()
+        env.update({
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0", "HOME": str(home),
+        })
+
+        def run(command, *, cwd=None):
+            result = subprocess.run(
+                command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            if result.returncode != 0:
+                raise AssertionError((command, result.stdout.decode("utf-8", "replace"),
+                                      result.stderr.decode("utf-8", "replace")))
+            return result.stdout
+
+        signer_payloads = {}
+        fingerprints = {}
+        private_keys = {}
+        for label in ("trusted", "untrusted"):
+            private_key = keys / label
+            run([module.shutil.which("ssh-keygen"), "-q", "-t", "ed25519", "-N", "",
+                 "-C", "devlane-fixture-" + label, "-f", str(private_key)])
+            fields = private_key.with_suffix(".pub").read_text(encoding="ascii").split()
+            signer_payloads[label] = (
+                "devlane-test@example.invalid " + fields[0] + " " + fields[1] + "\n"
+            ).encode("ascii")
+            private_keys[label] = private_key
+            fingerprint = run([
+                module.shutil.which("ssh-keygen"), "-l", "-E", "sha256", "-f",
+                str(private_key.with_suffix(".pub")),
+            ]).decode("ascii").split()[1]
+            fingerprints[label] = fingerprint
+
+        run(["git", "init", "--quiet", str(source)])
+        run(["git", "config", "user.name", "DevLane Fixture"], cwd=source)
+        run(["git", "config", "user.email", "devlane-test@example.invalid"], cwd=source)
+        run(["git", "remote", "add", "origin", sorted(module.SOURCE_REPOSITORY_URLS)[0]], cwd=source)
+        signer_path = source / module.SIGNER_PATH
+        signer_path.parent.mkdir(parents=True)
+        signer_path.write_bytes(signer_payloads["trusted"])
+        (source / "README.md").write_text("bound base\n", encoding="ascii")
+        run(["git", "add", "docs/commit-signers", "README.md"], cwd=source)
+        run(["git", "commit", "--quiet", "-m", "bound base"], cwd=source)
+        base_sha = run(["git", "rev-parse", "HEAD"], cwd=source).decode("ascii").strip()
+        if intermediate:
+            (source / "intermediate.txt").write_text("intermediate\n", encoding="ascii")
+            run(["git", "add", "intermediate.txt"], cwd=source)
+            run(["git", "commit", "--quiet", "-m", "intermediate"], cwd=source)
+
+        if substitute_signer:
+            signer_path.write_bytes(signer_payloads["untrusted"])
+        (source / "README.md").write_text("candidate source\n", encoding="ascii")
+        run(["git", "add", "README.md", "docs/commit-signers"], cwd=source)
+        commit = ["git", "-c", "gpg.format=ssh", "-c",
+                  "user.signingkey=" + str(private_keys[signer]), "commit", "--quiet"]
+        if signed:
+            commit.append("-S")
+        commit.extend(("-m", "candidate"))
+        run(commit, cwd=source)
+        source_sha = run(["git", "rev-parse", "HEAD"], cwd=source).decode("ascii").strip()
+
+        run(["git", "init", "--quiet", str(control)])
+        run(["git", "config", "user.name", "DevLane Fixture"], cwd=control)
+        run(["git", "config", "user.email", "devlane-control@example.invalid"], cwd=control)
+        revocation_path = control / module.REVOCATION_PATH
+        revocation_path.parent.mkdir(parents=True)
+        revocation_payload = (fingerprints["trusted"] + "\n").encode("ascii") if revoked else b""
+        revocation_path.write_bytes(revocation_payload)
+        run(["git", "add", "ci/revoked-signer-fingerprints"], cwd=control)
+        run(["git", "commit", "--quiet", "-m", "control policy"], cwd=control)
+        control_sha = run(["git", "rev-parse", "HEAD"], cwd=control).decode("ascii").strip()
+        if policy_changed:
+            revocation_path.write_bytes((fingerprints["trusted"] + "\n").encode("ascii"))
+        return {
+            "source": source, "control": control, "base_sha": base_sha,
+            "source_sha": source_sha, "control_sha": control_sha,
+        }
+
+    def _verify_source_fixture(self, fixture, *, admitted_main_sha=None):
+        module = coordinator.source_admission
+        source_sha = fixture["source_sha"]
+        return module.verify_core_source(
+            source_repository=fixture["source"], control_repository=fixture["control"],
+            source_sha=source_sha, base_sha=fixture["base_sha"],
+            admitted_main_sha=admitted_main_sha or source_sha,
+            control_sha=fixture["control_sha"],
+        )
+
+    def test_core_source_verifier_accepts_directly_bound_valid_signature(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._source_admission_fixture(temporary)
+            evidence = self._verify_source_fixture(fixture)
+        self.assertEqual(evidence["source_sha"], fixture["source_sha"])
+        self.assertEqual(evidence["base_sha"], fixture["base_sha"])
+        self.assertEqual(evidence["admission"], "github-main-exact")
+
+    def test_core_source_verifier_rejects_unsigned_and_untrusted_signatures(self):
+        for signed, signer in ((False, "trusted"), (True, "untrusted")):
+            with self.subTest(signed=signed, signer=signer), tempfile.TemporaryDirectory() as temporary:
+                fixture = self._source_admission_fixture(temporary, signed=signed, signer=signer)
+                with self.assertRaisesRegex(coordinator.source_admission.AdmissionRefusal, "signature-invalid"):
+                    self._verify_source_fixture(fixture)
+
+    def test_core_source_verifier_rejects_revoked_signature(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._source_admission_fixture(temporary, revoked=True)
+            with self.assertRaisesRegex(coordinator.source_admission.AdmissionRefusal, "signature-invalid"):
+                self._verify_source_fixture(fixture)
+
+    def test_core_source_verifier_rejects_candidate_signer_authority_substitution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._source_admission_fixture(
+                temporary, signer="untrusted", substitute_signer=True,
+            )
+            with self.assertRaisesRegex(
+                    coordinator.source_admission.AdmissionRefusal, "signer-authority-changed"):
+                self._verify_source_fixture(fixture)
+
+    def test_core_source_verifier_rejects_changed_ancestry_and_admitted_main(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._source_admission_fixture(temporary, intermediate=True)
+            with self.assertRaisesRegex(coordinator.source_admission.AdmissionRefusal, "source-base-mismatch"):
+                self._verify_source_fixture(fixture)
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._source_admission_fixture(temporary)
+            with self.assertRaisesRegex(coordinator.source_admission.AdmissionRefusal, "source-binding-mismatch"):
+                self._verify_source_fixture(fixture, admitted_main_sha="0" * 40)
+
+    def test_core_source_verifier_rejects_mismatched_current_revocation_policy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._source_admission_fixture(temporary, policy_changed=True)
+            with self.assertRaisesRegex(
+                    coordinator.source_admission.AdmissionRefusal, "revocation-file-mismatch"):
+                self._verify_source_fixture(fixture)
+
     def _ready_wave(self, temporary):
         ledger = CoordinatorLedgerAcceptanceTests()._new_ledger(temporary)
         record = _ledger_record(state="assets-attached")
@@ -945,6 +1092,54 @@ class SingleDispatchOwnerTests(unittest.TestCase):
             with self.assertRaisesRegex(coordinator.Refusal, "platform-profile-unsupported"):
                 coordinator.dispatch_wave(ledger, "wave-test-0001", key_path, platform="macos")
             self.assertFalse(key_path.exists())
+
+    def test_windows_platform_still_refuses_core_rust_schema_two(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger, key_path = self._ready_wave(temporary)
+            record = coordinator._read(ledger / "wave-test-0001.json")
+            record["profile"] = "core-rust"
+            record["platform"] = "windows"
+            _write_record(ledger, record)
+            with self.assertRaisesRegex(coordinator.Refusal, "platform-profile-unsupported"):
+                coordinator.dispatch_wave(ledger, "wave-test-0001", key_path, platform="windows")
+            self.assertFalse(key_path.exists())
+
+    def test_core_rust_dispatch_stops_before_secret_install_when_signature_check_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger, key_path = self._ready_wave(temporary)
+            record = coordinator._read(ledger / "wave-test-0001.json")
+            record["profile"] = "core-rust"
+            _write_record(ledger, record)
+            with mock.patch.object(coordinator, "_verify_core_source_admission",
+                                   side_effect=coordinator.Refusal("source-signature-verification")) as verify, \
+                    mock.patch.object(coordinator.subprocess, "run") as subprocess_run, \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    self.assertRaisesRegex(coordinator.Refusal, "source-signature-verification"):
+                coordinator.dispatch_wave(ledger, "wave-test-0001", key_path)
+            verify.assert_called_once()
+            subprocess_run.assert_not_called()
+            self.assertFalse(key_path.exists())
+
+    def test_core_rust_source_check_uses_the_bound_base_and_current_control_policy(self):
+        record = _ledger_record()
+        record["profile"] = "core-rust"
+        with mock.patch.dict(os.environ, {"DEVLANE_CORE_SOURCE_REPOSITORY": "/trusted/core-checkout"}), \
+                mock.patch.object(coordinator, "_gh_json", return_value={
+                    "object": {"sha": bundle.CORE_RUST_SOURCE_REVISION},
+                }) as api, \
+                mock.patch.object(coordinator.source_admission, "verify_core_source") as verify:
+            coordinator._verify_core_source_admission(record)
+        api.assert_called_once_with(
+            "repos/Moh-Bakr/" + coordinator.source_admission.CORE_SOURCE_REPOSITORY + "/git/ref/heads/main",
+        )
+        verify.assert_called_once_with(
+            source_repository="/trusted/core-checkout",
+            control_repository=Path(coordinator.__file__).resolve().parents[2],
+            source_sha=bundle.CORE_RUST_SOURCE_REVISION,
+            base_sha=bundle.CORE_RUST_ADMITTED_BASE_REVISION,
+            admitted_main_sha=bundle.CORE_RUST_SOURCE_REVISION,
+            control_sha=record["control_sha"],
+        )
 
     def test_key_file_requires_exact_lowercase_hex_without_echoing_contents(self):
         with tempfile.TemporaryDirectory() as temporary:

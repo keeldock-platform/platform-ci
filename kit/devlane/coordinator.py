@@ -24,6 +24,7 @@ import fetch
 import control_audit
 import permit
 import public_audit
+import source_admission
 
 
 LEDGER_FIELDS = {
@@ -913,6 +914,30 @@ def _verify_remote_main(expected_sha):
         _fail("remote-main-moved")
 
 
+def _verify_core_source_admission(record):
+    """Verify the pinned source before a key can be installed for a source-bearing run."""
+    source_root = os.environ.get("DEVLANE_CORE_SOURCE_REPOSITORY")
+    if not source_root or Path(source_root).is_symlink():
+        _fail("source-signature-verification")
+    try:
+        ref = _gh_json("repos/Moh-Bakr/" + source_admission.CORE_SOURCE_REPOSITORY + "/git/ref/heads/main")
+        admitted_main_sha = (ref.get("object") or {}).get("sha") if type(ref) is dict else None
+        if admitted_main_sha != bundle.CORE_RUST_SOURCE_REVISION:
+            _fail("source-signature-verification")
+        source_admission.verify_core_source(
+            source_repository=source_root,
+            control_repository=Path(__file__).resolve().parents[2],
+            source_sha=bundle.CORE_RUST_SOURCE_REVISION,
+            base_sha=bundle.CORE_RUST_ADMITTED_BASE_REVISION,
+            admitted_main_sha=admitted_main_sha,
+            control_sha=record["control_sha"],
+        )
+    except Refusal:
+        raise
+    except (OSError, ValueError, source_admission.AdmissionRefusal):
+        _fail("source-signature-verification")
+
+
 def _control_dispatch_path(root, wave_id):
     return root / ("control-dispatch-" + wave_id + ".json")
 
@@ -1503,6 +1528,8 @@ def dispatch_wave(ledger, wave_id, key_file, *, platform=None, poll_seconds=10,
             _fail("platform-binding-mismatch")
         if selected_platform != "linux" and record["profile"] != "core-node":
             _fail("platform-profile-unsupported")
+        if record["profile"] == "core-rust":
+            _verify_core_source_admission(record)
         _verify_remote_main(record["control_sha"])
         _verify_secret_absent()
         transition(ledger, wave_id, "mark-secret-installing")

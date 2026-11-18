@@ -775,13 +775,17 @@ class DeadlineTests(unittest.TestCase):
                         output = io.StringIO()
                         with patch.dict(os.environ, {"GITHUB_RUN_ID": run_id}), \
                                 patch.object(host_cleanup, "_confirm_supervisor_absent"), \
+                                patch.object(host_cleanup, "_deadline_check"), \
+                                patch.object(host_cleanup, "_cleanup_deadline_cutoff",
+                                             return_value=time.monotonic() + 60), \
                                 patch.object(host_cleanup, "clean_node_snapshot", return_value=True) as remove_snapshot, \
                                 patch.object(host_cleanup, "clean_node_vendor_source", return_value=True) as remove_vendor, \
                                 contextlib.redirect_stdout(output):
                             self.assertEqual(host_cleanup.main(safe_arguments), 0)
                         self.assertEqual(output.getvalue().strip(), "cleanup_receipt=confirmed")
                         remove_snapshot.assert_called_once_with("devlane-run-1", str(run_root / "deadline.json"))
-                        remove_vendor.assert_called_once_with("devlane-vendor-1")
+                        remove_vendor.assert_called_once_with("devlane-vendor-1",
+                                                              deadline_file=str(run_root / "deadline.json"))
                         self.assertFalse(run_root.exists())
                 elif script == "supervisor.py":
                     required = {
@@ -946,7 +950,11 @@ class DeadlineTests(unittest.TestCase):
             proc_root = base / "proc-fixture"
             process = proc_root / "4242"
             process.mkdir(parents=True)
-            (process / "cmdline").write_bytes(b"python3 kit/devlane/supervisor.py _serve\0")
+            state = run_root / "state"
+            (process / "cmdline").write_bytes(
+                b"python3\0kit/devlane/supervisor.py\0_serve\0--state-dir\0"
+                + os.fsencode(str(state)) + b"\0"
+            )
             deadline_path = base / "deadline.json"
             deadline.create(deadline_path, 120, 60, 180)
             errors = io.StringIO()
@@ -959,6 +967,202 @@ class DeadlineTests(unittest.TestCase):
                 ])
             self.assertEqual(result, 2)
             self.assertIn("cleanup_receipt=unconfirmed", errors.getvalue())
+
+    def test_host_cleanup_ignores_supervisor_owned_by_another_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            run_id = "foreign-supervisor-0001"
+            run_root = base / ("devlane-" + run_id)
+            proc_root = base / "proc-fixture"
+            process = proc_root / "4242"
+            process.mkdir(parents=True)
+            foreign_state = base / "devlane-other-run" / "state"
+            (process / "cmdline").write_bytes(
+                b"python3\0kit/devlane/supervisor.py\0_serve\0--state-dir\0"
+                + os.fsencode(str(foreign_state)) + b"\0"
+            )
+            deadline_path = base / "deadline.json"
+            deadline.create(deadline_path, 120, 60, 180)
+            output = io.StringIO()
+            with patch.dict(os.environ, {"GITHUB_RUN_ID": run_id}), \
+                    patch.object(host_cleanup, "PROC_ROOT", proc_root), \
+                    contextlib.redirect_stdout(output):
+                host_cleanup.clean(str(run_root), str(base), deadline_file=str(deadline_path))
+            self.assertEqual(output.getvalue().strip(), "cleanup_receipt=confirmed")
+
+    def test_host_cleanup_refuses_ambiguous_argv_that_resolves_to_this_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            run_id = "ambiguous-supervisor-0001"
+            run_root = base / ("devlane-" + run_id)
+            proc_root = base / "proc-fixture"
+            process = proc_root / "4242"
+            process.mkdir(parents=True)
+            state = run_root / "state"
+            foreign_state = base / "devlane-other-run" / "state"
+            (process / "cmdline").write_bytes(
+                b"python3\0kit/devlane/supervisor.py\0_serve\0--state-dir\0"
+                + os.fsencode(str(foreign_state)) + b"\0--state-dir\0"
+                + os.fsencode(str(state)) + b"\0"
+            )
+            deadline_path = base / "deadline.json"
+            deadline.create(deadline_path, 120, 60, 180)
+            errors = io.StringIO()
+            with patch.dict(os.environ, {"GITHUB_RUN_ID": run_id}), \
+                    patch.object(host_cleanup, "PROC_ROOT", proc_root), \
+                    patch.object(host_cleanup, "SUPERVISOR_EXIT_SETTLE_SECONDS", 0), \
+                    contextlib.redirect_stderr(errors):
+                result = host_cleanup.main([
+                    "--root", str(run_root), "--runner-temp", str(base),
+                    "--deadline-file", str(deadline_path),
+                ])
+            self.assertEqual(result, 2)
+            self.assertIn("cleanup_receipt=unconfirmed", errors.getvalue())
+
+    def test_host_cleanup_tolerates_process_exiting_during_scan(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            state = base / "state"
+            proc_root = base / "proc-fixture"
+            process = proc_root / "4242"
+            process.mkdir(parents=True)
+            cmdline = process / "cmdline"
+            cmdline.write_bytes(b"python3\x00")
+            deadline_path = base / "deadline.json"
+            deadline.create(deadline_path, 120, 60, 180)
+            original_open = Path.open
+
+            def vanish_on_read(path, *args, **kwargs):
+                if path == cmdline:
+                    raise ProcessLookupError(3, "No such process")
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(host_cleanup, "PROC_ROOT", proc_root), \
+                    patch.object(Path, "open", vanish_on_read):
+                host_cleanup._confirm_supervisor_absent(state, deadline_path)
+
+    def test_host_cleanup_waits_for_exiting_supervisor_of_same_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            proc_root = base / "proc-fixture"
+            process = proc_root / "4242"
+            process.mkdir(parents=True)
+            state = base / "state"
+            cmdline = process / "cmdline"
+            cmdline.write_bytes(
+                b"python3\0kit/devlane/supervisor.py\0_serve\0--state-dir\0"
+                + os.fsencode(str(state)) + b"\0"
+            )
+            deadline_path = base / "deadline.json"
+            deadline.create(deadline_path, 120, 60, 180)
+            real_sleep = time.sleep
+
+            def exit_supervisor(seconds):
+                cmdline.write_bytes(b"")
+                real_sleep(0)
+
+            with patch.object(host_cleanup, "PROC_ROOT", proc_root), \
+                    patch.object(host_cleanup.time, "sleep", exit_supervisor):
+                host_cleanup._confirm_supervisor_absent(state, deadline_path)
+
+    def test_host_cleanup_refuses_to_spend_reserved_reap_time(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            state = base / "state"
+            deadline_path = base / "deadline.json"
+            deadline.create(deadline_path, 120, 60, 180)
+            with patch.object(host_cleanup.time, "monotonic", side_effect=[10.0, 10.0]), \
+                    patch.object(host_cleanup.deadline_budget, "cleanup_remaining",
+                                 side_effect=[0.05, deadline.DeadlineRefusal("total-deadline-exhausted")]), \
+                    patch.object(host_cleanup, "_supervisor_present", return_value=True), \
+                    patch.object(host_cleanup.time, "sleep") as sleep:
+                with self.assertRaisesRegex(RuntimeError, "cleanup-incomplete"):
+                    host_cleanup._confirm_supervisor_absent(state, deadline_path)
+            sleep.assert_not_called()
+
+    def test_host_cleanup_refuses_when_empty_process_scan_exhausts_shared_deadline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            proc_root = base / "proc-fixture"
+            proc_root.mkdir()
+            deadline_path = base / "deadline.json"
+            start = time.monotonic()
+            deadline.create(deadline_path, 20, 6, 26, now=start)
+            with patch.object(host_cleanup, "PROC_ROOT", proc_root), \
+                    patch.object(host_cleanup.deadline_budget.time, "monotonic",
+                                 side_effect=[start + 22, start + 23]):
+                with self.assertRaisesRegex(RuntimeError, "cleanup-incomplete"):
+                    host_cleanup._supervisor_present(base / "state", deadline_path)
+
+    def test_host_cleanup_checks_a_wide_process_inventory_during_iteration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            proc_root = base / "proc-fixture"
+            proc_root.mkdir()
+            for process_id in range(1000, 1060):
+                process = proc_root / str(process_id)
+                process.mkdir()
+                (process / "cmdline").write_bytes(b"python3\x00")
+            deadline_path = base / "deadline.json"
+            deadline.create(deadline_path, 120, 60, 180)
+            calls = 0
+
+            def expire_during_scan(_deadline_file, _cap):
+                nonlocal calls
+                calls += 1
+                if calls >= 8:
+                    host_cleanup._fail("process-alive")
+                return 10
+
+            reads = 0
+            original_open = Path.open
+
+            def count_reads(path, *args, **kwargs):
+                nonlocal reads
+                if path.name == "cmdline":
+                    reads += 1
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(host_cleanup, "PROC_ROOT", proc_root), \
+                    patch.object(host_cleanup, "_cleanup_timeout", expire_during_scan), \
+                    patch.object(Path, "open", count_reads):
+                with self.assertRaisesRegex(RuntimeError, "cleanup-incomplete"):
+                    host_cleanup._supervisor_present(base / "state", deadline_path)
+            self.assertLess(reads, 60)
+
+    def test_host_cleanup_refuses_confirmation_when_shared_deadline_expires_during_tree_removal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            run_id = "tree-deadline-0001"
+            run_root = base / ("devlane-" + run_id)
+            run_root.mkdir()
+            deadline_path = run_root / "deadline.json"
+            deadline.create(deadline_path, 120, 60, 180)
+            for index in range(12):
+                (run_root / ("payload-%02d" % index)).write_text("owned", encoding="ascii")
+            calls = 0
+
+            def expire_during_tree(_deadline_file, _cap):
+                nonlocal calls
+                calls += 1
+                if calls >= 20:
+                    host_cleanup._fail("process-alive")
+                return 10
+
+            errors = io.StringIO()
+            with patch.dict(os.environ, {"GITHUB_RUN_ID": run_id}), \
+                    patch.object(host_cleanup, "_confirm_supervisor_absent"), \
+                    patch.object(host_cleanup, "_cleanup_timeout", expire_during_tree), \
+                    contextlib.redirect_stderr(errors):
+                result = host_cleanup.main([
+                    "--root", str(run_root), "--runner-temp", str(base),
+                    "--deadline-file", str(deadline_path),
+                ])
+            self.assertEqual(result, 2)
+            self.assertIn("cleanup_receipt=unconfirmed", errors.getvalue())
+            self.assertTrue(run_root.exists())
+            self.assertTrue((run_root / "payload-01").exists())
+            self.assertEqual(deadline_path.read_text(encoding="ascii").count("work_deadline"), 1)
 
 
 if __name__ == "__main__":

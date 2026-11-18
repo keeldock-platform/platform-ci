@@ -53,6 +53,7 @@ namespace KeelDock.Platform.DevLaneWindows
         private const int ErrorMoreData = 234;
         private const uint WaitObject0 = 0;
         private const uint WaitTimeout = 0x00000102;
+        private const uint WaitFailed = UInt32.MaxValue;
         private const uint JobExitCode = 0x4b44574b;
         private const ulong ProcessMemoryLimit = 4294967296UL;
         private const ulong JobMemoryLimit = 12884901888UL;
@@ -70,6 +71,10 @@ namespace KeelDock.Platform.DevLaneWindows
         private const uint FileAttributeDirectory = 0x00000010;
         private const uint FileAttributeReparsePoint = 0x00000400;
         private const uint ProcessQueryLimitedInformation = 0x1000;
+        private const uint ProcessTerminate = 0x0001;
+        private const uint ProcessSynchronize = 0x00100000;
+        private const uint JobObjectQueryAccess = 0x0004;
+        private const uint JobObjectTerminateAccess = 0x0008;
         private const uint TokenAdjustPrivileges = 0x0020;
         private const uint SePrivilegeEnabled = 0x00000002;
         private const uint UnprotectedDaclSecurityInformation = 0x20000000;
@@ -80,9 +85,10 @@ namespace KeelDock.Platform.DevLaneWindows
         private const int ErrorNotFound = 1168;
         private const int ErrorFileNotFound = 2;
         private const int ErrorPathNotFound = 3;
+        private const int ErrorAlreadyExists = 183;
         private const int ErrorNotAllAssigned = 1300;
         private const int CleanupEntryLimit = 250000;
-        private const int CleanupDeadlineMilliseconds = 600000;
+        private const int CleanupDeadlineMilliseconds = 300000;
         private const uint SecurityEnabled = 0x00000004;
 
         [StructLayout(LayoutKind.Sequential)]
@@ -325,8 +331,13 @@ namespace KeelDock.Platform.DevLaneWindows
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool CloseHandle(IntPtr handle);
 
-        [DllImport("kernel32.dll", SetLastError = true)]
+        [DllImport("kernel32.dll", EntryPoint = "CreateJobObjectW", CharSet = CharSet.Unicode,
+            ExactSpelling = true, SetLastError = true)]
         private static extern IntPtr CreateJobObjectW(IntPtr security, string name);
+
+        [DllImport("kernel32.dll", EntryPoint = "OpenJobObjectW", CharSet = CharSet.Unicode,
+            ExactSpelling = true, SetLastError = true)]
+        private static extern IntPtr OpenJobObjectW(uint access, bool inherit, string name);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -503,34 +514,143 @@ namespace KeelDock.Platform.DevLaneWindows
             return EnablePrivilege("SeRestorePrivilege");
         }
 
-        public static void AssertCleanupQuiescent(string packageSid, string jobState)
+        private static string CleanupJobName(string profileName)
         {
-            if (jobState != "none" && jobState != "terminated-empty")
+            if (String.IsNullOrEmpty(profileName) || profileName.Length > 64)
+                throw new InvalidOperationException("cleanup_job_name");
+            return "Local\\KeelDock.DevLane." + profileName;
+        }
+
+        private static void TerminateCleanupJob(string profileName)
+        {
+            IntPtr job = OpenJobObjectW(JobObjectQueryAccess | JobObjectTerminateAccess, false,
+                CleanupJobName(profileName));
+            if (job == IntPtr.Zero)
+            {
+                int error = Marshal.GetLastWin32Error();
+                if (error == ErrorFileNotFound || error == ErrorPathNotFound) return;
+                throw new InvalidOperationException("cleanup_job_open");
+            }
+            try
+            {
+                if (!TerminateJobObject(job, JobExitCode))
+                    throw new InvalidOperationException("cleanup_job_terminate");
+                if (!WaitForEmptyJob(job, 10000))
+                    throw new InvalidOperationException("cleanup_job_reap");
+            }
+            finally { Close(job); }
+        }
+
+        private static void VerifyCleanupJobEmpty(string profileName)
+        {
+            IntPtr job = OpenJobObjectW(JobObjectQueryAccess, false, CleanupJobName(profileName));
+            if (job == IntPtr.Zero)
+            {
+                int error = Marshal.GetLastWin32Error();
+                if (error == ErrorFileNotFound || error == ErrorPathNotFound) return;
+                throw new InvalidOperationException("cleanup_job_verify_open");
+            }
+            try
+            {
+                if (!WaitForEmptyJob(job, 0))
+                    throw new InvalidOperationException("cleanup_job_verify_nonempty");
+            }
+            finally { Close(job); }
+        }
+
+        public static void AssertCleanupQuiescent(string profileName, string packageSid, string jobState)
+        {
+            AssertCleanupQuiescent(profileName, packageSid, jobState, false, Stopwatch.StartNew());
+        }
+
+        public static string RunNamedCleanupJobLifecycleFixture(string profileName, string packageSid)
+        {
+            if (String.IsNullOrEmpty(profileName) || profileName.Length > 64 || String.IsNullOrEmpty(packageSid))
+                throw new InvalidOperationException("cleanup_job_fixture_arguments");
+            string commandProcessor = Environment.GetEnvironmentVariable("ComSpec");
+            if (String.IsNullOrEmpty(commandProcessor))
+                throw new InvalidOperationException("cleanup_job_fixture_command_processor");
+            IntPtr job = IntPtr.Zero;
+            ProcessInformation child = new ProcessInformation();
+            bool childCreated = false;
+            try
+            {
+                job = CreateJobObjectW(IntPtr.Zero, CleanupJobName(profileName));
+                if (job == IntPtr.Zero) throw new InvalidOperationException("cleanup_job_fixture_create");
+                if (Marshal.GetLastWin32Error() == ErrorAlreadyExists)
+                    throw new InvalidOperationException("cleanup_job_fixture_already_exists");
+                SetJobLimits(job);
+                if (!WaitForEmptyJob(job, 0, 10))
+                    throw new InvalidOperationException("cleanup_job_fixture_delayed_empty_query");
+                StartupInfoEx startup = new StartupInfoEx();
+                startup.StartupInfo.cb = (uint)Marshal.SizeOf(typeof(StartupInfo));
+                string commandText = "\"" + commandProcessor + "\" /d /c ping.exe -n 60 127.0.0.1 >NUL";
+                if (!CreateProcessW(commandProcessor, new StringBuilder(commandText), IntPtr.Zero, IntPtr.Zero,
+                    false, CreateSuspended | CreateUnicodeEnvironment, IntPtr.Zero, null, ref startup, out child))
+                    throw new InvalidOperationException("cleanup_job_fixture_process_create");
+                childCreated = true;
+                if (!AssignProcessToJobObject(job, child.Process))
+                    throw new InvalidOperationException("cleanup_job_fixture_assign");
+                if (WaitForEmptyJob(job, 100))
+                    throw new InvalidOperationException("cleanup_job_fixture_not_pending");
+                if (ResumeThread(child.Thread) == UInt32.MaxValue)
+                    throw new InvalidOperationException("cleanup_job_fixture_resume");
+                AssertCleanupQuiescent(profileName, packageSid, "pending");
+                if (WaitForProcess(child.Process, 0) != WaitObject0)
+                    throw new InvalidOperationException("cleanup_job_fixture_process_alive");
+                VerifyCleanupJobEmpty(profileName);
+                return "windows_native_job_lifecycle=created empty-first-query-delayed pending reopened terminated reaped";
+            }
+            finally
+            {
+                if (job != IntPtr.Zero)
+                {
+                    TerminateJobObject(job, JobExitCode);
+                    WaitForEmptyJob(job, 10000);
+                }
+                if (childCreated)
+                {
+                    if (WaitForSingleObject(child.Process, 0) != WaitObject0)
+                        TerminateProcess(child.Process, JobExitCode);
+                    WaitForSingleObject(child.Process, 10000);
+                    Close(child.Thread);
+                    Close(child.Process);
+                }
+                Close(job);
+            }
+        }
+
+        private static void AssertCleanupQuiescent(string profileName, string packageSid, string jobState,
+            bool verificationPass, Stopwatch totalTimer)
+        {
+            if ((jobState != "none" && jobState != "pending" && jobState != "terminated-empty")
+                || String.IsNullOrEmpty(profileName))
                 throw new InvalidOperationException("cleanup_job_state");
             IntPtr expectedSid = IntPtr.Zero;
             try
             {
-                if (String.IsNullOrEmpty(packageSid) || !ConvertStringSidToSidW(packageSid, out expectedSid)
+                if (!ConvertStringSidToSidW(packageSid, out expectedSid)
                     || expectedSid == IntPtr.Zero || !IsValidSid(expectedSid))
                     throw new InvalidOperationException("cleanup_identity_sid");
                 using (PrivilegeScope debugPrivilege = EnablePrivilege("SeDebugPrivilege"))
                 {
+                    if (!verificationPass) TerminateCleanupJob(profileName);
                     Process[] processes = Process.GetProcesses();
+                    if (totalTimer.ElapsedMilliseconds > CleanupDeadlineMilliseconds)
+                        throw new InvalidOperationException("cleanup_process_timeout");
                     if (processes == null || processes.Length > CleanupEntryLimit)
                         throw new InvalidOperationException("cleanup_process_enumeration");
                     int currentSession = Process.GetCurrentProcess().SessionId;
-                    Stopwatch timer = Stopwatch.StartNew();
                     try
                     {
                         foreach (Process item in processes)
                         {
-                            if (timer.ElapsedMilliseconds > CleanupDeadlineMilliseconds)
+                            if (totalTimer.ElapsedMilliseconds > CleanupDeadlineMilliseconds)
                                 throw new InvalidOperationException("cleanup_process_timeout");
                             uint processId;
                             try { processId = unchecked((uint)item.Id); }
                             catch { throw new InvalidOperationException("cleanup_process_enumeration"); }
-                            if (processId == 0) continue;
-                            if (processId == 4) continue;
+                            if (processId == 0 || processId == 4) continue;
                             int processSession;
                             try { processSession = item.SessionId; }
                             catch
@@ -539,7 +659,7 @@ namespace KeelDock.Platform.DevLaneWindows
                                 throw new InvalidOperationException("cleanup_process_session");
                             }
                             if (processSession != currentSession) continue;
-                            IntPtr process = OpenProcess(ProcessQueryLimitedInformation, false, processId);
+                            IntPtr process = OpenCleanupProcessHandle(processId, verificationPass);
                             if (process == IntPtr.Zero)
                             {
                                 int openError = Marshal.GetLastWin32Error();
@@ -547,10 +667,8 @@ namespace KeelDock.Platform.DevLaneWindows
                                     || openError == ErrorFileNotFound || openError == ErrorPathNotFound
                                     || IsProcessGone(item);
                                 if (processGone) continue;
-                                string accessClassification = ClassifyCleanupProcessAccessFailureFixture(
-                                    openError, item.ProcessName, false);
-                                if (accessClassification != "refuse") continue;
-                                throw new InvalidOperationException("cleanup_process_inspection");
+                                RequireCleanupProcessInspection(openError, item.ProcessName, false);
+                                continue;
                             }
                             try
                             {
@@ -558,7 +676,7 @@ namespace KeelDock.Platform.DevLaneWindows
                                 if (!GetProcessInformation(process, ProcessProtectionLevelInfo, ref protection,
                                     (uint)Marshal.SizeOf(typeof(ProcessProtectionLevelInformation))))
                                 {
-                                    if (WaitForSingleObject(process, 0) == WaitObject0) continue;
+                                    if (WaitForProcess(process, 0) == WaitObject0) continue;
                                     throw new InvalidOperationException("cleanup_process_protection");
                                 }
                                 string classification = ClassifyCleanupProcessFixture(processSession, currentSession,
@@ -567,7 +685,7 @@ namespace KeelDock.Platform.DevLaneWindows
                                 IntPtr token = IntPtr.Zero;
                                 if (!OpenProcessToken(process, TokenQuery, out token) || token == IntPtr.Zero)
                                 {
-                                    if (WaitForSingleObject(process, 0) == WaitObject0) continue;
+                                    if (WaitForProcess(process, 0) == WaitObject0) continue;
                                     throw new InvalidOperationException("cleanup_process_token");
                                 }
                                 try
@@ -588,7 +706,9 @@ namespace KeelDock.Platform.DevLaneWindows
                                         {
                                             if (ReadTokenDword(token, TokenIsLessPrivilegedAppContainer) != 1)
                                                 throw new InvalidOperationException("cleanup_process_identity");
-                                            throw new InvalidOperationException("cleanup_process_alive");
+                                            if (verificationPass)
+                                                throw new InvalidOperationException("cleanup_process_alive");
+                                            TerminateAndReapCleanupProcess(process);
                                         }
                                     }
                                     finally { Marshal.FreeHGlobal(app); }
@@ -602,7 +722,23 @@ namespace KeelDock.Platform.DevLaneWindows
                     {
                         foreach (Process item in processes) item.Dispose();
                     }
+                    if (totalTimer.ElapsedMilliseconds > CleanupDeadlineMilliseconds)
+                        throw new InvalidOperationException("cleanup_process_timeout");
+                    if (!verificationPass)
+                    {
+                        VerifyCleanupJobEmpty(profileName);
+                        AssertCleanupQuiescent(profileName, packageSid, jobState, true, totalTimer);
+                        VerifyCleanupJobEmpty(profileName);
+                    }
+                    if (totalTimer.ElapsedMilliseconds > CleanupDeadlineMilliseconds)
+                        throw new InvalidOperationException("cleanup_process_timeout");
                 }
+            }
+            catch (InvalidOperationException error)
+            {
+                if (error.Message == "cleanup_process_wait_failed"
+                    || error.Message == "cleanup_process_reap") throw;
+                throw new InvalidOperationException("cleanup_processes");
             }
             catch
             {
@@ -618,6 +754,150 @@ namespace KeelDock.Platform.DevLaneWindows
         {
             try { return process.HasExited; }
             catch { return false; }
+        }
+
+        private static IntPtr OpenCleanupProcessHandle(uint processId, bool verificationPass)
+        {
+            uint access = ProcessQueryLimitedInformation | ProcessSynchronize
+                | (verificationPass ? 0U : ProcessTerminate);
+            return OpenProcess(access, false, processId);
+        }
+
+        public static string RunCleanupProcessHandleFixture()
+        {
+            AssertCleanupProcessWaitFailure();
+            AssertCleanupProcessAccessRefusal();
+            AssertCleanupProcessUnreapedRefusal();
+            RunCleanupProcessTerminationFixture();
+            return "windows_native_process_wait=synchronize timeout-distinguished wait-failed=refused "
+                + "inaccessible=refused unreaped=refused terminated=reaped";
+        }
+
+        private static void AssertCleanupProcessWaitFailure()
+        {
+            try
+            {
+                WaitForProcess(IntPtr.Zero, 0);
+            }
+            catch (InvalidOperationException error)
+            {
+                if (error.Message == "cleanup_process_wait_failed") return;
+                throw;
+            }
+            throw new InvalidOperationException("cleanup_process_fixture_wait_failure_missing");
+        }
+
+        private static void AssertCleanupProcessAccessRefusal()
+        {
+            using (Process protectedProcess = Process.GetProcessById(4))
+            {
+                IntPtr process = OpenCleanupProcessHandle(4, false);
+                if (process != IntPtr.Zero)
+                {
+                    Close(process);
+                    throw new InvalidOperationException("cleanup_process_fixture_access_was_granted");
+                }
+                int error = Marshal.GetLastWin32Error();
+                if (error != ErrorAccessDenied)
+                    throw new InvalidOperationException("cleanup_process_fixture_access_error");
+                try
+                {
+                    RequireCleanupProcessInspection(error, protectedProcess.ProcessName, false);
+                }
+                catch (InvalidOperationException refusal)
+                {
+                    if (refusal.Message == "cleanup_process_inspection") return;
+                    throw;
+                }
+            }
+            throw new InvalidOperationException("cleanup_process_fixture_access_refusal_missing");
+        }
+
+        private static void AssertCleanupProcessUnreapedRefusal()
+        {
+            string commandProcessor = Environment.GetEnvironmentVariable("ComSpec");
+            if (String.IsNullOrEmpty(commandProcessor))
+                throw new InvalidOperationException("cleanup_process_fixture_command_processor");
+            StartupInfoEx startup = new StartupInfoEx();
+            startup.StartupInfo.cb = (uint)Marshal.SizeOf(typeof(StartupInfo));
+            string commandText = "\"" + commandProcessor + "\" /d /c ping.exe -n 60 127.0.0.1 >NUL";
+            ProcessInformation child;
+            if (!CreateProcessW(commandProcessor, new StringBuilder(commandText), IntPtr.Zero, IntPtr.Zero,
+                false, CreateSuspended | CreateUnicodeEnvironment, IntPtr.Zero, null, ref startup, out child))
+                throw new InvalidOperationException("cleanup_process_fixture_process_create");
+            try
+            {
+                try
+                {
+                    RequireCleanupProcessReaped(child.Process, 0);
+                }
+                catch (InvalidOperationException refusal)
+                {
+                    if (refusal.Message == "cleanup_process_reap") return;
+                    throw;
+                }
+                throw new InvalidOperationException("cleanup_process_fixture_unreaped_refusal_missing");
+            }
+            finally
+            {
+                if (WaitForSingleObject(child.Process, 0) != WaitObject0)
+                    TerminateProcess(child.Process, JobExitCode);
+                WaitForSingleObject(child.Process, 10000);
+                Close(child.Thread);
+                Close(child.Process);
+            }
+        }
+
+        private static void RunCleanupProcessTerminationFixture()
+        {
+            string commandProcessor = Environment.GetEnvironmentVariable("ComSpec");
+            if (String.IsNullOrEmpty(commandProcessor))
+                throw new InvalidOperationException("cleanup_process_fixture_command_processor");
+            StartupInfoEx startup = new StartupInfoEx();
+            startup.StartupInfo.cb = (uint)Marshal.SizeOf(typeof(StartupInfo));
+            string commandText = "\"" + commandProcessor + "\" /d /c ping.exe -n 60 127.0.0.1 >NUL";
+            ProcessInformation child;
+            if (!CreateProcessW(commandProcessor, new StringBuilder(commandText), IntPtr.Zero, IntPtr.Zero,
+                false, CreateSuspended | CreateUnicodeEnvironment, IntPtr.Zero, null, ref startup, out child))
+                throw new InvalidOperationException("cleanup_process_fixture_process_create");
+            IntPtr cleanupProcess = IntPtr.Zero;
+            try
+            {
+                cleanupProcess = OpenCleanupProcessHandle(child.ProcessId, false);
+                if (cleanupProcess == IntPtr.Zero)
+                    throw new InvalidOperationException("cleanup_process_fixture_open");
+                TerminateAndReapCleanupProcess(cleanupProcess);
+                if (WaitForProcess(child.Process, 0) != WaitObject0)
+                    throw new InvalidOperationException("cleanup_process_fixture_original_handle_unreaped");
+            }
+            finally
+            {
+                Close(cleanupProcess);
+                if (WaitForSingleObject(child.Process, 0) != WaitObject0)
+                    TerminateProcess(child.Process, JobExitCode);
+                WaitForSingleObject(child.Process, 10000);
+                Close(child.Thread);
+                Close(child.Process);
+            }
+        }
+
+        private static void RequireCleanupProcessInspection(int openError, string processName, bool processGone)
+        {
+            if (ClassifyCleanupProcessAccessFailureFixture(openError, processName, processGone) == "refuse")
+                throw new InvalidOperationException("cleanup_process_inspection");
+        }
+
+        private static void TerminateAndReapCleanupProcess(IntPtr process)
+        {
+            if (!TerminateProcess(process, JobExitCode) && WaitForProcess(process, 0) != WaitObject0)
+                throw new InvalidOperationException("cleanup_process_terminate");
+            RequireCleanupProcessReaped(process, 10000);
+        }
+
+        private static void RequireCleanupProcessReaped(IntPtr process, uint timeoutMilliseconds)
+        {
+            if (WaitForProcess(process, timeoutMilliseconds) != WaitObject0)
+                throw new InvalidOperationException("cleanup_process_reap");
         }
 
         private static string ReadTokenUserSid(IntPtr token)
@@ -721,8 +1001,10 @@ namespace KeelDock.Platform.DevLaneWindows
                 if (nul == IntPtr.Zero || nul.ToInt64() == -1) throw new InvalidOperationException("nul_handle");
 
                 Phase("job-create");
-                job = CreateJobObjectW(IntPtr.Zero, null);
+                job = CreateJobObjectW(IntPtr.Zero, CleanupJobName(profileName));
                 if (job == IntPtr.Zero) throw new InvalidOperationException("job_create");
+                if (Marshal.GetLastWin32Error() == ErrorAlreadyExists)
+                    throw new InvalidOperationException("job_already_exists");
                 SetJobLimits(job);
 
                 IntPtr required = IntPtr.Zero;
@@ -913,13 +1195,25 @@ namespace KeelDock.Platform.DevLaneWindows
 
         private static bool WaitForEmptyJob(IntPtr job, int timeoutMilliseconds)
         {
+            return WaitForEmptyJob(job, timeoutMilliseconds, 0);
+        }
+
+        private static bool WaitForEmptyJob(IntPtr job, int timeoutMilliseconds,
+            int delayBeforeFirstQueryMilliseconds)
+        {
+            if (timeoutMilliseconds < 0 || delayBeforeFirstQueryMilliseconds < 0) return false;
             Stopwatch timer = Stopwatch.StartNew();
             int size = 8 + IntPtr.Size * (int)ActiveProcessLimit;
             IntPtr buffer = Marshal.AllocHGlobal(size);
             try
             {
-                while (timer.ElapsedMilliseconds <= timeoutMilliseconds)
+                if (delayBeforeFirstQueryMilliseconds > 0)
+                    System.Threading.Thread.Sleep(delayBeforeFirstQueryMilliseconds);
+                bool firstQuery = true;
+                while (true)
                 {
+                    if (!firstQuery && timer.ElapsedMilliseconds > timeoutMilliseconds) return false;
+                    firstQuery = false;
                     for (int offset = 0; offset < size; offset += IntPtr.Size)
                         Marshal.WriteIntPtr(buffer, offset, IntPtr.Zero);
                     uint returned;
@@ -929,11 +1223,21 @@ namespace KeelDock.Platform.DevLaneWindows
                     }
                     else if (returned < 8 || Marshal.ReadInt32(buffer, 4) < 0) return false;
                     else if (Marshal.ReadInt32(buffer, 4) == 0) return true;
+                    if (timer.ElapsedMilliseconds >= timeoutMilliseconds) return false;
                     System.Threading.Thread.Sleep(100);
                 }
-                return false;
             }
             finally { Marshal.FreeHGlobal(buffer); }
+        }
+
+        private static uint WaitForProcess(IntPtr process, uint timeoutMilliseconds)
+        {
+            uint result = WaitForSingleObject(process, timeoutMilliseconds);
+            if (result == WaitFailed)
+                throw new InvalidOperationException("cleanup_process_wait_failed");
+            if (result != WaitObject0 && result != WaitTimeout)
+                throw new InvalidOperationException("cleanup_process_wait_failed");
+            return result;
         }
 
         private static string VerifyToken(IntPtr process, IntPtr expectedSid, bool internetClient,

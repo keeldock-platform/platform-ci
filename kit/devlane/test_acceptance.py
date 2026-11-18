@@ -360,14 +360,14 @@ class AuthenticatedSourceSetAcceptanceTests(unittest.TestCase):
         source_sets = bundle._expected_core_rust_source_sets()
         self.assertEqual(source_sets["domain"], "keeldock" + "-core/core-rust-candidate-baseline/v1")
         candidate = source_sets["candidate"]
-        self.assertEqual(candidate["source_revision"], "9d6cc9e68694e17857d7702e83654131804a1bda")
-        self.assertEqual(candidate["tree_oid"], "958e13e531d1b2601f241a91a9f80a44ac04d889")
+        self.assertEqual(candidate["source_revision"], "8d0750cb3bd8694f45a6142314b0679b34152c88")
+        self.assertEqual(candidate["tree_oid"], "be3665d91f7c9cf2c7c28e8580653321ff2511f4")
         self.assertEqual(candidate["full_map_sha256"],
-                         "d6ef344e2129babea26ac39c04bacf7eb4cbd3d770acb8416b2fe11a1c334eab")
+                         "d537ce9c87f29d650ba8ae89ec6f1eb5ffc463e38b735bc2a91ff391f9b1ad3c")
         self.assertEqual(candidate["selected_map_sha256"],
-                         "ca99e9c82c8ea07bc4a1d73d881da673dc5f71194c0db4c61c179da5d248b6b3")
-        self.assertEqual(candidate["selected_file_count"], 2636)
-        self.assertEqual(candidate["selected_bytes"], 16619832)
+                         "0d6635303fce6788ded9526ea69a95396ac68ba5b2d4d3bf1072280fbfe5f6f0")
+        self.assertEqual(candidate["selected_file_count"], 3082)
+        self.assertEqual(candidate["selected_bytes"], 21671750)
         self.assertEqual(source_sets["exclusions"], [
             {"path": ".npmrc", "status": "untransferred-unscanned"},
         ])

@@ -146,6 +146,8 @@ jobs:
           validated_file="$capture_dir/validated"
           validator_stderr_file="$capture_dir/validator-stderr"
           trap '/bin/rm -rf "$capture_dir" 2>/dev/null' EXIT
+          : >"$stdout_file"
+          : >"$stderr_file"
           set +e
           sudo -n -- /usr/bin/env -i \
             PATH=/usr/bin:/bin:/usr/sbin:/sbin \
@@ -154,8 +156,11 @@ jobs:
             RUNNER_TEMP="$RUNNER_TEMP" \
             GITHUB_RUN_ID="$GITHUB_RUN_ID" \
             GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
-            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B kit/confinement/macos_rust_toolchain.py --control-sha "$CI_SHA" \
-            >"$stdout_file" 2>"$stderr_file"
+            /bin/sh -c '
+              exec /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
+                -I -S -B kit/confinement/macos_rust_toolchain.py --control-sha "$3" \
+                >"$1" 2>"$2"
+            ' sh "$stdout_file" "$stderr_file" "$CI_SHA"
           status=$?
           set -e
           if [[ "$status" -ne 0 ]]; then

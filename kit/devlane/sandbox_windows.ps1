@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('create', 'firewall-install', 'firewall-remove', 'run', 'delete')]
+    [ValidateSet('create', 'firewall-install', 'firewall-remove', 'run', 'quiesce', 'delete')]
     [string]$Mode,
     [Parameter(Mandatory = $true)]
     [string]$StateFile,
@@ -21,7 +21,7 @@ function Start-CleanupBudget {
     $script:WindowsCleanupEntries = 0
 }
 function Assert-CleanupBudgetTime {
-    if ($script:WindowsCleanupTimer.ElapsedMilliseconds -gt 600000) {
+    if ($script:WindowsCleanupTimer.ElapsedMilliseconds -gt 300000) {
         $script:cleanupReason = 'other'
         throw
     }
@@ -140,6 +140,12 @@ try {
             $null -eq $state.owned_roots -or $null -eq $state.acl_grants -or $null -eq $state.integrity_grants -or
             @($state.owned_roots).Count -gt 128 -or
             $state.job_state -notin @('none', 'pending', 'terminated-empty')) { throw }
+    if ($Mode -eq 'quiesce') {
+        [KeelDock.Platform.DevLaneWindows.Boundary]::AssertCleanupQuiescent(
+            [string]$state.profile_name, [string]$state.package_sid, [string]$state.job_state)
+        Write-Output 'windows_processes=terminated verified=empty'
+        exit 0
+    }
     if ($Mode -eq 'firewall-install') {
         $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
         if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw }
@@ -302,7 +308,7 @@ try {
             if ($null -eq $ownedInfo -or -not $ownedInfo.Item.PSIsContainer) { throw }
         }
         [KeelDock.Platform.DevLaneWindows.Boundary]::AssertCleanupQuiescent(
-            [string]$state.package_sid, [string]$state.job_state)
+            [string]$state.profile_name, [string]$state.package_sid, [string]$state.job_state)
         Remove-NetFirewallRule -Name $state.firewall_rule -ErrorAction SilentlyContinue
         if (@(Get-NetFirewallRule -Name $state.firewall_rule -ErrorAction SilentlyContinue).Count -ne 0) { throw }
         function Clear-AppContainerStorage([string]$PackageSid, [string]$ProfileName) {
@@ -389,14 +395,11 @@ try {
             Invoke-CleanupIcacls $pathInfo.Path @('/setintegritylevel', '(OI)(CI)M')
         }
         [void](Clear-AppContainerStorage ([string]$state.package_sid) ([string]$state.profile_name))
-        [KeelDock.Platform.DevLaneWindows.Boundary]::AssertCleanupQuiescent(
-            [string]$state.package_sid, [string]$state.job_state)
         $deleteResult = [KeelDock.Platform.DevLaneWindows.Boundary]::DeleteProfile([string]$state.profile_name)
         if ($deleteResult -ne 'deleted') {
             $cleanupReason = [string]$deleteResult
             throw
         }
-        Remove-Item -LiteralPath $statePath -Force
         Write-Output 'windows_sandbox_cleanup=confirmed firewall=removed profile=deleted'
         exit 0
     }

@@ -292,19 +292,70 @@ def _windows_precheckout_cleanup_outputs():
     ]
 
 
-def _windows_real_shred_cleanup_outputs():
+def _windows_missing_state_cleanup_refusal_outputs():
     with tempfile.TemporaryDirectory(prefix="devlane-checkout-") as directory:
         root = Path(directory) / "run-root"
         root.mkdir()
-        (root / "checkout-complete").write_bytes(b"complete")
-        result = sandbox_windows.cleanup_runner(root / "state" / "sandbox.json", root,
-                                                root / "workspace" / "source")
-        if root.exists():
-            raise AssertionError("sandbox shred left the run root")
-    return result.splitlines() + [
+        marker = root / "checkout-complete"
+        marker.write_bytes(b"complete")
+        outside = Path(directory) / "outside-canary.bin"
+        outside.write_bytes(b"outside-stays")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = sandbox_windows.main([
+                "shred", "--state", str(root / "state" / "sandbox.json"),
+                "--root", str(root), "--workspace", str(root / "workspace" / "source"),
+            ])
+        if result != 1 or stdout.getvalue() or stderr.getvalue() != "devlane_refusal=windows-cleanup-profile-failed\n":
+            raise AssertionError("missing sandbox state did not produce the exact cleanup refusal")
+        if not marker.is_file() or marker.read_bytes() != b"complete":
+            raise AssertionError("missing sandbox state did not preserve the checked-out run root")
+        if outside.read_bytes() != b"outside-stays":
+            raise AssertionError("missing sandbox state changed outside data")
+    return stderr.getvalue().splitlines()
+
+
+def _later_acl_success_audit_fixture():
+    identity = dict(IDENTITY, platform="windows")
+    failed_step = "Fetch public control and validate dispatch"
+    cleanup_step = "Shred runner-local workspace"
+    outputs = [
+        "devlane_crypto_state=run-root-exported",
+        "devlane_crypto_state=checkout-complete",
+        "devlane_crypto_refusal=crypto-acl-stdout-bom-or-whitespace",
+        "devlane_deadline_refusal=crypto-dependency-seal-failed",
+    ]
+    cleanup_outputs = [
+        "windows_runner_shred=confirmed files=1 bytes=8 reparse=0",
+        "windows_sandbox_cleanup=confirmed firewall=removed profile=deleted",
         "cleanup_receipt=confirmed",
         "devlane_job=completed public_output=filtered cleanup=confirmed",
     ]
+    jobs = _encrypted_jobs(platform="windows")
+    run_job = {job["name"]: job for job in jobs}[audit.PLATFORM_RUN_JOBS["windows"]]
+    run_job["conclusion"] = "failure"
+    failed_index = next(index for index, step in enumerate(run_job["steps"])
+                        if step["name"] == failed_step)
+    for index, step in enumerate(run_job["steps"]):
+        if step["name"] == cleanup_step:
+            step["conclusion"] = "success"
+        elif index < failed_index:
+            step["conclusion"] = "success"
+        elif index == failed_index:
+            step["conclusion"] = "failure"
+        else:
+            step["conclusion"] = "skipped"
+    log = _render_real_runner_encrypted_log(
+        identity,
+        early_failure={
+            "step": failed_step,
+            "marker": outputs[-1],
+            "outputs": outputs,
+            "cleanup_outputs": cleanup_outputs,
+            "exit_code": 1,
+        },
+    )
+    return identity, jobs, log
 
 
 def _render_log(job_key, identity=None, *, records=(), kind="encrypted", skip=("Install pinned Rust toolchain",)):
@@ -983,7 +1034,7 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 ["devlane_crypto_state=run-root-exported", "devlane_crypto_state=checkout-complete",
                  "devlane_crypto_refusal=crypto-target-invalid",
                  "devlane_deadline_refusal=crypto-dependency-seal-failed"],
-                _windows_real_shred_cleanup_outputs(),
+                _windows_missing_state_cleanup_refusal_outputs(),
                 True,
             ),
             (
@@ -991,7 +1042,7 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 ["devlane_crypto_state=run-root-exported", "devlane_crypto_state=checkout-complete",
                  "devlane_crypto_refusal=crypto-acl-stdout-bom-or-whitespace",
                  "devlane_deadline_refusal=crypto-dependency-seal-failed"],
-                _windows_real_shred_cleanup_outputs(),
+                _windows_missing_state_cleanup_refusal_outputs(),
                 True,
             ),
             (
@@ -1000,7 +1051,7 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                  "devlane_crypto_acl_failure=operation=apply-crypto-target-acl exception=IOException",
                  "devlane_crypto_refusal=crypto-acl-protection-failed",
                  "devlane_deadline_refusal=crypto-dependency-seal-failed"],
-                _windows_real_shred_cleanup_outputs(),
+                _windows_missing_state_cleanup_refusal_outputs(),
                 True,
             ),
             (
@@ -1008,7 +1059,7 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 ["devlane_crypto_state=run-root-exported", "devlane_crypto_state=checkout-complete",
                  "devlane_crypto_refusal=crypto-seal-write-failed",
                  "devlane_deadline_refusal=crypto-dependency-seal-failed"],
-                _windows_real_shred_cleanup_outputs(),
+                _windows_missing_state_cleanup_refusal_outputs(),
                 True,
             ),
         )
@@ -1049,7 +1100,7 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                                     if step["name"] == failed_step)
                 for index, step in enumerate(run_job["steps"]):
                     if step["name"] == cleanup_step:
-                        step["conclusion"] = "success"
+                        step["conclusion"] = "failure" if name.startswith("later-") else "success"
                     elif index < failed_index:
                         step["conclusion"] = "success"
                     elif index == failed_index:
@@ -1068,6 +1119,23 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                     "  RUN_ROOT: " + _env_value("RUN_ROOT", identity, "encrypted", "windows-2025")
                 ).encode("utf-8")
                 self.assertEqual(log.count(run_root_env), int(cleanup_has_run_root))
+                if name.startswith("later-"):
+                    self.assertIn(b"devlane_crypto_state=checkout-complete", log)
+                    self.assertIn(b"devlane_refusal=windows-cleanup-profile-failed", log)
+                    self.assertNotIn(b"windows_runner_shred=confirmed", log)
+                    self.assertNotIn(b"windows_sandbox_cleanup=confirmed", log)
+                    self.assertNotIn(
+                        "cleanup_receipt=confirmed",
+                        {audit.TIME_PREFIX.sub("", line.decode("utf-8")).rstrip("\r\n")
+                         for line in log.splitlines()},
+                    )
+                    with self.assertRaises(audit.AuditRefusal):
+                        audit.validate_job_log_surface(
+                            log, audit.PLATFORM_RUN_JOBS["windows"], identity, completed=True,
+                        )
+                    with self.assertRaises(audit.AuditRefusal):
+                        _run_audit_with_log(identity, jobs, log)
+                    continue
                 if name == "initial-acl":
                     self.assertIn(b"windows_precheckout_cleanup=confirmed", log)
                     self.assertNotIn(b"windows_runner_shred=confirmed", log)
@@ -1080,8 +1148,6 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                         audit.validate_job_log_surface(
                             fabricated_shred, audit.PLATFORM_RUN_JOBS["windows"], identity, completed=True,
                         )
-                if name in ("later-target", "later-acl", "later-seal"):
-                    self.assertIn(b"windows_runner_shred=confirmed files=1 bytes=8 reparse=0", log)
                 surface = audit.validate_job_log_surface(
                     log, audit.PLATFORM_RUN_JOBS["windows"], identity, completed=True,
                 )
@@ -1091,30 +1157,50 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
                 audit.validate_job_contract(jobs, identity, "core-node")
                 audit.validate_job_log_metadata_binding(surface, run_job, identity)
                 self.assertFalse(audit.validate_dispatch_marker(log, identity, allow_missing=True))
-                if name == "later-acl":
-                    missing_checkout = log.replace(
-                        b"devlane_crypto_state=checkout-complete\n", b"", 1,
-                    )
-                    with self.assertRaises(audit.AuditRefusal):
-                        audit.validate_job_log_surface(
-                            missing_checkout, audit.WINDOWS_RUN_JOB, identity, completed=True,
-                        )
-                    wrong_step = audit._Grammar(
-                        ".github/workflows/devlane-encrypted.yml", audit.WINDOWS_RUN_JOB,
-                        identity, "encrypted",
-                    )
-                    self.assertFalse(wrong_step.step_output_ok(
-                        "Prepare hosted Windows isolation state",
-                        "devlane_crypto_refusal=crypto-acl-stdout-bom-or-whitespace", {},
-                    ))
-                    linux_identity = dict(IDENTITY, platform="linux")
-                    linux = audit._Grammar(
-                        ".github/workflows/devlane-encrypted.yml", audit.RUN_JOB,
-                        linux_identity, "encrypted",
-                    )
-                    self.assertFalse(linux.step_output_ok(
-                        failed_step, "devlane_crypto_refusal=crypto-acl-stdout-bom-or-whitespace", {},
-                    ))
+
+    def test_windows_later_acl_missing_checkout_is_rejected_with_successful_cleanup(self):
+        identity, jobs, log = _later_acl_success_audit_fixture()
+        expected = (
+            "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed "
+            "disposition=run-failed-at-bootstrap"
+        )
+        self.assertEqual(_run_audit_with_log(identity, jobs, log), expected)
+
+        missing_checkout = log.replace(
+            b"devlane_crypto_state=checkout-complete\n", b"", 1,
+        )
+        with self.assertRaises(audit.AuditRefusal):
+            audit.validate_job_log_surface(
+                missing_checkout, audit.WINDOWS_RUN_JOB, identity, completed=True,
+            )
+        with self.assertRaises(audit.AuditRefusal):
+            _run_audit_with_log(identity, jobs, missing_checkout)
+
+    def test_windows_later_acl_refusal_is_rejected_from_wrong_step(self):
+        identity = dict(IDENTITY, platform="windows")
+        grammar = audit._Grammar(
+            ".github/workflows/devlane-encrypted.yml", audit.WINDOWS_RUN_JOB,
+            identity, "encrypted",
+        )
+        refusal = "devlane_crypto_refusal=crypto-acl-stdout-bom-or-whitespace"
+        self.assertTrue(grammar.step_output_ok("Fetch public control and validate dispatch", refusal, {}))
+        self.assertFalse(grammar.step_output_ok("Prepare hosted Windows isolation state", refusal, {}))
+
+    def test_windows_later_acl_refusal_is_rejected_on_wrong_platform(self):
+        refusal = "devlane_crypto_refusal=crypto-acl-stdout-bom-or-whitespace"
+        windows_identity = dict(IDENTITY, platform="windows")
+        windows = audit._Grammar(
+            ".github/workflows/devlane-encrypted.yml", audit.WINDOWS_RUN_JOB,
+            windows_identity, "encrypted",
+        )
+        self.assertTrue(windows.step_output_ok("Fetch public control and validate dispatch", refusal, {}))
+
+        linux_identity = dict(IDENTITY, platform="linux")
+        linux = audit._Grammar(
+            ".github/workflows/devlane-encrypted.yml", audit.RUN_JOB,
+            linux_identity, "encrypted",
+        )
+        self.assertFalse(linux.step_output_ok("Fetch public control and validate dispatch", refusal, {}))
 
     def test_macos_and_windows_early_failures_are_audited_with_fixed_dispositions(self):
         scenarios = (

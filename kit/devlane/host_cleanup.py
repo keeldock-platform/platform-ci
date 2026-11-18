@@ -2,7 +2,6 @@
 
 import argparse
 import os
-import shutil
 import signal
 import stat
 import subprocess
@@ -21,6 +20,8 @@ import node_vendor_source
 """The 14-minute child cap leaves one minute inside the workflow's 15-minute cleanup watchdog."""
 HOST_DEADLINE_SECONDS = 840
 PROC_ROOT = Path("/proc")
+MAX_PROC_INVENTORY = 100000
+MAX_PROC_CMDLINE_BYTES = 65536
 
 
 def _fail(reason="tree-remove"):
@@ -53,16 +54,23 @@ def _cleanup_timeout(deadline_file, cap):
 
 
 def _kill_incomplete_supervisor(state, deadline_file):
+    _deadline_check(deadline_file)
     pid_file = state / "host-pid"
     if not pid_file.exists():
         return
     try:
-        raw = pid_file.read_text(encoding="ascii")
-        if not raw.isdecimal() or len(raw) > 10:
+        with pid_file.open("rb") as pid_handle:
+            raw_bytes = pid_handle.read(11)
+        raw = raw_bytes.decode("ascii", "strict")
+        if not raw.isdecimal() or len(raw_bytes) > 10:
             _fail("process-alive")
         pid = int(raw)
         command = Path("/proc") / str(pid) / "cmdline"
-        cmdline = command.read_bytes().replace(b"\x00", b" ")
+        with command.open("rb") as command_handle:
+            cmdline = command_handle.read(MAX_PROC_CMDLINE_BYTES + 1).replace(b"\x00", b" ")
+        if len(cmdline) > MAX_PROC_CMDLINE_BYTES:
+            _fail("process-alive")
+        _deadline_check(deadline_file)
         if b"kit/devlane/supervisor.py" not in cmdline or b"_serve" not in cmdline:
             _fail("process-alive")
         subprocess.run(["sudo", "-n", "kill", "--", "-" + str(pid)],
@@ -71,6 +79,7 @@ def _kill_incomplete_supervisor(state, deadline_file):
                        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
         deadline = time.monotonic() + _cleanup_timeout(deadline_file, 5)
         while time.monotonic() < deadline:
+            _deadline_check(deadline_file)
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
@@ -81,22 +90,108 @@ def _kill_incomplete_supervisor(state, deadline_file):
         _fail("process-alive")
 
 
-def _confirm_supervisor_absent(state):
+def _same_path(left, right):
     try:
-        process_ids = [entry.name for entry in PROC_ROOT.iterdir() if entry.name.isdecimal()]
+        return os.path.realpath(left) == os.path.realpath(right)
+    except (OSError, ValueError):
+        return left == right
+
+
+def _supervisor_serves_state(command, state):
+    if type(command) is not bytes:
+        return False
+    arguments = command.rstrip(b"\x00").split(b"\x00")
+    script_indexes = [index for index, argument in enumerate(arguments)
+                      if argument.rsplit(b"/", 1)[-1] == b"supervisor.py"]
+    if (len(script_indexes) != 1 or script_indexes[0] + 1 >= len(arguments)
+            or arguments[script_indexes[0] + 1] != b"_serve"):
+        return False
+    state_values = []
+    index = script_indexes[0] + 2
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == b"--state-dir":
+            if index + 1 >= len(arguments):
+                return False
+            state_values.append(arguments[index + 1])
+            index += 2
+            continue
+        if argument.startswith(b"--state-dir="):
+            state_values.append(argument.partition(b"=")[2])
+        index += 1
+    if not state_values:
+        return False
+    expected_state = os.fsencode(str(state))
+    return any(_same_path(value, expected_state) for value in state_values)
+
+
+def _deadline_check(deadline_file):
+    _cleanup_timeout(deadline_file, HOST_DEADLINE_SECONDS)
+
+
+def _cleanup_deadline_cutoff(deadline_file):
+    try:
+        value = deadline_budget._read(deadline_file)
+    except (OSError, deadline_budget.DeadlineRefusal, ValueError, UnicodeError):
+        _fail("process-alive")
+    return value["work_deadline"] + value["cleanup_reserve"] - min(
+        deadline_budget.KILL_REAP_SECONDS, value["cleanup_reserve"])
+
+
+def _supervisor_present(state, deadline_file):
+    _deadline_check(deadline_file)
+    entries_seen = 0
+    found = False
+    try:
+        process_entries = os.scandir(PROC_ROOT)
     except OSError:
         _fail("process-alive")
-    for process_id in process_ids:
+    try:
+        with process_entries:
+            for entry in process_entries:
+                _deadline_check(deadline_file)
+                if not entry.name.isdecimal():
+                    continue
+                entries_seen += 1
+                if entries_seen > MAX_PROC_INVENTORY:
+                    _fail("process-alive")
+                try:
+                    with (PROC_ROOT / entry.name / "cmdline").open("rb") as command_file:
+                        command = command_file.read(MAX_PROC_CMDLINE_BYTES + 1)
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                except OSError:
+                    _fail("process-alive")
+                if len(command) > MAX_PROC_CMDLINE_BYTES:
+                    _fail("process-alive")
+                if _supervisor_serves_state(command, state):
+                    found = True
+                    break
+    except OSError:
+        _fail("process-alive")
+    _deadline_check(deadline_file)
+    return found
+
+
+SUPERVISOR_EXIT_SETTLE_SECONDS = 3
+
+
+def _confirm_supervisor_absent(state, deadline_file):
+    """A just-killed supervisor may still be exiting; wait briefly for this state's process only."""
+    settle = time.monotonic() + _cleanup_timeout(deadline_file, SUPERVISOR_EXIT_SETTLE_SECONDS)
+    while _supervisor_present(state, deadline_file):
+        now = time.monotonic()
+        if now >= settle:
+            _fail("process-alive")
         try:
-            command = (PROC_ROOT / process_id / "cmdline").read_bytes()
-        except FileNotFoundError:
-            continue
-        except OSError:
+            cleanup_remaining = deadline_budget.cleanup_remaining(deadline_file)
+        except deadline_budget.DeadlineRefusal:
             _fail("process-alive")
-        if b"supervisor.py" in command and b"_serve" in command:
-            _fail("process-alive")
+        time.sleep(min(0.1, settle - now, cleanup_remaining))
+    _deadline_check(deadline_file)
     if os.path.ismount(state / "namespace-root"):
         _fail("umount-busy")
+    _deadline_check(deadline_file)
 
 
 def clean_node_snapshot(snapshot_id, deadline_file):
@@ -117,9 +212,11 @@ def clean_node_snapshot(snapshot_id, deadline_file):
     return True
 
 
-def clean_node_vendor_source(snapshot_id, *, control_uid=0):
+def clean_node_vendor_source(snapshot_id, *, control_uid=0, deadline_file=None):
     if not node_tool_snapshot.valid_snapshot_id(snapshot_id):
         _fail()
+    if deadline_file:
+        _deadline_check(deadline_file)
     base = node_vendor_source.PROTECTED_BASE
     area = base / snapshot_id
     try:
@@ -139,7 +236,12 @@ def clean_node_vendor_source(snapshot_id, *, control_uid=0):
         _fail()
     if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != control_uid:
         _fail()
-    owned_tree_cleanup.remove_owned_tree(area, base, prefix="node-vendor-cleanup-")
+    owned_tree_cleanup.remove_owned_tree(
+        area, base, prefix="node-vendor-cleanup-",
+        deadline_check=(lambda: _deadline_check(deadline_file)) if deadline_file else None,
+    )
+    if deadline_file:
+        _deadline_check(deadline_file)
     if area.exists() or area.is_symlink():
         _fail()
     return True
@@ -148,6 +250,8 @@ def clean_node_vendor_source(snapshot_id, *, control_uid=0):
 def clean(root_arg, runner_temp, deadline_file, node_snapshot_id="", node_vendor_id=""):
     root = Path(root_arg)
     base = Path(runner_temp)
+    deadline_cutoff = _cleanup_deadline_cutoff(deadline_file)
+    deadline_path = Path(deadline_file)
     if not root.is_absolute() or not base.is_absolute() or root.parent != base:
         _fail()
     if root.name != "devlane-" + os.environ.get("GITHUB_RUN_ID", ""):
@@ -155,11 +259,12 @@ def clean(root_arg, runner_temp, deadline_file, node_snapshot_id="", node_vendor
     if root.is_symlink():
         _fail()
     if not root.exists():
-        _confirm_supervisor_absent(root / "state")
+        _confirm_supervisor_absent(root / "state", deadline_file)
         if node_snapshot_id:
             clean_node_snapshot(node_snapshot_id, deadline_file)
         if node_vendor_id:
-            clean_node_vendor_source(node_vendor_id)
+            clean_node_vendor_source(node_vendor_id, deadline_file=deadline_file)
+        _deadline_check(deadline_file)
         print("cleanup_receipt=confirmed")
         return
     try:
@@ -187,24 +292,48 @@ def clean(root_arg, runner_temp, deadline_file, node_snapshot_id="", node_vendor
             _fail(_isolated_cleanup_reason(result.stderr) or "process-alive")
     else:
         _kill_incomplete_supervisor(state, deadline_file)
-    _confirm_supervisor_absent(state)
+    _confirm_supervisor_absent(state, deadline_file)
     prepared = root / "prepared"
     if prepared.exists() or prepared.is_symlink():
         if prepared.is_symlink():
             _fail()
-        owned_tree_cleanup.remove_owned_tree(prepared, root, prefix="prepared-cleanup-")
+        owned_tree_cleanup.remove_owned_tree(
+            prepared, root, prefix="prepared-cleanup-", deadline_check=lambda: _deadline_check(deadline_file),
+        )
+        _deadline_check(deadline_file)
     if prepared.exists() or prepared.is_symlink():
         _fail("tree-remove")
     if node_snapshot_id:
         clean_node_snapshot(node_snapshot_id, deadline_file)
     if node_vendor_id:
-        clean_node_vendor_source(node_vendor_id)
+        clean_node_vendor_source(node_vendor_id, deadline_file=deadline_file)
+    _deadline_check(deadline_file)
+    last_name = None
+    if deadline_path.parent == root and deadline_path.name == "deadline.json":
+        last_name = deadline_path.name
+
+    def final_tree_deadline_check():
+        if last_name is not None and not deadline_path.exists():
+            if time.monotonic() >= deadline_cutoff:
+                _fail("process-alive")
+            return
+        _deadline_check(deadline_file)
+
     try:
-        shutil.rmtree(root)
-    except OSError:
+        owned_tree_cleanup.remove_owned_tree(
+            root, base, prefix="runner-cleanup-", deadline_check=final_tree_deadline_check,
+            last_name=last_name,
+        )
+    except RuntimeError as error:
+        if getattr(error, "cleanup_reason", ""):
+            raise
+        if "deadline" in str(error):
+            _fail("process-alive")
         _fail("tree-remove")
     if root.exists() or root.is_symlink():
         _fail("tree-remove")
+    if time.monotonic() >= deadline_cutoff:
+        _fail("process-alive")
     print("cleanup_receipt=confirmed")
 
 

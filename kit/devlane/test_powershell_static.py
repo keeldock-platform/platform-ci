@@ -409,8 +409,10 @@ class PowerShellStaticTests(unittest.TestCase):
         self.assertIn("UnprotectedDaclSecurityInformation = 0x20000000", native)
         self.assertIn("$script:WindowsCleanupEntries -ge 250000", script)
         self.assertIn("$PendingCount -ge 250000", script)
-        self.assertIn("$script:WindowsCleanupTimer.ElapsedMilliseconds -gt 600000", script)
-        self.assertIn('jobState != "none" && jobState != "terminated-empty"', native)
+        self.assertIn("$script:WindowsCleanupTimer.ElapsedMilliseconds -gt 300000", script)
+        delete = script.split("if ($Mode -eq 'delete') {", 1)[1].split("\n    throw\n} catch {", 1)[0]
+        self.assertLess(delete.index("AssertCleanupQuiescent"), delete.index("Remove-NetFirewallRule"))
+        self.assertIn('jobState != "none" && jobState != "pending" && jobState != "terminated-empty"', native)
         self.assertIn('result.Job += " terminated=confirmed empty=confirmed"', native)
         windows_source = (ROOT / "kit/devlane/sandbox_windows.py").read_text(encoding="utf-8")
         self.assertIn("timeout=MAX_CHILD_SECONDS + 300", windows_source)

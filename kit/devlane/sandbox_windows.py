@@ -31,7 +31,10 @@ MAX_COMMAND_LINE = 30000
 MAX_CHILD_SECONDS = 10800
 WINDOWS_CLEANUP_STEP_SECONDS = 900
 WINDOWS_SHRED_RESERVE_SECONDS = 300
-WINDOWS_PROFILE_CLEANUP_TIMEOUT_SECONDS = WINDOWS_CLEANUP_STEP_SECONDS - WINDOWS_SHRED_RESERVE_SECONDS
+WINDOWS_QUIESCE_TIMEOUT_SECONDS = 120
+WINDOWS_PROFILE_CLEANUP_TIMEOUT_SECONDS = (
+    WINDOWS_CLEANUP_STEP_SECONDS - WINDOWS_SHRED_RESERVE_SECONDS - 2 * WINDOWS_QUIESCE_TIMEOUT_SECONDS
+)
 WINDOWS_PREPARE_HEARTBEAT_SECONDS = 60
 WINDOWS_PROCESS_CLASSES = {
     "node.exe": "node", "npm.exe": "npm", "npm.cmd": "npm", "cmd.exe": "cmd",
@@ -402,7 +405,7 @@ def _validate_cleanup_roots(state_path):
         if (type(state) is not dict or state.get("schema") != 1
                 or type(grants) is not list or type(integrity_roots) is not list
                 or type(owned_roots) is not list or len(owned_roots) > 128
-                or state.get("job_state") not in ("none", "terminated-empty")
+                or state.get("job_state") not in ("none", "pending", "terminated-empty")
                 or len(grants) + len(integrity_roots) > 10000):
             _refuse("profile-cleanup", reason="other")
         for root in owned_roots:
@@ -704,6 +707,22 @@ def create_profile(state_path, *, failure_prefix=None, monitor_stage=None):
             or any(type(path) is not str or len(path) > 260 for path in state["integrity_grants"])):
         _refuse("profile-state")
     return state
+
+
+def quiesce_run(state_path):
+    if sys.platform != "win32":
+        _refuse("windows-host-required")
+    state = _read_json(state_path, 4 * 1024 * 1024)
+    if (type(state) is not dict or state.get("schema") != 1
+            or state.get("job_state") not in ("none", "pending", "terminated-empty")):
+        _refuse("profile-cleanup", reason="other")
+    validate_profile_name(state.get("profile_name"))
+    validate_package_sid(state.get("package_sid"))
+    line = _run_powershell("quiesce", state_path, timeout=WINDOWS_QUIESCE_TIMEOUT_SECONDS,
+                           failure_prefix="windows-cleanup")
+    if line != "windows_processes=terminated verified=empty":
+        _refuse("windows-cleanup-profile-failed")
+    return line + "\n"
 
 
 def install_firewall(state_path):
@@ -1624,15 +1643,234 @@ def run_profile(context_path, manifest_path, source_root, prepared_root, scratch
     return 0 if all(result == "pass" for _stage, result in outcomes) and not _summary_failed(summary) else 1
 
 
+class _CleanupFileTime(ctypes.Structure):
+    _fields_ = (("low", ctypes.c_uint32), ("high", ctypes.c_uint32))
+
+
+class _CleanupByHandleInfo(ctypes.Structure):
+    _fields_ = (
+        ("attributes", ctypes.c_uint32), ("creation", _CleanupFileTime),
+        ("access", _CleanupFileTime), ("write", _CleanupFileTime),
+        ("volume", ctypes.c_uint32), ("size_high", ctypes.c_uint32),
+        ("size_low", ctypes.c_uint32), ("links", ctypes.c_uint32),
+        ("file_high", ctypes.c_uint32), ("file_low", ctypes.c_uint32),
+    )
+
+
+class _CleanupBasicInfo(ctypes.Structure):
+    _fields_ = (
+        ("creation", ctypes.c_int64), ("access", ctypes.c_int64),
+        ("write", ctypes.c_int64), ("change", ctypes.c_int64),
+        ("attributes", ctypes.c_uint32), ("reserved", ctypes.c_uint32),
+    )
+
+
+class _CleanupDispositionInfo(ctypes.Structure):
+    _fields_ = (("delete_file", ctypes.c_ubyte),)
+
+
+_WINDOWS_FILE_READ_ATTRIBUTES = 0x00000080
+_WINDOWS_FILE_WRITE_ATTRIBUTES = 0x00000100
+_WINDOWS_DELETE = 0x00010000
+_WINDOWS_GENERIC_WRITE = 0x40000000
+_WINDOWS_GENERIC_READ = 0x80000000
+
+
+def _windows_cleanup_api():
+    if sys.platform != "win32":
+        _refuse("windows-host-required")
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = (
+        ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+        ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+    )
+    kernel.CreateFileW.restype = ctypes.c_void_p
+    kernel.GetFileInformationByHandle.argtypes = (ctypes.c_void_p, ctypes.POINTER(_CleanupByHandleInfo))
+    kernel.GetFileInformationByHandle.restype = ctypes.c_int
+    kernel.SetFileInformationByHandle.argtypes = (
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32,
+    )
+    kernel.SetFileInformationByHandle.restype = ctypes.c_int
+    kernel.WriteFile.argtypes = (
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p,
+    )
+    kernel.WriteFile.restype = ctypes.c_int
+    kernel.FlushFileBuffers.argtypes = (ctypes.c_void_p,)
+    kernel.FlushFileBuffers.restype = ctypes.c_int
+    kernel.CloseHandle.argtypes = (ctypes.c_void_p,)
+    kernel.CloseHandle.restype = ctypes.c_int
+    return kernel
+
+
+def _windows_extended_path(path):
+    value = os.path.abspath(str(path))
+    if value.startswith("\\\\?\\"):
+        return value
+    if value.startswith("\\\\"):
+        _refuse("shred-root-invalid")
+    return "\\\\?\\" + value
+
+
+def _windows_handle_identity(kernel, handle):
+    information = _CleanupByHandleInfo()
+    if not kernel.GetFileInformationByHandle(handle, ctypes.byref(information)):
+        error = ctypes.get_last_error()
+        failure = OSError(error, os.strerror(error))
+        failure.winerror = error
+        raise failure
+    return {
+        "volume": information.volume,
+        "file_id": (information.file_high << 32) | information.file_low,
+        "size": (information.size_high << 32) | information.size_low,
+        "links": information.links,
+        "attributes": information.attributes,
+        "directory": bool(information.attributes & 0x10),
+        "reparse": bool(information.attributes & 0x400),
+    }
+
+
+def _windows_cleanup_identity(path, *, require_directory=False, allow_reparse=False):
+    kernel = _windows_cleanup_api()
+    handle = kernel.CreateFileW(
+        _windows_extended_path(path), 0x80, 0x1 | 0x2, None, 3,
+        0x00200000 | 0x02000000, None,
+    )
+    if handle in (None, ctypes.c_void_p(-1).value):
+        error = ctypes.get_last_error()
+        failure = OSError(error, os.strerror(error))
+        failure.winerror = error
+        raise failure
+    try:
+        identity = _windows_handle_identity(kernel, handle)
+        if (require_directory and not identity["directory"]
+                or not allow_reparse and identity["reparse"]):
+            _refuse("shred-entry-inspection-failed")
+        return identity
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _same_windows_identity(actual, expected, *, directory=False):
+    keys = ("volume", "file_id", "directory", "reparse")
+    if not directory:
+        keys += ("size", "links")
+    return all(actual.get(key) == expected.get(key) for key in keys)
+
+
+def _windows_parent_handles(kernel, ancestors):
+    handles = []
+    try:
+        for path, expected in ancestors:
+            handle = kernel.CreateFileW(
+                _windows_extended_path(path), 0x80, 0x1 | 0x2, None, 3,
+                0x00200000 | 0x02000000, None,
+            )
+            if handle in (None, ctypes.c_void_p(-1).value):
+                error = ctypes.get_last_error()
+                failure = OSError(error, os.strerror(error))
+                failure.winerror = error
+                raise failure
+            actual = _windows_handle_identity(kernel, handle)
+            if (not actual["directory"] or actual["reparse"]
+                    or not _same_windows_identity(actual, expected, directory=True)):
+                kernel.CloseHandle(handle)
+                _refuse("shred-entry-inspection-failed")
+            handles.append(handle)
+        return handles
+    except Exception:
+        for handle in reversed(handles):
+            kernel.CloseHandle(handle)
+        raise
+
+
+def _windows_remove_entry(path, expected, ancestors, *, overwrite=False, allow_reparse=False):
+    kernel = _windows_cleanup_api()
+    parent_handles = _windows_parent_handles(kernel, ancestors)
+    handle = None
+    try:
+        access = _WINDOWS_FILE_READ_ATTRIBUTES | _WINDOWS_FILE_WRITE_ATTRIBUTES | _WINDOWS_DELETE
+        if overwrite:
+            access |= _WINDOWS_GENERIC_WRITE | _WINDOWS_GENERIC_READ
+        handle = kernel.CreateFileW(
+            _windows_extended_path(path), access, 0, None, 3,
+            0x00200000 | 0x02000000, None,
+        )
+        if handle in (None, ctypes.c_void_p(-1).value):
+            error = ctypes.get_last_error()
+            failure = OSError(error, os.strerror(error))
+            failure.winerror = error
+            raise failure
+        actual = _windows_handle_identity(kernel, handle)
+        if (not _same_windows_identity(actual, expected,
+                                       directory=bool(expected["directory"] or actual["directory"]))
+                or actual["directory"] != expected["directory"]
+                or actual["reparse"] != expected["reparse"]
+                or actual["reparse"] and not allow_reparse
+                or not actual["directory"] and not actual["reparse"] and actual["links"] != 1):
+            _refuse("shred-entry-inspection-failed")
+        if actual["attributes"] & 0x1:
+            basic = _CleanupBasicInfo()
+            basic.attributes = actual["attributes"] & ~0x1
+            if basic.attributes == 0:
+                basic.attributes = 0x80
+            if not kernel.SetFileInformationByHandle(handle, 0, ctypes.byref(basic), ctypes.sizeof(basic)):
+                error = ctypes.get_last_error()
+                failure = OSError(error, os.strerror(error))
+                failure.winerror = error
+                raise failure
+        if overwrite:
+            remaining = actual["size"]
+            while remaining:
+                chunk = os.urandom(min(1024 * 1024, remaining))
+                buffer = ctypes.create_string_buffer(chunk)
+                written = ctypes.c_uint32()
+                if (not kernel.WriteFile(handle, buffer, len(chunk), ctypes.byref(written), None)
+                        or written.value != len(chunk)):
+                    error = ctypes.get_last_error()
+                    failure = OSError(error, os.strerror(error))
+                    failure.winerror = error
+                    raise failure
+                remaining -= written.value
+            if not kernel.FlushFileBuffers(handle):
+                error = ctypes.get_last_error()
+                failure = OSError(error, os.strerror(error))
+                failure.winerror = error
+                raise failure
+        disposition = _CleanupDispositionInfo(1)
+        if not kernel.SetFileInformationByHandle(
+                handle, 4, ctypes.byref(disposition), ctypes.sizeof(disposition)):
+            error = ctypes.get_last_error()
+            failure = OSError(error, os.strerror(error))
+            failure.winerror = error
+            raise failure
+    finally:
+        if handle not in (None, ctypes.c_void_p(-1).value):
+            kernel.CloseHandle(handle)
+        for parent in reversed(parent_handles):
+            kernel.CloseHandle(parent)
+
+
 def shred_tree(root, plaintext_root=None, overwrite_limit=1024 * 1024 * 1024):
     root = Path(root)
-    if root.is_symlink() or not root.is_dir():
+    try:
+        root_identity = _windows_cleanup_identity(root, require_directory=True)
+    except WindowsBoundaryRefusal:
+        raise
+    except OSError as error:
+        _refuse("shred-root-invalid", reason=_windows_cleanup_error_reason(error))
+    if root_identity["reparse"]:
         _refuse("shred-root-invalid")
+    try:
+        root_parent_identity = _windows_cleanup_identity(root.parent, require_directory=True)
+    except OSError as error:
+        _refuse("shred-root-invalid", reason=_windows_cleanup_error_reason(error))
     plaintext_root = Path(plaintext_root) if plaintext_root else None
     total = 0
     files = []
     directory_paths = []
     reparse_entries = []
+    directory_identities = {root: root_identity}
     failures = []
     failure_reasons = []
 
@@ -1640,83 +1878,126 @@ def shred_tree(root, plaintext_root=None, overwrite_limit=1024 * 1024 * 1024):
         failures.append(code)
         failure_reasons.append(_windows_cleanup_error_reason(error) if error is not None else "other")
 
+    def ancestors_for(parent):
+        chain = []
+        current = parent
+        while True:
+            identity = directory_identities.get(current)
+            if identity is None:
+                _refuse("shred-entry-inspection-failed")
+            chain.append((current, identity))
+            if current == root:
+                break
+            current = current.parent
+            if not current.is_relative_to(root):
+                _refuse("shred-entry-inspection-failed")
+        chain.reverse()
+        return chain
+
+    def inspect(path, *, require_directory=False, allow_reparse=False):
+        metadata = path.stat(follow_symlinks=False)
+        identity = _windows_cleanup_identity(path, require_directory=require_directory,
+                                             allow_reparse=allow_reparse)
+        return metadata, identity
+
     def walk_error(error):
         record_failure("shred-enumerate-failed", error)
-    for current, child_directories, names in os.walk(root, topdown=True, followlinks=False, onerror=walk_error):
-        for name in list(child_directories):
-            path = Path(current) / name
-            try:
-                metadata = path.stat(follow_symlinks=False)
-                is_symlink = path.is_symlink()
-                reparse = is_symlink or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
-            except OSError as error:
-                child_directories.remove(name)
-                record_failure("shred-entry-inspection-failed", error)
-                continue
-            if reparse:
-                child_directories.remove(name)
-                reparse_entries.append((path, True, is_symlink))
-            else:
-                directory_paths.append(path)
-        for name in names:
-            path = Path(current) / name
-            try:
-                metadata = path.stat(follow_symlinks=False)
-                is_symlink = path.is_symlink()
-                reparse = is_symlink or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
-            except OSError as error:
-                record_failure("shred-entry-inspection-failed", error)
-                continue
-            if reparse:
-                reparse_entries.append((path, False, is_symlink))
-            elif not path.is_file():
+
+    try:
+        for current, child_directories, names in os.walk(root, topdown=True, followlinks=False, onerror=walk_error):
+            current_path = Path(current)
+            current_identity = directory_identities.get(current_path)
+            if current_identity is None:
                 record_failure("shred-entry-inspection-failed")
-            else:
-                size = metadata.st_size
-                total += size
-                files.append((path, size))
-    files.sort(key=lambda item: (0 if plaintext_root and item[0].is_relative_to(plaintext_root) else 1,
-                                 len(item[0].parts), str(item[0])))
+                child_directories.clear()
+                continue
+            try:
+                _metadata, opened_identity = inspect(current_path, require_directory=True)
+                if not _same_windows_identity(opened_identity, current_identity, directory=True):
+                    raise WindowsBoundaryRefusal("shred-entry-inspection-failed")
+            except (OSError, WindowsBoundaryRefusal) as error:
+                record_failure("shred-entry-inspection-failed", error)
+                child_directories.clear()
+                continue
+            for name in list(child_directories):
+                path = current_path / name
+                try:
+                    metadata, identity = inspect(path, require_directory=True, allow_reparse=True)
+                    is_symlink = path.is_symlink()
+                except OSError as error:
+                    child_directories.remove(name)
+                    record_failure("shred-entry-inspection-failed", error)
+                    continue
+                except WindowsBoundaryRefusal as error:
+                    child_directories.remove(name)
+                    record_failure("shred-entry-inspection-failed", error)
+                    continue
+                if identity["reparse"] or is_symlink:
+                    child_directories.remove(name)
+                    reparse_entries.append((path, True, is_symlink, identity, ancestors_for(current_path)))
+                elif not stat.S_ISDIR(metadata.st_mode):
+                    child_directories.remove(name)
+                    record_failure("shred-entry-inspection-failed")
+                else:
+                    directory_identities[path] = identity
+                    directory_paths.append((path, identity, ancestors_for(current_path)))
+            for name in names:
+                path = current_path / name
+                try:
+                    metadata, identity = inspect(path, allow_reparse=True)
+                    is_symlink = path.is_symlink()
+                except OSError as error:
+                    record_failure("shred-entry-inspection-failed", error)
+                    continue
+                except WindowsBoundaryRefusal as error:
+                    record_failure("shred-entry-inspection-failed", error)
+                    continue
+                if identity["reparse"] or is_symlink:
+                    reparse_entries.append((path, False, is_symlink, identity, ancestors_for(current_path)))
+                elif not stat.S_ISREG(metadata.st_mode) or identity["directory"]:
+                    record_failure("shred-entry-inspection-failed")
+                elif identity["links"] != 1:
+                    record_failure("shred-hardlink-refused")
+                else:
+                    total += identity["size"]
+                    files.append((path, identity, ancestors_for(current_path)))
+    except (OSError, WindowsBoundaryRefusal) as error:
+        record_failure("shred-entry-inspection-failed", error)
+
+    if failures:
+        reason = failure_reasons[0] if failure_reasons else "other"
+        print("windows_cleanup_reason=" + reason, flush=True)
+        _refuse(failures[0], reason=reason)
+
+    files.sort(key=lambda item: (
+        0 if plaintext_root and item[0].is_relative_to(plaintext_root) else 1,
+        len(item[0].parts), str(item[0]),
+    ))
     cleaned = 0
-    for path, is_directory, is_symlink in reparse_entries:
+    for path, is_directory, is_symlink, identity, ancestors in reparse_entries:
         try:
-            _retry_windows_cleanup(lambda: path.rmdir() if is_directory and not is_symlink else path.unlink())
+            _retry_windows_cleanup(lambda: _windows_remove_entry(
+                path, identity, ancestors, allow_reparse=True,
+            ))
             cleaned += 1
         except OSError as error:
             record_failure("shred-reparse-remove-failed", error)
-    for path, size in files:
-        if size <= overwrite_limit:
-            try:
-                def overwrite_file():
-                    remaining = size
-                    with path.open("r+b", buffering=0) as output:
-                        while remaining:
-                            chunk = os.urandom(min(1024 * 1024, remaining))
-                            output.write(chunk)
-                            remaining -= len(chunk)
-                        output.flush()
-                        os.fsync(output.fileno())
-                _retry_windows_cleanup(overwrite_file)
-            except OSError as error:
-                record_failure("shred-overwrite-failed", error)
-                try:
-                    _retry_windows_cleanup(path.unlink)
-                    cleaned += 1
-                except OSError as retry_error:
-                    record_failure("shred-file-remove-failed", retry_error)
-                continue
+    for path, identity, ancestors in files:
         try:
-            _retry_windows_cleanup(path.unlink)
+            _retry_windows_cleanup(lambda: _windows_remove_entry(
+                path, identity, ancestors, overwrite=identity["size"] <= overwrite_limit,
+            ))
             cleaned += 1
         except OSError as error:
-            record_failure("shred-file-remove-failed", error)
-    for path in reversed(directory_paths):
+            record_failure("shred-overwrite-failed" if identity["size"] <= overwrite_limit
+                           else "shred-file-remove-failed", error)
+    for path, identity, ancestors in reversed(directory_paths):
         try:
-            _retry_windows_cleanup(path.rmdir)
+            _windows_remove_entry(path, identity, ancestors)
         except OSError as error:
             record_failure("shred-directory-remove-failed", error)
     try:
-        _retry_windows_cleanup(root.rmdir)
+        _windows_remove_entry(root, root_identity, [(root.parent, root_parent_identity)])
     except OSError as error:
         record_failure("shred-root-remove-failed", error)
     if failures:
@@ -1730,23 +2011,30 @@ def cleanup_runner(state_path, root, plaintext_root=None):
     errors = []
     error_reasons = []
     state = Path(state_path)
-    if state.is_file():
+    if not state.is_file():
+        _refuse("windows-cleanup-profile-failed", reason="other")
+    try:
+        quiesce_run(state)
+    except WindowsBoundaryRefusal as error:
+        _refuse("windows-cleanup-profile-failed", reason=error.reason)
+    except Exception:
+        _refuse("windows-cleanup-profile-failed", reason="other")
+    profile_failure = None
+    try:
+        delete_profile(state)
+    except WindowsBoundaryRefusal as error:
+        profile_failure = error
+    except Exception:
+        profile_failure = WindowsBoundaryRefusal("windows-cleanup-profile-failed", reason="other")
+    if profile_failure is not None:
         try:
-            remove_firewall(state)
+            quiesce_run(state)
         except WindowsBoundaryRefusal as error:
-            errors.append("windows-cleanup-firewall-failed")
-            error_reasons.append(error.reason)
+            _refuse("windows-cleanup-profile-failed", reason=error.reason)
         except Exception:
-            errors.append("windows-cleanup-firewall-failed")
-            error_reasons.append("other")
-        try:
-            delete_profile(state)
-        except WindowsBoundaryRefusal as error:
-            errors.append("windows-cleanup-profile-failed")
-            error_reasons.append(error.reason)
-        except Exception:
-            errors.append("windows-cleanup-profile-failed")
-            error_reasons.append("other")
+            _refuse("windows-cleanup-profile-failed", reason="other")
+        errors.append("windows-cleanup-profile-failed")
+        error_reasons.append(profile_failure.reason)
     shred_receipt = None
     try:
         shred_receipt = shred_tree(root, plaintext_root=plaintext_root)

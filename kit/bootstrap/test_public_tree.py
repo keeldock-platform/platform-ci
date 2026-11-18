@@ -985,6 +985,7 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/bundle.py',
             'kit/devlane/control_audit.py',
             'kit/devlane/coordinator.py',
+            'kit/devlane/source_admission.py',
             'kit/devlane/decrypt_once.py',
             'kit/devlane/acceptance_diagnostics.py',
             'kit/devlane/diagnostic_contract.py',

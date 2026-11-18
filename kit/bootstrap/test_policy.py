@@ -720,7 +720,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIn("rust-toolchain-audit", workflow)
         self.assertIn("kit/confinement/macos_reviewed_build.py --control-sha", workflow)
         self.assertIn(
-            "kit/confinement/macos_rust_toolchain.py --control-sha \"$CI_SHA\"", workflow
+            "kit/confinement/macos_rust_toolchain.py --control-sha \"$3\"", workflow
         )
         self.assertIn(
             "kit/confinement/macos_public_audit.py rust-toolchain-publish", workflow
@@ -730,7 +730,7 @@ class WorkflowPolicyTests(unittest.TestCase):
             workflow,
         )
         self.assertIn(
-            "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B kit/confinement/macos_rust_toolchain.py",
+            "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \\\n                -I -S -B kit/confinement/macos_rust_toolchain.py",
             workflow,
         )
         self.assertIn("GITHUB_RUN_ID=\"$GITHUB_RUN_ID\" \\\n", workflow)
@@ -740,7 +740,11 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIn("GITHUB_REPOSITORY=\"$CI_REPOSITORY\" \\\n", workflow)
         self.assertIn("GITHUB_EVENT_NAME=\"$CI_EVENT_NAME\" \\\n", workflow)
         self.assertIn("GITHUB_REF=\"$CI_REF\" \\\n", workflow)
-        self.assertIn('>"$stdout_file" 2>"$stderr_file"', workflow)
+        self.assertEqual(workflow.count("/bin/sh -c '"), 1)
+        self.assertEqual(workflow.count('>"$1" 2>"$2"'), 1)
+        self.assertEqual(workflow.count("' sh \"$stdout_file\" \"$stderr_file\""), 1)
+        self.assertEqual(workflow.count("' sh \"$stdout_file\" \"$stderr_file\" \"$CI_SHA\""), 1)
+        self.assertEqual(workflow.count(': >"$stdout_file"\n          : >"$stderr_file"'), 1)
         self.assertIn(
             '<"$stdout_file" >"$validated_file" 2>"$validator_stderr_file"', workflow
         )
@@ -836,7 +840,7 @@ class WorkflowPolicyTests(unittest.TestCase):
             base.replace("      - name: Run source-free Rust toolchain smoke\n", ""),
             base.replace("macos_public_audit.py rust-toolchain-publish", "macos_public_audit.py rust-toolchain-audit"),
             base.replace(
-                "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B kit/confinement/macos_rust_toolchain.py",
+                "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \\\n                -I -S -B kit/confinement/macos_rust_toolchain.py",
                 "/usr/bin/python3 -I -S -B kit/confinement/macos_rust_toolchain.py",
             ),
             base.replace("      - name: Write trusted summary visibility control\n", ""),
@@ -845,7 +849,8 @@ class WorkflowPolicyTests(unittest.TestCase):
             base.replace('  if: ${{ always() }}\n', '  if: ${{ success() }}\n'),
             base.replace("kit/confinement/macos_rust_toolchain.py --control-sha", "kit/confinement/macos_reviewed_build.py --control-sha"),
             base.replace('GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \\\n', ""),
-            base.replace('>"$stdout_file" 2>"$stderr_file"', ""),
+            base.replace('>"$1" 2>"$2"', ""),
+            base.replace("' sh \"$stdout_file\" \"$stderr_file\" \"$CI_SHA\"", "' sh \"$stdout_file\" \"$stderr_file\""),
             base.replace("      - name: Run source-free reviewed build smoke\n", "      - name: Extra execution\n        run: echo extra\n      - name: Run source-free reviewed build smoke\n"),
             base.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-latest\n"),
             base + "  unexpected:\n    runs-on: ubuntu-24.04\n    steps: []\n",
@@ -1455,7 +1460,11 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIn("--source-sha \"$REQUESTED_SOURCE_SHA\" --base-sha \"$REQUESTED_BASE_SHA\"", workflow)
         self.assertIn("--base-branch \"$REQUESTED_BASE_BRANCH\"", workflow)
         self.assertIn("core-contract-publish", workflow)
-        self.assertIn(">\"$stdout_file\" 2>\"$stderr_file\"", workflow)
+        self.assertEqual(workflow.count("/bin/sh -c '"), 2)
+        self.assertEqual(workflow.count('>"$1" 2>"$2"'), 2)
+        self.assertEqual(workflow.count("' sh \"$stdout_file\" \"$stderr_file\""), 2)
+        self.assertEqual(workflow.count("' sh \"$stdout_file\" \"$stderr_file\" \"$CI_SHA\""), 1)
+        self.assertEqual(workflow.count(': >"$stdout_file"\n          : >"$stderr_file"'), 2)
         self.assertIn("<\"$stdout_file\" >\"$validated_file\" 2>\"$validator_stderr_file\"", workflow)
         self.assertIn("Revoke token if contract did not confirm", workflow)
         self.assertIn("--phase revoke --token-stdin", workflow)

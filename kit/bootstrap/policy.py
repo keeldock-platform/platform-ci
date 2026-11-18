@@ -32,7 +32,7 @@ MACOS_SOURCE_READER_WORKFLOW_SHA256 = "e6082feb71990ef2590c791f09927d6a33a277d0b
 MACOS_RULES_SOURCE_READER_WORKFLOW_SHA256 = "c0f145c306a6fff9739496d2a6b352016f4203cb5836807cefc3b862facf8431"
 MACOS_RULES_BOOTSTRAP_WORKFLOW_SHA256 = "f56e0c0eb86493c320a72048201d4bfae6bedbec46ee85a8b027674d5cd62d3a"
 MACOS_CORE_BOOTSTRAP_WORKFLOW_SHA256 = "b140312f22310633089594255fb17d25aeece02869355e608408098c4e91a4eb"
-MACOS_CORE_CONTRACT_WORKFLOW_SHA256 = "e55f8d95bb4666a965912b2832aa68aded0f6c166c324082e61ca599b7bac9cc"
+MACOS_CORE_CONTRACT_WORKFLOW_SHA256 = "1bc6cff651d67edfc3a083b10663655bbaa4ad64bc50a4b8baa470e35b8a42c5"
 DEVELOPMENT_FEEDBACK_SMOKE_WORKFLOW_SHA256 = "380f71c2f95239492dea787383eadc648077d75ce676d9640186ff3b88dc65a9"
 
 
@@ -809,6 +809,8 @@ jobs:
           validated_file="$capture_dir/validated"
           validator_stderr_file="$capture_dir/validator-stderr"
           trap '/bin/rm -rf "$capture_dir" 2>/dev/null' EXIT
+          : >"$stdout_file"
+          : >"$stderr_file"
           set +e
           sudo -n -- /usr/bin/env -i \
             PATH=/usr/bin:/bin:/usr/sbin:/sbin \
@@ -817,8 +819,11 @@ jobs:
             RUNNER_TEMP="$RUNNER_TEMP" \
             GITHUB_RUN_ID="$GITHUB_RUN_ID" \
             GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
-            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B kit/confinement/macos_rust_toolchain.py --control-sha "$CI_SHA" \
-            >"$stdout_file" 2>"$stderr_file"
+            /bin/sh -c '
+              exec /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
+                -I -S -B kit/confinement/macos_rust_toolchain.py --control-sha "$3" \
+                >"$1" 2>"$2"
+            ' sh "$stdout_file" "$stderr_file" "$CI_SHA"
           status=$?
           set -e
           if [[ "$status" -ne 0 ]]; then
