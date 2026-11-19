@@ -30,6 +30,7 @@ import rust_tooling
 import rust_preparation_smoke
 import supervisor
 import sandbox_macos
+import sandbox_windows
 import control_python
 import macos_registry_rehearsal
 import test_e2e
@@ -37,10 +38,17 @@ import test_e2e
 
 WORKFLOW_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_SCRIPT = re.compile(
-    r"(?=(?:\bpython3\s+-B\s+|\bsudo\s+-n\s+(?:--preserve-env=[A-Za-z0-9_,]+\s+)?"
-    r"['\"]?\$python_bin['\"]?\s+-B\s+)"
+    r"(?=(?:\b(?:python3?|py)\s+|\bsudo\s+-n\s+(?:--preserve-env=[A-Za-z0-9_,]+\s+)?"
+    r"['\"]?\$python_bin['\"]?\s+)"
+    r"(?:(?:-[^\s;|&]+)\s+(?:(?:'[^']*'|\"[^\"]*\"|(?!kit/devlane/)[^\s;|&]+)\s+)?)*?"
     r"(kit/devlane/[A-Za-z0-9_.-]+\.py)\b([^\n]*))",
 )
+
+
+def _powershell_arguments(raw):
+    raw = re.sub(r"\(Join-Path\s+([^\s]+)\s+'([^']+)'\)",
+                 lambda match: shlex.quote(match[1] + "/" + match[2].replace("\\", "/")), raw)
+    return shlex.split(raw)
 
 
 def _workflow_script_invocations():
@@ -50,17 +58,19 @@ def _workflow_script_invocations():
         jobs = public_audit.parse_workflow(path)
         for job_name, job in jobs.items():
             for step in job["steps"]:
-                body = re.sub(r"\\\n[ \t]*", " ", "\n".join(step["run"]))
+                body = re.sub(r"[\\`]\n[ \t]*", " ", "\n".join(step["run"]))
                 for line in body.splitlines():
                     for match in WORKFLOW_SCRIPT.finditer(line):
                         script = Path(match.group(1)).name
                         raw_arguments = match.group(2)
                         if script == "deadline.py" and raw_arguments.lstrip().startswith("run "):
                             raw_arguments = raw_arguments.split(" -- ", 1)[0]
-                            arguments = shlex.split(raw_arguments) + ["--", "fixed-child"]
+                            arguments = (_powershell_arguments(raw_arguments) if job_name.endswith("-windows")
+                                         else shlex.split(raw_arguments)) + ["--", "fixed-child"]
                         else:
                             try:
-                                arguments = shlex.split(raw_arguments)
+                                arguments = (_powershell_arguments(raw_arguments) if job_name.endswith("-windows")
+                                             else shlex.split(raw_arguments))
                             except ValueError:
                                 arguments = shlex.split(raw_arguments + "'")
                         calls.append((workflow_name, job_name, step["name"],
@@ -648,6 +658,11 @@ class DeadlineTests(unittest.TestCase):
             ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "macos_registry_rehearsal.py"): 1,
             ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "control_python.py"): 4,
             ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "supervisor.py"): 4,
+            ("devlane-encrypted.yml", "devlane-encrypted-run-windows", "deadline.py"): 6,
+            ("devlane-encrypted.yml", "devlane-encrypted-run-windows", "control_python.py"): 3,
+            ("devlane-encrypted.yml", "devlane-encrypted-run-windows", "fetch.py"): 4,
+            ("devlane-encrypted.yml", "devlane-encrypted-run-windows", "permit.py"): 3,
+            ("devlane-encrypted.yml", "devlane-encrypted-run-windows", "sandbox_windows.py"): 7,
             ("devlane-encrypted.yml", "devlane-encrypted-audit", "public_audit.py"): 1,
         })
         self.assertEqual(Counter((workflow, job, script) for workflow, job, _step, script, _args in calls),
@@ -655,7 +670,7 @@ class DeadlineTests(unittest.TestCase):
 
         for workflow, _job, _step, script, arguments in calls:
             with self.subTest(workflow=workflow, script=script, arguments=arguments):
-                arguments = _cli_arguments(arguments)
+                arguments = _cli_arguments([value.replace("$env:", "$") for value in arguments])
                 if script == "deadline.py":
                     self.assertIn("--file", arguments)
                     self._assert_required_argument(deadline.main, arguments, "--file")
@@ -832,6 +847,8 @@ class DeadlineTests(unittest.TestCase):
                             macos_registry_rehearsal.main(arguments)
                         remaining.assert_called_once_with("$RUN_ROOT/deadline.json")
                         identity.assert_not_called()
+                elif script == "sandbox_windows.py":
+                    self._check_windows_child(arguments)
                 elif script == "sandbox_macos.py":
                     required = {
                         "preflight": ("--state-dir", "--workspace", "--profile", "--run-id", "--control-sha"),
@@ -851,6 +868,11 @@ class DeadlineTests(unittest.TestCase):
                     safe_arguments = [value.replace("$runner_uid)", "501").replace("$runner_uid", "501")
                                       .replace("$crypto_target", "/tmp/control-python-deps")
                                       .replace("$RUN_ROOT", "/tmp/devlane-12345") for value in arguments]
+                    if "windows" in safe_arguments and "run" in safe_arguments:
+                        child = safe_arguments[safe_arguments.index("run") + 1:]
+                        self.assertEqual(child[0], "kit/devlane/sandbox_windows.py")
+                        self._check_windows_child(child[1:])
+                        safe_arguments = safe_arguments[:safe_arguments.index("run")] + ["run", "fixed-child"]
                     for option in ("--target", "--platform"):
                         self._assert_required_argument(control_python.main, safe_arguments, option)
                     self.assertTrue(any(command in safe_arguments for command in ("seal", "check", "run")))
@@ -861,6 +883,120 @@ class DeadlineTests(unittest.TestCase):
                     self.assertEqual(arguments, [])
                 else:
                     self.fail("unreviewed workflow Python child argv: " + script)
+
+    def _check_windows_child(self, arguments):
+        required = {
+            "prepare": ("--projection", "--output", "--deadline", "--state"),
+            "positive-control": (), "create-profile": ("--state",),
+            "firewall-install": ("--state",),
+            "probe": ("--state", "--run-root", "--prepared", "--scratch"),
+            "decrypt": ("--context", "--bundle", "--source", "--manifest"),
+            "execute": ("--context", "--manifest", "--source", "--prepared", "--scratch",
+                        "--run-root", "--state", "--deadline"),
+            "shred": ("--state", "--root", "--workspace"),
+        }[arguments[0]]
+        for option in required:
+            self._assert_required_argument(sandbox_windows.main, arguments, option)
+        if arguments[0] in {"prepare", "execute"}:
+            with patch.object(sandbox_windows, "prepare_dependencies") as prepare_call, \
+                    patch.object(sandbox_windows, "run_profile", return_value=0) as run_call, \
+                    patch.object(sandbox_windows, "_validate_windows_toolchain",
+                                 return_value={"node": "node", "npm_cli": "npm", "cmd": "cmd", "hashes": {}}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(sandbox_windows.main(arguments), 0)
+                actual = (prepare_call if arguments[0] == "prepare" else run_call).call_args.args
+                self.assertIn(arguments[arguments.index("--deadline") + 1], actual)
+            self._assert_windows_expired_deadline(arguments)
+        else:
+            operations = {
+                "positive-control": "positive_connectivity", "create-profile": "create_profile",
+                "firewall-install": "install_firewall", "probe": "run_network_probe",
+                "decrypt": "decrypt_bundle", "shred": "cleanup_runner",
+            }
+            with patch.object(sandbox_windows, operations[arguments[0]], return_value="") as operation, \
+                    patch.object(sandbox_windows, "_validate_windows_toolchain",
+                                 return_value={"node": "node", "cmd": "cmd"}), \
+                    patch.object(sandbox_windows.Path, "mkdir"), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(sandbox_windows.main(arguments), 0)
+                operation.assert_called_once()
+
+    def _assert_windows_expired_deadline(self, arguments):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            expired = root / "deadline.json"
+            expired.write_text(json.dumps({"work_deadline": 0}), encoding="ascii")
+            source = root / "source"
+            (source / "node_modules").mkdir(parents=True)
+            projection = root / "projection.json"
+            projection.write_text("{}", encoding="ascii")
+            substitutions = {"--deadline": str(expired), "--projection": str(projection),
+                             "--output": str(root / "output"), "--source": str(source),
+                             "--prepared": str(root / "prepared"), "--scratch": str(root / "scratch"),
+                             "--run-root": str(root), "--state": str(root / "state" / "state.json")}
+            actual = list(arguments)
+            for option, value in substitutions.items():
+                if option in actual:
+                    actual[actual.index(option) + 1] = value
+            output = io.StringIO()
+            with patch.object(sandbox_windows.sys, "platform", "win32"), \
+                    patch.object(sandbox_windows.fetch, "validate_projection", return_value={
+                        "npm_package": {}, "npm_lock": {}, "playwright": []}), \
+                    patch.object(sandbox_windows.fetch, "validate_dispatch", return_value={}), \
+                    patch.object(sandbox_windows, "_npm_tools", return_value=(root / "node", root / "npm")), \
+                    patch.object(sandbox_windows, "_copy_pinned_windows_toolchain",
+                                 return_value=(root / "node", root / "npm", root / "cmd", {})), \
+                    patch.object(sandbox_windows, "_validate_windows_toolchain",
+                                 return_value={"node": str(root / "node"), "npm_cli": str(root / "npm"),
+                                               "cmd": str(root / "cmd"), "hashes": {}}), \
+                    patch.object(sandbox_windows, "_read_json", return_value={}), \
+                    patch.object(sandbox_windows, "profile_commands",
+                                 return_value=({}, [("test", ("node", []))])), \
+                    patch.object(sandbox_windows, "_reject_reparse_tree"), \
+                    patch.object(sandbox_windows, "validate_environment", return_value=[]), \
+                    patch.object(sandbox_windows, "create_profile"), \
+                    patch.object(sandbox_windows, "delete_profile"), \
+                    patch.object(sandbox_windows, "_native_run") as native, \
+                    patch.object(sandbox_windows, "_deadline_remaining",
+                                 wraps=sandbox_windows._deadline_remaining) as remaining, \
+                    contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                self.assertEqual(sandbox_windows.main(actual), 1)
+                remaining.assert_called_once_with(str(expired))
+                native.assert_not_called()
+
+    def test_every_windows_python_child_has_a_bounded_step_or_job_deadline(self):
+        jobs = public_audit.parse_workflow(WORKFLOW_ROOT / ".github/workflows/devlane-encrypted.yml")
+        job = jobs["devlane-encrypted-run-windows"]
+        calls = [call for call in _workflow_script_invocations() if call[1] == "devlane-encrypted-run-windows"]
+        self.assertEqual(len(calls), 23)
+        for _workflow, _job, step_name, script, _arguments in calls:
+            with self.subTest(step=step_name, script=script):
+                step = next(step for step in job["steps"] if step["name"] == step_name)
+                limit = step["timeout_minutes"] or job["timeout_minutes"]
+                self.assertIsInstance(limit, int)
+                self.assertGreater(limit, 0)
+                self.assertLessEqual(limit, 180)
+
+    def test_inventory_recognises_interpreter_flags_before_script(self):
+        for interpreter in ("python", "python3", "py"):
+            for flags in ("", "-B ", "-B -I -X utf8 -W ignore ", "-3 -B ",
+                          "-X pycache_prefix=/tmp/cache -B ", "-X pycache_prefix=C:\\cache -B ",
+                          "-W 'ignore::DeprecationWarning' -B ", "-- "):
+                with self.subTest(interpreter=interpreter, flags=flags):
+                    match = WORKFLOW_SCRIPT.search(interpreter + " " + flags + "kit/devlane/unlisted.py --x y")
+                    self.assertIsNotNone(match)
+                    self.assertEqual(match[1], "kit/devlane/unlisted.py")
+
+    def test_unlisted_windows_python_B_child_fails_inventory(self):
+        original = _workflow_script_invocations()
+        jobs = {"devlane-encrypted-run-windows": {"steps": [{"name": "unlisted", "run": [
+            "python -B kit/devlane/unlisted.py --deadline missing"]}]}}
+        with patch.object(public_audit, "parse_workflow", return_value=jobs):
+            extra = _workflow_script_invocations()
+        self.assertTrue(any(call[3] == "unlisted.py" for call in extra))
+        with patch(__name__ + "._workflow_script_invocations", return_value=original + extra):
+            with self.assertRaises(AssertionError):
+                self.test_all_actual_python_child_argv_are_inventoried_and_deadline_consumers_reach_their_real_parsers()
 
     def _assert_required_argument(self, parser_main, arguments, option):
         errors = io.StringIO()
