@@ -1,8 +1,10 @@
-"""Coordinator-run native registry rehearsal. No CI dispatch or workflow changes.
+"""Native registry rehearsal invoked by hosted macOS dependency preparation.
 
 Requires a fresh, successful sandbox_macos preflight and its public projection.
 Runs as root on the approved macOS image. Leaves evidence under RUN_ROOT/
 registry-rehearsal; use normal sandbox_macos cleanup afterward, even on failure.
+The workflow captures raw diagnostics privately and clears the verified offline PF
+record before production preparation installs its own gateway rules.
 """
 import argparse
 import hashlib
@@ -83,6 +85,7 @@ def main():
     projection = harness._validate_projection_file(args.projection, harness.PROFILE_NAME, args.control_sha)
     root = state.parent / 'registry-rehearsal'
     root.mkdir(mode=0o755)
+    root.chmod(0o711)
     paths = {name: root / name for name in ('project', 'prepared', 'cache', 'home', 'tmp')}
     for path in paths.values():
         path.mkdir(mode=0o700)

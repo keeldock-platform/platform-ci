@@ -10,12 +10,14 @@ import re
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 from unittest import mock
 
 import sandbox_macos as sandbox
+import macos_registry_rehearsal as registry_rehearsal
 import public_audit
 
 NODE = shutil.which("node")
@@ -38,6 +40,88 @@ def _hosted_profile_probe_available():
 
 
 class MacPrepareBoundaryTests(unittest.TestCase):
+    def test_registry_parent_traversal_survives_restrictive_umask(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary).resolve()
+            state = run_root / "state"
+            state.mkdir()
+            projection = {"npm_package": {}, "npm_lock": {}}
+            ident = {"uid": 12345, "gid": 12345}
+            arguments = ["rehearsal", "--state-dir", str(state), "--projection", "unused",
+                         "--control-sha", "a" * 40, "--deadline-file", "unused"]
+            class SetupComplete(Exception):
+                pass
+            previous_umask = os.umask(0o077)
+            try:
+                with mock.patch.object(sys, "argv", arguments), \
+                        mock.patch.object(registry_rehearsal.sys, "platform", "darwin"), \
+                        mock.patch.object(os, "geteuid", return_value=0), \
+                        mock.patch.object(sandbox, "_identity", return_value=ident), \
+                        mock.patch.object(sandbox, "_validate_prepare_run_root"), \
+                        mock.patch.object(sandbox, "_validate_projection_file", return_value=projection), \
+                        mock.patch.object(sandbox, "_chown_tree") as chown, \
+                        mock.patch.object(sandbox, "_resolve_registry", side_effect=SetupComplete), \
+                        self.assertRaises(SetupComplete):
+                    registry_rehearsal.main()
+            finally:
+                os.umask(previous_umask)
+            root = run_root / "registry-rehearsal"
+            self.assertEqual(root.stat().st_mode & 0o777, 0o711)
+            self.assertEqual({call.args for call in chown.call_args_list},
+                             {(root / name, ident["uid"], ident["gid"])
+                              for name in ("project", "prepared", "cache", "home", "tmp")})
+            for call in chown.call_args_list:
+                self.assertEqual(call.args[0].stat().st_mode & 0o777, 0o700)
+
+    def test_hosted_registry_runs_before_preparation_and_sanitizes_failures(self):
+        identity = {"platform": "macos", "profile": "core-node"}
+        grammar = public_audit._Grammar(".github/workflows/devlane-encrypted.yml",
+                                       public_audit.MACOS_RUN_JOB, identity, "encrypted")
+        step = next(step for step in grammar.steps if step["name"] == public_audit.MACOS_PREPARE_STEP)
+        script = "\n".join(step["run"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            stub = root / "python3"
+            stub.write_text(chr(35) + "!" + sys.executable + "\n" + '''import os, subprocess, sys
+args = sys.argv[1:]
+if args[:2] == ['-B', '-c']:
+    print(__file__)
+    sys.exit(0)
+if args[1].endswith('/deadline.py'):
+    sys.exit(subprocess.run(args[args.index('--') + 1:]).returncode)
+operation = 'registry' if args[1].endswith('/macos_registry_rehearsal.py') else args[2]
+with open(os.environ['TRACE'], 'a') as output:
+    output.write(operation + '\\n')
+if operation in ('registry', 'root-pf-cleanup'):
+    print('private-diagnostic-canary')
+if operation == os.environ['FAIL_AT']:
+    sys.exit(1)
+if operation == 'prepare':
+    print('dependency_preparation=complete')
+''')
+            stub.chmod(0o700)
+            sudo = root / "sudo"
+            sudo.write_text(chr(35) + '!/bin/sh\nshift\nexec "$@"\n')
+            sudo.chmod(0o700)
+            for fail_at, expected in (("", ["registry", "root-pf-cleanup", "prepare"]),
+                                      ("registry", ["registry"]),
+                                      ("root-pf-cleanup", ["registry", "root-pf-cleanup"])):
+                with self.subTest(fail_at=fail_at):
+                    trace = root / "trace"
+                    trace.unlink(missing_ok=True)
+                    result = subprocess.run(["/bin/bash", "-c", "umask 077\n" + script], capture_output=True, text=True,
+                        env={"PATH": str(root) + ":/usr/bin:/bin", "RUN_ROOT": str(root),
+                             "DEVLANE_PLATFORM": "macos", "DEVLANE_PROFILE": "core-node",
+                             "CI_SHA": "a" * 40, "TRACE": str(trace), "FAIL_AT": fail_at}, timeout=15)
+                    self.assertEqual(trace.read_text().splitlines(), expected)
+                    self.assertEqual(result.returncode, 2 if fail_at else 0)
+                    self.assertEqual(result.stdout, "" if fail_at else
+                                     "macos_registry_rehearsal=passed\ndependency_preparation=complete\n")
+                    self.assertEqual(result.stderr, "devlane_supervisor_refusal=macos-prepare-internal\n"
+                                     if fail_at else "")
+                    self.assertIn("private-diagnostic-canary", (root / "registry-rehearsal-private.log").read_text())
+                    self.assertEqual((root / "registry-rehearsal-private.log").stat().st_mode & 0o777, 0o600)
+
     @unittest.skipUnless(hasattr(os, "getuid"), "requires POSIX ownership metadata")
     def test_prepare_run_root_must_remain_runner_owned_with_hosted_modes(self):
         with tempfile.TemporaryDirectory(prefix="devlane-prepare-root-") as temporary:
@@ -69,6 +153,7 @@ class MacPrepareBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve(strict=True)
             node = root / "node/bin/node"
+            node_alias = root / "node-alias"
             library = root / "dependency/lib/runtime.dylib"
             transitive = library.parent / "transitive.dylib"
             alias = root / "links/runtime.dylib"
@@ -77,6 +162,7 @@ class MacPrepareBoundaryTests(unittest.TestCase):
             for path in (node, library, transitive):
                 path.write_bytes(b"fixture")
             alias.symlink_to(library)
+            node_alias.symlink_to(node)
             (library.parent / "private-sibling").write_bytes(b"secret")
             def otool(command, **kwargs):
                 current = Path(command[2])
@@ -88,7 +174,7 @@ class MacPrepareBoundaryTests(unittest.TestCase):
             with mock.patch.object(sandbox.sys, "platform", "darwin"), \
                     mock.patch.object(sandbox, "CLT_OTOOL_PATH", str(node)), \
                     mock.patch.object(sandbox.subprocess, "run", side_effect=otool):
-                self.assertEqual(sandbox._macos_node_runtime_read_files(node),
+                self.assertEqual(sandbox._macos_node_runtime_read_files(node_alias),
                                  {node, library, transitive})
 
     def test_runtime_file_grants_do_not_read_siblings_or_ancestors(self):
@@ -118,6 +204,15 @@ class MacPrepareBoundaryTests(unittest.TestCase):
                 for path in ("/opt/dependency/lib/private-sibling", "/opt/dependency/private-sibling",
                              "/opt/toolcache/node/24/private-sibling", "/opt/dependency/lib"):
                     self.assertFalse(readable(path), path)
+                if text == offline:
+                    self.assertTrue(readable("/opt/toolcache/node/24/bin/node"))
+                    for path in ("/opt/toolcache/node/24/bin/private-sibling",
+                                 "/opt/toolcache/node/24/bin", "/opt/dependency"):
+                        self.assertFalse(readable(path), path)
+        self.assertIn('(allow file-read* (literal "/opt/toolcache/node/24/bin/node"))', offline)
+        self.assertIn('(allow file-read-metadata (literal "/opt/toolcache/node/24/bin"))', offline)
+        self.assertNotIn('(allow file-read* (subpath "/opt/toolcache/node/24/bin"))', offline)
+        self.assertNotIn('(allow file-read* (literal "/opt/toolcache/node/24/bin"))', offline)
         self.assertIn('(sysctl-name "hw.memsize")', offline)
         self.assertIn('(deny network*)', offline)
         self.assertIn('(deny mach-lookup)', offline)
@@ -132,15 +227,23 @@ class MacPrepareBoundaryTests(unittest.TestCase):
             dependency.parent.mkdir(parents=True)
             dependency.write_bytes(b"runtime-canary")
             sibling.write_bytes(b"private-canary")
+            node = root / "tool/bin/node"
+            node.parent.mkdir(parents=True)
+            shutil.copy2("/bin/cat", node)
+            bin_sibling = node.with_name("private-sibling")
+            bin_sibling.write_bytes(b"private-bin-canary")
+            ancestor_sibling = dependency.parent.parent / "private-sibling"
+            ancestor_sibling.write_bytes(b"private-ancestor-canary")
             with mock.patch.object(sandbox, "_macos_node_runtime_read_files", return_value={dependency}):
                 profile = sandbox.profile_text(
                     workspace=root / "workspace", prepared=root / "prepared", scratch=root / "scratch",
-                    home=root / "home", control=sandbox.CONTROL_ROOT, node="/bin/cat",
+                    home=root / "home", control=sandbox.CONTROL_ROOT, node=node,
                     developer=sandbox.CLT_DEVELOPER_DIRECTORY, clang=sandbox.CLT_CLANG_PATH,
                 )
-            for path, allowed in ((dependency, True), (sibling, False)):
+            for path, allowed in ((dependency, True), (sibling, False),
+                                  (ancestor_sibling, False), (bin_sibling, False)):
                 result = subprocess.run(
-                    ["/usr/bin/sandbox-exec", "-p", profile, "/bin/cat", str(path)],
+                    ["/usr/bin/sandbox-exec", "-p", profile, str(node), str(path)],
                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     timeout=10, check=False,
                 )

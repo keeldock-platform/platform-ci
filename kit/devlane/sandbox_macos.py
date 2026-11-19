@@ -658,6 +658,7 @@ def _validate_prepare_run_root(state, ident):
 
 
 def _macos_node_runtime_read_files(node):
+    """Return canonical runtime files, never directories to grant recursively."""
     if sys.platform != "darwin" or not Path(node).is_file():
         return set()
     otool = Path(CLT_OTOOL_PATH)
@@ -1179,15 +1180,14 @@ def _quote(path):
 
 
 def profile_text(*, workspace, prepared, scratch, home, control, node, developer, clang, npm_cli=None):
-    node_root = Path(node).parent
     allowed_reads = {
         "/System/Library", "/System/Volumes/Preboot/Cryptexes/OS", "/usr/lib", "/usr/share", "/usr/bin",
         "/bin", str(Path(workspace)), str(Path(prepared)), str(Path(control)), str(Path(home)),
-        str(Path(developer)), str(node_root), str(Path(workspace).parent / "trusted"), str(Path(scratch)),
+        str(Path(developer)), str(Path(workspace).parent / "trusted"), str(Path(scratch)),
     }
     if npm_cli is not None:
         allowed_reads.add(str(Path(npm_cli).parent.parent))
-    runtime_files = _macos_node_runtime_read_files(node)
+    runtime_files = {Path(node).resolve(), *_macos_node_runtime_read_files(node)}
     ancestors = {Path("/")}
     for directory in {*allowed_reads, *(path.parent for path in runtime_files)}:
         current = Path(directory)

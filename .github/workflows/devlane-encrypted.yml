@@ -985,7 +985,25 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$DEVLANE_PLATFORM" == "macos" ]]; then
+            umask 077
             python_bin="$(python3 -B -c 'import sys; print(sys.executable)')"
+            if [[ "$DEVLANE_PROFILE" == "core-node" ]]; then
+              if ! python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+                sudo -n "$python_bin" -B kit/devlane/macos_registry_rehearsal.py \
+                  --state-dir "$RUN_ROOT/state" --projection "$RUN_ROOT/projection.json" \
+                  --control-sha "$CI_SHA" --deadline-file "$RUN_ROOT/deadline.json" \
+                  >"$RUN_ROOT/registry-rehearsal-private.log" 2>&1; then
+                printf 'devlane_supervisor_refusal=macos-prepare-internal\n' >&2
+                exit 2
+              fi
+              if ! python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
+                sudo -n "$python_bin" -B kit/devlane/sandbox_macos.py root-pf-cleanup \
+                  --state-dir "$RUN_ROOT/state" >>"$RUN_ROOT/registry-rehearsal-private.log" 2>&1; then
+                printf 'devlane_supervisor_refusal=macos-prepare-internal\n' >&2
+                exit 2
+              fi
+              printf 'macos_registry_rehearsal=passed\n'
+            fi
             python3 -B kit/devlane/deadline.py run --file "$RUN_ROOT/deadline.json" -- \
               sudo -n "$python_bin" -B kit/devlane/sandbox_macos.py prepare \
                 --state-dir "$RUN_ROOT/state" --projection "$RUN_ROOT/projection.json" \

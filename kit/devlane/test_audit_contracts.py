@@ -235,7 +235,10 @@ def _step_outputs(step, identity, kind, records):
         "Fetch ciphertext and sanitized dependency projection": [
             "public_asset_verified=true bytes=4096", "public_asset_verified=true bytes=512",
             "fetch_projection_valid=true"],
-        "Prepare dependencies before the cut": ["dependency_preparation=complete"],
+        "Prepare dependencies before the cut": (
+            ["macos_registry_rehearsal=passed"]
+            if identity.get("platform") == "macos" and identity["profile"] == "core-node" else []
+        ) + ["dependency_preparation=complete"],
         "Prove public connectivity before the cut": ["network_positive_control=pass"],
         "Cut network and start the isolated supervisor": ["offline_supervisor=ready"],
         "Probe isolation before decryption": ["network_cut_probe=pass"],
@@ -722,6 +725,26 @@ def _terminal_control_jobs(require_main=True):
 
 
 class EncryptedAuditorMutationTests(unittest.TestCase):
+    def test_macos_registry_proof_is_required_and_cannot_move_repeat_or_expand(self):
+        identity = dict(IDENTITY, platform="macos")
+        log = _render_real_runner_encrypted_log(identity)
+        audit.validate_job_log_surface(log, audit.MACOS_RUN_JOB, identity, completed=True)
+        marker = "macos_registry_rehearsal=passed"
+        for replacement in ("", marker + "\n" + marker, marker + " extra", "macos_registry_rehearsal=failed"):
+            with self.subTest(replacement=replacement), self.assertRaises(audit.AuditRefusal):
+                audit.validate_job_log_surface(
+                    _replace_output_line(log, marker, replacement), audit.MACOS_RUN_JOB, identity, completed=True,
+                )
+        removed = _replace_output_line(log, marker, "")
+        moved = _insert_output_before(removed, "network_cut_probe=pass", marker)
+        with self.assertRaises(audit.AuditRefusal):
+            audit.validate_job_log_surface(moved, audit.MACOS_RUN_JOB, identity, completed=True)
+        for platform_name in ("linux", "windows"):
+            other = dict(IDENTITY, platform=platform_name)
+            grammar = audit._Grammar(".github/workflows/devlane-encrypted.yml",
+                                     audit.PLATFORM_RUN_JOBS[platform_name], other, "encrypted")
+            self.assertFalse(grammar.step_output_ok(audit.MACOS_PREPARE_STEP, marker, {}))
+
     def test_windows_policy_imports_without_unix_only_stdlib_modules(self):
         root = Path(__file__).resolve().parents[2]
         direct_scripts = (

@@ -1191,6 +1191,13 @@ class _Grammar:
                 return False
             seen.append(denial.group(0))
             return True
+        if line.startswith("macos_registry_rehearsal="):
+            if (self.job_runner != "macos-15" or step_name != MACOS_PREPARE_STEP
+                    or self.identity.get("platform") != "macos" or self.identity.get("profile") != "core-node"
+                    or line != "macos_registry_rehearsal=passed"):
+                return False
+            public_counts["macos_registry_rehearsal"] = public_counts.get("macos_registry_rehearsal", 0) + 1
+            return public_counts["macos_registry_rehearsal"] == 1
         if line.startswith("macos_dns_probe"):
             if (self.job_runner != "macos-15" or step_name != MACOS_PREPARE_STEP
                     or self.identity.get("platform") != "macos" or self.identity.get("profile") != "core-node"
@@ -2417,6 +2424,12 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
                     _refuse()
             if counts.get("decrypt_refusal_detail", 0) > 1:
                 _refuse()
+        if (grammar.job_runner == "macos-15" and identity.get("platform") == "macos"
+                and identity.get("profile") == "core-node"
+                and (early_failure is None or early_failure in (
+                    MACOS_SUPERVISOR_START_STEP, MACOS_PROBE_STEP, MACOS_EXECUTE_STEP))
+                and counts.get("macos_registry_rehearsal") != 1):
+            _refuse()
         cleanup_line = "cleanup_receipt=confirmed"
         cleanup_failure_receipts = counts.get("cleanup_receipt_failed", 0)
         prepare_cleanup_refusal = counts.get("windows_prepare_cleanup_refusal", 0)
