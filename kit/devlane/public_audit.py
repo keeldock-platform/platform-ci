@@ -1705,6 +1705,8 @@ def _hosted_preamble(lines, grammar, job_name, identity, workflow_path):
             for pattern, value in zip(image_patterns, runner_image)):
         _refuse()
     permissions = ["Metadata: read"]
+    if grammar.kind == "encrypted" and job_name == MACOS_RUN_JOB:
+        permissions = ["Contents: read", "Metadata: read"]
     if grammar.kind == "encrypted" and job_name == AUDIT_JOB:
         permissions = ["Actions: read", "Checks: read", "Metadata: read"]
     if group("GITHUB_TOKEN Permissions") != permissions:
@@ -2623,6 +2625,27 @@ def validate_job_contract(jobs, identity, profile, *, surface=None):
         _refuse()
     steps = _steps(run_job)
     expected_names = _expected_step_names(profile, identity)
+
+
+    workflow = parse_workflow(REPOSITORY_ROOT / (_legacy_encrypted_workflow_path(identity) or WORKFLOW_PATH))
+    setup_names = [step["name"] for step in workflow[active_name]["steps"]
+                   if step["uses"] and step["uses"].startswith("actions/setup-node@")]
+    post_names = ["Post " + name for name in reversed(setup_names)]
+    required_posts = ["Post " + name for name in reversed(setup_names)
+                      if any(step.get("name") == name and step.get("status") == "completed"
+                             and step.get("conclusion") != "skipped" for step in steps)]
+    post_steps = [step for step in steps if step.get("name") in post_names]
+    if [step.get("name") for step in post_steps] != required_posts:
+        _refuse()
+    if post_steps:
+        if ([step.get("name") for step in post_steps] != required_posts
+                or steps[-len(post_steps):] != post_steps):
+            _refuse()
+        for step in post_steps:
+            expected_post = "success" if run_job["conclusion"] == "success" else "skipped"
+            if step.get("status") != "completed" or step.get("conclusion") != expected_post:
+                _refuse()
+        steps = steps[:-len(post_steps)]
     if [step.get("name") for step in steps] != expected_names:
         _refuse()
     step_by_name = {step["name"]: step for step in steps}

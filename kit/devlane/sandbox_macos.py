@@ -4,6 +4,7 @@ import argparse
 import base64
 import hashlib
 import json
+import ipaddress
 import os
 from pathlib import Path
 import platform
@@ -29,6 +30,7 @@ import filter as output_filter
 import supervisor as linux_supervisor
 import refusal_codes
 import macos_denial_paths
+import registry_proxy
 
 WORKER_NAME_PREFIX = "kddevlane"
 WORKER_GROUP = 20
@@ -739,7 +741,40 @@ def _macos_node_runtime_read_roots(node):
     return roots
 
 
-def preparation_profile_text(*, project, prepared, cache, home, temporary, node, npm_cli, variant="base"):
+def _registry_addresses(values):
+    if not isinstance(values, (tuple, list)) or len(values) > 32:
+        _refuse("profile-config-invalid")
+    result = set()
+    for value in values:
+        if type(value) is not str:
+            _refuse("profile-config-invalid")
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError:
+            _refuse("profile-config-invalid")
+        if not address.is_global or address.is_multicast or address.is_reserved:
+            _refuse("profile-config-invalid")
+        result.add(str(address))
+    return tuple(sorted(result))
+
+
+def _resolve_registry():
+
+    script = ("import socket,json; print(json.dumps(sorted({r[4][0] for r in "
+              "socket.getaddrinfo('registry.npmjs.org',443,type=socket.SOCK_STREAM)})))")
+    code, stdout, stderr = _run((sys.executable, "-I", "-S", "-c", script),
+                                timeout=DNS_PROBE_TIMEOUT_SECONDS, capture_limit=4096)
+    try:
+        addresses = _registry_addresses(json.loads(stdout))
+    except (ValueError, TypeError):
+        _refuse("profile-config-invalid")
+    if code or stderr or not addresses:
+        _refuse("profile-config-invalid")
+    return addresses
+
+
+def preparation_profile_text(*, project, prepared, cache, home, temporary, node, npm_cli, variant="base",
+                             proxy_port=None, proxy_ca=None):
     if variant not in MACOS_DNS_VARIANTS:
         _refuse("profile-config-invalid")
     node_root = Path(node).parent
@@ -768,43 +803,15 @@ def preparation_profile_text(*, project, prepared, cache, home, temporary, node,
     writable = {str(project), str(prepared), str(cache), str(home), str(temporary)}
     lines = [
         "(version 1)", "(deny default)", "(allow process-fork)",
-        "(allow network-outbound)", "(deny network-inbound)",
-        '(allow mach-lookup (global-name "com.apple.dnssd.service"))',
+        "(deny network-inbound)",
         "(allow signal (target same-sandbox))", "(allow sysctl-read)",
     ]
-    variant_additions = {
-        "configd": (
-            '(allow mach-lookup (global-name "com.apple.SystemConfiguration.configd"))',
-        ),
-        "resolver-files": (
-            '(allow file-read* (literal "' + MACOS_PRIVATE_ROOT + '/etc/resolv.conf") '
-            '(literal "' + MACOS_PRIVATE_ROOT + '/var/run/resolv.conf") (literal "/etc/hosts") '
-            '(literal "' + MACOS_PRIVATE_ROOT + '/etc/services"))',
-            '(allow file-read* (subpath "/Library/Preferences/SystemConfiguration"))',
-        ),
-        "mdnsresponder-socket": (
-            "(allow system-socket (socket-domain AF_UNIX))",
-            '(allow network-outbound (remote unix-socket '
-            '(path-literal "' + MACOS_PRIVATE_ROOT + '/var/run/mDNSResponder")))',
-        ),
-        "networkd": (
-            '(allow mach-lookup (global-name "com.apple.networkd"))',
-            '(allow mach-lookup (global-name "com.apple.nesessionmanager"))',
-        ),
-        "dnsconfig": (
-            '(allow mach-lookup (global-name "com.apple.SystemConfiguration.DNSConfiguration"))',
-            '(allow mach-lookup (global-name "com.apple.SystemConfiguration.configd"))',
-            '(allow file-read-data (subpath "/System/Library/Frameworks/SystemConfiguration.framework"))',
-            '(allow file-read-metadata (subpath "/System/Library/Frameworks/SystemConfiguration.framework"))',
-            '(allow file-read-data (subpath "/usr/lib/system"))',
-            '(allow file-read-metadata (subpath "/usr/lib/system"))',
-        ),
-    }
-    if variant == "all":
-        for name in ("configd", "resolver-files", "mdnsresponder-socket", "networkd", "dnsconfig"):
-            lines.extend(variant_additions[name])
-    elif variant != "base":
-        lines.extend(variant_additions[variant])
+
+    if proxy_port is not None:
+        boundary_guard.proxy_rules_for_uid(501, proxy_port)
+        lines.append('(allow network-outbound (remote tcp "localhost:' + str(proxy_port) + '"))')
+    if proxy_ca is not None:
+        lines.append("(allow file-read* (literal " + _quote(proxy_ca) + "))")
     lines.extend("(allow process-exec (literal " + _quote(path) + "))" for path in sorted(executable))
     lines.extend("(allow file-read* (subpath " + _quote(path) + "))" for path in sorted(readable))
     lines.extend("(allow file-read* (literal " + _quote(str(path)) + "))" for path in sorted(ancestors))
@@ -882,16 +889,9 @@ def _collect_macos_sandbox_denials(pid, emitted, *, run_root=None):
 
 
 def _preparation_dns_probe(*, ident, profiles, cwd, env):
-    resolver_script = (
-        'const dns = require("node:dns"); '
-        'const timer = setTimeout(() => process.exit(1), '
-        + str(DNS_LOOKUP_TIMEOUT_MILLISECONDS)
-        + '); '
-        'dns.lookup("registry.npmjs.org", { all: true }, (error, addresses) => {'
-        ' clearTimeout(timer); process.exit(error || !addresses.length ? 1 : 0); });'
-    )
-    preparation_command = _npm_preparation_command(ident)
-    resolver_command = (preparation_command[0], "-e", resolver_script)
+
+    resolver_command = (ident["node"], ident["npm_cli"], "ping", "--fetch-retries=0",
+                        "--fetch-timeout=5000")
 
     def probe(command):
         try:
@@ -1084,47 +1084,70 @@ def _prepare(state, projection_path, output_path, profile, control_sha, deadline
     )
     for path in (project, prepared, cache, home, temporary):
         _chown_tree(path, ident["uid"], ident["gid"])
-    for variant, candidate_path in profile_paths.items():
-        candidate_path.write_text(preparation_profile_text(
-            project=project, prepared=prepared, cache=cache, home=home, temporary=temporary,
-            node=ident["node"], npm_cli=ident["npm_cli"], variant=variant,
-        ), encoding="utf-8")
-        os.chmod(candidate_path, 0o444)
-    env = _preparation_env(ident, home=home, temporary=temporary, cache=cache, prepared=prepared)
-    _unconfined, _confined, selected_variant = _preparation_dns_probe(
-        ident=ident, profiles=profile_paths, cwd=project, env=env,
-    )
-    profile_path = profile_paths[selected_variant]
-    timeout = min(3600, deadline_budget.remaining(deadline_file))
-    with log.open("xb") as output_log:
-        code = _run_preparation_process(
-            _npm_preparation_command(ident),
-            ident=ident, profile=profile_path, cwd=project, env=env, output=output_log, timeout=timeout,
+    addresses = _resolve_registry()
+    proxy = registry_proxy.RegistryProxy(root / "registry-proxy-private", addresses)
+    ca = root / "registry-proxy-ca.pem"
+    try:
+        with ca.open("xb") as ca_file:
+            ca_file.write(proxy.cert.read_bytes())
+        os.chmod(ca, 0o444)
+        for variant, candidate_path in profile_paths.items():
+            candidate_path.write_text(preparation_profile_text(
+                project=project, prepared=prepared, cache=cache, home=home, temporary=temporary,
+                node=ident["node"], npm_cli=ident["npm_cli"], variant=variant,
+                proxy_port=proxy.port, proxy_ca=ca,
+            ), encoding="utf-8")
+            os.chmod(candidate_path, 0o444)
+        _install_pf(state, ident, proxy_port=proxy.port)
+    except BaseException:
+        proxy.close()
+        raise
+    try:
+        env = _preparation_env(ident, home=home, temporary=temporary, cache=cache, prepared=prepared)
+        env.update(proxy.environment(ca))
+        _unconfined, _confined, selected_variant = _preparation_dns_probe(
+            ident=ident, profiles=profile_paths, cwd=project, env=env,
         )
-    if log.stat().st_size > MAX_LOG_BYTES:
-        _refuse("log-too-large")
-    if code != 0:
-        _refuse("npm-failed-" + _npm_preparation_error_class(log, code))
-    if projection["playwright"]:
-        candidates = (
-            project / "node_modules" / "playwright" / "cli.js",
-            project / "node_modules" / "@playwright" / "test" / "cli.js",
-        )
-        cli = next((path for path in candidates if path.is_file() and not path.is_symlink()), None)
-        if cli is None:
-            _refuse("prepared-input-invalid")
-        with log.open("ab") as output_log:
+        profile_path = profile_paths[selected_variant]
+        timeout = min(3600, deadline_budget.remaining(deadline_file))
+        with log.open("xb") as output_log:
             code = _run_preparation_process(
-                (ident["node"], cli, "install", *projection["playwright"]),
-                ident=ident, profile=profile_path, cwd=project, env=env, output=output_log,
-                timeout=min(1800, deadline_budget.remaining(deadline_file)),
+                _npm_preparation_command(ident),
+                ident=ident, profile=profile_path, cwd=project, env=env, output=output_log, timeout=timeout,
             )
         if log.stat().st_size > MAX_LOG_BYTES:
             _refuse("log-too-large")
         if code != 0:
-            _refuse("playwright-failed")
-        if not (prepared / "ms-playwright").is_dir():
-            _refuse("prepared-input-invalid")
+            _refuse("npm-failed-" + _npm_preparation_error_class(log, code))
+        if projection["playwright"]:
+            candidates = (
+                project / "node_modules" / "playwright" / "cli.js",
+                project / "node_modules" / "@playwright" / "test" / "cli.js",
+            )
+            cli = next((path for path in candidates if path.is_file() and not path.is_symlink()), None)
+            if cli is None:
+                _refuse("prepared-input-invalid")
+            with log.open("ab") as output_log:
+                code = _run_preparation_process(
+                    (ident["node"], cli, "install", *projection["playwright"]),
+                    ident=ident, profile=profile_path, cwd=project, env=env, output=output_log,
+                    timeout=min(1800, deadline_budget.remaining(deadline_file)),
+                )
+            if log.stat().st_size > MAX_LOG_BYTES:
+                _refuse("log-too-large")
+            if code != 0:
+                _refuse("playwright-failed")
+            if not (prepared / "ms-playwright").is_dir():
+                _refuse("prepared-input-invalid")
+    finally:
+        try:
+            _terminate_worker_processes(ident["uid"])
+        finally:
+            proxy.close()
+        preparation_guard, pf_record = _pf_guard_from_file(state, ident)
+        preparation_guard.close()
+        Path(pf_record["rules_file"]).unlink(missing_ok=True)
+        (state / PF_STATE_FILE).unlink()
     source_modules = project / "node_modules"
     if not source_modules.is_dir() or source_modules.is_symlink():
         _refuse("prepared-input-invalid")
@@ -1262,7 +1285,8 @@ def _chown_tree(root, uid, gid, *, readonly=False):
 def _pf_guard_from_file(state, ident):
     record = _read_json(state / PF_STATE_FILE, 8192)
     required = {"schema", "uid", "token", "rules_file", "host_identity", "loaded"}
-    if (type(record) is not dict or set(record) != required or record.get("schema") != 1
+    if (type(record) is not dict or set(record) not in (required, required | {"proxy_port"})
+            or record.get("schema") != 1
             or record.get("uid") != ident["uid"] or type(record.get("token")) is not str
             or not record["token"].isdecimal() or type(record.get("loaded")) is not bool):
         _refuse("firewall-unavailable")
@@ -1273,20 +1297,26 @@ def _pf_guard_from_file(state, ident):
         runner_image_os=boundary_guard.APPROVED_RUNNER_IMAGE_OS,
         image_version=host["image_version"], architecture=host["architecture"],
     )
-    guard = boundary_guard.PFGuard(ident["uid"], record["token"], boundary_guard._rules_for_uid(ident["uid"]),
+    port = record.get("proxy_port")
+    rules = (boundary_guard.proxy_rules_for_uid(ident["uid"], port) if port is not None
+             else boundary_guard._rules_for_uid(ident["uid"]))
+    guard = boundary_guard.PFGuard(ident["uid"], record["token"], rules,
                                    record["rules_file"], identity)
     guard._load_attempted = record["loaded"]
     return guard, record
 
 
-def _install_pf(state, ident):
+def _install_pf(state, ident, *, proxy_port=None):
     boundary_guard.PF_ANCHOR = ANCHOR_NAME
     rules_file = MACOS_ROOT_DIRECTORY + "/kd-devlane-pf-" + ident["run_id"] + ".rules"
     prior = {name: os.environ.get(name) for name in ("ImageOS", "ImageVersion")}
     os.environ["ImageOS"] = ident["host_identity"]["image_os"]
     os.environ["ImageVersion"] = ident["host_identity"]["image_version"]
     try:
-        guard = boundary_guard.install_pf(ident["uid"], rules_file)
+        if proxy_port is not None:
+            guard = boundary_guard.install_pf(ident["uid"], rules_file, proxy_port=proxy_port)
+        else:
+            guard = boundary_guard.install_pf(ident["uid"], rules_file)
     except boundary_guard.GuardError:
         _refuse("firewall-unavailable")
     finally:
@@ -1299,6 +1329,8 @@ def _install_pf(state, ident):
         "schema": 1, "uid": ident["uid"], "token": guard.token,
         "rules_file": str(guard.rules_file), "host_identity": ident["host_identity"], "loaded": True,
     }
+    if proxy_port is not None:
+        record["proxy_port"] = proxy_port
     try:
         _write_json(state / PF_STATE_FILE, record, mode=0o600)
         guard.verify()

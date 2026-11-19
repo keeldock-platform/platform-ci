@@ -275,3 +275,50 @@ The encrypted bundle request uses the existing schema 1 fields: repository, sour
 Preparation verifies the pinned Node archive, runs npm ci with lifecycle scripts disabled, and runs cargo vendor --locked from the sanitized Cargo projection. The offline command set runs Cargo format, clippy and tests with default and all features, npm typecheck and test, then scripts/build-edition.sh for minimal, git-only and all-tools-so-far. The runner installs the fixed Ubuntu Tauri prerequisites: WebKitGTK 4.1, the native build tools, curl, wget, file, xdo, OpenSSL, Ayatana appindicator and librsvg development packages.
 
 The desktop reference at the time of this procedure does not define npm typecheck or test scripts. Add and verify those scripts in the desktop repository before a rehearsal. A successful Linux rehearsal is required before any private desktop wave. Native encrypted execution on macOS and Windows remains a later design item.
+
+Native macOS registry confinement rehearsal
+
+The coordinator runs this on a fresh approved macOS runner after the normal
+macOS preflight, public projection validation, and deadline creation, before any
+preparation or supervisor start. Use a disposable run root and the existing
+preflight worker account. This is a separate rehearsal; it leaves an offline PF
+guard installed and must finish with normal `sandbox_macos.py cleanup` even if
+it fails. Do not reuse its state for dependency preparation.
+
+```sh
+python_bin="$(python3 -B -c 'import sys; print(sys.executable)')"
+sudo -n "$python_bin" -B kit/devlane/macos_registry_rehearsal.py \
+  --state-dir "$RUN_ROOT/state" --projection "$RUN_ROOT/projection.json" \
+  --control-sha "$CI_SHA" --deadline-file "$RUN_ROOT/deadline.json"
+
+```
+
+Require exit zero and `registry-rehearsal/result.json` with `result=passed`.
+Retain the generated SBPL, both PF rule sets, counters, npm-ci log, phase logs,
+and result before cleanup. These are rehearsal evidence, not encrypted-job
+public log grammar; do not inject this step into the audited encrypted workflow.
+The script does not dispatch CI or change workflow permissions.
+
+The checks include trusted positive controls, PF-only worker negatives, registry
+HTTPS and npm ci under the combined profile/PF boundary, direct pinned-IP TCP
+connections carrying another TLS identity, forbidden CONNECT authorities, wrong
+SNI and HTTP Host, unrelated destinations/ports, IPv4/IPv6 raw DNS against live
+controlled responders, shutdown of an established registry TLS connection, and
+new-connection denial after the offline cut. DNS port 53 must be free on both
+loopback families; unavailable controls abort the rehearsal instead of passing a
+timeout. Fresh npm cache and projection lock integrity force real registry fetches.
+No native enforcement claim is established until the coordinator runs this step.
+
+The registry rehearsal cut probe sends a complete worker HTTP request and uses a
+trusted rehearsal-only latch to withhold the final header CRLF on the verified
+upstream TLS socket. This keeps an actual upstream exchange pending independently
+of registry response speed. Readiness requires the upstream latch; shutdown must
+close both the upstream socket and worker TLS within the cut deadline. Evidence
+is recorded in `upstream-exchange.log` and `offline_active_upstream` in the result.
+
+The source-free `python3 -B kit/devlane/test_registry_proxy.py` suite is hermetic:
+it redirects only the trusted registry pin to a local TLS responder with a
+separate test CA, retains hostname/certificate verification, and rejects other
+test transport destinations. Its npm ping disables the npm update notifier;
+concurrent CONNECTs are tested separately with independent real TLS connections.
+Live-registry HTTPS and npm-ci checks belong only to the native rehearsal above.

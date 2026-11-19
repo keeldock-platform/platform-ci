@@ -1110,6 +1110,8 @@ class PublicTreeTests(unittest.TestCase):
             'kit/devlane/control_python.py',
             'kit/devlane/test_control_python.py',
         })
+        expected.update({'kit/devlane/macos_registry_rehearsal.py', 'kit/devlane/registry_proxy.py', 'kit/devlane/registry_rehearsal.cjs', 'kit/devlane/test_registry_proxy.py'})
+        expected.add('kit/devlane/test_macos_audit_posts.py')
         self.assertEqual(set(PINNED_FILE_SHA256), expected)
         self.assertTrue({name for name in expected if type(name) is str}.issubset(PLATFORM_FILES))
         self.assertIn(("platform", ".github/workflows/public-policy.yml"), expected)

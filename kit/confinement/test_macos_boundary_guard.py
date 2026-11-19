@@ -4,6 +4,7 @@ import os
 from contextlib import ExitStack
 from pathlib import Path
 import stat
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -52,6 +53,8 @@ class PFctlHarness:
         if not argv or argv[0] != boundary.PFCTL_PATH:
             raise AssertionError("unexpected executable")
         args = argv[1:]
+        if args[:2] == ("-o", "none"):
+            args = args[2:]
         if args == ("-E",):
             if self.rules_on_enable is not None:
                 self.rules = self.rules_on_enable
@@ -209,6 +212,49 @@ class PFGuardTests(unittest.TestCase):
 
     def _install(self):
         return boundary.install_pf(501, self.rules_path)
+
+    @unittest.skipUnless(Path(boundary.PFCTL_PATH).exists(), "native PF parser unavailable")
+    def test_registry_rules_match_native_pf_parser_without_loading(self):
+        rules = boundary.proxy_rules_for_uid(501, 38443)
+        self.rules_path.write_text("\n".join(rules) + "\n")
+        parsed = subprocess.run([boundary.PFCTL_PATH, "-n", "-o", "none", "-v", "-f", str(self.rules_path)],
+                                capture_output=True, timeout=10)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr.decode(errors="replace"))
+        self.assertEqual(boundary._rendered_rules(parsed.stdout), tuple(boundary._parse_rule(r) for r in rules))
+
+    def test_registry_preparation_guard_is_pinned_stateless_and_transitions_to_offline(self):
+        pins = ("104.16.24.34", "2606:4700::6810:1822")
+        guard = boundary.install_pf(501, self.rules_path, proxy_port=38443)
+        self.assertEqual(len(guard.verify()), 5)
+        self.assertTrue(any(command[1:3] == ("-o", "none") for command in self.pf.commands))
+        self.assertEqual(guard.rules[-4:], boundary._rules_for_uid(501))
+        self.assertTrue(all("port = 38443 user = 501 flags any no state" in r for r in guard.rules[:1]))
+        self.assertNotIn("53", "\n".join(guard.rules))
+        guard.close()
+        self.assertEqual(self.pf.rules, b"")
+        self.rules_path.unlink()
+        offline = self._install()
+        self.assertEqual(offline.rules, boundary._rules_for_uid(501))
+        self.assertEqual(len(offline.verify()), 4)
+        offline.close()
+
+    def test_registry_guard_refuses_widened_or_stateful_readback(self):
+        guard = boundary.install_pf(501, self.rules_path, proxy_port=38443)
+        original = self.pf.rules
+        for changed in (
+                original.replace(b"127.0.0.1", b"1.1.1.1"),
+                original.replace(b"port = 38443", b"port = 53"),
+                original.replace(b"no state", b"keep state"),
+                original.replace(b"proto tcp from", b"proto udp from"),
+                original.replace(b"user = 501 flags", b"user = 502 flags"),
+                original.split(b"\n", 1)[1],
+                original + original.split(b"\n", 1)[0] + b"\n"):
+            self.pf.rules = changed
+            with self.subTest(changed=changed), self.assertRaises(boundary.GuardError):
+                guard.verify()
+        self.pf.rules = original
+        guard.verify()
+        guard.close()
 
     def test_pf_enable_token_from_stderr_is_retained_and_cleanup_is_scoped(self):
         self.pf.token_in_stderr = True

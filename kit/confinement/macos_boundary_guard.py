@@ -284,11 +284,25 @@ def _rules_for_uid(uid):
     )
 
 
+def proxy_rules_for_uid(uid, port):
+    if type(uid) is not int or uid <= 0 or type(port) is not int or not 1024 <= port <= 65535:
+        raise GuardError("pf_rules_unexpected")
+    return ("pass out quick inet proto tcp from any to 127.0.0.1 port = " + str(port)
+            + " user = " + str(uid) + " flags any no state",) + _rules_for_uid(uid)
+
+
 def _parse_rule(line):
     normalized = " ".join(line.strip().split())
     match = _PF_RULE_PATTERN.fullmatch(normalized)
     if match is None:
-        raise GuardError("pf_rules_unexpected")
+        proxy = re.fullmatch(
+            r"pass out quick inet proto tcp from any to 127\.0\.0\.1 "
+            r"port = ([0-9]+) user (?:= )?([0-9]+)(?: flags any)? no state", normalized)
+        if proxy is None:
+            raise GuardError("pf_rules_unexpected")
+        port, uid = map(int, proxy.groups())
+        proxy_rules_for_uid(uid, port)
+        return ("registry-proxy", "inet", port, uid)
     family, protocol, uid_text = match.groups()
     return family, protocol, int(uid_text)
 
@@ -414,6 +428,10 @@ class PFGuard:
         self.uid = uid
         self.token = token
         self.rules = tuple(rules)
+        self.expected_keys = tuple(_parse_rule(rule) for rule in self.rules)
+        if (self.expected_keys[-4:] != _expected_rule_keys(uid)
+                or any(key[0] != "registry-proxy" or key[3] != uid for key in self.expected_keys[:-4])):
+            raise GuardError("pf_rules_unexpected")
         self.rules_file = Path(rules_file)
         self.identity = identity
         self.counters = None
@@ -429,11 +447,11 @@ class PFGuard:
             raise GuardError("pf_unavailable")
 
         rules, _ = _pfctl(("-a", PF_ANCHOR, "-sr"))
-        if _rendered_rules(rules) != _expected_rule_keys(self.uid):
+        if _rendered_rules(rules) != self.expected_keys:
             raise GuardError("pf_rules_unexpected")
 
         verbose, _ = _pfctl(("-a", PF_ANCHOR, "-vvsr"))
-        self.counters = _read_counters(verbose, _expected_rule_keys(self.uid))
+        self.counters = _read_counters(verbose, self.expected_keys)
         if require_hits:
             if self.counters is None or any(
                 evaluations == 0 or packets == 0
@@ -454,7 +472,7 @@ class PFGuard:
                 can_flush = True
             else:
                 current = _rendered_rules(remaining)
-                if self._load_attempted and current == _expected_rule_keys(self.uid):
+                if self._load_attempted and current == self.expected_keys:
                     can_flush = True
                 else:
                     failed = True
@@ -465,7 +483,7 @@ class PFGuard:
             try:
                 current, _ = _pfctl(("-a", PF_ANCHOR, "-sr"))
                 if current.strip():
-                    if _rendered_rules(current) == _expected_rule_keys(self.uid):
+                    if _rendered_rules(current) == self.expected_keys:
                         _pfctl(("-a", PF_ANCHOR, "-F", "rules"))
                     else:
                         failed = True
@@ -491,7 +509,7 @@ class PFGuard:
         self._closed = True
 
 
-def install_pf(uid, rules_file):
+def install_pf(uid, rules_file, *, proxy_port=None):
     """Install and verify only the dedicated probe anchor and its enable token."""
     identity = check_platform()
     if os.geteuid() != 0 or type(uid) is not int or uid <= 0 or uid > 2147483647:
@@ -502,6 +520,7 @@ def install_pf(uid, rules_file):
     existing, _ = _pfctl(("-a", PF_ANCHOR, "-sr"))
     if existing.strip():
         raise GuardError("pf_rules_unexpected")
+    rules = proxy_rules_for_uid(uid, proxy_port) if proxy_port is not None else _rules_for_uid(uid)
 
     enable = _run_command((PFCTL_PATH, "-E"))
     if enable.returncode != 0:
@@ -510,7 +529,6 @@ def install_pf(uid, rules_file):
     if token is None:
         raise GuardError("cleanup_incomplete")
 
-    rules = _rules_for_uid(uid)
     guard = PFGuard(uid, token, rules, rules_file, identity)
     try:
         if not _has_parent_anchor(_read_pf_config()) or not _has_live_parent_anchor():
@@ -521,7 +539,10 @@ def install_pf(uid, rules_file):
         rules_path = _write_rules_file(rules_file, rules)
         guard.rules_file = rules_path
         guard._load_attempted = True
-        _pfctl(("-a", PF_ANCHOR, "-f", str(rules_path)))
+
+
+        load_options = ("-o", "none") if proxy_port is not None else ()
+        _pfctl((*load_options, "-a", PF_ANCHOR, "-f", str(rules_path)))
         guard.verify()
         return guard
     except BaseException:

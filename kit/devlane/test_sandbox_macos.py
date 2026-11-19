@@ -573,6 +573,145 @@ class MacRoundOneRegressionTests(unittest.TestCase):
             with self.assertRaisesRegex(sandbox.Refusal, "macos-preflight-root-helper"):
                 sandbox._run_root_helper("root-identity", {"state_dir": PRIVATE_RUN + "/state"})
 
+    def test_prepare_keeps_pinned_firewall_until_failed_worker_is_reaped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            state = root / "state"
+            state.mkdir()
+            for name in ("preparation-home", "preparation-tmp"):
+                (root / name).mkdir()
+            ident = {"uid": os.getuid(), "gid": os.getgid(), "node": NODE or "/usr/bin/true",
+                     "npm_cli": "/opt/node/lib/node_modules/npm/bin/npm-cli.js"}
+            cert = root / "cert.pem"
+            cert.write_text("test certificate")
+            proxy = mock.Mock(port=38443, cert=cert)
+            proxy.environment.return_value = {"HTTPS_PROXY": "http://127.0.0.1:38443",
+                                              "NODE_EXTRA_CA_CERTS": str(root / "registry-proxy-ca.pem")}
+            events = []
+            proxy.close.side_effect = lambda: events.append("proxy-close")
+            guard = mock.Mock()
+            guard.close.side_effect = lambda: events.append("close")
+            rules = root / "pf.rules"
+            def install(*args, **kwargs):
+                self.assertEqual(kwargs["proxy_port"], 38443)
+                rules.touch()
+                (state / sandbox.PF_STATE_FILE).touch()
+                events.append("install")
+            def npm(*args, **kwargs):
+                self.assertEqual(events, ["install"])
+                self.assertEqual(kwargs["env"]["HTTPS_PROXY"], "http://127.0.0.1:38443")
+                self.assertTrue(Path(kwargs["env"]["NODE_EXTRA_CA_CERTS"]).is_file())
+                kwargs["output"].write(b"npm error code ENOTFOUND\n")
+                events.append("npm")
+                return 1
+            with mock.patch.object(sandbox.os, "geteuid", return_value=0), \
+                    mock.patch.object(sandbox, "_identity", return_value=ident), \
+                    mock.patch.object(sandbox, "_validate_prepare_run_root"), \
+                    mock.patch.object(sandbox, "_validate_projection_file", return_value={
+                        "npm_package": {}, "npm_lock": {}, "playwright": []}), \
+                    mock.patch.object(sandbox, "_prepare_output_path", return_value=root / "prepared"), \
+                    mock.patch.object(sandbox, "_chown_tree"), \
+                    mock.patch.object(sandbox, "_resolve_registry", return_value=("104.16.24.34",)), \
+                    mock.patch.object(sandbox.registry_proxy, "RegistryProxy", return_value=proxy), \
+                    mock.patch.object(sandbox, "_install_pf", side_effect=install), \
+                    mock.patch.object(sandbox, "_pf_guard_from_file", return_value=(guard, {"rules_file": str(rules)})), \
+                    mock.patch.object(sandbox, "_preparation_dns_probe", return_value=("ok", "ok", "base")), \
+                    mock.patch.object(sandbox, "_run_preparation_process", side_effect=npm), \
+                    mock.patch.object(sandbox, "_terminate_worker_processes", side_effect=lambda uid: events.append("reap")), \
+                    mock.patch.object(sandbox.deadline_budget, "remaining", return_value=100):
+                with self.assertRaisesRegex(sandbox.Refusal, "npm-failed-ENOTFOUND"):
+                    sandbox._prepare(state, root / "projection.json", root / "prepared", "core-node", "a"*40,
+                                     root / "deadline.json")
+            self.assertEqual(events, ["install", "npm", "reap", "proxy-close", "close"])
+            self.assertFalse((state / sandbox.PF_STATE_FILE).exists())
+            self.assertFalse(rules.exists())
+
+    def test_prepare_success_publishes_readonly_modules_and_completes_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            state = root / "state"
+            state.mkdir()
+            for name in ("preparation-home", "preparation-tmp"):
+                (root / name).mkdir()
+            ident = {"uid": os.getuid(), "gid": os.getgid(), "node": NODE or "/usr/bin/true",
+                     "npm_cli": "/opt/node/lib/node_modules/npm/bin/npm-cli.js"}
+            cert = root / "cert.pem"
+            cert.write_text("test certificate")
+            proxy = mock.Mock(port=38443, cert=cert)
+            proxy.environment.return_value = {"HTTPS_PROXY": "http://127.0.0.1:38443",
+                                              "NODE_EXTRA_CA_CERTS": str(root / "registry-proxy-ca.pem")}
+            events = []
+            proxy.close.side_effect = lambda: events.append("proxy-close")
+            guard = mock.Mock()
+            guard.close.side_effect = lambda: events.append("close")
+            rules = root / "pf.rules"
+            def install(*args, **kwargs):
+                self.assertEqual(kwargs["proxy_port"], 38443)
+                rules.touch()
+                (state / sandbox.PF_STATE_FILE).touch()
+                events.append("install")
+            def npm(*args, **kwargs):
+                self.assertEqual(events, ["install"])
+                self.assertEqual(kwargs["env"]["HTTPS_PROXY"], "http://127.0.0.1:38443")
+                self.assertTrue(Path(kwargs["env"]["NODE_EXTRA_CA_CERTS"]).is_file())
+                modules = kwargs["cwd"] / "node_modules"
+                modules.mkdir()
+                (modules / "fixture.js").write_text("module.exports = 42;\n")
+                events.append("npm")
+                return 0
+            with mock.patch.object(sandbox.os, "geteuid", return_value=0), \
+                    mock.patch.object(sandbox, "_identity", return_value=ident), \
+                    mock.patch.object(sandbox, "_validate_prepare_run_root"), \
+                    mock.patch.object(sandbox, "_validate_projection_file", return_value={
+                        "npm_package": {}, "npm_lock": {}, "playwright": []}), \
+                    mock.patch.object(sandbox, "_prepare_output_path", return_value=root / "prepared"), \
+                    mock.patch.object(sandbox, "_chown_tree"), \
+                    mock.patch.object(sandbox, "_resolve_registry", return_value=("104.16.24.34",)), \
+                    mock.patch.object(sandbox.registry_proxy, "RegistryProxy", return_value=proxy), \
+                    mock.patch.object(sandbox, "_install_pf", side_effect=install), \
+                    mock.patch.object(sandbox, "_pf_guard_from_file", return_value=(guard, {"rules_file": str(rules)})), \
+                    mock.patch.object(sandbox, "_preparation_dns_probe", return_value=("ok", "ok", "base")), \
+                    mock.patch.object(sandbox, "_run_preparation_process", side_effect=npm), \
+                    mock.patch.object(sandbox, "_terminate_worker_processes", side_effect=lambda uid: events.append("reap")), \
+                    mock.patch.object(sandbox.deadline_budget, "remaining", return_value=100):
+                with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                    sandbox._prepare(state, root / "projection.json", root / "prepared", "core-node", "a"*40,
+                                     root / "deadline.json")
+            self.assertEqual(events, ["install", "npm", "reap", "proxy-close", "close"])
+            self.assertFalse((state / sandbox.PF_STATE_FILE).exists())
+            self.assertFalse(rules.exists())
+
+            self.assertEqual(stdout.getvalue(), "dependency_preparation=complete\n")
+            prepared = root / "prepared"
+            self.assertEqual((prepared / "node_modules/fixture.js").read_text(), "module.exports = 42;\n")
+            self.assertEqual(json.loads((prepared / "projection.json").read_text()),
+                             {"npm_package": {}, "npm_lock": {}, "playwright": []})
+            for path in prepared.rglob("*"):
+                self.assertEqual(path.stat().st_mode & 0o222, 0)
+            for name in ("preparation-project", "preparation-npm-cache", "preparation-home",
+                         "preparation-tmp", "preparation.log"):
+                self.assertFalse((root / name).exists(), name)
+            for variant in sandbox.MACOS_DNS_VARIANTS:
+                self.assertFalse((root / ("preparation-" + variant + ".sb")).exists())
+            for path in (prepared, prepared / "node_modules"):
+                path.chmod(0o700)
+
+    def test_registry_pins_reject_non_public_or_injected_destinations(self):
+        for values in (["127.0.0.1"], ["192.168.1.1"], ["::1"], ["224.0.0.1"], ["ff02::1"], [123], ["1.1.1.1:53"],
+                       ['1.1.1.1") (allow network*)'], ["104.16.24.34"] * 33):
+            with self.subTest(values=values), self.assertRaises(sandbox.Refusal):
+                sandbox._registry_addresses(values)
+
+    def test_registry_resolver_is_fixed_bounded_and_fail_closed(self):
+        with mock.patch.object(sandbox, "_run", return_value=(0, b'["104.16.24.34"]', b"")) as run:
+            self.assertEqual(sandbox._resolve_registry(), ("104.16.24.34",))
+        self.assertIn("registry.npmjs.org", run.call_args.args[0][-1])
+        self.assertEqual(run.call_args.kwargs["timeout"], sandbox.DNS_PROBE_TIMEOUT_SECONDS)
+        for response in ((0, b'[]', b''), (1, b'[]', b''), (0, b'["127.0.0.1"]', b''),
+                         (0, b'null', b''), (0, b'garbage', b'')):
+            with mock.patch.object(sandbox, "_run", return_value=response), self.assertRaises(sandbox.Refusal):
+                sandbox._resolve_registry()
+
     def test_dependency_preparation_is_unprivileged_and_network_outbound_only(self):
         profile = sandbox.preparation_profile_text(
             project=PRIVATE_RUN + "/preparation-project", prepared=PRIVATE_RUN + "/prepared",
@@ -580,43 +719,34 @@ class MacRoundOneRegressionTests(unittest.TestCase):
             node="/opt/node/bin/node", npm_cli="/opt/node/lib/node_modules/npm/bin/npm-cli.js",
         )
         self.assertIn("(deny default)", profile)
-        self.assertIn("(allow network-outbound)", profile)
-        self.assertIn("(allow sysctl-read)", profile)
+        self.assertNotIn("(allow network-outbound)", profile)
         self.assertIn("(deny network-inbound)", profile)
+        self.assertNotIn("mach-lookup", profile)
+        self.assertIn("(allow sysctl-read)", profile)
         self.assertNotIn("(allow network*)", profile)
-        self.assertIn('(allow mach-lookup (global-name "com.apple.dnssd.service"))', profile)
-        self.assertNotIn("com.apple.SystemConfiguration.configd", profile)
-        self.assertNotIn("mDNSResponder", profile)
         self.assertIn('(allow file-read* (literal "/opt"))', profile)
-        self.assertNotIn('(allow file-read-metadata (literal "/opt"))', profile)
         self.assertIn('(allow file-write* (subpath "' + PRIVATE_RUN + '/cache")', profile)
         self.assertNotIn('(allow file-write* (subpath "/Users")', profile)
         self.assertIn('(allow process-exec (literal "/usr/bin/xcrun"))', profile)
         self.assertIn('(allow file-read* (subpath "' + sandbox.CLT_DEVELOPER_DIRECTORY + '"))', profile)
-        variants = {
-            name: sandbox.preparation_profile_text(
-                project=PRIVATE_RUN + "/preparation-project", prepared=PRIVATE_RUN + "/prepared",
+        self.assertNotIn("remote tcp", profile)
+        for variant in sandbox.MACOS_DNS_VARIANTS:
+            pinned = sandbox.preparation_profile_text(
+                project=PRIVATE_RUN + "/project", prepared=PRIVATE_RUN + "/prepared",
                 cache=PRIVATE_RUN + "/cache", home=PRIVATE_RUN + "/home", temporary=PRIVATE_RUN + "/tmp",
-                node="/opt/node/bin/node", npm_cli="/opt/node/lib/node_modules/npm/bin/npm-cli.js", variant=name,
+                node="/opt/node/bin/node", npm_cli="/opt/node/lib/node_modules/npm/bin/npm-cli.js",
+                variant=variant, proxy_port=38443,
+                proxy_ca=PRIVATE_RUN + "/registry-proxy-ca.pem",
             )
-            for name in sandbox.MACOS_DNS_VARIANTS
-        }
-        self.assertIn("com.apple.SystemConfiguration.configd", variants["configd"])
-        private_root = chr(47) + "private"
-        self.assertIn(private_root + "/etc/resolv.conf", variants["resolver-files"])
-        self.assertIn('/Library/Preferences/SystemConfiguration', variants["resolver-files"])
-        self.assertIn("(socket-domain AF_UNIX)", variants["mdnsresponder-socket"])
-        self.assertIn('(remote unix-socket (path-literal "' + private_root + '/var/run/mDNSResponder"))',
-                      variants["mdnsresponder-socket"])
-        self.assertIn("com.apple.networkd", variants["networkd"])
-        self.assertIn("com.apple.nesessionmanager", variants["networkd"])
-        self.assertIn("com.apple.SystemConfiguration.DNSConfiguration", variants["dnsconfig"])
-        self.assertIn("com.apple.SystemConfiguration.configd", variants["dnsconfig"])
-        self.assertIn("SystemConfiguration.framework", variants["dnsconfig"])
-        self.assertIn('(allow file-read-data (subpath "/usr/lib/system"))', variants["dnsconfig"])
-        self.assertIn("com.apple.SystemConfiguration.configd", variants["all"])
-        self.assertIn("com.apple.SystemConfiguration.DNSConfiguration", variants["all"])
-        self.assertIn("com.apple.nesessionmanager", variants["all"])
+            self.assertIn('(remote tcp "localhost:38443")', pinned)
+            rules = sandbox.boundary_guard.proxy_rules_for_uid(501, 38443)
+            self.assertEqual(len(rules), 5)
+            self.assertIn("to 127.0.0.1 port = 38443 user = 501 flags any no state", rules[0])
+            self.assertEqual(rules[-4:], sandbox.boundary_guard._rules_for_uid(501))
+            self.assertNotIn("mach-lookup", pinned)
+            self.assertNotIn("remote udp", pinned)
+            self.assertNotIn("(allow network-outbound)", pinned)
+            self.assertIn('(literal "' + PRIVATE_RUN + '/registry-proxy-ca.pem")', pinned)
         with self.assertRaisesRegex(sandbox.Refusal, "profile-config-invalid"):
             sandbox.preparation_profile_text(
                 project=PRIVATE_RUN + "/preparation-project", prepared=PRIVATE_RUN + "/prepared",
@@ -703,8 +833,8 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         self.assertEqual(denials.call_count, 5)
         unconfined = spawn.call_args_list[0].args[0]
         self.assertEqual(unconfined[0], sandbox._npm_preparation_command(ident)[0])
-        self.assertEqual(unconfined[:2], ("/opt/node/bin/node", "-e"))
-        self.assertIn('"registry.npmjs.org"', unconfined[2])
+        self.assertEqual(unconfined[:2], (ident["node"], ident["npm_cli"]))
+        self.assertEqual(unconfined[2], "ping")
         for variant, call in zip(sandbox.MACOS_DNS_VARIANTS, spawn.call_args_list[1:]):
             confined = call.args[0]
             self.assertEqual(confined[:3], ("/usr/bin/sandbox-exec", "-f", str(profiles[variant])))
