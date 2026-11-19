@@ -15,6 +15,30 @@ def main():
     if sys.platform != 'win32':
         print('experiment_diagnostics=macos native-path-required')
         return 0
+    import unittest
+    from unittest import mock
+    import contextlib
+    import io
+    import test_windows_sandbox
+    methods=['test_icacls_native_status_survives_formatter','test_quiescence_catch_preserves_runtime_cause']
+    baseline_suite=unittest.TestSuite(test_windows_sandbox.NativeFailurePreservationTests(name) for name in methods)
+    read_text=Path.read_text
+    def before_read(path, *args, **kwargs):
+        text=read_text(path,*args,**kwargs)
+        if path.name=='sandbox_windows.ps1':
+            text=text.replace("throw [Runtime.InteropServices.COMException]::new('icacls-native', [int]$LASTEXITCODE)", 'throw')
+        if path.name=='sandbox_windows_native.cs':
+            text=text.replace('new InvalidOperationException("cleanup_processes", error)', 'new InvalidOperationException("cleanup_processes")')
+        return text
+    with mock.patch.object(Path,'read_text',new=before_read):
+        before=unittest.TextTestRunner(stream=io.StringIO()).run(baseline_suite)
+    if len(before.failures)!=2 or before.errors:
+        print('experiment_native_before=unexpected');return 1
+    print('experiment_native_before=expected-refusal')
+    after=unittest.TextTestRunner(stream=io.StringIO()).run(unittest.TestSuite(test_windows_sandbox.NativeFailurePreservationTests(name) for name in methods))
+    if not after.wasSuccessful():
+        print('experiment_native_after=failed');return 1
+    print('experiment_native_after=passed')
     ps = (ROOT / 'sandbox_windows.ps1').read_text()
     serializer = re.search(r'        function Save-State \{.*?\n        \}', ps, re.S).group()
     formatter = re.search(r'function Write-BoundaryFailure.*?\n\}', ps, re.S).group()
