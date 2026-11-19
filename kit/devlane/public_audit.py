@@ -1005,6 +1005,13 @@ class _Grammar:
 
     def step_output_ok(self, step_name, line, public_counts):
         """Fixed output lines, each bound to the step that is allowed to print it."""
+        if line.startswith("macos_diagnostic"):
+            try:
+                record = refusal_codes.parse_macos_diagnostic(line)
+            except (ValueError, TypeError, KeyError):
+                return False
+            return (self.job_runner == "macos-15" and step_name == (
+                MACOS_PROBE_STEP if record["kind"] == "probe" else MACOS_CLEANUP_STEP))
         step = next((item for item in self.steps if item["name"] == step_name), None)
         uses = (step or {}).get("uses") or ""
         launcher_phase = re.fullmatch(r"windows_launcher_phase=([a-z-]+)", line)
@@ -2110,6 +2117,28 @@ def _canonicalize_github_hosted_log(text, grammar, job_name, identity, workflow_
     return "\n".join(canonical) + "\n"
 
 
+def collect_macos_diagnostics(log):
+    """Independent closed-schema salvage even when the full log audit refuses.
+
+    Caller binds the job to the exact run first. No other log bytes are retained.
+    """
+    if type(log) is not bytes or len(log) > MAX_LOG_BYTES:
+        _refuse()
+    records = []
+    for row in log.splitlines():
+        row = TIME_PREFIX_BYTES.sub(b"", row, count=1)
+        if row.startswith(b"macos_diagnostic"):
+            try:
+                line = row.decode("ascii", "strict")
+                refusal_codes.parse_macos_diagnostic(line)
+            except (ValueError, TypeError, KeyError, UnicodeDecodeError):
+                _refuse()
+            records.append(row)
+    if len(records) > 128 or sum(len(row) + 1 for row in records) > 65536:
+        _refuse()
+    return records
+
+
 def validate_job_log_surface(log, job_name, identity, *, completed=True, workflow=None, failed_acceptance=False):
     """Closed contract for an encrypted-lane job log.
 
@@ -2140,6 +2169,7 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         diagnostic = TIME_PREFIX.sub("", raw_line, count=1)
         if diagnostic.startswith("devlane_audit_diagnostic") and diagnostic not in AUDIT_DIAGNOSTIC_LINES:
             _refuse()
+    collect_macos_diagnostics(log)
     kind = "synthetic" if workflow == "synthetic" else "encrypted"
     legacy_workflow = (_legacy_encrypted_workflow_path(identity) if kind == "encrypted"
                        else _legacy_synthetic_workflow_path(identity))

@@ -381,3 +381,64 @@ def _startup_exception_code(phase, error):
     trusted_phase = phase if phase in STARTUP_DIAGNOSTIC_PHASES else "serve"
     label = _STARTUP_EXCEPTION_LABELS.get(type(error), "unclassified")
     return "child-" + trusted_phase + "-" + label
+
+
+MACOS_PROBE_CHECKS = frozenset((
+    "inside_write", "scratch_report_read", "raw_log_read", "outside_write", "outside_read",
+    "other_home_read", "keychain_read", "private_folders_read", "ipv4_network", "ipv6_network",
+    "loopback_network", "udp4_network", "udp6_network", "detached_spawned",
+    "detached_marker_write", "detached_marker_unlink", "exit", "stderr", "timeout",
+    "canary", "detached_absent", "result_schema", "setup", "quiescence", "canary_unlink",
+))
+MACOS_RESIDUE_CLASSES = frozenset((
+    "worker-home", "scratch", "gateway-dir", "crypto-deps", "npm-cache",
+    "keychain-account-record", "run-tree", "firewall",
+))
+MACOS_ERRNO_CLASSES = frozenset((
+    "none", "permission", "busy", "readonly", "missing", "io", "other", "refusal", "unknown",
+))
+MACOS_CLEANUP_REASONS = frozenset((
+    "clear", "residue", "remove-failed", "worker-quiescence-failed", "open-holder",
+    "holder-inventory-failed", "firewall-close-failed", "account-delete-failed",
+    "account-remains", "account-check-failed",
+))
+MACOS_PROCESS_CLASSES = frozenset(("none", "node", "python", "shell", "other", "unknown"))
+
+
+def macos_diagnostic_valid(value):
+    if type(value) is not dict or value.get("schema") != "macos-diagnostic-v1":
+        return False
+    if value.get("kind") == "probe":
+        return (set(value) == {"schema", "kind", "check", "result", "exit"}
+                and value["check"] in MACOS_PROBE_CHECKS
+                and value["result"] in ("pass", "fail", "missing", "empty", "permission", "other", "timeout")
+                and (type(value["exit"]) is int and -255 <= value["exit"] <= 255
+                     or value["exit"] == "unavailable"))
+    if value.get("kind") == "cleanup":
+        return (set(value) == {"schema", "kind", "path_class", "entries", "errno", "process", "reason"}
+                and value["path_class"] in MACOS_RESIDUE_CLASSES
+                and type(value["entries"]) is int and 0 <= value["entries"] <= 2147483647
+                and value["reason"] in MACOS_CLEANUP_REASONS
+                and value["errno"] in MACOS_ERRNO_CLASSES
+                and value["process"] in MACOS_PROCESS_CLASSES)
+    return False
+
+
+def macos_diagnostic_line(value):
+    try:
+        valid = macos_diagnostic_valid(value)
+    except (TypeError, KeyError):
+        valid = False
+    if not valid:
+        raise ValueError("macos-diagnostic-schema")
+    return "macos_diagnostic=" + json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def parse_macos_diagnostic(line):
+    prefix = "macos_diagnostic="
+    if type(line) is not str or not line.startswith(prefix) or len(line) > 512:
+        raise ValueError("macos-diagnostic-schema")
+    value = json.loads(line[len(prefix):])
+    if macos_diagnostic_line(value) != line:
+        raise ValueError("macos-diagnostic-schema")
+    return value

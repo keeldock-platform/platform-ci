@@ -390,7 +390,7 @@ class RunLifecycleTests(unittest.TestCase):
             run = {"id": 54321, "path": coordinator.fetch.WORKFLOW_PATH, "head_branch": "main",
                    "head_sha": CONTROL_SHA, "event": "workflow_dispatch", "run_attempt": 1}
             response = {"total_count": 4, "jobs": [
-                {"name": "run"}, {"name": "macos"}, {"name": "windows"}, {"name": "audit"},
+                {"name": "run"}, {"name": coordinator.public_audit.MACOS_RUN_JOB, "id": 42}, {"name": "windows"}, {"name": "audit"},
             ]}
             observed = {}
 
@@ -402,10 +402,34 @@ class RunLifecycleTests(unittest.TestCase):
                     mock.patch.object(coordinator, "_verify_wave_marker"), \
                     mock.patch.object(coordinator.public_audit, "validate_final_public_surfaces", side_effect=validate), \
                     mock.patch.object(coordinator, "_preserve_diagnostics") as preserve, \
+                    mock.patch.object(coordinator.public_audit.GitHubAPI, "log_text", return_value=b""), \
                     mock.patch.object(coordinator, "_cli_token", return_value="opaque"):
                 self.assertEqual(coordinator._terminal_audit_disposition("54321", record, run, ledger), "accepted")
             self.assertEqual(observed["platform"], "macos")
-            preserve.assert_called_once_with(ledger, record, [])
+            self.assertEqual(preserve.call_args_list, [mock.call(ledger, record, [], namespace="macos-diagnostics"),
+                                                       mock.call(ledger, record, [])])
+
+    def test_macos_diagnostics_survive_full_audit_refusal_and_preserve_failure_holds_deletion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = self._ledger(temporary)
+            record = _ledger_record(state="run-attached")
+            record["platform"] = "macos"
+            run = {"id": 54321, "path": coordinator.fetch.WORKFLOW_PATH, "head_branch": "main",
+                   "head_sha": CONTROL_SHA, "event": "workflow_dispatch", "run_attempt": 1}
+            row = coordinator.public_audit.refusal_codes.macos_diagnostic_line({
+                "schema": "macos-diagnostic-v1", "kind": "cleanup", "path_class": "scratch",
+                "entries": 2, "errno": "busy", "process": "node", "reason": "open-holder"}).encode()
+            response = {"total_count": 4, "jobs": [{"name": coordinator.public_audit.MACOS_RUN_JOB, "id": 42}]}
+            with mock.patch.object(coordinator, "_gh_json", return_value=response), \
+                    mock.patch.object(coordinator, "_cli_token", return_value="opaque"), \
+                    mock.patch.object(coordinator.public_audit.GitHubAPI, "log_text", return_value=b"private source\n" + row), \
+                    mock.patch.object(coordinator.public_audit, "validate_final_public_surfaces", side_effect=ValueError):
+                self.assertEqual(coordinator._terminal_audit_disposition("54321", record, run, ledger), "refused")
+                target = ledger / ("macos-diagnostics-" + record["wave_id"] + ".jsonl")
+                self.assertEqual(target.read_bytes(), row + b"\n")
+                self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+                with mock.patch.object(coordinator, "_preserve_diagnostics", side_effect=OSError):
+                    self.assertEqual(coordinator._terminal_audit_disposition("54321", record, run, ledger), "preserve-failed")
 
     def test_terminal_audit_preserves_the_historical_two_job_count_only_for_legacy_identity(self):
         with tempfile.TemporaryDirectory() as temporary:

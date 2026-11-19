@@ -24,6 +24,7 @@ import fetch
 import control_audit
 import permit
 import public_audit
+import refusal_codes
 import source_admission
 
 
@@ -1066,11 +1067,18 @@ def wait_control_run(ledger, control_wave_id, poll_seconds=10, *, sleep=time.sle
         sleep(min(poll_seconds, max(1, record["reconcile_deadline_at"] - int(clock()))))
 
 
-def _preserve_diagnostics(root, record, records):
+def _preserve_diagnostics(root, record, records, *, namespace="diagnostics"):
     """Keep the validated public records in the private ledger before the logs are deleted."""
     if root is None:
         return None
-    target = Path(root) / ("diagnostics-" + record["wave_id"] + ".jsonl")
+    if namespace not in ("diagnostics", "macos-diagnostics"):
+        _fail("diagnostics-namespace")
+    target = Path(root) / (namespace + "-" + record["wave_id"] + ".jsonl")
+    if namespace == "macos-diagnostics":
+        if len(records) > 128:
+            _fail("diagnostics-size")
+        for line in records:
+            refusal_codes.parse_macos_diagnostic(line.decode("ascii", "strict"))
     payload = b"".join(line + b"\n" for line in records)
     if len(payload) > 64 * 1024:
         _fail("diagnostics-size")
@@ -1081,6 +1089,11 @@ def _preserve_diagnostics(root, record, records):
         output.flush()
         os.fsync(output.fileno())
     os.replace(temporary, target)
+    descriptor = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
     return target.name
 
 
@@ -1100,6 +1113,17 @@ def _terminal_audit_disposition(run_id, record, run, root=None):
                     "profile": record["profile"], "platform": record["platform"],
                     "wave_id": record["wave_id"],
                     "bundle_id": record["bundle_id"], "cache_baseline_sha256": record["cache_baseline_sha256"]}
+        if record["platform"] == "macos":
+            active = [job for job in jobs if type(job) is dict
+                      and job.get("name") == public_audit.MACOS_RUN_JOB]
+            if len(active) != 1 or type(active[0].get("id")) is not int or active[0]["id"] <= 0:
+                return "refused"
+            raw = public_audit.GitHubAPI(_cli_token()).log_text(active[0]["id"])
+            safe = public_audit.collect_macos_diagnostics(raw)
+            try:
+                _preserve_diagnostics(root, record, safe, namespace="macos-diagnostics")
+            except Exception:
+                return "preserve-failed"
         public = public_audit.validate_final_public_surfaces(
             public_audit.GitHubAPI(_cli_token()), jobs, identity, record["profile"],
         )

@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import errno
 import hashlib
 import json
 import ipaddress
@@ -1563,6 +1564,13 @@ def _validate_profile(state, worker):
         _refuse("profile-config-invalid")
 
 
+def _probe_diagnostic(check, result, code="unavailable"):
+    print(refusal_codes.macos_diagnostic_line({
+        "schema": "macos-diagnostic-v1", "kind": "probe", "check": check,
+        "result": result, "exit": code if type(code) is int and -255 <= code <= 255 else "unavailable",
+    }), flush=True)
+
+
 def _deny_probe_script():
     return (
         "const fs=require('node:fs');const net=require('node:net');const dgram=require('node:dgram');"
@@ -1589,6 +1597,10 @@ def _deny_probe_script():
         "try{s.close();}catch{}resolve(value);};const s=dgram.createSocket(kind);s.on('error',e=>finish(denied(e)));"
         "s.send(Buffer.from('probe'),9,address,e=>finish(e?denied(e):false));"
         "setTimeout(()=>finish(false),700);});"
+        "try{fs.writeFileSync(detached,'control');result.detached_marker_write=true;}"
+        "catch{result.detached_marker_write=false;}"
+        "try{fs.unlinkSync(detached);result.detached_marker_unlink=true;}"
+        "catch{result.detached_marker_unlink=false;}"
         "try{child.spawn(process.execPath,['-e',\"setTimeout(()=>require('node:fs').writeFileSync(process.argv[1],'alive'),1200)\",detached],"
         "{detached:true,stdio:'ignore'}).unref();result.detached_spawned=true;}catch{result.detached_spawned=false;}"
         "Promise.all([tcp('192.0.2.1',4),tcp('2001:db8::1',6),tcp('127.0.0.1',4),"
@@ -1607,9 +1619,10 @@ def _deny_probe(state, worker, ident):
                     + ident["run_id"] + "/T/probe-file")
     outside_dir = root / "outside-canary-dir"
     outside = outside_dir / "outside-canary"
-    detached = Path(worker["scratch"]) / "detached-probe-marker"
+    detached = Path(worker["scratch"]) / "tmp" / "detached-probe-marker"
     raw_canary = Path(worker["scratch"]) / "raw" / "probe.log"
     if any(item.exists() or item.is_symlink() for item in (outside_dir, detached, raw_canary)):
+        _probe_diagnostic("setup", "fail")
         _refuse("positive-control-failed")
     outside_dir.mkdir(mode=0o700)
     outside.write_bytes(b"outside-canary")
@@ -1623,34 +1636,68 @@ def _deny_probe(state, worker, ident):
     command = ("/usr/bin/sandbox-exec", "-f", str(path), worker["node"], "-e", script,
                worker["scratch"], str(outside), fake_user, fake_keychain, fake_folders,
                str(detached), str(raw_canary))
-    code, stdout, stderr = _run(
-        command, env={"PATH": "/usr/bin:/bin", "HOME": ident["home"], "TMPDIR": worker["scratch"], "LC_ALL": "C"},
-        user=worker["worker_uid"], group=worker["worker_gid"], timeout=20, capture_limit=4096,
-    )
-    _terminate_worker_processes(worker["worker_uid"])
+    try:
+        code, stdout, stderr = _run(
+            command, env={"PATH": "/usr/bin:/bin", "HOME": ident["home"], "TMPDIR": worker["scratch"], "LC_ALL": "C"},
+            user=worker["worker_uid"], group=worker["worker_gid"], timeout=20, capture_limit=4096,
+        )
+    except Refusal as error:
+        _probe_diagnostic("timeout", "timeout" if str(error) == "total-deadline-exhausted" else "fail")
+        _probe_diagnostic("exit", "missing")
+        for check in sorted(refusal_codes.MACOS_PROBE_CHECKS - {"timeout", "exit"}):
+            _probe_diagnostic(check, "missing")
+        raise
+    _probe_diagnostic("timeout", "pass", code)
+    _probe_diagnostic("exit", "pass" if code == 0 else "fail", code)
+    stderr_class = "empty" if not stderr else "permission" if any(
+        token in stderr for token in (b"Operation not permitted", b"Permission denied", b"EPERM", b"EACCES")
+    ) else "other"
+    _probe_diagnostic("stderr", stderr_class, code)
+    try:
+        _terminate_worker_processes(worker["worker_uid"])
+    except Refusal:
+        _probe_diagnostic("quiescence", "fail", code)
+        for check in sorted(refusal_codes.MACOS_PROBE_CHECKS - {"timeout", "exit", "stderr", "quiescence"}):
+            _probe_diagnostic(check, "missing", code)
+        raise
+    _probe_diagnostic("quiescence", "pass", code)
     time.sleep(1.3)
     try:
         row = [line[len(b"KD-SBPL:"):] for line in stdout.splitlines() if line.startswith(b"KD-SBPL:")]
         result = json.loads(row[0].decode("ascii")) if len(row) == 1 else None
     except (ValueError, UnicodeDecodeError):
         result = None
-    unchanged = False
-    try:
-        unchanged = outside.read_bytes() == b"outside-canary"
-        outside.unlink()
-        outside_dir.rmdir()
-        raw_canary.unlink()
-        (Path(worker["scratch"]) / "reports" / "vitest.json").unlink(missing_ok=True)
-    except OSError:
-        _refuse("positive-control-failed")
     expected = {
         "inside_write": True, "scratch_report_read": True, "raw_log_read": True,
         "outside_write": True, "outside_read": True, "other_home_read": True,
         "keychain_read": True, "private_folders_read": True, "ipv4_network": True,
         "ipv6_network": True, "loopback_network": True, "udp4_network": True,
-        "udp6_network": True, "detached_spawned": True,
+        "udp6_network": True, "detached_spawned": True, "detached_marker_write": True, "detached_marker_unlink": True,
     }
-    if code != 0 or stderr or not unchanged or result != expected or detached.exists() or outside.exists():
+    for check in expected:
+        _probe_diagnostic(check, "pass" if isinstance(result, dict) and result.get(check) is True
+                          else "fail" if isinstance(result, dict) and check in result else "missing", code)
+    exact = type(result) is dict and set(result) == set(expected) and all(value is True for value in result.values())
+    _probe_diagnostic("result_schema", "pass" if exact else "fail", code)
+    try:
+        unchanged = outside.read_bytes() == b"outside-canary"
+    except OSError:
+        _probe_diagnostic("canary", "missing", code)
+        _probe_diagnostic("canary_unlink", "missing", code)
+        _probe_diagnostic("detached_absent", "missing", code)
+        _refuse("positive-control-failed")
+    _probe_diagnostic("canary", "pass" if unchanged else "fail", code)
+    _probe_diagnostic("detached_absent", "fail" if detached.exists() else "pass", code)
+    try:
+        outside.unlink()
+        outside_dir.rmdir()
+        raw_canary.unlink()
+        (Path(worker["scratch"]) / "reports" / "vitest.json").unlink(missing_ok=True)
+    except OSError:
+        _probe_diagnostic("canary_unlink", "fail", code)
+        _refuse("positive-control-failed")
+    _probe_diagnostic("canary_unlink", "pass", code)
+    if code != 0 or stderr or not unchanged or not exact or detached.exists() or outside.exists():
         _refuse("positive-control-failed")
 
 
@@ -2017,7 +2064,14 @@ def _filter_summary(records, allowlists, required_frames=()):
         else:
             _refuse("summary-record-invalid")
     summary = output_filter.filter_records(serialized, allowlists, required_frames)
-    output_filter.validate_public_summary(summary, allowlists, required_frames)
+    public_allowlists = dict(allowlists)
+    for kind in ("files", "tests", "frames"):
+        public_allowlists[kind] = {identifier: identifier for identifier in allowlists[kind].values()}
+    public_lines = {}
+    for name, identifier in allowlists["files"].items():
+        public_lines[identifier] = max(public_lines.get(identifier, 0), allowlists["max_lines"].get(name, 0))
+    public_allowlists["max_lines"] = public_lines
+    output_filter.validate_public_summary(summary, public_allowlists, required_frames)
     return summary
 
 
@@ -2244,6 +2298,104 @@ def _delete_worker_account(intent):
         _refuse("cleanup-incomplete")
 
 
+def _cleanup_errno(error):
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, OSError):
+            return {errno.EACCES: "permission", errno.EPERM: "permission", errno.EBUSY: "busy",
+                    errno.EROFS: "readonly", errno.ENOENT: "missing", errno.EIO: "io"}.get(error.errno, "other")
+        error = error.__context__
+    return "refusal"
+
+
+def _open_process_classes(root):
+    code, stdout, stderr = _run(
+        ("/usr/sbin/lsof", "-nP", "-Fpc", "+D", str(root)), timeout=20,
+        env={"PATH": "/usr/bin:/bin", "HOME": "/var/empty", "LC_ALL": "C"}, capture_limit=65536,
+    )
+    if code not in (0, 1) or stderr:
+        return {"unknown"}
+    if not stdout:
+        return set() if code == 1 else {"unknown"}
+    classes = set()
+    own = False
+    needs_command = False
+    seen_process = False
+    for row in stdout.splitlines():
+        if row.startswith(b"p"):
+            if needs_command or not row[1:].isdigit() or int(row[1:]) <= 0:
+                return {"unknown"}
+            own = int(row[1:]) == os.getpid()
+            seen_process = True
+            needs_command = True
+        elif row.startswith(b"c") and needs_command and len(row) > 1:
+            needs_command = False
+            if not own:
+                command = row[1:].lower()
+                classes.add("node" if command.startswith(b"node") else "python" if command.startswith(b"python")
+                            else "shell" if command in (b"sh", b"bash", b"zsh") else "other")
+        elif seen_process and not needs_command and re.fullmatch(rb"f(?:[0-9]+|cwd|rtd|txt|mem|DEL|NOFD|err|pd|tr|ltx|jld|mmap)", row):
+            continue
+        else:
+            return {"unknown"}
+    return {"unknown"} if needs_command else classes
+
+
+def _diagnostic_path_present(root, path):
+    for parent in reversed(path.relative_to(root).parents):
+        ancestor = root / parent
+        if ancestor.is_symlink():
+            return False
+    return path.exists() or path.is_symlink()
+
+
+def _residue_diagnostics(root, *, error=None, processes=(), reason=None):
+    groups = {
+        "worker-home": [root / "worker-home", root / "preparation-home"], "scratch": [root / "scratch"],
+        "gateway-dir": [root / "registry-proxy-private", root / "registry-rehearsal" / "proxy-private"],
+        "crypto-deps": [root / "control-python-deps"],
+        "npm-cache": [root / "scratch" / "npm-cache", root / "preparation-npm-cache"],
+        "run-tree": [root],
+    }
+    for path_class, paths in groups.items():
+        count = 0
+        failure = _cleanup_errno(error) if error is not None else "none"
+        try:
+            for path in paths:
+                if _diagnostic_path_present(root, path):
+                    count += 1
+                    if path.is_dir() and not path.is_symlink():
+                        def walk_error(exc):
+                            raise exc
+                        for _directory, directories, files in os.walk(path, followlinks=False, onerror=walk_error):
+                            count += len(directories) + len(files)
+        except OSError as exc:
+            failure = _cleanup_errno(exc)
+        class_processes = set()
+        if count and processes:
+            for path in paths:
+                if _diagnostic_path_present(root, path) and path.is_dir() and not path.is_symlink():
+                    try:
+                        class_processes.update(_open_process_classes(path))
+                    except Exception:
+                        class_processes.add("unknown")
+            if class_processes and failure == "none":
+                failure = "busy" if "unknown" not in class_processes else "unknown"
+        cause = (reason or ("remove-failed" if error is not None else "holder-inventory-failed"
+                            if "unknown" in class_processes else "open-holder" if class_processes else "residue")) if count else "clear"
+        _cleanup_diagnostic(path_class, min(count, 2147483647), failure, class_processes, reason=cause)
+
+
+def _cleanup_diagnostic(path_class, entries, error="none", processes=(), *, reason=None):
+    for process in sorted(processes or {"none"}):
+        print(refusal_codes.macos_diagnostic_line({
+            "schema": "macos-diagnostic-v1", "kind": "cleanup", "path_class": path_class,
+            "entries": entries, "errno": error, "process": process,
+            "reason": reason or ("clear" if entries == 0 and error == "none" else "residue"),
+        }), flush=True)
+
+
 def _root_cleanup(state_dir, root_dir, runner_temp, workspace, run_id):
     if os.geteuid() != 0:
         _refuse("macos-root-required")
@@ -2287,12 +2439,24 @@ def _root_cleanup(state_dir, root_dir, runner_temp, workspace, run_id):
         if account in _directory_users():
             errors.append("cleanup-intent-missing")
     workers_gone = True
+    quiescence_reason = None
     if intent is not None:
         try:
             _terminate_worker_processes(intent["uid"])
         except Refusal:
             workers_gone = False
             errors.append("worker-processes")
+            quiescence_reason = "worker-quiescence-failed"
+    holders = {"unknown"}
+    if workers_gone:
+        try:
+            holders = _open_process_classes(root) if root.exists() else set()
+        except Exception:
+            holders = {"unknown"}
+        if holders:
+            workers_gone = False
+            errors.append("open-processes")
+            quiescence_reason = "holder-inventory-failed" if "unknown" in holders else "open-holder"
     pf_path = state / PF_STATE_FILE
     if pf_path.is_file() and not pf_path.is_symlink():
         if workers_gone and identity is not None:
@@ -2301,31 +2465,41 @@ def _root_cleanup(state_dir, root_dir, runner_temp, workspace, run_id):
                 guard.close()
                 Path(record["rules_file"]).unlink(missing_ok=True)
                 pf_path.unlink(missing_ok=True)
-            except Exception:
+            except Exception as error:
+                _cleanup_diagnostic("firewall", 1, _cleanup_errno(error), holders, reason="firewall-close-failed")
                 errors.append("firewall")
         else:
+            _cleanup_diagnostic("firewall", 1, "busy", holders, reason=quiescence_reason)
             errors.append("firewall")
     if intent is not None and workers_gone:
         try:
             _delete_worker_account(intent)
-        except Exception:
+        except Exception as error:
+            _cleanup_diagnostic("keychain-account-record", 1, _cleanup_errno(error), holders, reason="account-delete-failed")
             errors.append("account")
     elif intent is not None:
         errors.append("account")
+    tree_error = None
     if workers_gone:
         try:
             _clean_tree(root)
-        except Exception:
+        except Exception as error:
+            tree_error = error
             errors.append("tree")
     else:
         errors.append("tree")
+    _residue_diagnostics(root, error=tree_error, processes=holders, reason=quiescence_reason)
     if root.exists() or root.is_symlink():
         errors.append("tree-remains")
     if intent is not None:
         try:
-            if intent["account"] in _directory_users():
+            account_remains = intent["account"] in _directory_users()
+            _cleanup_diagnostic("keychain-account-record", int(account_remains), "refusal" if account_remains else "none", holders,
+                                reason="account-remains" if account_remains else "clear")
+            if account_remains:
                 errors.append("account-remains")
-        except Exception:
+        except Exception as error:
+            _cleanup_diagnostic("keychain-account-record", 0, _cleanup_errno(error), {"unknown"}, reason="account-check-failed")
             errors.append("account-check")
         try:
             if _worker_process_ids(intent["uid"]):

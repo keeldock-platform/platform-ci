@@ -19,6 +19,20 @@ class MacosAuditPostTests(unittest.TestCase):
                 audit.validate_job_log_surface(changed, audit.MACOS_RUN_JOB, identity, completed=True)
 
 
+    def test_diagnostics_are_step_bound_and_collected_without_other_log_bytes(self):
+        row = audit.refusal_codes.macos_diagnostic_line({
+            "schema": "macos-diagnostic-v1", "kind": "probe", "check": "outside_read", "result": "fail", "exit": 1})
+        identity = dict(IDENTITY, platform="macos")
+        log = _render_real_runner_encrypted_log(identity)
+        changed = log.replace(b"network_cut_probe=pass", row.encode() + b"\nnetwork_cut_probe=pass", 1)
+        audit.validate_job_log_surface(changed, audit.MACOS_RUN_JOB, identity, completed=True)
+        self.assertEqual(audit.collect_macos_diagnostics(b"private file\n2026-11-19T00:00:00Z " + row.encode()), [row.encode()])
+        for bad in (row + " ", row.replace('"outside_read"', '"private-file"'), row.replace('"exit":1', '"exit":true')):
+            with self.subTest(bad=bad), self.assertRaises(audit.AuditRefusal):
+                audit.collect_macos_diagnostics(bad.encode())
+        grammar = audit._Grammar(".github/workflows/devlane-encrypted.yml", audit.MACOS_RUN_JOB, identity, "encrypted")
+        self.assertFalse(grammar.step_output_ok(audit.MACOS_CLEANUP_STEP, row, {}))
+
     def test_macos_prepare_failure_with_real_setup_node_post_metadata(self):
         identity = dict(IDENTITY, platform="macos")
         jobs = _encrypted_jobs(platform="macos")

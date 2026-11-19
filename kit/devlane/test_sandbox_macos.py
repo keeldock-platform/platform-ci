@@ -600,6 +600,222 @@ class MacProfileTests(unittest.TestCase):
             self.assertEqual(stdout.getvalue(), "offline_supervisor=ready\n")
 
 
+class MacProbeRegressionTests(unittest.TestCase):
+    @unittest.skipUnless(NODE, "requires Node")
+    def test_actual_generated_probe_emits_one_json_line(self):
+        harness = r"""
+const vm=require('node:vm');const EventEmitter=require('node:events');
+const denied=()=>Object.assign(new Error('denied'),{code:'EPERM'});
+const fs={writeFileSync(p){if(!p.includes('/reports/')&&!p.includes('/tmp/'))throw denied();},
+ readFileSync(p){if(p.endsWith('vitest.json'))return '{"numPassedTests":1}';
+ if(p.endsWith('probe.log'))return 'probe-log-readable';throw denied();},
+ openSync(){throw denied();},closeSync(){},unlinkSync(){}};
+const net={createConnection(){const s=new EventEmitter();s.destroy=()=>{};
+ queueMicrotask(()=>s.emit('error',denied()));return s;}};
+const dgram={createSocket(){const s=new EventEmitter();s.close=()=>{};
+ s.send=(b,p,a,cb)=>queueMicrotask(()=>cb(denied()));return s;}};
+const child={spawn(){return {unref(){}};}};
+const modules={'node:fs':fs,'node:net':net,'node:dgram':dgram,'node:child_process':child};
+vm.runInNewContext(process.argv[1],{require:n=>modules[n],Buffer,setTimeout,
+ process:{argv:['node','/scratch','/outside','/other','/keychain','/folders',
+ '/scratch/tmp/detached-probe-marker','/scratch/raw/probe.log'],stdout:process.stdout}});
+"""
+        result = subprocess.run([NODE, "-e", harness, sandbox._deny_probe_script()],
+                                capture_output=True, timeout=5, check=True)
+        self.assertEqual(result.stderr, b"")
+        self.assertTrue(result.stdout.endswith(b"\n"))
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        values = json.loads(result.stdout.removeprefix(b"KD-SBPL:"))
+        self.assertEqual(len(values), 16)
+        self.assertTrue(all(value is True for value in values.values()))
+
+    def test_every_failed_canary_and_bad_transport_still_refuses(self):
+        expected = {name: True for name in (
+            "inside_write", "scratch_report_read", "raw_log_read", "outside_write", "outside_read",
+            "other_home_read", "keychain_read", "private_folders_read", "ipv4_network", "ipv6_network",
+            "loopback_network", "udp4_network", "udp6_network", "detached_spawned", "detached_marker_write", "detached_marker_unlink")}
+        cases = [(None, 0, b""), *[(name, 0, b"") for name in expected],
+                 (None, 1, b""), (None, 0, b"unexpected stderr")]
+        for failed, code, stderr in cases:
+            with self.subTest(failed=failed, code=code, stderr=stderr), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                scratch = root / "scratch"
+                for name in ("raw", "reports", "tmp"):
+                    (scratch / name).mkdir(parents=True)
+                worker = {"scratch": str(scratch), "worker_uid": os.getuid(), "worker_gid": os.getgid(),
+                          "node": NODE or "/usr/bin/true"}
+                values = dict(expected)
+                if failed:
+                    values[failed] = False
+                stdout = b"KD-SBPL:" + json.dumps(values).encode() + b"\n"
+                diagnostics = io.StringIO()
+                with mock.patch("sys.stdout", diagnostics), mock.patch.object(sandbox, "_run", return_value=(code, stdout, stderr)) as run, \
+                        mock.patch.object(sandbox.os, "chown"), \
+                        mock.patch.object(sandbox, "_open_process_classes", return_value=set()), \
+                    mock.patch.object(sandbox, "_terminate_worker_processes") as terminate, \
+                        mock.patch.object(sandbox.time, "sleep"):
+                    if failed or code or stderr:
+                        with self.assertRaisesRegex(sandbox.Refusal, "positive-control-failed"):
+                            sandbox._deny_probe(root / "state", worker, {"run_id": "123", "home": str(root)})
+                    else:
+                        sandbox._deny_probe(root / "state", worker, {"run_id": "123", "home": str(root)})
+                    self.assertEqual(run.call_args.args[0][-2], str(scratch / "tmp" / "detached-probe-marker"))
+                    terminate.assert_called_once_with(os.getuid())
+
+                records = [sandbox.refusal_codes.parse_macos_diagnostic(line)
+                           for line in diagnostics.getvalue().splitlines()]
+                by_check = {row["check"]: row for row in records}
+                self.assertTrue(set(expected) <= set(by_check))
+                self.assertTrue(all(row["exit"] == code for row in records))
+                if failed:
+                    self.assertEqual(by_check[failed]["result"], "fail")
+                self.assertEqual(by_check["exit"]["result"], "fail" if code else "pass")
+                self.assertEqual(by_check["stderr"]["result"], "other" if stderr else "empty")
+
+    @unittest.skipUnless(NODE, "requires Node")
+    def test_detached_marker_destination_can_actually_record_a_survivor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            scratch = root / "scratch"
+            (scratch / "tmp").mkdir(parents=True)
+            scratch.chmod(0o555)
+            marker = scratch / "tmp" / "detached-probe-marker"
+            with self.assertRaises(PermissionError):
+                (scratch / "detached-probe-marker").write_bytes(b"alive")
+            subprocess.run([NODE, "-e", "require('node:fs').writeFileSync(process.argv[1],'alive')", str(marker)],
+                           capture_output=True, timeout=5, check=True)
+            self.assertEqual(marker.read_bytes(), b"alive")
+            scratch.chmod(0o700)
+
+
+class MacSummaryRegressionTests(unittest.TestCase):
+    def test_public_summary_maps_identities_and_rejects_confidential_fields(self):
+        allowlists = {"files": {"src/example.ts": "file_0001"}, "tests": {"suite::case": "case_0001"},
+                      "frames": {}, "stages": ["typecheck", "unit"], "codes": ["TS2322", "DEVLANE_FAILURE"],
+                      "max_lines": {"src/example.ts": 100}, "suites": []}
+        record = {"kind": "diagnostic", "stage": "typecheck", "code": "TS2322",
+                  "file": "src/example.ts", "line": 7, "level": "error"}
+        summary = sandbox._filter_summary([record], allowlists)
+        self.assertIn(b'"file":"file_0001"', summary)
+        self.assertNotIn(b"src/example.ts", summary)
+        hostile = dict(record, message="PRIVATE_SOURCE_CANARY ::error:: SECRET_CANARY")
+        with self.assertRaises(sandbox.output_filter.FilterRefusal):
+            sandbox._filter_summary([hostile], allowlists)
+
+
+class MacCleanupLayoutRegressionTests(unittest.TestCase):
+    def test_hosted_layout_shreds_real_tree_after_account_and_firewall_teardown(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary).resolve()
+            root = temp / "devlane-123"
+            state = root / "state"
+            workspace = temp / "runner-workspace"
+            state.mkdir(parents=True)
+            workspace.mkdir()
+            intent = {"schema": 1, "run_id": "123", "runner_uid": os.getuid(), "uid": 544,
+                      "gid": sandbox.WORKER_GROUP, "account": "kddevlane123",
+                      "home": str(root / "worker-home")}
+            identity = {**intent, "node": "/node", "npm_cli": "/npm", "node_sha256": "a" * 64,
+                        "npm_sha256": "b" * 64, "developer_directory": "/developer", "clang": "/clang",
+                        "host_identity": {}}
+            sandbox._write_json(state / sandbox.CLEANUP_INTENT_FILE, intent)
+            sandbox._write_json(state / sandbox.IDENTITY_FILE, identity)
+            sandbox._write_json(state / sandbox.PF_STATE_FILE, {})
+            for name in ("prepared/node_modules", "registry-proxy-private", "registry-rehearsal/proxy-private",
+                         "control-python-deps", "control-npm", "worker-home", "scratch/raw", "scratch/reports"):
+                directory = root / name
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / "canary").write_bytes(b"confidential fixture")
+                (directory / "canary").chmod(0o444)
+                directory.chmod(0o555)
+            outside = temp / "outside"
+            outside.write_bytes(b"preserve")
+            (root / "external-link").symlink_to(outside)
+            rules = temp / "rules"
+            rules.write_bytes(b"rules")
+            account_present = True
+            def users():
+                return {intent["account"]} if account_present else set()
+            def command(argv, **_kwargs):
+                nonlocal account_present
+                if "-read" in argv:
+                    output = ("UniqueID: 544\nPrimaryGroupID: 20\nNFSHomeDirectory: " + intent["home"] + "\n").encode()
+                else:
+                    self.assertIn("-delete", argv)
+                    account_present = False
+                    output = b""
+                return mock.Mock(returncode=0, stdout=output, stderr=b"")
+            guard = mock.Mock()
+            stdout = io.StringIO()
+            with mock.patch.object(sandbox.os, "geteuid", return_value=0), \
+                    mock.patch.object(sandbox, "_open_process_classes", return_value=set()), \
+                    mock.patch.object(sandbox, "_terminate_worker_processes") as terminate, \
+                    mock.patch.object(sandbox, "_worker_process_ids", return_value=[]), \
+                    mock.patch.object(sandbox, "_directory_users", side_effect=users), \
+                    mock.patch.object(sandbox.boundary_guard, "_run_command", side_effect=command), \
+                    mock.patch.object(sandbox, "_pf_guard_from_file", return_value=(guard, {"rules_file": str(rules)})), \
+                    mock.patch("sys.stdout", stdout):
+                self.assertEqual(sandbox._root_cleanup(state, root, temp, workspace, "123"), 0)
+            self.assertTrue(stdout.getvalue().endswith("cleanup_receipt=confirmed\n"))
+            for line in stdout.getvalue().splitlines()[:-1]:
+                sandbox.refusal_codes.parse_macos_diagnostic(line)
+            terminate.assert_called_once_with(544)
+            guard.close.assert_called_once_with()
+            self.assertFalse(root.exists())
+            self.assertFalse(rules.exists())
+            self.assertFalse(account_present)
+            self.assertEqual(outside.read_bytes(), b"preserve")
+
+
+class MacDecryptGuardRegressionTests(unittest.TestCase):
+    @unittest.skipUnless(sandbox.bundle.AESGCM, "requires cryptography")
+    def test_real_crypto_refusals_and_order_guards_clear_secret_at_cli_boundary(self):
+        key = bytes(range(32))
+        for scenario, reason in (("no-secret", "key-format"), ("wrong-key", "auth-tag"),
+                                 ("expired", "expired"), ("substitution", "binding-mismatch"),
+                                 ("unprobed", None), ("replay", None)):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                state = root / "state"
+                state.mkdir()
+                context = {"repository_id": "1430960557", "control_sha": "a" * 40,
+                           "platform": "macos", "profile": "core-node", "wave_id": "wave-test-0001",
+                           "bundle_id": "bundle-test-0001", "projection_sha256": "b" * 64,
+                           "expires": int(time.time()) + (-60 if scenario == "expired" else 600)}
+                binding = sandbox._expected_envelope(context)
+                payload = sandbox.bundle.build_envelope(b"invalid archive", key, binding)
+                bundle_path = root / "bundle.enc"
+                bundle_path.write_bytes(payload)
+                context["bundle_sha256"] = hashlib.sha256(payload).hexdigest()
+                if scenario == "substitution":
+                    context["bundle_id"] = "bundle-test-0002"
+                worker = {"probe_complete": scenario != "unprobed", "decrypted": scenario == "replay",
+                          "execution_complete": False}
+                arguments = ["decrypt", "--state-dir", str(state), "--context", str(root / "context"),
+                             "--bundle", str(bundle_path), "--projection", str(root / "projection"),
+                             "--deadline-file", str(root / "deadline.json")]
+                sandbox.deadline_budget.create(root / "deadline.json", 60, 30, 90)
+                stderr = io.StringIO()
+                secret = "" if scenario == "no-secret" else (bytes(reversed(key)) if scenario == "wrong-key" else key).hex()
+                with mock.patch.object(sandbox.os, "geteuid", return_value=0), \
+                        mock.patch.object(sandbox, "_identity", return_value={"uid": 544}), \
+                        mock.patch.object(sandbox, "_worker_state", return_value=worker), \
+                        mock.patch.object(sandbox, "_validate_context", return_value=context), \
+                        mock.patch.object(sandbox, "_check_public_control"), \
+                        mock.patch.object(sandbox, "_probe_pf"), \
+                        mock.patch.object(sandbox, "_open_process_classes", return_value=set()), \
+                    mock.patch.object(sandbox, "_terminate_worker_processes"), \
+                        mock.patch.object(sandbox, "_validate_projection_file", return_value={}), \
+                        mock.patch.dict(os.environ, {"DEVLANE_DECRYPT_KEY": secret}), \
+                        mock.patch("sys.stderr", stderr):
+                    self.assertEqual(sandbox.main(arguments), 2)
+                    self.assertNotIn("DEVLANE_DECRYPT_KEY", os.environ)
+                expected = ("devlane_supervisor_refusal=decrypt-rejected\ndecrypt_refusal=" + reason + "\n"
+                            if reason else "devlane_supervisor_refusal=decrypt-order\n")
+                self.assertEqual(stderr.getvalue(), expected)
+                self.assertFalse((root / "workspace").exists())
+
+
 class MacRoundOneRegressionTests(unittest.TestCase):
     def test_trusted_tool_checks_emit_distinct_fixed_refusals(self):
         with tempfile.TemporaryDirectory(prefix="devlane-tool-check-") as temporary:
@@ -1044,7 +1260,8 @@ class MacRoundOneRegressionTests(unittest.TestCase):
         ))
         process = mock.Mock(returncode=0)
         with mock.patch.object(sandbox.subprocess, "Popen", return_value=process) as spawn, \
-                mock.patch.object(sandbox, "_terminate_worker_processes"):
+                mock.patch.object(sandbox, "_open_process_classes", return_value=set()), \
+                    mock.patch.object(sandbox, "_terminate_worker_processes"):
             self.assertEqual(sandbox._run_preparation_process(
                 command,
                 ident={"uid": 544, "gid": sandbox.WORKER_GROUP}, profile=PRIVATE_RUN + "/preparation.sb",
@@ -1411,6 +1628,7 @@ class MacRoundOneRegressionTests(unittest.TestCase):
             with mock.patch.object(sandbox.os, "geteuid", return_value=0), \
                     mock.patch.object(sandbox, "_cleanup_intent", return_value=intent), \
                     mock.patch.object(sandbox, "_identity", return_value=identity), \
+                    mock.patch.object(sandbox, "_open_process_classes", return_value=set()), \
                     mock.patch.object(sandbox, "_terminate_worker_processes"), \
                     mock.patch.object(sandbox, "_pf_guard_from_file", return_value=(guard, {"rules_file": str(temp / "rules")})), \
                     mock.patch.object(sandbox, "_delete_worker_account") as delete_account, \
@@ -1452,6 +1670,7 @@ class MacRoundOneRegressionTests(unittest.TestCase):
 
             with mock.patch.object(sandbox.os, "geteuid", return_value=0), \
                     mock.patch.object(sandbox, "_directory_users", side_effect=directory_users), \
+                    mock.patch.object(sandbox, "_open_process_classes", return_value=set()), \
                     mock.patch.object(sandbox, "_terminate_worker_processes"), \
                     mock.patch.object(sandbox, "_worker_process_ids", return_value=[]), \
                     mock.patch.object(sandbox, "_worker_account_attributes", return_value={
@@ -1498,6 +1717,107 @@ class MacRoundOneRegressionTests(unittest.TestCase):
                     self.assertRaises(sandbox.Refusal):
                 sandbox._root_cleanup(state, root, temp, workspace, "123")
             clean_tree.assert_not_called()
+
+
+
+class WaveDiagnosticTests(unittest.TestCase):
+    def test_closed_schema_rejects_free_text_in_every_field(self):
+        import refusal_codes as contract
+        rows = [
+            {"schema": "macos-diagnostic-v1", "kind": "probe", "check": "exit", "result": "pass", "exit": 0},
+            {"schema": "macos-diagnostic-v1", "kind": "cleanup", "path_class": "scratch", "entries": 1,
+             "errno": "permission", "process": "python", "reason": "remove-failed"},
+        ]
+        for row in rows:
+            line = contract.macos_diagnostic_line(row)
+            self.assertEqual(contract.parse_macos_diagnostic(line), row)
+            for field in row:
+                for malicious in (chr(47) + "private/secret", "source.ts", "token=secret", {}, [], None, True):
+                    changed = dict(row, **{field: malicious})
+                    with self.subTest(field=field, malicious=malicious), self.assertRaises(ValueError):
+                        contract.macos_diagnostic_line(changed)
+            for changed in (dict(row, extra="private"), {k: v for k, v in row.items() if k != "kind"}):
+                with self.assertRaises(ValueError):
+                    contract.macos_diagnostic_line(changed)
+        for suffix in (" ", "\n", ',"extra":"secret"'):
+            with self.assertRaises(ValueError):
+                contract.parse_macos_diagnostic(line + suffix)
+
+    def test_probe_timeout_records_missing_assertions_without_raw_exception(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            scratch = root / "scratch"
+            for name in ("raw", "reports", "tmp"):
+                (scratch / name).mkdir(parents=True)
+            worker = {"scratch": str(scratch), "worker_uid": os.getuid(), "worker_gid": os.getgid(), "node": "/node"}
+            output = io.StringIO()
+            with mock.patch.object(sandbox, "_run", side_effect=sandbox.Refusal("total-deadline-exhausted")), \
+                    mock.patch.object(sandbox.os, "chown"), mock.patch("sys.stdout", output), \
+                    self.assertRaises(sandbox.Refusal):
+                sandbox._deny_probe(root / "state", worker, {"run_id": "123", "home": str(root)})
+            records = [sandbox.refusal_codes.parse_macos_diagnostic(line) for line in output.getvalue().splitlines()]
+            self.assertEqual({row["check"] for row in records}, sandbox.refusal_codes.MACOS_PROBE_CHECKS)
+            self.assertTrue(all(row["exit"] == "unavailable" for row in records))
+            self.assertEqual(next(row["result"] for row in records if row["check"] == "timeout"), "timeout")
+
+    def test_all_uid_holder_inventory_never_emits_process_names(self):
+        with mock.patch.object(sandbox, "_run", return_value=(0, b"p123\ncnode-secret\nf3\nfcwd\np456\ncprivate-process\nftxt\n", b"")) as run:
+            self.assertEqual(sandbox._open_process_classes(Path("/fixture")), {"node", "other"})
+            self.assertIn("+D", run.call_args.args[0])
+        for response in ((2, b"", b"secret"), (0, b"malformed", b""), (0, b"p123", b""),
+                         (0, b"cprivate", b""), (0, b"", b"")):
+            with mock.patch.object(sandbox, "_run", return_value=response):
+                self.assertEqual(sandbox._open_process_classes(Path("/fixture")), {"unknown"})
+
+    def test_residue_errno_and_counts_do_not_follow_external_links(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run"
+            (root / "scratch").mkdir(parents=True)
+            (root / "scratch" / "private-name").write_text("secret")
+            (root / "scratch" / "alias").symlink_to(Path(temporary))
+            output = io.StringIO()
+            with mock.patch("sys.stdout", output), mock.patch.object(sandbox, "_open_process_classes", return_value={"node"}):
+                sandbox._residue_diagnostics(root, error=PermissionError(1, "private path"), processes={"node"})
+            rows = [sandbox.refusal_codes.parse_macos_diagnostic(line) for line in output.getvalue().splitlines()]
+            scratch = next(row for row in rows if row["path_class"] == "scratch")
+            self.assertEqual((scratch["entries"], scratch["errno"], scratch["process"]), (3, "permission", "node"))
+            self.assertNotIn("private", output.getvalue())
+
+    def test_cleanup_orders_quiescence_before_account_and_shred(self):
+        for holders in (set(), {"node"}, {"unknown"}):
+            with self.subTest(holders=holders), tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary).resolve()
+                root = temp / "devlane-123"
+                state = root / "state"
+                workspace = temp / "workspace"
+                state.mkdir(parents=True)
+                workspace.mkdir()
+                intent = {"schema": 1, "run_id": "123", "runner_uid": 501, "uid": 544,
+                          "gid": 20, "account": "kddevlane123", "home": str(root / "worker-home")}
+                (state / sandbox.CLEANUP_INTENT_FILE).write_bytes(sandbox.bundle.canonical_json(intent))
+                events = []
+                def shred(path):
+                    events.append("shred")
+                    sandbox.shutil.rmtree(path)
+                output = io.StringIO()
+                with mock.patch.object(sandbox.os, "geteuid", return_value=0), \
+                        mock.patch.object(sandbox, "_directory_users", return_value=set()), \
+                        mock.patch.object(sandbox, "_worker_process_ids", return_value=[]), \
+                        mock.patch.object(sandbox, "_terminate_worker_processes", side_effect=lambda uid: events.append("worker")), \
+                        mock.patch.object(sandbox, "_open_process_classes", side_effect=lambda path: events.append("holders") or holders), \
+                        mock.patch.object(sandbox, "_delete_worker_account", side_effect=lambda value: events.append("account")), \
+                        mock.patch.object(sandbox, "_clean_tree", side_effect=shred), \
+                        mock.patch("sys.stdout", output):
+                    if holders:
+                        with self.assertRaisesRegex(sandbox.Refusal, "cleanup-incomplete"):
+                            sandbox._root_cleanup(state, root, temp, workspace, "123")
+                        self.assertEqual(events[:2], ["worker", "holders"])
+                        self.assertTrue(all(event == "holders" for event in events[2:]))
+                        self.assertTrue(root.exists())
+                        self.assertNotIn("cleanup_receipt=confirmed", output.getvalue())
+                    else:
+                        self.assertEqual(sandbox._root_cleanup(state, root, temp, workspace, "123"), 0)
+                        self.assertEqual(events, ["worker", "holders", "account", "shred"])
 
 
 if __name__ == "__main__":
