@@ -31,6 +31,7 @@ import rust_preparation_smoke
 import supervisor
 import sandbox_macos
 import control_python
+import macos_registry_rehearsal
 import test_e2e
 
 
@@ -636,14 +637,15 @@ class DeadlineTests(unittest.TestCase):
             ("devlane-encrypted.yml", "devlane-encrypted-run", "prepare.py"): 1,
             ("devlane-encrypted.yml", "devlane-encrypted-run", "rust_tooling.py"): 2,
             ("devlane-encrypted.yml", "devlane-encrypted-run", "supervisor.py"): 4,
-            ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "deadline.py"): 31,
+            ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "deadline.py"): 33,
             ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "fetch.py"): 4,
             ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "host_cleanup.py"): 1,
             ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "network_probe.py"): 1,
             ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "permit.py"): 3,
             ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "prepare.py"): 1,
             ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "rust_tooling.py"): 2,
-            ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "sandbox_macos.py"): 6,
+            ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "sandbox_macos.py"): 7,
+            ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "macos_registry_rehearsal.py"): 1,
             ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "control_python.py"): 4,
             ("devlane-encrypted.yml", "devlane-encrypted-run-macos", "supervisor.py"): 4,
             ("devlane-encrypted.yml", "devlane-encrypted-audit", "public_audit.py"): 1,
@@ -818,6 +820,18 @@ class DeadlineTests(unittest.TestCase):
                     self.assertEqual(arguments, [])
                 elif script == "network_probe.py":
                     self._assert_required_argument(network_probe.main, arguments, "--output")
+                elif script == "macos_registry_rehearsal.py":
+                    for option in ("--state-dir", "--projection", "--control-sha", "--deadline-file"):
+                        self._assert_required_argument(macos_registry_rehearsal.main, arguments, option)
+                    with patch.object(macos_registry_rehearsal.sys, "platform", "darwin"), \
+                            patch.object(macos_registry_rehearsal.os, "geteuid", return_value=0), \
+                            patch.object(deadline, "remaining", side_effect=deadline.DeadlineRefusal(
+                                "total-deadline-exhausted")) as remaining, \
+                            patch.object(sandbox_macos, "_identity") as identity:
+                        with self.assertRaisesRegex(deadline.DeadlineRefusal, "total-deadline-exhausted"):
+                            macos_registry_rehearsal.main(arguments)
+                        remaining.assert_called_once_with("$RUN_ROOT/deadline.json")
+                        identity.assert_not_called()
                 elif script == "sandbox_macos.py":
                     required = {
                         "preflight": ("--state-dir", "--workspace", "--profile", "--run-id", "--control-sha"),
@@ -829,6 +843,7 @@ class DeadlineTests(unittest.TestCase):
                         "decrypt": ("--state-dir", "--context", "--bundle", "--projection", "--deadline-file"),
                         "execute": ("--state-dir", "--context", "--deadline-file"),
                         "cleanup": ("--state-dir", "--root", "--runner-temp", "--workspace", "--run-id"),
+                        "root-pf-cleanup": ("--state-dir",),
                     }[arguments[0]]
                     for option in required:
                         self._assert_required_argument(sandbox_macos.main, arguments, option)

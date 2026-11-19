@@ -47,8 +47,10 @@ class MacPrepareBoundaryTests(unittest.TestCase):
             state.mkdir()
             projection = {"npm_package": {}, "npm_lock": {}}
             ident = {"uid": 12345, "gid": 12345}
+            deadline_file = run_root / "deadline.json"
+            sandbox.deadline_budget.create(deadline_file, 60, 30, 90)
             arguments = ["rehearsal", "--state-dir", str(state), "--projection", "unused",
-                         "--control-sha", "a" * 40, "--deadline-file", "unused"]
+                         "--control-sha", "a" * 40, "--deadline-file", str(deadline_file)]
             class SetupComplete(Exception):
                 pass
             previous_umask = os.umask(0o077)

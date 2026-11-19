@@ -70,13 +70,14 @@ class HeldUpstream:
         return Exchange()
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('state-dir', 'projection', 'control-sha', 'deadline-file'):
         parser.add_argument('--' + name, required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if sys.platform != 'darwin' or os.geteuid() != 0:
         parser.error('approved native macOS root session required')
+    harness.deadline_budget.remaining(args.deadline_file)
     state = Path(args.state_dir).resolve(strict=True)
     ident = harness._identity(state)
     harness._validate_prepare_run_root(state, ident)
