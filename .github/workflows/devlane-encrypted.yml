@@ -855,6 +855,7 @@ jobs:
             exit 1
           fi
       - name: Experiment independent runtime diagnostics
+        id: experiment_diagnostics
         if: ${{ !cancelled() }}
         continue-on-error: true
         timeout-minutes: 5
@@ -1173,6 +1174,10 @@ jobs:
             printf 'devlane_supervisor_refusal=runner-unknown\n' >&2
             exit 1
           fi
+      - name: Preserve experiment diagnostic verdict
+        if: ${{ always() }}
+        run: |
+          if [[ '${{ steps.experiment_diagnostics.outcome }}' != 'success' ]]; then exit 1; fi
       - name: Shred runner-local workspace
         id: cleanup
         if: ${{ always() }}
@@ -1548,6 +1553,7 @@ jobs:
           }
           Write-Output 'windows_runner=hosted-admin verified=windows-2025'
       - name: Experiment independent runtime diagnostics
+        id: experiment_diagnostics
         if: ${{ !cancelled() }}
         continue-on-error: true
         timeout-minutes: 5
@@ -1677,6 +1683,10 @@ jobs:
           $toolchain = Get-Content -LiteralPath (Join-Path $env:RUN_ROOT 'prepared-root\prepared\toolchain.json') -Raw | ConvertFrom-Json
           python -B kit/devlane/sandbox_windows.py execute --context (Join-Path $env:RUN_ROOT 'context.json') --manifest (Join-Path $env:RUN_ROOT 'state\manifest.json') --source (Join-Path $env:RUN_ROOT 'workspace\source') --prepared (Join-Path $env:RUN_ROOT 'prepared-root\prepared') --scratch (Join-Path $env:RUN_ROOT 'scratch') --run-root $env:RUN_ROOT --state (Join-Path $env:RUN_ROOT 'state\sandbox.json') --deadline (Join-Path $env:RUN_ROOT 'deadline.json')
           if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Preserve experiment diagnostic verdict
+        if: ${{ always() }}
+        run: |
+          if ('${{ steps.experiment_diagnostics.outcome }}' -ne 'success') { exit 1 }
       - name: Shred runner-local workspace
         id: cleanup
         if: ${{ always() }}
