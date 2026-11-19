@@ -1695,6 +1695,19 @@ catch { if ($_.Exception.HResult -ne 87) { exit 3 }; exit 0 }
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
         self.assertEqual(result.returncode, 0)
 
+    @unittest.skipUnless(os.name == "nt", "requires hosted Windows C# runtime")
+    def test_quiescence_catch_preserves_runtime_cause(self):
+        native = Path(windows.__file__).with_name("sandbox_windows_native.cs").read_text()
+        method = native.split("private static void AssertCleanupQuiescent", 1)[1].split("private static bool IsProcessGone", 1)[0]
+        catches = method[method.index("            catch (InvalidOperationException error)"):method.index("            finally\n            {\n                LocalFree(expectedSid)")]
+        source = 'using System; public static class CauseProbe { public static bool Run() { try { try { throw new InvalidOperationException("cleanup_process_inspection"); } ' + catches + ' } catch (InvalidOperationException error) { return error.InnerException != null && error.InnerException.Message == "cleanup_process_inspection"; } } }'
+        import base64
+        script = "Add-Type -TypeDefinition @'\n" + source + "\n'@\nif (-not [CauseProbe]::Run()) { exit 3 }; exit 0"
+        result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                                 base64.b64encode(script.encode("utf-16le")).decode("ascii")],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        self.assertEqual(result.returncode, 0)
+
     def test_quiescence_wrapper_preserves_diagnostic_exception(self):
         native = Path(windows.__file__).with_name("sandbox_windows_native.cs").read_text()
         method = native.split("private static void AssertCleanupQuiescent", 1)[1].split("private static bool IsProcessGone", 1)[0]
