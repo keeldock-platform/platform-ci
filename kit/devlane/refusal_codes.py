@@ -210,6 +210,10 @@ MACOS_OPERATION_RAW_REFUSALS = {
         "prepared-member-type", "prepared-link-invalid", "cleanup-incomplete",
     )),
     "cleanup": frozenset((
+        "cleanup-intent-missing", "cleanup-worker-quiescence-failed", "cleanup-holder-inventory-failed", "cleanup-open-holder",
+        "cleanup-firewall-close-failed", "cleanup-account-delete-failed", "cleanup-tree-remove-failed",
+        "cleanup-tree-remains", "cleanup-account-remains", "cleanup-account-check-failed",
+        "cleanup-worker-processes-remain", "cleanup-worker-process-check-failed",
         "macos-root-required", "input-unavailable", "state-directory-permissions", "cleanup-root-invalid",
         "cleanup-intent-invalid", "cleanup-incomplete", "cleanup-process-inventory",
         "cleanup-process-termination", "cleanup-process-incomplete", "firewall-unavailable",
@@ -231,6 +235,18 @@ MACOS_OPERATION_RAW_REFUSALS["prepare"] |= frozenset(
     "npm-failed-" + error_class for error_class in MACOS_NPM_PREPARATION_ERROR_CLASSES
 )
 _MACOS_OPERATION_ALIASES = {
+    "cleanup-intent-missing": "intent-missing",
+    "cleanup-worker-quiescence-failed": "worker-quiescence-failed",
+    "cleanup-holder-inventory-failed": "holder-inventory-failed",
+    "cleanup-open-holder": "open-holder",
+    "cleanup-firewall-close-failed": "firewall-close-failed",
+    "cleanup-account-delete-failed": "account-delete-failed",
+    "cleanup-tree-remove-failed": "tree-remove-failed",
+    "cleanup-tree-remains": "tree-remains",
+    "cleanup-account-remains": "account-remains",
+    "cleanup-account-check-failed": "account-check-failed",
+    "cleanup-worker-processes-remain": "worker-processes-remain",
+    "cleanup-worker-process-check-failed": "worker-process-check-failed",
     "macos-root-required": "root-required", "prepare-run-root-invalid": "run-root-invalid",
     "prepared-output-invalid": "output-invalid", "prepared-output-path-invalid": "output-path-invalid",
     "prepared-output-exists": "output-exists", "prepared-file-count": "file-count",
@@ -392,7 +408,7 @@ MACOS_PROBE_CHECKS = frozenset((
 ))
 MACOS_RESIDUE_CLASSES = frozenset((
     "worker-home", "scratch", "gateway-dir", "crypto-deps", "npm-cache",
-    "keychain-account-record", "run-tree", "firewall",
+    "keychain-account-record", "run-tree", "firewall", "worker-processes",
 ))
 MACOS_ERRNO_CLASSES = frozenset((
     "none", "permission", "busy", "readonly", "missing", "io", "other", "refusal", "unknown",
@@ -400,7 +416,8 @@ MACOS_ERRNO_CLASSES = frozenset((
 MACOS_CLEANUP_REASONS = frozenset((
     "clear", "residue", "remove-failed", "worker-quiescence-failed", "open-holder",
     "holder-inventory-failed", "firewall-close-failed", "account-delete-failed",
-    "account-remains", "account-check-failed",
+    "account-remains", "account-check-failed", "intent-missing", "tree-remove-failed", "tree-remains",
+    "worker-processes-remain", "worker-process-check-failed",
 ))
 MACOS_PROCESS_CLASSES = frozenset(("none", "node", "python", "shell", "other", "unknown"))
 

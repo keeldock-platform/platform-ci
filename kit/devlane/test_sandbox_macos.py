@@ -434,10 +434,6 @@ class MacProfileTests(unittest.TestCase):
                      "TMPDIR": str(root / "scratch"), "LC_ALL": "C"},
                 timeout=10, check=False, close_fds=True,
             )
-            local_major = platform.mac_ver()[0].split(".", 1)[0]
-            if (result.returncode == -signal.SIGABRT and local_major.isdecimal()
-                    and int(local_major) >= 27):
-                self.skipTest("sandbox-exec aborts before returning on macOS 27")
             self.assertEqual(result.returncode, 0, "sandbox-exec did not run the generated profile")
             self.assertNotIn(b"syntax error", result.stderr.lower())
 
@@ -628,6 +624,86 @@ vm.runInNewContext(process.argv[1],{require:n=>modules[n],Buffer,setTimeout,
         values = json.loads(result.stdout.removeprefix(b"KD-SBPL:"))
         self.assertEqual(len(values), 16)
         self.assertTrue(all(value is True for value in values.values()))
+
+    @unittest.skipUnless(platform.system() == "Darwin" and NODE, "requires macOS Seatbelt and Node")
+    def test_native_node_startup_writes_with_the_offline_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for name in ("workspace/source", "prepared", "scratch/reports", "home", "control"):
+                (root / name).mkdir(parents=True)
+            profile = sandbox.profile_text(
+                workspace=root / "workspace", prepared=root / "prepared", scratch=root / "scratch",
+                home=root / "home", control=root / "control", node=NODE,
+                developer=sandbox.CLT_DEVELOPER_DIRECTORY, clang=sandbox.CLT_CLANG_PATH,
+            )
+            self.assertIn('(allow file-read-data (literal "/"))', profile)
+            self.assertIn('(sysctl-name "hw.pagesize_compat")', profile)
+            marker = root / "scratch/reports/started"
+            result = subprocess.run(
+                ["/usr/bin/sandbox-exec", "-p", profile, NODE, "-e",
+                 "require('node:fs').writeFileSync(process.argv[1],'started')", str(marker)],
+                env={"PATH": "/usr/bin:/bin", "HOME": str(root / "home"),
+                     "TMPDIR": str(root / "scratch"), "LC_ALL": "C"},
+                stdin=subprocess.DEVNULL, capture_output=True, close_fds=True, start_new_session=True, timeout=20,
+            )
+            self.assertEqual((result.returncode, result.stderr), (0, b""))
+            self.assertEqual(marker.read_bytes(), b"started")
+
+    @unittest.skipUnless(platform.system() == "Darwin" and NODE, "requires macOS Seatbelt and Node")
+    def test_native_probe_negatives_deny_real_canaries_with_runtime_allowances(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for name in ("workspace/source", "prepared", "scratch/reports", "scratch/raw", "scratch/tmp", "home", "control"):
+                (root / name).mkdir(parents=True)
+            profile = sandbox.profile_text(
+                workspace=root / "workspace", prepared=root / "prepared", scratch=root / "scratch",
+                home=root / "home", control=root / "control", node=NODE,
+                developer=sandbox.CLT_DEVELOPER_DIRECTORY, clang=sandbox.CLT_CLANG_PATH,
+            )
+            (root / sandbox.SBPL_FILE).write_text(profile)
+            worker = {"scratch": str(root / "scratch"), "worker_uid": os.getuid(),
+                      "worker_gid": os.getgid(), "node": NODE}
+            descendants = set()
+            def run(argv, **kwargs):
+                canaries = [argv[-6], str(Path(argv[-5]) / "probe-file"), argv[-4], argv[-3]]
+                unconfined = subprocess.run(
+                    [NODE, "-e", "for(const p of process.argv.slice(1)){if(require('node:fs').readFileSync(p,'utf8')!=='outside-canary')process.exit(1)}", *canaries],
+                    capture_output=True, timeout=10,
+                )
+                self.assertEqual((unconfined.returncode, unconfined.stderr), (0, b""))
+                process = subprocess.Popen(argv, env=kwargs["env"], stdin=subprocess.DEVNULL,
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                           close_fds=True, start_new_session=True)
+                deadline = time.monotonic() + 20
+                try:
+                    while True:
+                        try:
+                            stdout, stderr = process.communicate(timeout=0.05)
+                            return process.returncode, stdout, stderr
+                        except subprocess.TimeoutExpired:
+                            self.assertLess(time.monotonic(), deadline)
+                            children = subprocess.run(["/usr/bin/pgrep", "-P", str(process.pid)],
+                                                      capture_output=True, text=True, timeout=5)
+                            self.assertIn(children.returncode, (0, 1))
+                            for value in children.stdout.split():
+                                pid = int(value)
+                                if pid not in descendants:
+                                    os.kill(pid, signal.SIGKILL)
+                                    descendants.add(pid)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.communicate(timeout=5)
+            def terminate(uid):
+                self.assertEqual(len(descendants), 1)
+            output = io.StringIO()
+            with mock.patch.object(sandbox, "_run", side_effect=run), \
+                    mock.patch.object(sandbox, "_terminate_worker_processes", side_effect=terminate), \
+                    mock.patch("sys.stdout", output):
+                sandbox._deny_probe(root / "state", worker, {"run_id": "123", "home": str(root / "home")})
+            rows = [sandbox.refusal_codes.parse_macos_diagnostic(line) for line in output.getvalue().splitlines()]
+            self.assertTrue(all(row["result"] in ("pass", "empty") and row["exit"] == 0 for row in rows))
+            self.assertFalse((root / "outside-canary-dir").exists())
 
     def test_every_failed_canary_and_bad_transport_still_refuses(self):
         expected = {name: True for name in (
@@ -1728,14 +1804,20 @@ class WaveDiagnosticTests(unittest.TestCase):
             {"schema": "macos-diagnostic-v1", "kind": "cleanup", "path_class": "scratch", "entries": 1,
              "errno": "permission", "process": "python", "reason": "remove-failed"},
         ]
+        rows.extend({"schema": "macos-diagnostic-v1", "kind": "cleanup", "path_class": "worker-processes",
+                     "entries": 0, "errno": "refusal", "process": "unknown", "reason": reason}
+                    for reason in ("intent-missing", "tree-remove-failed", "tree-remains",
+                                   "worker-processes-remain", "worker-process-check-failed"))
         for row in rows:
             line = contract.macos_diagnostic_line(row)
             self.assertEqual(contract.parse_macos_diagnostic(line), row)
             for field in row:
-                for malicious in (chr(47) + "private/secret", "source.ts", "token=secret", {}, [], None, True):
+                for malicious in (chr(47) + "private/secret", "source.ts", "token=secret", {}, [], None, True, False, 0.0):
                     changed = dict(row, **{field: malicious})
                     with self.subTest(field=field, malicious=malicious), self.assertRaises(ValueError):
                         contract.macos_diagnostic_line(changed)
+                    with self.subTest(parser_field=field, malicious=malicious), self.assertRaises(ValueError):
+                        contract.parse_macos_diagnostic("macos_diagnostic=" + json.dumps(changed, sort_keys=True, separators=(",", ":")))
             for changed in (dict(row, extra="private"), {k: v for k, v in row.items() if k != "kind"}):
                 with self.assertRaises(ValueError):
                     contract.macos_diagnostic_line(changed)
@@ -1783,6 +1865,60 @@ class WaveDiagnosticTests(unittest.TestCase):
             self.assertEqual((scratch["entries"], scratch["errno"], scratch["process"]), (3, "permission", "node"))
             self.assertNotIn("private", output.getvalue())
 
+    def test_clear_residue_succeeds_or_names_the_non_tree_failure(self):
+        for processes, account_error, expected in (
+            ([], False, None), ([999], False, "cleanup-worker-processes-remain"),
+            (OSError("private process failure"), False, "cleanup-worker-process-check-failed"),
+            ([], True, "cleanup-account-check-failed"),
+        ):
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary).resolve()
+                root = temp / "devlane-123"
+                state = root / "state"
+                workspace = temp / "workspace"
+                state.mkdir(parents=True)
+                workspace.mkdir()
+                intent = {"schema": 1, "run_id": "123", "runner_uid": 501, "uid": 544,
+                          "gid": 20, "account": "kddevlane123", "home": str(root / "worker-home")}
+                (state / sandbox.CLEANUP_INTENT_FILE).write_bytes(sandbox.bundle.canonical_json(intent))
+                output = io.StringIO()
+                def users():
+                    if account_error:
+                        raise OSError("private account failure")
+                    return set()
+                def worker_ids(uid):
+                    if isinstance(processes, Exception):
+                        raise processes
+                    return processes
+                with mock.patch.object(sandbox.os, "geteuid", return_value=0), \
+                        mock.patch.object(sandbox, "_directory_users", side_effect=users), \
+                        mock.patch.object(sandbox, "_worker_process_ids", side_effect=worker_ids), \
+                        mock.patch.object(sandbox, "_terminate_worker_processes"), \
+                        mock.patch.object(sandbox, "_open_process_classes", return_value=set()), \
+                        mock.patch.object(sandbox, "_delete_worker_account"), \
+                        mock.patch("sys.stdout", output):
+                    if expected:
+                        with self.assertRaises(sandbox.Refusal) as caught:
+                            sandbox._root_cleanup(state, root, temp, workspace, "123")
+                        self.assertEqual(caught.exception.code, expected)
+                        self.assertEqual(sandbox._operation_refusal_code("cleanup", caught.exception), "macos-" + expected)
+                        self.assertNotIn("cleanup_receipt=confirmed", output.getvalue())
+                    else:
+                        self.assertEqual(sandbox._root_cleanup(state, root, temp, workspace, "123"), 0)
+                        self.assertIn("cleanup_receipt=confirmed", output.getvalue())
+                self.assertFalse(root.exists())
+                import public_audit
+                records = [sandbox.refusal_codes.parse_macos_diagnostic(line.decode("ascii"))
+                           for line in public_audit.collect_macos_diagnostics(output.getvalue().encode("ascii"))]
+                self.assertTrue(records)
+                self.assertTrue(all(row["entries"] == 0 for row in records))
+                if expected:
+                    self.assertIn(expected.removeprefix("cleanup-"), {row["reason"] for row in records})
+                    self.assertFalse(all(row["reason"] == "clear" for row in records))
+                else:
+                    self.assertTrue(all(row["reason"] == "clear" for row in records))
+                self.assertNotIn("private", output.getvalue())
+
     def test_cleanup_orders_quiescence_before_account_and_shred(self):
         for holders in (set(), {"node"}, {"unknown"}):
             with self.subTest(holders=holders), tempfile.TemporaryDirectory() as temporary:
@@ -1809,7 +1945,7 @@ class WaveDiagnosticTests(unittest.TestCase):
                         mock.patch.object(sandbox, "_clean_tree", side_effect=shred), \
                         mock.patch("sys.stdout", output):
                     if holders:
-                        with self.assertRaisesRegex(sandbox.Refusal, "cleanup-incomplete"):
+                        with self.assertRaisesRegex(sandbox.Refusal, "cleanup-holder-inventory-failed" if "unknown" in holders else "cleanup-open-holder"):
                             sandbox._root_cleanup(state, root, temp, workspace, "123")
                         self.assertEqual(events[:2], ["worker", "holders"])
                         self.assertTrue(all(event == "holders" for event in events[2:]))

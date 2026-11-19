@@ -431,6 +431,67 @@ class RunLifecycleTests(unittest.TestCase):
                 with mock.patch.object(coordinator, "_preserve_diagnostics", side_effect=OSError):
                     self.assertEqual(coordinator._terminal_audit_disposition("54321", record, run, ledger), "preserve-failed")
 
+    def test_every_cleanup_condition_survives_audit_refusal_and_run_deletion(self):
+        conditions = (
+            "intent-missing", "worker-quiescence-failed", "holder-inventory-failed", "open-holder",
+            "firewall-close-failed", "account-delete-failed", "tree-remove-failed", "tree-remains",
+            "account-remains", "account-check-failed", "worker-processes-remain", "worker-process-check-failed",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = self._ledger(temporary)
+            record = _attached_record()
+            record["platform"] = "macos"
+            _write_record(ledger, record)
+            run = {"id": 54321, "path": coordinator.fetch.WORKFLOW_PATH, "head_branch": "main",
+                   "head_sha": CONTROL_SHA, "event": "workflow_dispatch", "run_attempt": 1, "conclusion": "failure"}
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                sandbox_macos._cleanup_failure_diagnostics(["cleanup-" + reason for reason in conditions])
+            raw = Path(temporary) / "job.log"
+            raw.write_bytes(b"private source\n" + output.getvalue().encode("ascii"))
+            present = {"run": True, "logs": True}
+            deleted = []
+
+            def status(endpoint):
+                if endpoint.endswith("/actions/runs/54321/logs"):
+                    return 200 if present["logs"] else 404
+                if endpoint.endswith("/actions/runs/54321"):
+                    return 200 if present["run"] else 404
+                return 404
+
+            def delete(endpoint):
+                deleted.append(endpoint)
+                if endpoint.endswith("/logs"):
+                    raw.unlink()
+                    present["logs"] = False
+                if endpoint.endswith("/actions/runs/54321"):
+                    present["run"] = False
+                    raw.unlink(missing_ok=True)
+
+            response = {"total_count": 4, "jobs": [{"name": coordinator.public_audit.MACOS_RUN_JOB, "id": 42}]}
+            with self._cleanup(ledger, status=status, delete=delete, identity=False), \
+                    mock.patch.object(coordinator, "_verify_terminal", return_value=run), \
+                    mock.patch.object(coordinator, "_verify_run_identity", return_value=run), \
+                    mock.patch.object(coordinator, "_verify_wave_marker"), \
+                    mock.patch.object(coordinator, "_gh_json", return_value=response), \
+                    mock.patch.object(coordinator, "_cli_token", return_value="opaque"), \
+                    mock.patch.object(coordinator.public_audit.GitHubAPI, "log_text", side_effect=lambda _: raw.read_bytes()), \
+                    mock.patch.object(coordinator.public_audit, "validate_final_public_surfaces", side_effect=ValueError) as audit:
+                coordinator.cleanup_terminal(ledger, record["wave_id"])
+            audit.assert_called_once()
+            self.assertFalse(raw.exists())
+            self.assertFalse(present["run"])
+            self.assertTrue(any(endpoint.endswith("/logs") for endpoint in deleted))
+            updated = coordinator._read(ledger / (record["wave_id"] + ".json"))
+            self.assertEqual(updated["state"], "deleted")
+            self.assertEqual(updated["cleanup_attempts"][-1]["audit_disposition"], "refused")
+            target = ledger / ("macos-diagnostics-" + record["wave_id"] + ".jsonl")
+            saved = coordinator.public_audit.collect_macos_diagnostics(target.read_bytes())
+            reasons = {coordinator.refusal_codes.parse_macos_diagnostic(row.decode("ascii"))["reason"] for row in saved}
+            self.assertEqual(reasons, set(conditions))
+            self.assertNotIn(b"private", target.read_bytes())
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
     def test_terminal_audit_preserves_the_historical_two_job_count_only_for_legacy_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
             ledger = self._ledger(temporary)

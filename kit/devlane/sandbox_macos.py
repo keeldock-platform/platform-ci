@@ -1218,6 +1218,7 @@ def profile_text(*, workspace, prepared, scratch, home, control, node, developer
     }
     write_roots = {str(Path(workspace) / "source"), str(Path(home)), *scratch_writes}
     lines.extend((
+        '(allow file-read-data (literal "/"))',
         "(allow file-read* (literal \"/dev/null\") (literal \"/dev/urandom\") "
         + "(literal \"/dev/random\") (literal \"/dev/zero\"))",
         "(allow file-write* " + " ".join("(subpath " + _quote(path) + ")" for path in sorted(write_roots))
@@ -1225,7 +1226,8 @@ def profile_text(*, workspace, prepared, scratch, home, control, node, developer
         "(allow file-map-executable (subpath " + _quote(Path(prepared) / "node_modules") + ") "
         + "(subpath " + _quote(Path(workspace) / "source") + "))",
         "(allow sysctl-read (sysctl-name \"hw.machine\") (sysctl-name \"hw.ncpu\") (sysctl-name \"kern.ostype\") "
-        + "(sysctl-name \"hw.memsize\") (sysctl-name \"kern.osrelease\") (sysctl-name \"kern.osversion\"))",
+        + "(sysctl-name \"hw.memsize\") (sysctl-name \"kern.osrelease\") (sysctl-name \"kern.osversion\") "
+        + "(sysctl-name \"hw.pagesize_compat\"))",
     ))
     return "\n".join(lines) + "\n"
 
@@ -1613,19 +1615,23 @@ def _deny_probe_script():
 def _deny_probe(state, worker, ident):
     root = state.parent
     path = root / SBPL_FILE
-    fake_user = chr(47) + "Users" + chr(47) + "devlane-probe-" + ident["run_id"]
-    fake_keychain = fake_user + "/Library/Keychains/devlane-probe-" + ident["run_id"] + ".keychain-db"
-    fake_folders = (chr(47) + "private" + chr(47) + "var" + chr(47) + "folders/devlane-probe-"
-                    + ident["run_id"] + "/T/probe-file")
     outside_dir = root / "outside-canary-dir"
     outside = outside_dir / "outside-canary"
+    fake_user = outside_dir / "other-home"
+    fake_keychain = fake_user / "Library" / "Keychains" / "probe.keychain-db"
+    fake_folders = outside_dir / "private-folders" / "T" / "probe-file"
     detached = Path(worker["scratch"]) / "tmp" / "detached-probe-marker"
     raw_canary = Path(worker["scratch"]) / "raw" / "probe.log"
     if any(item.exists() or item.is_symlink() for item in (outside_dir, detached, raw_canary)):
         _probe_diagnostic("setup", "fail")
         _refuse("positive-control-failed")
     outside_dir.mkdir(mode=0o700)
-    outside.write_bytes(b"outside-canary")
+    fake_keychain.parent.mkdir(parents=True)
+    fake_folders.parent.mkdir(parents=True)
+    canaries = (outside, fake_user / "probe-file", fake_keychain, fake_folders)
+    for canary in canaries:
+        canary.write_bytes(b"outside-canary")
+    _chown_tree(outside_dir, worker["worker_uid"], worker["worker_gid"])
     raw_canary.write_bytes(b"probe-log-readable")
     os.chown(outside_dir, worker["worker_uid"], worker["worker_gid"])
     os.chown(outside, worker["worker_uid"], worker["worker_gid"])
@@ -1634,7 +1640,7 @@ def _deny_probe(state, worker, ident):
     os.chmod(raw_canary, 0o444)
     script = _deny_probe_script()
     command = ("/usr/bin/sandbox-exec", "-f", str(path), worker["node"], "-e", script,
-               worker["scratch"], str(outside), fake_user, fake_keychain, fake_folders,
+               worker["scratch"], str(outside), str(fake_user), str(fake_keychain), str(fake_folders),
                str(detached), str(raw_canary))
     try:
         code, stdout, stderr = _run(
@@ -1680,7 +1686,7 @@ def _deny_probe(state, worker, ident):
     exact = type(result) is dict and set(result) == set(expected) and all(value is True for value in result.values())
     _probe_diagnostic("result_schema", "pass" if exact else "fail", code)
     try:
-        unchanged = outside.read_bytes() == b"outside-canary"
+        unchanged = all(canary.read_bytes() == b"outside-canary" for canary in canaries)
     except OSError:
         _probe_diagnostic("canary", "missing", code)
         _probe_diagnostic("canary_unlink", "missing", code)
@@ -1689,8 +1695,11 @@ def _deny_probe(state, worker, ident):
     _probe_diagnostic("canary", "pass" if unchanged else "fail", code)
     _probe_diagnostic("detached_absent", "fail" if detached.exists() else "pass", code)
     try:
-        outside.unlink()
-        outside_dir.rmdir()
+        for canary in canaries:
+            canary.unlink()
+        for directory in (fake_keychain.parent, fake_keychain.parent.parent, fake_user,
+                          fake_folders.parent, fake_folders.parent.parent, outside_dir):
+            directory.rmdir()
         raw_canary.unlink()
         (Path(worker["scratch"]) / "reports" / "vitest.json").unlink(missing_ok=True)
     except OSError:
@@ -2396,6 +2405,27 @@ def _cleanup_diagnostic(path_class, entries, error="none", processes=(), *, reas
         }), flush=True)
 
 
+def _cleanup_failure_diagnostics(errors):
+    classes = {
+        "cleanup-intent-missing": "keychain-account-record",
+        "cleanup-worker-quiescence-failed": "worker-processes",
+        "cleanup-holder-inventory-failed": "run-tree",
+        "cleanup-open-holder": "run-tree",
+        "cleanup-firewall-close-failed": "firewall",
+        "cleanup-account-delete-failed": "keychain-account-record",
+        "cleanup-tree-remove-failed": "run-tree",
+        "cleanup-tree-remains": "run-tree",
+        "cleanup-account-remains": "keychain-account-record",
+        "cleanup-account-check-failed": "keychain-account-record",
+        "cleanup-worker-processes-remain": "worker-processes",
+        "cleanup-worker-process-check-failed": "worker-processes",
+    }
+    for code in dict.fromkeys(errors):
+        path_class = classes[code]
+        processes = {"unknown"} if path_class == "worker-processes" else set()
+        _cleanup_diagnostic(path_class, 0, "refusal", processes, reason=code.removeprefix("cleanup-"))
+
+
 def _root_cleanup(state_dir, root_dir, runner_temp, workspace, run_id):
     if os.geteuid() != 0:
         _refuse("macos-root-required")
@@ -2445,7 +2475,7 @@ def _root_cleanup(state_dir, root_dir, runner_temp, workspace, run_id):
             _terminate_worker_processes(intent["uid"])
         except Refusal:
             workers_gone = False
-            errors.append("worker-processes")
+            errors.append("cleanup-worker-quiescence-failed")
             quiescence_reason = "worker-quiescence-failed"
     holders = {"unknown"}
     if workers_gone:
@@ -2455,7 +2485,7 @@ def _root_cleanup(state_dir, root_dir, runner_temp, workspace, run_id):
             holders = {"unknown"}
         if holders:
             workers_gone = False
-            errors.append("open-processes")
+            errors.append("cleanup-holder-inventory-failed" if "unknown" in holders else "cleanup-open-holder")
             quiescence_reason = "holder-inventory-failed" if "unknown" in holders else "open-holder"
     pf_path = state / PF_STATE_FILE
     if pf_path.is_file() and not pf_path.is_symlink():
@@ -2467,47 +2497,48 @@ def _root_cleanup(state_dir, root_dir, runner_temp, workspace, run_id):
                 pf_path.unlink(missing_ok=True)
             except Exception as error:
                 _cleanup_diagnostic("firewall", 1, _cleanup_errno(error), holders, reason="firewall-close-failed")
-                errors.append("firewall")
+                errors.append("cleanup-firewall-close-failed")
         else:
             _cleanup_diagnostic("firewall", 1, "busy", holders, reason=quiescence_reason)
-            errors.append("firewall")
+            errors.append("cleanup-firewall-close-failed")
     if intent is not None and workers_gone:
         try:
             _delete_worker_account(intent)
         except Exception as error:
             _cleanup_diagnostic("keychain-account-record", 1, _cleanup_errno(error), holders, reason="account-delete-failed")
-            errors.append("account")
+            errors.append("cleanup-account-delete-failed")
     elif intent is not None:
-        errors.append("account")
+        errors.append("cleanup-account-delete-failed")
     tree_error = None
     if workers_gone:
         try:
             _clean_tree(root)
         except Exception as error:
             tree_error = error
-            errors.append("tree")
+            errors.append("cleanup-tree-remove-failed")
     else:
-        errors.append("tree")
+        errors.append("cleanup-tree-remove-failed")
     _residue_diagnostics(root, error=tree_error, processes=holders, reason=quiescence_reason)
     if root.exists() or root.is_symlink():
-        errors.append("tree-remains")
+        errors.append("cleanup-tree-remains")
     if intent is not None:
         try:
             account_remains = intent["account"] in _directory_users()
             _cleanup_diagnostic("keychain-account-record", int(account_remains), "refusal" if account_remains else "none", holders,
                                 reason="account-remains" if account_remains else "clear")
             if account_remains:
-                errors.append("account-remains")
+                errors.append("cleanup-account-remains")
         except Exception as error:
             _cleanup_diagnostic("keychain-account-record", 0, _cleanup_errno(error), {"unknown"}, reason="account-check-failed")
-            errors.append("account-check")
+            errors.append("cleanup-account-check-failed")
         try:
             if _worker_process_ids(intent["uid"]):
-                errors.append("worker-processes-remain")
+                errors.append("cleanup-worker-processes-remain")
         except Exception:
-            errors.append("worker-process-check")
+            errors.append("cleanup-worker-process-check-failed")
     if errors:
-        _refuse("cleanup-incomplete")
+        _cleanup_failure_diagnostics(errors)
+        _refuse(errors[0])
     print("cleanup_receipt=confirmed")
     return 0
 

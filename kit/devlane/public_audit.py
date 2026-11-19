@@ -283,7 +283,7 @@ AUDIT_SUBREASONS = frozenset((
     "hosted-step-block", "hosted-log-canonicalization", "job-log-surface", "check-run-output",
     "job-step-shape", "job-grammar", "job-contract", "terminal-job-contract", "run-record", "dispatch-marker",
     "audit-outcome", "step-metadata-binding", "audit-environment", "github-audit-surface",
-    "public-surface", "audit-internal-check",
+    "public-surface", "audit-internal-check", "macos-cleanup-failed",
 ))
 AUDIT_REASON_BY_CHECK = {
     "parse_workflow": "workflow-parse",
@@ -296,6 +296,7 @@ AUDIT_REASON_BY_CHECK = {
     "validate_check_output": "check-run-output",
     "_steps": "job-step-shape",
     "validate_job_contract": "job-contract",
+    "validate_macos_cleanup_outcome": "macos-cleanup-failed",
     "validate_terminal_job_contract": "terminal-job-contract",
     "validate_run_record": "run-record",
     "validate_dispatch_marker": "dispatch-marker",
@@ -2634,6 +2635,12 @@ def _refuse():
     raise AuditRefusal("audit-contract", AUDIT_REASON_BY_CHECK.get(caller, "audit-internal-check"))
 
 
+def validate_macos_cleanup_outcome(platform, run_job, cleanup_step):
+    if (platform == "macos" and run_job.get("conclusion") == "failure"
+            and cleanup_step.get("status") == "completed" and cleanup_step.get("conclusion") == "failure"):
+        _refuse()
+
+
 def _steps(job):
     values = job.get("steps")
     if type(values) is not list or len(values) > 32 or any(type(step) is not dict for step in values):
@@ -2771,6 +2778,7 @@ def validate_job_contract(jobs, identity, profile, *, surface=None):
         }.get(platform, set())
         if candidate in platform_early_steps:
             early_failure_step = candidate
+    validate_macos_cleanup_outcome(platform, run_job, cleanup_step)
     windows_prepare_cleanup_failure = (
         platform == "windows" and early_failure_step == WINDOWS_PREPARE_STEP
         and cleanup_step.get("status") == "completed" and cleanup_step.get("conclusion") == "failure"
@@ -2968,7 +2976,7 @@ def _audit_outcome_line(jobs, identity, diagnosed_failure=None):
         return "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed disposition=" + disposition
     steps = {step.get("name"): step for step in _steps(run_job)}
     cleanup = steps.get("Shred runner-local workspace")
-    cleanup_state = ("failed" if identity.get("platform") == "windows" and type(cleanup) is dict
+    cleanup_state = ("failed" if identity.get("platform") in ("windows", "macos") and type(cleanup) is dict
                      and cleanup.get("conclusion") == "failure" else "confirmed")
     failed = next((name for name, step in steps.items()
                    if step.get("status") == "completed" and step.get("conclusion") == "failure"), None)

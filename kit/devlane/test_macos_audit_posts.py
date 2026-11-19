@@ -9,6 +9,33 @@ from test_audit_contracts import (
 
 
 class MacosAuditPostTests(unittest.TestCase):
+    def test_failed_macos_cleanup_is_named_and_never_accepted_as_confirmed(self):
+        identity = dict(IDENTITY, platform="macos")
+        jobs = _encrypted_jobs(platform="macos")
+        run = next(job for job in jobs if job["name"] == audit.MACOS_RUN_JOB)
+        run["conclusion"] = "failure"
+        for step in run["steps"]:
+            if step["name"] == audit.MACOS_CLEANUP_STEP:
+                step["conclusion"] = "failure"
+        _sync_setup_posts(run)
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.validate_job_contract(jobs, identity, "core-node")
+        self.assertEqual((caught.exception.code, caught.exception.reason), ("audit-contract", "macos-cleanup-failed"))
+        for step in run["steps"]:
+            if step["name"] == audit.MACOS_PROBE_STEP:
+                step["conclusion"] = "failure"
+        outcome = audit._audit_outcome_line(jobs, identity, diagnosed_failure=audit.MACOS_PROBE_STEP)
+        self.assertIn("cleanup=failed", outcome)
+        self.assertIn("disposition=run-failed-at-macos-probe", outcome)
+        jobs = _encrypted_jobs(platform="macos")
+        run = next(job for job in jobs if job["name"] == audit.MACOS_RUN_JOB)
+        for step in run["steps"]:
+            if step["name"] == audit.MACOS_CLEANUP_STEP:
+                step["conclusion"] = "failure"
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.validate_job_contract(jobs, identity, "core-node")
+        self.assertEqual(caught.exception.reason, "job-contract")
+
     def test_macos_hosted_permissions_match_only_the_declared_contents_read(self):
         identity = dict(IDENTITY, platform="macos")
         log = _render_real_runner_encrypted_log(identity)
