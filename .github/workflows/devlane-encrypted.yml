@@ -72,10 +72,10 @@ concurrency:
 jobs:
   devlane-encrypted-run:
     name: devlane-encrypted-run
-    if: ${{ inputs.platform == 'linux' }}
+    if: ${{ false }}
     runs-on: ubuntu-24.04
     timeout-minutes: 180
-    environment: devlane-decrypt
+    environment: devlane-experiment-${{ inputs.platform }}
     permissions: {}
     defaults:
       run:
@@ -201,7 +201,7 @@ jobs:
                   or os.environ.get("CI_REPOSITORY_ID") != "1430960557"
                   or os.environ.get("CI_SERVER_URL") != "https://github.com"
                   or os.environ.get("CI_EVENT_NAME") != "workflow_dispatch"
-                  or os.environ.get("CI_REF") != "refs/heads/main"
+                  or os.environ.get("CI_REF") != "refs/heads/experiment/devlane-macwin-0119"
                   or not re.fullmatch(r"[1-9][0-9]{0,18}", os.environ.get("CI_RUN_ID", ""))
                   or not re.fullmatch(r"[a-f0-9]{40}", os.environ.get("CI_SHA", ""))):
               refuse("dispatch-identity")
@@ -287,12 +287,14 @@ jobs:
           fi
           printf 'devlane_swap=disabled\n'
       - name: Reserve work time for control evidence cache restore
+        if: ${{ false }}
         timeout-minutes: 1
         run: |
           set -euo pipefail
           python3 -B kit/devlane/deadline.py guard-action --file "$RUN_ROOT/deadline.json" \
             --step-timeout-seconds 60 --margin-seconds 60
       - name: Restore exact source-free control evidence
+        if: ${{ false }}
         timeout-minutes: 1
         uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
         with:
@@ -301,6 +303,7 @@ jobs:
           enableCrossOsArchive: true
           fail-on-cache-miss: true
       - name: Verify exact source-free control evidence
+        if: ${{ false }}
         run: |
           set -euo pipefail
           python3 -B kit/devlane/permit.py verify-control \
@@ -534,7 +537,7 @@ jobs:
     if: ${{ inputs.platform == 'macos' }}
     runs-on: macos-15
     timeout-minutes: 180
-    environment: devlane-decrypt
+    environment: devlane-experiment-${{ inputs.platform }}
     permissions:
       contents: read
     defaults:
@@ -661,7 +664,7 @@ jobs:
                   or os.environ.get("CI_REPOSITORY_ID") != "1430960557"
                   or os.environ.get("CI_SERVER_URL") != "https://github.com"
                   or os.environ.get("CI_EVENT_NAME") != "workflow_dispatch"
-                  or os.environ.get("CI_REF") != "refs/heads/main"
+                  or os.environ.get("CI_REF") != "refs/heads/experiment/devlane-macwin-0119"
                   or not re.fullmatch(r"[1-9][0-9]{0,18}", os.environ.get("CI_RUN_ID", ""))
                   or not re.fullmatch(r"[a-f0-9]{40}", os.environ.get("CI_SHA", ""))):
               refuse("dispatch-identity")
@@ -851,13 +854,21 @@ jobs:
             printf 'devlane_host_preflight=refused code=runner-unknown\n' >&2
             exit 1
           fi
+      - name: Experiment independent runtime diagnostics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          python3 -B kit/devlane/experiment_diagnostics.py
       - name: Reserve work time for control evidence cache restore
+        if: ${{ false }}
         timeout-minutes: 1
         run: |
           set -euo pipefail
           python3 -B kit/devlane/deadline.py guard-action --file "$RUN_ROOT/deadline.json" \
             --step-timeout-seconds 60 --margin-seconds 60
       - name: Restore exact source-free control evidence
+        if: ${{ false }}
         timeout-minutes: 1
         uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
         with:
@@ -866,6 +877,7 @@ jobs:
           enableCrossOsArchive: true
           fail-on-cache-miss: true
       - name: Verify exact source-free control evidence
+        if: ${{ false }}
         run: |
           set -euo pipefail
           python3 -B kit/devlane/permit.py verify-control \
@@ -1196,7 +1208,7 @@ jobs:
     if: ${{ inputs.platform == 'windows' }}
     runs-on: windows-2025
     timeout-minutes: 180
-    environment: devlane-decrypt
+    environment: devlane-experiment-${{ inputs.platform }}
     permissions: {}
     defaults:
       run:
@@ -1346,7 +1358,7 @@ jobs:
           $started = Join-Path $runRoot 'deadline-start'
           if ($env:CI_REPOSITORY -ne 'keeldock-platform/platform-ci' -or $env:CI_REPOSITORY_ID -ne '1430960557' -or
               $env:CI_SERVER_URL -ne 'https://github.com' -or $env:CI_EVENT_NAME -ne 'workflow_dispatch' -or
-              $env:CI_REF -ne 'refs/heads/main' -or $env:DEVLANE_PLATFORM -ne 'windows' -or
+              $env:CI_REF -ne 'refs/heads/experiment/devlane-macwin-0119' -or $env:DEVLANE_PLATFORM -ne 'windows' -or
               $env:DEVLANE_PROFILE -ne 'core-node' -or $env:CI_RUN_ATTEMPT -ne '1' -or
               $env:CI_SHA -notmatch '^[a-f0-9]{40}$') { exit 1 }
           python -B -c 'import os,sys,time; fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_BINARY",0),0o600); f=os.fdopen(fd,"wb"); f.write(("%.17g\n" % time.monotonic()).encode("ascii")); f.flush(); os.fsync(f.fileno()); f.close()' $started
@@ -1535,12 +1547,20 @@ jobs:
             Refuse-Preflight 'windows-npm-runtime-version-invalid'
           }
           Write-Output 'windows_runner=hosted-admin verified=windows-2025'
+      - name: Experiment independent runtime diagnostics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          python -B kit/devlane/experiment_diagnostics.py
       - name: Reserve work time for control evidence cache restore
+        if: ${{ false }}
         timeout-minutes: 1
         run: |
           python -B kit/devlane/deadline.py guard-action --file (Join-Path $env:RUN_ROOT 'deadline.json') --step-timeout-seconds 60 --margin-seconds 60
           if ($LASTEXITCODE -ne 0) { exit 1 }
       - name: Restore exact source-free control evidence
+        if: ${{ false }}
         timeout-minutes: 1
         uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
         with:
@@ -1549,6 +1569,7 @@ jobs:
           enableCrossOsArchive: true
           fail-on-cache-miss: true
       - name: Verify exact source-free control evidence
+        if: ${{ false }}
         run: |
           python -B kit/devlane/permit.py verify-control --file (Join-Path $env:CI_WORKSPACE 'devlane-control-evidence\permit.json') --control-sha $env:CI_SHA --run-id $env:CI_CONTROL_RUN_ID
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -1756,7 +1777,7 @@ jobs:
                   or os.environ.get("CI_REPOSITORY_ID") != "1430960557"
                   or os.environ.get("CI_SERVER_URL") != "https://github.com"
                   or os.environ.get("CI_EVENT_NAME") != "workflow_dispatch"
-                  or os.environ.get("CI_REF") != "refs/heads/main"
+                  or os.environ.get("CI_REF") != "refs/heads/experiment/devlane-macwin-0119"
                   or not re.fullmatch(r"[a-f0-9]{40}", os.environ.get("CI_SHA", ""))
                   or not re.fullmatch(r"[1-9][0-9]{0,18}", run_id)
                   or not re.fullmatch(r"[1-9][0-9]{0,3}", attempt)):

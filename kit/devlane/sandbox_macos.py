@@ -1235,7 +1235,7 @@ def profile_text(*, workspace, prepared, scratch, home, control, node, developer
 def _check_public_control(state, context, profile, control_sha):
     if (context.get("repository") != fetch.REPOSITORY or context.get("repository_id") != fetch.REPOSITORY_ID
             or context.get("server_url") != "https://github.com" or context.get("event") != "workflow_dispatch"
-            or context.get("ref") != "refs/heads/main" or context.get("profile") != profile
+            or context.get("ref") != "refs/heads/experiment/devlane-macwin-0119" or context.get("profile") != profile
             or context.get("control_sha") != control_sha or not bundle.GIT_SHA.fullmatch(control_sha)):
         _refuse("dispatch-context-invalid")
 
@@ -2601,7 +2601,7 @@ def main(argv=None):
             host = boundary_guard.check_platform()
             if (os.environ.get("CI_REPOSITORY") != fetch.REPOSITORY
                     or os.environ.get("CI_EVENT_NAME") != "workflow_dispatch"
-                    or os.environ.get("CI_REF") != "refs/heads/main"
+                    or os.environ.get("CI_REF") != "refs/heads/experiment/devlane-macwin-0119"
                     or os.environ.get("CI_SHA") != args.control_sha):
                 _refuse("dispatch-context-invalid")
             _host_preflight(state, args.workspace, args.profile, args.run_id)

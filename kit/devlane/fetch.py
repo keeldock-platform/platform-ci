@@ -77,7 +77,7 @@ def validate_dispatch(identity, expected_profile=None, now=None):
         _fail("repository-identity")
     if identity["server_url"] != "https://github.com" or identity["event"] != "workflow_dispatch":
         _fail("dispatch-origin")
-    if identity["ref"] != "refs/heads/main" or identity["workflow_path"] != WORKFLOW_PATH:
+    if identity["ref"] != "refs/heads/experiment/devlane-macwin-0119" or identity["workflow_path"] != WORKFLOW_PATH:
         _fail("dispatch-control-ref")
     if type(identity["control_sha"]) is not str or not re.fullmatch(r"[a-f0-9]{40,64}", identity["control_sha"]):
         _fail("control-sha")
