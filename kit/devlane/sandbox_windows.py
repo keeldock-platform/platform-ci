@@ -624,6 +624,10 @@ def _run_powershell(mode, state_path, request_path=None, timeout=MAX_CHILD_SECON
             line = process.stdout.readline()
             if not line:
                 return
+            if re.fullmatch(rb"experiment_(?:icacls_exit=-?[0-9]{1,11}|windows_run_stage=(?:save|arguments|native))\r?\n?", line):
+                with output_lock:
+                    sys.stdout.write(line.decode("ascii", "strict")); sys.stdout.flush()
+                continue
             if _boundary_failure_line(line) and diagnostic_count[0] == 0:
                 diagnostic_count[0] += 1
                 with output_lock:

@@ -32,13 +32,13 @@ def main():
         return text
     with mock.patch.object(Path,'read_text',new=before_read):
         before=unittest.TextTestRunner(stream=io.StringIO()).run(baseline_suite)
-    if len(before.failures)!=2 or before.errors:
-        print('experiment_native_before=unexpected');return 1
-    print('experiment_native_before=expected-refusal')
+    diagnostic_failed = len(before.failures)!=2 or bool(before.errors)
+    print('experiment_native_before_tests=%d failures=%d errors=%d' % (before.testsRun,len(before.failures),len(before.errors)))
+    print('experiment_native_before='+('unexpected' if diagnostic_failed else 'expected-refusal'))
     after=unittest.TextTestRunner(stream=io.StringIO()).run(unittest.TestSuite(test_windows_sandbox.NativeFailurePreservationTests(name) for name in methods))
-    if not after.wasSuccessful():
-        print('experiment_native_after=failed');return 1
-    print('experiment_native_after=passed')
+    print('experiment_native_after_tests=%d failures=%d errors=%d' % (after.testsRun,len(after.failures),len(after.errors)))
+    if not after.wasSuccessful():diagnostic_failed=True
+    print('experiment_native_after='+('passed' if after.wasSuccessful() else 'failed'))
     ps = (ROOT / 'sandbox_windows.ps1').read_text()
     serializer = re.search(r'        function Save-State \{.*?\n        \}', ps, re.S).group()
     formatter = re.search(r'function Write-BoundaryFailure.*?\n\}', ps, re.S).group()
@@ -73,7 +73,7 @@ def main():
         for line in lines:
             if line in allowed or re.fullmatch(r'windows_boundary_failure operation=acl-write code=other win32=5 hresult=-2147024891 target=read-0 principal=package-sid',line): print(line)
         print('experiment_runtime_exit='+str(p.returncode))
-        return 0 if p.returncode==0 and all(x in lines for x in allowed) else 1
+        return 0 if not diagnostic_failed and p.returncode==0 and all(x in lines for x in allowed) else 1
 
 if __name__ == '__main__':
     raise SystemExit(main())

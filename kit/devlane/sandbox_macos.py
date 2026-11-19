@@ -1947,15 +1947,24 @@ def _capture_command(argv, *, worker, ident, stage, timeout):
             return 125
         _terminate_worker_processes(worker["worker_uid"])
         return 124
-    except Refusal:
+    except Refusal as error:
+        reason = str(error) if str(error) in ('process-cleanup-incomplete', 'cleanup-process-incomplete', 'report-file-invalid', 'report-file-exists') else 'other'
+        print('experiment_macos_capture stage=%s phase=refusal code=%s' % (stage, reason))
         return 125
     except (OSError, subprocess.SubprocessError, TypeError):
+        print('experiment_macos_capture stage=%s phase=os-error code=other' % stage)
         return 125
     finally:
         if descriptor is not None:
             os.close(descriptor)
         if directory_descriptor is not None:
             os.close(directory_descriptor)
+    try:
+        payload=(raw_directory / target_name).read_bytes()[:8192].lower()
+        reason='permission' if b'permission denied' in payload or b'operation not permitted' in payload else 'dyld' if b'dyld' in payload else 'npm' if b'npm error' in payload else 'other' if payload else 'empty'
+    except OSError:
+        reason='unavailable'
+    print('experiment_macos_capture stage=%s phase=return exit=%d class=%s' % (stage, process.returncode, reason))
     return process.returncode
 
 

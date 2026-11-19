@@ -133,6 +133,7 @@ function Invoke-CleanupIcacls([string]$Path, [string[]]$Arguments) {
     $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
     $script:BoundaryOperation = 'icacls'
     & $icacls $Path @Arguments '/L' '/Q' 2>$null | Out-Null
+    Write-Output ('experiment_icacls_exit=' + [int]$LASTEXITCODE)
     if ($LASTEXITCODE -ne 0) {
         $script:BoundaryNativeExit = 'other'
         if ($LASTEXITCODE -ge 1 -and $LASTEXITCODE -le 15) { $script:BoundaryNativeExit = [string]$LASTEXITCODE }
@@ -307,11 +308,14 @@ try {
             Add-TrackedGrant $path 'Modify' 3
             Add-TrackedIntegrityGrant $path
         }
+        Write-Output 'experiment_windows_run_stage=save'
         Save-State
+        Write-Output 'experiment_windows_run_stage=arguments'
         $environment = [string[]]@($request.environment)
         $arguments = [string[]]@($request.arguments)
         $state.job_state = 'pending'
         Save-State
+        Write-Output 'experiment_windows_run_stage=native'
         $result = [KeelDock.Platform.DevLaneWindows.Boundary]::Run(
             [string]$state.profile_name, [string]$state.package_sid, [string]$request.executable,
             $arguments, [string]$request.working_directory, $environment, [int]$request.timeout_milliseconds, $internetClient)
