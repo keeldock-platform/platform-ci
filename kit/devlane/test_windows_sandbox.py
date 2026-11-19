@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 import sandbox_windows as windows
+import test_audit_contracts as audit_fixtures
 
 
 class WindowsSandboxValidationTests(unittest.TestCase):
@@ -240,6 +241,93 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             self.assertIsNone(windows._token_bypass_traverse_status("lpac=verified"))
             self.assertIn("windows_token_bypass_traverse=absent\n", output.getvalue())
             self.assertIn(caught.exception.code, windows.refusal_codes.WINDOWS_PREPARE_REFUSAL_CODES)
+
+    def test_boundary_failure_probe_is_closed_and_does_not_print_exception_text(self):
+        diagnostic = b"windows_boundary_failure operation=state-save code=argument-types win32=other\n"
+        self.assertTrue(windows._boundary_failure_line(diagnostic))
+        self.assertTrue(windows._boundary_failure_line(
+            b"windows_boundary_failure operation=icacls code=icacls-exit-5 win32=other\n"))
+        for bad in (diagnostic.replace(b"state-save", b"private-path"),
+                    diagnostic.replace(b"argument-types", b"private-message"),
+                    diagnostic.replace(b"other", b"12345"), diagnostic + b"private content"):
+            self.assertFalse(windows._boundary_failure_line(bad))
+        process = mock.Mock(returncode=1)
+        process.stdout = io.BytesIO(diagnostic + b"windows_sandbox=refused code=boundary\n")
+        with mock.patch.object(windows.subprocess, "Popen", return_value=process), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(windows.WindowsBoundaryRefusal):
+                windows._run_powershell("run", "sandbox.json", failure_prefix="windows-prepare")
+        self.assertEqual(output.getvalue(), diagnostic.decode())
+
+    def test_failed_prepare_cleanup_uses_only_the_validated_surviving_preparation_journal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            state = root / "state" / "sandbox.json"
+            state.parent.mkdir()
+            preparation = state.with_name("preparation.json")
+            preparation.write_text(json.dumps({"schema": 1, "owned_roots": [str(root)],
+                "acl_grants": [], "integrity_grants": [], "job_state": "none"}))
+            with mock.patch.object(windows, "quiesce_run") as quiesce, \
+                    mock.patch.object(windows, "delete_profile") as delete, \
+                    mock.patch.object(windows, "shred_tree", return_value="shred-fixture\n") as shred:
+                result = windows.cleanup_runner(state, root)
+            quiesce.assert_called_once_with(preparation)
+            delete.assert_called_once_with(preparation)
+            shred.assert_called_once()
+            self.assertIn("profile=deleted", result)
+            state.write_text("{}")
+            with mock.patch.object(windows, "quiesce_run") as quiesce:
+                with self.assertRaises(windows.WindowsBoundaryRefusal):
+                    windows.cleanup_runner(state, root)
+            quiesce.assert_not_called()
+            state.unlink()
+            preparation.write_text(json.dumps({"schema": 1, "owned_roots": [str(root)],
+                "acl_grants": [{"path": str(root.parent / "outside")}], "integrity_grants": [],
+                "job_state": "none"}))
+            with mock.patch.object(windows, "quiesce_run") as quiesce, \
+                    mock.patch.object(windows, "shred_tree") as shred:
+                with self.assertRaises(windows.WindowsBoundaryRefusal):
+                    windows.cleanup_runner(state, root)
+            quiesce.assert_not_called()
+            shred.assert_not_called()
+            preparation.unlink()
+            preparation.symlink_to(root / "outside.json")
+            with self.assertRaises(windows.WindowsBoundaryRefusal):
+                windows.cleanup_runner(state, root)
+
+    def test_launcher_journal_uses_explicit_arrays_before_any_acl_write(self):
+        script = Path(windows.__file__).with_name("sandbox_windows.ps1").read_text()
+        journal = script.split("function Save-State {", 1)[1].split("function Add-TrackedIntegrityGrant", 1)[0]
+        self.assertIn("$state.acl_grants = $grants.ToArray()", journal)
+        self.assertIn("$state.integrity_grants = $integrityGrants.ToArray()", journal)
+        self.assertNotIn("@($grants)", script)
+        tracked = script.split("function Add-TrackedGrant", 1)[1].split("function Save-State", 1)[0]
+        self.assertLess(tracked.index("$grants.Add("), tracked.index("Save-State"))
+        self.assertLess(tracked.index("Save-State"), tracked.index("Set-Acl"))
+        self.assertIn("Write-BoundaryFailure $_", script)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows PowerShell runtime fixture")
+    def test_actual_state_serializer_roundtrips_empty_and_nonempty_grant_journals(self):
+        script = Path(windows.__file__).with_name("sandbox_windows.ps1").read_text()
+        function = "function Save-State {" + script.split("function Save-State {", 1)[1].split(
+            "        function Add-TrackedIntegrityGrant", 1)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "state.json"
+            source = (
+                "$ErrorActionPreference='Stop'; $statePath=" + "'" + str(state_path).replace("'", "''") + "';\n"
+                "$script:BoundaryOperation='acl-rule'; $script:OwnedRoots=@('C:\\fixture');\n"
+                "$state=[pscustomobject]@{owned_roots=@();acl_grants=@();integrity_grants=@()};\n"
+                "$grants=[Collections.Generic.List[object]]::new();\n"
+                "$integrityGrants=[Collections.Generic.List[string]]::new();\n" + function + "\n"
+                "for ($i=0; $i -lt 3; $i++) { Save-State; "
+                "$saved=Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json; "
+                "if ($null -eq $saved.acl_grants -or $saved.acl_grants.Count -ne $i) { throw }; "
+                "$grants.Add([pscustomobject]@{path='C:\\fixture';rights='Modify';inheritance=3}) }; 'journal=pass'"
+            )
+            result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", source],
+                                    capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+            self.assertEqual(result.stdout.strip(), b"journal=pass")
 
     def test_profile_cleanup_reason_is_emitted_from_only_the_bounded_native_vocabulary(self):
         process = mock.Mock(returncode=1)
@@ -1464,6 +1552,128 @@ class WindowsSandboxValidationTests(unittest.TestCase):
             with self.assertRaises(windows.WindowsBoundaryRefusal):
                 windows._read_adapter_records(report)
 
+
+
+class WindowsRehearsalRegressionTests(unittest.TestCase):
+    def setUp(self):
+        self.identity = {"ref": "refs/heads/main", "control_sha": audit_fixtures.SHA, "run_id": "12345"}
+
+    def test_successful_graph_snapshot_retains_all_public_names_attempts_and_conclusions(self):
+        control = audit_fixtures.control_audit
+        rows = audit_fixtures._control_jobs()
+        api = mock.Mock()
+        api.json.return_value = ({"total_count": 18, "jobs": rows}, {})
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            control.read_control_graph(api, "/fixture", self.identity)
+        lines = [line for line in output.getvalue().splitlines() if line.startswith("control_graph_row ")]
+        self.assertEqual(len(lines), 18)
+        for row in rows:
+            self.assertTrue(any("name=" + row["name"] + " occurrence=1 attempt=1" in line
+                                and "conclusion=" + str(row["conclusion"]).lower() in line
+                                for line in lines))
+
+    def test_detailed_exception_probe_survives_fake_powershell_and_requires_refusal(self):
+        diagnostic = (b"windows_boundary_failure operation=acl-write code=other win32=5 "
+                      b"hresult=-2147024891 target=read-0 principal=package-sid\n")
+        for exit_code in (0, 1):
+            process = mock.Mock(returncode=exit_code)
+            process.stdout = io.BytesIO(diagnostic + b"windows_sandbox=refused code=boundary\n")
+            with mock.patch.object(windows.subprocess, "Popen", return_value=process), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                with self.assertRaises(windows.WindowsBoundaryRefusal):
+                    windows._run_powershell("run", "sandbox.json", failure_prefix="windows-prepare")
+            self.assertEqual(output.getvalue(), diagnostic.decode())
+        for bad in (diagnostic.replace(b"read-0", b"private/path"),
+                    diagnostic.replace(b"package-sid", b"secret"),
+                    diagnostic.replace(b"code=other", b"code=private-message")):
+            self.assertFalse(windows._boundary_failure_line(bad))
+
+    def test_windows_boundary_probe_is_failure_bound_and_has_no_free_text(self):
+        identity = dict(audit_fixtures.IDENTITY, platform="windows")
+        diagnostic = ("windows_boundary_failure operation=state-save code=argument-types win32=other "
+                      "hresult=-2146233087 target=owned-root principal=package-sid")
+        failure = {
+            "step": audit_fixtures.audit.WINDOWS_PREPARE_STEP,
+            "marker": "devlane_refusal=windows-prepare-powershell-nonzero", "exit_code": 1,
+            "outputs": ["windows_prepare_stage=none", "windows_prepare_stage_start=npm-ci",
+                        diagnostic, "devlane_refusal=windows-prepare-powershell-nonzero",
+                        "windows_prepare_stage_start=profile-cleanup"],
+        }
+        log = audit_fixtures._render_real_runner_encrypted_log(identity, early_failure=failure)
+        audit_fixtures.audit.validate_job_log_surface(log, audit_fixtures.audit.PLATFORM_RUN_JOBS["windows"], identity, completed=True)
+        for changed in (log.replace(b"code=argument-types", b"code=private-content"),
+                        log.replace(b"operation=state-save", b"operation=private-path"),
+                        log.replace(diagnostic.encode(), (diagnostic + "\n") .encode() * 3),
+                        audit_fixtures._render_real_runner_encrypted_log(identity).replace(
+                            b"windows_prepare_stage_start=npm-ci", (diagnostic + "\nwindows_prepare_stage_start=npm-ci").encode())):
+            with self.assertRaises(audit_fixtures.audit.AuditRefusal):
+                audit_fixtures.audit.validate_job_log_surface(changed, audit_fixtures.audit.PLATFORM_RUN_JOBS["windows"], identity, completed=True)
+
+    def test_recorded_windows_image_patch_version_is_audited_with_closed_metadata(self):
+        identity = dict(audit_fixtures.IDENTITY, platform="windows")
+        log = audit_fixtures._render_real_runner_encrypted_log(identity)
+        before, image = log.split(b"Image: windows-2025-vs2026", 1)
+        log = before + b"Image: windows-2025-vs2026" + image.replace(
+            b"Version: 20261103.629", b"Version: 20261116.315.1", 1)
+        log = log.replace(b"/20261103.629/images/windows/", b"/20261116.315/images/windows/")
+        log = log.replace(b"win25-vs2026%2F20261103.629", b"win25-vs2026%2F20261116.315")
+        self.assertIn(b"Version: 20261116.315.1", log)
+        audit_fixtures.audit.validate_job_log_surface(log, audit_fixtures.audit.PLATFORM_RUN_JOBS["windows"], identity, completed=True)
+        for changed in (
+                log.replace(b"20261116.315.1\n", b"20261116.315.2\n"),
+                log.replace(b"20261116.315.1\n", b"20261116.315.1 injected\n"),
+                log.replace(b"Image: windows-2025-vs2026", b"Image: unknown"),
+                log.replace(b"github.com/actions/runner-images/blob/win25-vs2026", b"example.com/runner-images")):
+            with self.subTest(changed=changed[:60]), self.assertRaises(audit_fixtures.audit.AuditRefusal):
+                audit_fixtures.audit.validate_job_log_surface(changed, audit_fixtures.audit.PLATFORM_RUN_JOBS["windows"], identity, completed=True)
+
+    def test_live_graph_api_lag_is_reread_without_relaxing_the_contract(self):
+        stale = audit_fixtures._control_jobs()
+        own = next(job for job in stale if job["name"] == audit_fixtures.control_audit.RUN_JOB)
+        own["steps"][2].update(status="pending", conclusion=None)
+        api = type("API", (), {})()
+        api.json = unittest.mock.Mock(side_effect=[
+            ({"total_count": 18, "jobs": stale}, {}),
+            ({"total_count": 18, "jobs": audit_fixtures._control_jobs()}, {}),
+        ])
+        with mock.patch.object(audit_fixtures.control_audit.time, "sleep") as sleep, contextlib.redirect_stdout(io.StringIO()) as output:
+            result = audit_fixtures.control_audit.read_control_graph(api, "/recorded-run", self.identity)
+        self.assertEqual(len(result), 18)
+        sleep.assert_called_once_with(2)
+        self.assertIn("snapshot=1 reason=self-audit", output.getvalue())
+        self.assertIn("snapshot=2 reason=valid", output.getvalue())
+        self.assertEqual(api.json.call_count, 2)
+
+    def test_graph_probe_distinguishes_persistent_failures_and_never_accepts_them(self):
+        mutations = []
+        for reason in ("count", "pagination", "names", "attempt", "identity", "child-live", "child-conclusion",
+                       "self-status", "self-step-names", "self-fetch", "self-audit", "self-cache-skipped"):
+            jobs, headers = audit_fixtures._control_jobs(), {}
+            own = next(job for job in jobs if job["name"] == audit_fixtures.control_audit.RUN_JOB)
+            child = next(job for job in jobs if job["name"] != audit_fixtures.control_audit.RUN_JOB)
+            if reason == "count": jobs.pop()
+            elif reason == "pagination": headers["Link"] = "untrusted header is never printed"
+            elif reason == "names": child["name"] = "untrusted job name is never printed"
+            elif reason == "attempt": child["run_attempt"] = 2
+            elif reason == "identity": child["head_sha"] = "e" * 40
+            elif reason == "child-live": child["status"] = "in_progress"
+            elif reason == "child-conclusion": child["conclusion"] = "neutral"
+            elif reason == "self-status": own["status"] = "queued"
+            elif reason == "self-step-names": own["steps"].pop(3)
+            elif reason == "self-fetch": own["steps"][1]["status"] = "in_progress"
+            elif reason == "self-audit": own["steps"][2]["status"] = "pending"
+            elif reason == "self-cache-skipped": own["steps"][3].update(status="completed", conclusion="skipped")
+            record = {"total_count": 18, "jobs": jobs}
+            with self.subTest(reason=reason):
+                self.assertEqual(audit_fixtures.control_audit.control_graph_probe(record, headers, self.identity), reason)
+                api = type("API", (), {})()
+                api.json = unittest.mock.Mock(return_value=(record, headers))
+                with mock.patch.object(audit_fixtures.control_audit.time, "sleep"), contextlib.redirect_stdout(io.StringIO()) as output:
+                    with self.assertRaises(audit_fixtures.control_audit.ControlAuditRefusal) as caught:
+                        audit_fixtures.control_audit.read_control_graph(api, "/recorded-run", self.identity)
+                self.assertEqual(caught.exception.stage, "job-graph")
+                self.assertEqual(api.json.call_count, 4)
+                self.assertNotIn("untrusted", output.getvalue())
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 import urllib.request
@@ -516,15 +517,129 @@ def validate_synthetic_log(log, identity, *, failed_acceptance=False):
         _refuse()
 
 
+def control_graph_probe(value, headers, identity):
+    """Classify an API snapshot without printing API-controlled text or identifiers."""
+    if type(value) is not dict or type(value.get("jobs")) is not list:
+        return "schema"
+    rows = value["jobs"]
+    if headers.get("Link"):
+        return "pagination"
+    if value.get("total_count") != 18 or len(rows) != 18:
+        return "count"
+    if any(type(row) is not dict for row in rows):
+        return "schema"
+    names = [row.get("name") for row in rows]
+    if any(type(name) is not str for name in names) or set(names) != CONTROL_JOB_NAMES:
+        return "names"
+    if any(row.get("run_attempt") != 1 for row in rows):
+        return "attempt"
+    if any(row.get("run_id") != int(identity["run_id"]) or
+           row.get("head_sha") != identity["control_sha"] for row in rows):
+        return "identity"
+    for row in rows:
+        if row["name"] == RUN_JOB:
+            continue
+        try:
+            _validate_child_steps(row["name"], row, require_main=identity["ref"] == "refs/heads/main")
+        except ControlAuditRefusal:
+            return "child-steps"
+        if row.get("status") != "completed":
+            return "child-live"
+        if row.get("conclusion") != "success" and not (
+                row["name"] == SYNTHETIC_JOB and row.get("conclusion") == "failure"):
+            return "child-conclusion"
+    own = next(row for row in rows if row["name"] == RUN_JOB)
+    if own.get("status") != "in_progress" or own.get("conclusion") is not None:
+        return "self-status"
+    try:
+        steps = _step_rows(own)
+    except ControlAuditRefusal:
+        return "self-step-names"
+    if [step.get("name") for step in steps] != list(CONTROL_AUDIT_FINAL_STEPS):
+        return "self-step-names"
+    if steps[0].get("status") != "completed" or steps[0].get("conclusion") != "success":
+        return "self-fetch"
+    if steps[1].get("status") != "in_progress" or steps[1].get("conclusion") is not None:
+        return "self-audit"
+    final = steps[2]
+    if final.get("status") == "completed" and final.get("conclusion") == "skipped":
+        return "self-cache-skipped"
+    if final.get("status") not in ("pending", "queued") or final.get("conclusion") is not None:
+        return "self-cache-state"
+    return "check-url-or-id"
+
+
+def emit_control_graph_snapshot(value, headers):
+    """Retain bounded state evidence while excluding all API-supplied free text."""
+    def number(value):
+        return str(value) if type(value) is int and 0 <= value <= 100 else "other"
+
+    def state(value, choices):
+        return "none" if value is None else value if type(value) is str and value in choices else "other"
+
+    rows = value.get("jobs") if type(value) is dict else None
+    print("control_graph_snapshot rows=" + number(len(rows) if type(rows) is list else None)
+          + " total=" + number(value.get("total_count") if type(value) is dict else None)
+          + " pagination=" + ("present" if headers.get("Link") else "absent"), flush=True)
+    if type(rows) is not list or len(rows) > 100:
+        return
+    statuses = ("pending", "queued", "waiting", "requested", "in_progress", "completed")
+    conclusions = ("success", "failure", "neutral", "skipped", "cancelled", "timed_out", "action_required")
+    for row_index, row in enumerate(rows, 1):
+        if type(row) is dict and (type(row.get("name")) is not str or row["name"] not in CONTROL_JOB_NAMES):
+            print("control_graph_row name=unknown row=" + str(row_index)
+                  + " attempt=" + number(row.get("run_attempt"))
+                  + " status=" + state(row.get("status"), statuses)
+                  + " conclusion=" + state(row.get("conclusion"), conclusions), flush=True)
+    for index, name in enumerate(sorted(CONTROL_JOB_NAMES), 1):
+        matches = [row for row in rows if type(row) is dict and row.get("name") == name]
+        for occurrence, job in enumerate(matches, 1):
+            print("control_graph_row name=" + name + " occurrence=" + str(occurrence)
+                  + " attempt=" + number(job.get("run_attempt"))
+                  + " status=" + state(job.get("status"), statuses)
+                  + " conclusion=" + state(job.get("conclusion"), conclusions), flush=True)
+        if len(matches) != 1:
+            continue
+        job = matches[0]
+        print("control_graph_job index=" + str(index) + " attempt=" + number(job.get("run_attempt"))
+              + " status=" + state(job.get("status"), statuses)
+              + " conclusion=" + state(job.get("conclusion"), conclusions), flush=True)
+        if name == RUN_JOB and type(job.get("steps")) is list:
+            for step_index, step_name in enumerate(CONTROL_AUDIT_FINAL_STEPS, 1):
+                steps = [step for step in job["steps"] if type(step) is dict and step.get("name") == step_name]
+                if len(steps) == 1:
+                    print("control_graph_self_step index=" + str(step_index)
+                          + " status=" + state(steps[0].get("status"), statuses)
+                          + " conclusion=" + state(steps[0].get("conclusion"), conclusions), flush=True)
+
+
+def read_control_graph(api, prefix, identity):
+    for attempt in range(1, 5):
+        value, headers = api.json(prefix + "/jobs?filter=all&per_page=100&page=1")
+        try:
+            if (type(value) is not dict or value.get("total_count") != 18
+                    or type(value.get("jobs")) is not list or len(value["jobs"]) != 18
+                    or headers.get("Link")):
+                _refuse("job-graph")
+            jobs = _under_stage("job-graph", validate_jobs, value["jobs"], identity)
+        except ControlAuditRefusal:
+            reason = control_graph_probe(value, headers, identity)
+            print("control_graph_probe snapshot=" + str(attempt) + " reason=" + reason, flush=True)
+            emit_control_graph_snapshot(value, headers)
+            if attempt == 4:
+                _refuse("job-graph")
+            time.sleep(2)
+        else:
+            print("control_graph_probe snapshot=" + str(attempt) + " reason=valid", flush=True)
+            emit_control_graph_snapshot(value, headers)
+            return jobs
+
+
 def run_audit(api, identity):
     prefix = "/repos/" + REPOSITORY + "/actions/runs/" + identity["run_id"]
     run, _ = api.json(prefix)
     _under_stage("run-record", validate_run_record, run, identity)
-    value, headers = api.json(prefix + "/jobs?filter=all&per_page=100&page=1")
-    if (type(value) is not dict or value.get("total_count") != 18 or type(value.get("jobs")) is not list
-            or len(value["jobs"]) != 18 or headers.get("Link")):
-        _refuse("job-graph")
-    jobs = _under_stage("job-graph", validate_jobs, value["jobs"], identity)
+    jobs = read_control_graph(api, prefix, identity)
     """Hosted-output assertion: the real synthetic job log must satisfy the same closed contract the encrypted-lane auditor applies, so any drift in what GitHub actually prints (scaffolding, cache action, setup action, env blocks) fails the control, never a private run."""
     synthetic_job = jobs[SYNTHETIC_JOB]
     _under_stage("synthetic-log", validate_synthetic_log,

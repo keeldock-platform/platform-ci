@@ -440,11 +440,15 @@ namespace KeelDock.Platform.DevLaneWindows
             finally { LocalFree(sid); }
         }
 
+        public static int FirstProfileDeleteStatus { get; private set; }
+
         public static string DeleteProfile(string name)
         {
+            FirstProfileDeleteStatus = 0;
             for (int attempt = 0; attempt < 4; attempt++)
             {
                 int status = DeleteAppContainerProfile(name);
+                if (status != 0 && FirstProfileDeleteStatus == 0) FirstProfileDeleteStatus = status;
                 if (status == 0 || unchecked((uint)status) == 0x80070002) return "deleted";
                 string reason = CleanupReason(status);
                 if (reason != "sharing-violation" || attempt == 3) return reason;

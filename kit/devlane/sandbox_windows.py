@@ -587,6 +587,19 @@ def _windows_process_summary(root_pid):
         return 0, "other"
 
 
+def _boundary_failure_line(line):
+    if type(line) is not bytes:
+        return False
+    operations = b"|".join(item.encode("ascii") for item in refusal_codes.WINDOWS_BOUNDARY_OPERATIONS)
+    codes = b"|".join(item.encode("ascii") for item in refusal_codes.WINDOWS_BOUNDARY_FAILURE_CODES)
+    return re.fullmatch(
+        b"windows_boundary_failure operation=(?:" + operations + b") code=(?:" + codes
+        + rb") win32=(?:other|2|3|5|32|33|87|1300|1314)"
+        + rb"(?: hresult=-?[0-9]{1,10} target=(?:none|owned-root|profile|read-[0-9]{1,6}|write-[0-9]{1,6})"
+        + rb" principal=(?:none|package-sid|low-integrity))?\r?\n?", line,
+    ) is not None
+
+
 def _run_powershell(mode, state_path, request_path=None, timeout=MAX_CHILD_SECONDS + 300,
                     failure_prefix=None, monitor_stage=None):
     script = Path(__file__).with_name("sandbox_windows.ps1").resolve(strict=True)
@@ -601,6 +614,7 @@ def _run_powershell(mode, state_path, request_path=None, timeout=MAX_CHILD_SECON
                             rb"process-create-suspended|job-assign|resume|wait|exit)\r?\n?\Z")
     captured = bytearray()
     overflow = [False]
+    diagnostic_count = [0]
     output_lock = threading.Lock()
     process = None
     reader = None
@@ -610,6 +624,12 @@ def _run_powershell(mode, state_path, request_path=None, timeout=MAX_CHILD_SECON
             line = process.stdout.readline()
             if not line:
                 return
+            if _boundary_failure_line(line) and diagnostic_count[0] == 0:
+                diagnostic_count[0] += 1
+                with output_lock:
+                    sys.stdout.write(line.decode("ascii", "strict"))
+                    sys.stdout.flush()
+                continue
             if phase_line.fullmatch(line):
                 with output_lock:
                     sys.stdout.write(line.decode("ascii", "strict"))
@@ -667,7 +687,7 @@ def _run_powershell(mode, state_path, request_path=None, timeout=MAX_CHILD_SECON
         _refuse((failure_prefix or "windows") + "-powershell-start-failed")
     except subprocess.SubprocessError:
         _refuse("powershell-unavailable")
-    if result.returncode != 0 or len(result.stdout) > 8192:
+    if result.returncode != 0 or len(result.stdout) > 8192 or diagnostic_count[0]:
         if mode == "delete" and len(result.stdout) <= 8192:
             match = re.fullmatch(
                 rb"(?:windows_cleanup_reason=(sharing-violation|access-denied|not-found|other)\r?\n)?"
@@ -2011,8 +2031,17 @@ def cleanup_runner(state_path, root, plaintext_root=None):
     errors = []
     error_reasons = []
     state = Path(state_path)
-    if not state.is_file():
+    expected = Path(root) / "state" / "sandbox.json"
+    preparation = Path(root) / "state" / "preparation.json"
+    if state == expected and state.is_file() and preparation.exists():
         _refuse("windows-cleanup-profile-failed", reason="other")
+    if not state.is_file():
+        if (state != expected or state.is_symlink() or preparation.is_symlink()
+                or not preparation.is_file() or _is_reparse(preparation.parent)
+                or _is_reparse(preparation) or _is_reparse(root)):
+            _refuse("windows-cleanup-profile-failed", reason="other")
+        _validate_cleanup_roots(preparation)
+        state = preparation
     try:
         quiesce_run(state)
     except WindowsBoundaryRefusal as error:

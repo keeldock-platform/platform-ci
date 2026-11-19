@@ -10,6 +10,31 @@ $ProgressPreference = 'SilentlyContinue'
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $cleanupReason = $null
 $script:OwnedRoots = @()
+$script:BoundaryOperation = 'types-load'
+$script:BoundaryNativeExit = 'other'
+$script:BoundaryTarget = 'none'
+$script:BoundaryPrincipal = 'none'
+function Write-BoundaryFailure([object]$Failure) {
+    $operations = @('other', 'types-load', 'state-load', 'state-save', 'path-inspection', 'acl-read', 'acl-rule', 'acl-write', 'icacls', 'quiesce', 'firewall-remove', 'storage-clear', 'profile-delete')
+    $codes = @('profile-delete-native', 'other', 'argument-types', 'cleanup_file_link_count', 'cleanup_identity_sid', 'cleanup_job_name', 'cleanup_job_open', 'cleanup_job_reap', 'cleanup_job_state', 'cleanup_job_terminate', 'cleanup_job_verify_nonempty', 'cleanup_job_verify_open', 'cleanup_path', 'cleanup_process_alive', 'cleanup_process_enumeration', 'cleanup_process_identity', 'cleanup_process_inspection', 'cleanup_process_protection', 'cleanup_process_reap', 'cleanup_process_session', 'cleanup_process_terminate', 'cleanup_process_timeout', 'cleanup_process_token', 'cleanup_process_user', 'cleanup_process_wait_failed', 'cleanup_processes', 'cleanup_reparse_or_type')
+    $operation = $script:BoundaryOperation
+    if ($operation -cnotin $operations) { $operation = 'other' }
+    $code = 'other'
+    $win32 = 'other'
+    $exception = $Failure.Exception
+    $hresult = [int]$exception.HResult
+    for ($depth = 0; $depth -lt 4 -and $null -ne $exception; $depth++) {
+        if ($exception.Message -ceq 'Argument types do not match') { $code = 'argument-types' }
+        elseif ($exception.Message -cin $codes) { $code = [string]$exception.Message }
+        $hresult = [int]$exception.HResult
+        $number = $hresult -band 65535
+        if ($number -in @(2, 3, 5, 32, 33, 87, 1300, 1314)) { $win32 = [string]$number }
+        $exception = $exception.InnerException
+    }
+    if ($operation -ceq 'icacls') { $code = 'icacls-exit-' + $script:BoundaryNativeExit }
+    Write-Output ('windows_boundary_failure operation=' + $operation + ' code=' + $code + ' win32=' + $win32 + ' hresult=' + $hresult +
+        ' target=' + $script:BoundaryTarget + ' principal=' + $script:BoundaryPrincipal)
+}
 function Write-LauncherPhase([string]$Phase) {
     if ($Phase -notin @('types-load', 'appcontainer-sid', 'token-create', 'acl-grant', 'job-create',
             'process-create-suspended', 'job-assign', 'resume', 'wait', 'exit')) { throw }
@@ -37,6 +62,7 @@ function Add-CleanupBudgetEntry([int]$PendingCount = 0) {
 function Get-CleanupPathInfo([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path) -or $Path.Length -gt 4096 -or
             -not [IO.Path]::IsPathRooted($Path)) { throw }
+    $script:BoundaryOperation = 'path-inspection'
     $fullPath = [IO.Path]::GetFullPath($Path)
     $root = [IO.Path]::GetPathRoot($fullPath)
     if ([string]::IsNullOrEmpty($root) -or $root.Length -ne 3 -or $fullPath.StartsWith('\\') -or
@@ -105,8 +131,13 @@ function Assert-CleanupTreeSafe([string]$Path) {
 function Invoke-CleanupIcacls([string]$Path, [string[]]$Arguments) {
     $Path = Assert-OwnedPath $Path
     $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
+    $script:BoundaryOperation = 'icacls'
     & $icacls $Path @Arguments '/L' '/Q' 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw }
+    if ($LASTEXITCODE -ne 0) {
+        $script:BoundaryNativeExit = 'other'
+        if ($LASTEXITCODE -ge 1 -and $LASTEXITCODE -le 15) { $script:BoundaryNativeExit = [string]$LASTEXITCODE }
+        throw
+    }
 }
 function Set-CleanupStorageAccess([string]$Path) {
     $Path = Assert-OwnedPath $Path
@@ -133,6 +164,7 @@ try {
         Write-Output 'windows_sandbox_profile=created appcontainer=lpac capabilities=empty'
         exit 0
     }
+    $script:BoundaryOperation = 'state-load'
     $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
     if ($state.schema -ne 1 -or $state.profile_name -notmatch '^KDDevLane[a-f0-9]{32}$' -or
             $state.package_sid -notmatch '^S-1-15-2-(?:[0-9]+-){6}[0-9]+$' -or
@@ -141,6 +173,7 @@ try {
             @($state.owned_roots).Count -gt 128 -or
             $state.job_state -notin @('none', 'pending', 'terminated-empty')) { throw }
     if ($Mode -eq 'quiesce') {
+        $script:BoundaryOperation = 'quiesce'
         [KeelDock.Platform.DevLaneWindows.Boundary]::AssertCleanupQuiescent(
             [string]$state.profile_name, [string]$state.package_sid, [string]$state.job_state)
         Write-Output 'windows_processes=terminated verified=empty'
@@ -162,6 +195,7 @@ try {
         exit 0
     }
     if ($Mode -eq 'firewall-remove') {
+        $script:BoundaryOperation = 'firewall-remove'
         Remove-NetFirewallRule -Name $state.firewall_rule -ErrorAction SilentlyContinue
         if (@(Get-NetFirewallRule -Name $state.firewall_rule -ErrorAction SilentlyContinue).Count -ne 0) { throw }
         Write-Output 'windows_firewall=removed'
@@ -185,6 +219,7 @@ try {
         $integrityGrants = [Collections.Generic.List[string]]::new()
         foreach ($path in @($state.integrity_grants)) { $integrityGrants.Add([string]$path) }
         function Add-TrackedGrant([string]$path, [string]$rightsName, [int]$inheritanceValue) {
+            $script:BoundaryPrincipal = 'package-sid'
             $path = Assert-OwnedPath $path
             $inheritance = [Security.AccessControl.InheritanceFlags]$inheritanceValue
             $rights = [Enum]::Parse([Security.AccessControl.FileSystemRights], $rightsName)
@@ -196,24 +231,31 @@ try {
                 if (-not $pathInfo.Item.PSIsContainer) { throw }
                 Assert-CleanupTreeSafe $pathInfo.Path
             }
+            $script:BoundaryOperation = 'acl-read'
             $acl = Get-Acl -LiteralPath $path
+            $script:BoundaryOperation = 'acl-rule'
             $rule = [Security.AccessControl.FileSystemAccessRule]::new($sid, $rights, $inheritance,
                 [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)
             $grants.Add([pscustomobject]@{ path = $path; rights = $rightsName; inheritance = $inheritanceValue })
             Save-State
             [void]$acl.AddAccessRule($rule)
+            $script:BoundaryOperation = 'acl-write'
             Set-Acl -LiteralPath $path -AclObject $acl
         }
         function Save-State {
+            $previousOperation = $script:BoundaryOperation
+            $script:BoundaryOperation = 'state-save'
             $state.owned_roots = @($script:OwnedRoots)
-            $state.acl_grants = @($grants)
-            $state.integrity_grants = @($integrityGrants)
+            $state.acl_grants = $grants.ToArray()
+            $state.integrity_grants = $integrityGrants.ToArray()
             $temporaryState = $statePath + '.tmp'
             $json = $state | ConvertTo-Json -Depth 8 -Compress
             [IO.File]::WriteAllText($temporaryState, $json + "`n", [Text.UTF8Encoding]::new($false))
             Move-Item -LiteralPath $temporaryState -Destination $statePath -Force
+            $script:BoundaryOperation = $previousOperation
         }
         function Add-TrackedIntegrityGrant([string]$path) {
+            $script:BoundaryPrincipal = 'low-integrity'
             $path = Assert-OwnedPath $path
             if ($integrityGrants.Contains($path)) { return }
             $pathInfo = Get-CleanupPathInfo $path
@@ -235,19 +277,29 @@ try {
                     [StringComparison]::OrdinalIgnoreCase))) { throw }
         $script:OwnedRoots = @($baseInfo.Path)
         $state.owned_roots = @($script:OwnedRoots)
+        $script:BoundaryTarget = 'owned-root'
+        $script:BoundaryPrincipal = 'package-sid'
         Save-State
         [void](Assert-OwnedPath $statePath)
         [void](Assert-OwnedPath ([IO.Path]::GetFullPath($RequestFile)))
         foreach ($path in @([string]$request.executable, [string]$request.working_directory)) {
             [void](Assert-OwnedPath $path)
         }
+        $targetIndex = 0
         foreach ($entry in @($request.read_paths)) {
+            $script:BoundaryTarget = 'read-' + $targetIndex
+            $targetIndex++
+            $script:BoundaryPrincipal = 'package-sid'
             $path = Assert-OwnedPath ([string]$entry)
             $item = Get-Item -LiteralPath $path -Force
             if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw }
             Add-TrackedGrant $path 'ReadAndExecute' $(if ($item.PSIsContainer) { 3 } else { 0 })
         }
+        $targetIndex = 0
         foreach ($entry in @($request.write_paths)) {
+            $script:BoundaryTarget = 'write-' + $targetIndex
+            $targetIndex++
+            $script:BoundaryPrincipal = 'package-sid'
             $path = Assert-OwnedPath ([string]$entry)
             $item = Get-Item -LiteralPath $path -Force
             if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw }
@@ -307,8 +359,10 @@ try {
             $ownedInfo = Get-CleanupPathInfo $ownedRoot
             if ($null -eq $ownedInfo -or -not $ownedInfo.Item.PSIsContainer) { throw }
         }
+        $script:BoundaryOperation = 'quiesce'
         [KeelDock.Platform.DevLaneWindows.Boundary]::AssertCleanupQuiescent(
             [string]$state.profile_name, [string]$state.package_sid, [string]$state.job_state)
+        $script:BoundaryOperation = 'firewall-remove'
         Remove-NetFirewallRule -Name $state.firewall_rule -ErrorAction SilentlyContinue
         if (@(Get-NetFirewallRule -Name $state.firewall_rule -ErrorAction SilentlyContinue).Count -ne 0) { throw }
         function Clear-AppContainerStorage([string]$PackageSid, [string]$ProfileName) {
@@ -394,17 +448,23 @@ try {
             Assert-CleanupTreeSafe $pathInfo.Path
             Invoke-CleanupIcacls $pathInfo.Path @('/setintegritylevel', '(OI)(CI)M')
         }
+        $script:BoundaryTarget = 'profile'
+        $script:BoundaryPrincipal = 'package-sid'
+        $script:BoundaryOperation = 'storage-clear'
         [void](Clear-AppContainerStorage ([string]$state.package_sid) ([string]$state.profile_name))
+        $script:BoundaryOperation = 'profile-delete'
         $deleteResult = [KeelDock.Platform.DevLaneWindows.Boundary]::DeleteProfile([string]$state.profile_name)
         if ($deleteResult -ne 'deleted') {
             $cleanupReason = [string]$deleteResult
-            throw
+            throw [Runtime.InteropServices.COMException]::new('profile-delete-native',
+                [KeelDock.Platform.DevLaneWindows.Boundary]::FirstProfileDeleteStatus)
         }
         Write-Output 'windows_sandbox_cleanup=confirmed firewall=removed profile=deleted'
         exit 0
     }
     throw
 } catch {
+    Write-BoundaryFailure $_
     if ($Mode -eq 'delete' -and $null -eq $cleanupReason) {
         $code = ([int]$_.Exception.HResult) -band 65535
         if ($code -in @(32, 33)) { $cleanupReason = 'sharing-violation' }

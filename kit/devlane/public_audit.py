@@ -1015,6 +1015,20 @@ class _Grammar:
                 MACOS_PROBE_STEP if record["kind"] == "probe" else MACOS_CLEANUP_STEP))
         step = next((item for item in self.steps if item["name"] == step_name), None)
         uses = (step or {}).get("uses") or ""
+        if line.startswith("windows_boundary_failure "):
+            match = re.fullmatch(
+                r"windows_boundary_failure operation=([a-z-]+) code=([a-z0-9_-]+) "
+                r"win32=(other|2|3|5|32|33|87|1300|1314)"
+                r"(?: hresult=-?[0-9]{1,10} target=(?:none|owned-root|profile|read-[0-9]{1,6}|write-[0-9]{1,6})"
+                r" principal=(?:none|package-sid|low-integrity))?", line)
+            if (match is None or self.job_runner != "windows-2025"
+                    or step_name not in (WINDOWS_PREPARE_STEP, "Shred runner-local workspace")
+                    or match.group(1) not in refusal_codes.WINDOWS_BOUNDARY_OPERATIONS
+                    or match.group(2) not in refusal_codes.WINDOWS_BOUNDARY_FAILURE_CODES):
+                return False
+            key = "windows_boundary_failure_" + step_name
+            public_counts[key] = public_counts.get(key, 0) + 1
+            return public_counts[key] <= (2 if step_name == WINDOWS_PREPARE_STEP else 1)
         launcher_phase = re.fullmatch(r"windows_launcher_phase=([a-z-]+)", line)
         if launcher_phase is not None:
             phase = launcher_phase.group(1)
@@ -1735,7 +1749,7 @@ def _hosted_preamble(lines, grammar, job_name, identity, workflow_path):
     elif job_runner == "windows-2025":
         image_patterns = (
             r"Image: windows-2025-vs2026",
-            r"Version: [0-9]{8}\.[0-9]{3}",
+            r"Version: [0-9]{8}\.[0-9]{3}(?:\.1)?",
             r"Included Software: https://github\.com/actions/runner-images/blob/win25-vs2026/[0-9]{8}\.[0-9]{3}/images/windows/Windows2025-VS2026-Readme\.md",
             r"Image Release: https://github\.com/actions/runner-images/releases/tag/win25-vs2026%2F[0-9]{8}\.[0-9]{3}",
         )
@@ -2582,6 +2596,10 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
     }
     if (counts.get("crypto_refusal_reason", 0) > 1
             or not _crypto_reason_matches_bootstrap_code(crypto_surface, identity)):
+        _refuse()
+    if counts.get("windows_boundary_failure_" + WINDOWS_PREPARE_STEP) and early_failure != WINDOWS_PREPARE_STEP:
+        _refuse()
+    if counts.get("windows_boundary_failure_Shred runner-local workspace") and not counts.get("cleanup_failure_refusal"):
         _refuse()
     failure_stage = None
     if early_failure is not None:

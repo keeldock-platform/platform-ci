@@ -459,3 +459,9 @@ def parse_macos_diagnostic(line):
     if macos_diagnostic_line(value) != line:
         raise ValueError("macos-diagnostic-schema")
     return value
+
+
+WINDOWS_BOUNDARY_OPERATIONS = ('other', 'types-load', 'state-load', 'state-save', 'path-inspection', 'acl-read', 'acl-rule', 'acl-write', 'icacls', 'quiesce', 'firewall-remove', 'storage-clear', 'profile-delete')
+WINDOWS_BOUNDARY_FAILURE_CODES = ('other', 'argument-types', 'cleanup_file_link_count', 'cleanup_identity_sid', 'cleanup_job_name', 'cleanup_job_open', 'cleanup_job_reap', 'cleanup_job_state', 'cleanup_job_terminate', 'cleanup_job_verify_nonempty', 'cleanup_job_verify_open', 'cleanup_path', 'cleanup_process_alive', 'cleanup_process_enumeration', 'cleanup_process_identity', 'cleanup_process_inspection', 'cleanup_process_protection', 'cleanup_process_reap', 'cleanup_process_session', 'cleanup_process_terminate', 'cleanup_process_timeout', 'cleanup_process_token', 'cleanup_process_user', 'cleanup_process_wait_failed', 'cleanup_processes', 'cleanup_reparse_or_type')
+WINDOWS_BOUNDARY_FAILURE_CODES += ('profile-delete-native',)
+WINDOWS_BOUNDARY_FAILURE_CODES += tuple("icacls-exit-" + str(code) for code in range(1, 16)) + ("icacls-exit-other",)
