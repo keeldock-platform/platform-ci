@@ -481,7 +481,7 @@ PINNED_FILE_SHA256 = {
     'kit/bootstrap/policy_linux.py': '0b314a645e43f2aaec58ca23150386b5865e8a27c3101459d00d42370e7d5a5f',
     'kit/bootstrap/policy_npm.py': 'b110b4573b2919003792e05bdcec60a0108f9e2ea1ebc1ce820ff77216271794',
     'kit/bootstrap/policy_rust.py': '4306a55701a5a04c884b2b21091a6d06307134e3570f0d5d65cb103ff84023ec',
-    'kit/bootstrap/public_tree.py': '8f5be2ce90eac9b134ae3f07bdbeb30d1b7458e02f6ddde48f87e96b5c644c8f',
+    'kit/bootstrap/public_tree.py': 'd1e28ec5fb4dc0d6c0bd691765f676db3bdc3fb051018115de6348c9a6eea3d7',
     'kit/bootstrap/test_policy_baselines.py': '690980cc3a140970d2b813d854823e3e9f32d8b09db9e25c0ca143140c3af627',
     'kit/bootstrap/test_policy_handoff.py': '3cf707fec6cc1a62e49a948b496fe00765a04ec171fd4cdc57b07d214d3100a2',
     'kit/bootstrap/test_policy_linux.py': 'f1c62480d608d680e73cdbf0ca8b7c83552919bd5de4caa095d5e04e8c3e5f8c',
@@ -773,10 +773,10 @@ PINNED_FILE_SHA256 = {
     'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/src/main.rs': 'cadaae13fdda82c558f51a943c89cdf05dbcf151eed89dca388c66b1f74a3539',
     'kit/devlane/fixtures/desktop-tauri-smoke/src-tauri/tauri.conf.json': '9bce3fca18224c76a7825207f84b34dae160e4e133b9d51e7230fe25dcebd2d7',
     'kit/devlane/sandbox_windows.py': '47eaafec32a487002a739c70b6e48468e768e0ebfcdae5ddcfdeed1c86b67999',
-    'kit/devlane/sandbox_windows.ps1': 'e6aab25c40a2272921aae1a9d9a3c4a2d1310243496f41c8deb1693ef6576f40',
-    'kit/devlane/sandbox_windows_native.cs': '1b8d7a79e3e3734536dbfc1f6deed29f8bbf475c5674d62f8c78605d1ad01200',
+    'kit/devlane/sandbox_windows.ps1': '4ec4d5f299446f5a0660694963bbcdd6a4148fece626e2b3bb7e8948ea31b97d',
+    'kit/devlane/sandbox_windows_native.cs': '4373d5eeb89598d851fda9fe9907ed29647dd234c6a7b12e5bec3b5654524f0d',
     'kit/devlane/sandbox_windows_reporter.mjs': 'ac3ebae312331a2095dfe2c11200dae4f3db2c9be77add796bedd1a60f496d6d',
-    'kit/devlane/test_windows_sandbox.py': '932055752fdf23595b28496a178d4935eb33a66add21bebcacbcb49bfc76ea4d',
+    'kit/devlane/test_windows_sandbox.py': '666205e48c6d8295a57d71bf7b6e8fe00555b1defebd32835062b228a19846b2',
 }
 BINARY_FIXTURE_FILES = frozenset((
     "kit/devlane/fixtures/real-netns-rtnetlink-ipv4-ubuntu2404.bin",

@@ -136,7 +136,7 @@ function Invoke-CleanupIcacls([string]$Path, [string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) {
         $script:BoundaryNativeExit = 'other'
         if ($LASTEXITCODE -ge 1 -and $LASTEXITCODE -le 15) { $script:BoundaryNativeExit = [string]$LASTEXITCODE }
-        throw
+        throw [Runtime.InteropServices.COMException]::new('icacls-native', [int]$LASTEXITCODE)
     }
 }
 function Set-CleanupStorageAccess([string]$Path) {

@@ -742,11 +742,11 @@ namespace KeelDock.Platform.DevLaneWindows
             {
                 if (error.Message == "cleanup_process_wait_failed"
                     || error.Message == "cleanup_process_reap") throw;
-                throw new InvalidOperationException("cleanup_processes");
+                throw new InvalidOperationException("cleanup_processes", error);
             }
-            catch
+            catch (Exception error)
             {
-                throw new InvalidOperationException("cleanup_processes");
+                throw new InvalidOperationException("cleanup_processes", error);
             }
             finally
             {

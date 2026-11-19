@@ -1675,5 +1675,31 @@ class WindowsRehearsalRegressionTests(unittest.TestCase):
                 self.assertEqual(api.json.call_count, 4)
                 self.assertNotIn("untrusted", output.getvalue())
 
+
+class NativeFailurePreservationTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "requires hosted Windows PowerShell")
+    def test_icacls_native_status_survives_formatter(self):
+        script = Path(windows.__file__).with_suffix(".ps1").read_text()
+        function = script.split("function Invoke-CleanupIcacls", 1)[1].split("function Set-CleanupStorageAccess", 1)[0]
+        probe = """$ErrorActionPreference='Stop'
+function Assert-OwnedPath([string]$Path) { return $Path }
+function Join-Path { return 'Invoke-FakeIcacls' }
+function Invoke-FakeIcacls { $global:LASTEXITCODE=87 }
+function Invoke-CleanupIcacls""" + function + """
+try { Invoke-CleanupIcacls 'fixture' @('/setintegritylevel','(OI)(CI)L'); exit 2 }
+catch { if ($_.Exception.HResult -ne 87) { exit 3 }; exit 0 }
+"""
+        import base64
+        result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                                 base64.b64encode(probe.encode("utf-16le")).decode("ascii")],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        self.assertEqual(result.returncode, 0)
+
+    def test_quiescence_wrapper_preserves_diagnostic_exception(self):
+        native = Path(windows.__file__).with_name("sandbox_windows_native.cs").read_text()
+        method = native.split("private static void AssertCleanupQuiescent", 1)[1].split("private static bool IsProcessGone", 1)[0]
+        self.assertEqual(method.count('new InvalidOperationException("cleanup_processes", error)'), 2)
+        self.assertIn("catch (Exception error)", method)
+
 if __name__ == "__main__":
     unittest.main()
