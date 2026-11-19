@@ -385,7 +385,7 @@ def _find_node_tools():
     npm_name = shutil.which("npm")
     if not node_name or not npm_name:
         _refuse("node-toolchain-missing")
-    node = _trusted_file(Path(node_name), executable=True)
+    node = _trusted_file(Path(node_name).resolve(strict=True), executable=True)
     npm_launcher = Path(npm_name).resolve(strict=True)
     if npm_launcher.name == "npm-cli.js":
         npm_entry = npm_launcher
@@ -657,7 +657,7 @@ def _validate_prepare_run_root(state, ident):
         _refuse("prepare-run-root-invalid")
 
 
-def _macos_node_runtime_read_roots(node):
+def _macos_node_runtime_read_files(node):
     if sys.platform != "darwin" or not Path(node).is_file():
         return set()
     otool = Path(CLT_OTOOL_PATH)
@@ -669,7 +669,7 @@ def _macos_node_runtime_read_roots(node):
         _refuse("tool-runtime-dependencies-invalid")
     pending = [executable]
     visited = set()
-    roots = {executable.parent, executable.parent.parent}
+    files = {executable}
     while pending:
         current = pending.pop()
         if current in visited:
@@ -730,15 +730,14 @@ def _macos_node_runtime_read_roots(node):
             existing = next((candidate for candidate in candidates if candidate.is_file()), None)
             if existing is None:
                 _refuse("tool-runtime-dependencies-invalid")
-            roots.add(existing.parent)
             try:
                 resolved = existing.resolve(strict=True)
-            except OSError:
+            except (OSError, RuntimeError):
                 _refuse("tool-runtime-dependencies-invalid")
-            roots.add(resolved.parent)
+            files.add(resolved)
             if not str(resolved).startswith(("/usr/lib/", "/System/Library/")):
                 pending.append(resolved)
-    return roots
+    return files
 
 
 def _registry_addresses(values):
@@ -784,7 +783,7 @@ def preparation_profile_text(*, project, prepared, cache, home, temporary, node,
         "/usr/bin", "/bin", "/dev", CLT_DEVELOPER_DIRECTORY, str(node_root), str(npm_root), str(project),
         str(prepared), str(cache), str(home), str(temporary),
     }
-    readable.update(str(path) for path in _macos_node_runtime_read_roots(node))
+    runtime_files = _macos_node_runtime_read_files(node)
     runtime_config_files = {
         Path("/etc/ssl/openssl.cnf"), Path("/etc/openssl/openssl.cnf"),
         Path("/usr/local/etc/openssl@3/openssl.cnf"), Path("/opt/homebrew/etc/openssl@3/openssl.cnf"),
@@ -816,6 +815,9 @@ def preparation_profile_text(*, project, prepared, cache, home, temporary, node,
     lines.extend("(allow file-read* (subpath " + _quote(path) + "))" for path in sorted(readable))
     lines.extend("(allow file-read* (literal " + _quote(str(path)) + "))" for path in sorted(ancestors))
     lines.extend("(allow file-read* (literal " + _quote(str(path)) + "))" for path in sorted(runtime_config_files))
+    lines.extend("(allow file-read* (literal " + _quote(path) + "))" for path in sorted(runtime_files))
+    runtime_ancestors = {parent for path in runtime_files for parent in path.parents}
+    lines.extend("(allow file-read-metadata (literal " + _quote(path) + "))" for path in sorted(runtime_ancestors))
     lines.extend("(allow file-write* (subpath " + _quote(path) + "))" for path in sorted(writable))
     lines.extend((
         "(allow file-read* (literal \"/dev/null\") (literal \"/dev/urandom\") "
@@ -1185,6 +1187,13 @@ def profile_text(*, workspace, prepared, scratch, home, control, node, developer
     }
     if npm_cli is not None:
         allowed_reads.add(str(Path(npm_cli).parent.parent))
+    runtime_files = _macos_node_runtime_read_files(node)
+    ancestors = {Path("/")}
+    for directory in {*allowed_reads, *(path.parent for path in runtime_files)}:
+        current = Path(directory)
+        while current != current.parent:
+            ancestors.add(current)
+            current = current.parent
     allowed_exec = {
         "/bin/sh", "/bin/bash", "/usr/bin/env", "/usr/bin/sandbox-exec", "/usr/bin/xcrun",
         str(Path(node)), str(Path(clang)),
@@ -1200,6 +1209,8 @@ def profile_text(*, workspace, prepared, scratch, home, control, node, developer
     }
     lines.extend("(allow process-exec (subpath " + _quote(path) + "))" for path in sorted(process_roots))
     lines.extend("(allow file-read* (subpath " + _quote(path) + "))" for path in sorted(allowed_reads))
+    lines.extend("(allow file-read* (literal " + _quote(path) + "))" for path in sorted(runtime_files))
+    lines.extend("(allow file-read-metadata (literal " + _quote(str(path)) + "))" for path in sorted(ancestors))
     scratch_writes = {
         str(Path(scratch) / "reports"), str(Path(scratch) / "playwright-results"),
         str(Path(scratch) / "tmp"), str(Path(scratch) / "npm-cache"),
@@ -1213,7 +1224,7 @@ def profile_text(*, workspace, prepared, scratch, home, control, node, developer
         "(allow file-map-executable (subpath " + _quote(Path(prepared) / "node_modules") + ") "
         + "(subpath " + _quote(Path(workspace) / "source") + "))",
         "(allow sysctl-read (sysctl-name \"hw.machine\") (sysctl-name \"hw.ncpu\") (sysctl-name \"kern.ostype\") "
-        + "(sysctl-name \"kern.osrelease\") (sysctl-name \"kern.osversion\"))",
+        + "(sysctl-name \"hw.memsize\") (sysctl-name \"kern.osrelease\") (sysctl-name \"kern.osversion\"))",
     ))
     return "\n".join(lines) + "\n"
 
@@ -2122,39 +2133,59 @@ def _execute(state, context_path, deadline_file):
 
 
 def _clean_tree(root):
+    """Shred a quiescent run tree without following links or modifying aliases."""
     base = Path(root)
     if not base.exists() and not base.is_symlink():
         return
+
+    def clean(directory):
+        descriptor = os.dup(directory) if isinstance(directory, int) else os.open(
+            directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        try:
+            os.fchmod(descriptor, 0o700)
+            for name in os.listdir(descriptor):
+                info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode):
+                    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+                    try:
+                        clean(child)
+                    finally:
+                        os.close(child)
+                    os.rmdir(name, dir_fd=descriptor)
+                    continue
+                if stat.S_ISREG(info.st_mode):
+                    reader = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
+                    try:
+                        actual = os.fstat(reader)
+                        if (not stat.S_ISREG(actual.st_mode) or actual.st_nlink != 1
+                                or (actual.st_dev, actual.st_ino) != (info.st_dev, info.st_ino)):
+                            _refuse("cleanup-incomplete")
+                        os.fchmod(reader, 0o600)
+                        writer = os.open(name, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
+                        with os.fdopen(writer, "wb", buffering=0) as output:
+                            opened = os.fstat(output.fileno())
+                            if (opened.st_dev, opened.st_ino) != (actual.st_dev, actual.st_ino) or opened.st_nlink != 1:
+                                _refuse("cleanup-incomplete")
+                            remaining = opened.st_size
+                            block = bytes(65536)
+                            while remaining:
+                                count = output.write(block[:min(len(block), remaining)])
+                                if not count:
+                                    _refuse("cleanup-incomplete")
+                                remaining -= count
+                            output.flush()
+                            os.fsync(output.fileno())
+                    finally:
+                        os.close(reader)
+                os.unlink(name, dir_fd=descriptor)
+        finally:
+            os.close(descriptor)
+
     if base.is_symlink() or not base.is_dir():
         _refuse("cleanup-root-invalid")
-    for current, directories, files in os.walk(base, topdown=False, followlinks=False):
-        for name in files:
-            path = Path(current) / name
-            try:
-                info = path.lstat()
-                if stat.S_ISREG(info.st_mode):
-                    with path.open("r+b", buffering=0) as output:
-                        remaining = info.st_size
-                        block = bytes(min(65536, remaining))
-                        while remaining:
-                            count = min(len(block), remaining)
-                            output.write(block[:count])
-                            remaining -= count
-                        output.flush()
-                        os.fsync(output.fileno())
-                path.unlink()
-            except OSError:
-                _refuse("cleanup-incomplete")
-        for name in directories:
-            path = Path(current) / name
-            try:
-                if path.is_symlink():
-                    path.unlink()
-                else:
-                    path.rmdir()
-            except OSError:
-                _refuse("cleanup-incomplete")
     try:
+        clean(base)
         base.rmdir()
     except OSError:
         _refuse("cleanup-incomplete")

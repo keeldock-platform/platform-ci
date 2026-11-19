@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import signal
 import shutil
 import subprocess
@@ -63,6 +64,164 @@ class MacPrepareBoundaryTests(unittest.TestCase):
             state.chmod(0o755)
             with self.assertRaisesRegex(sandbox.Refusal, "prepare-run-root-invalid"):
                 sandbox._validate_prepare_run_root(state, ident)
+
+    def test_runtime_discovery_returns_only_canonical_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            node = root / "node/bin/node"
+            library = root / "dependency/lib/runtime.dylib"
+            transitive = library.parent / "transitive.dylib"
+            alias = root / "links/runtime.dylib"
+            for path in (node, library, transitive, alias):
+                path.parent.mkdir(parents=True, exist_ok=True)
+            for path in (node, library, transitive):
+                path.write_bytes(b"fixture")
+            alias.symlink_to(library)
+            (library.parent / "private-sibling").write_bytes(b"secret")
+            def otool(command, **kwargs):
+                current = Path(command[2])
+                dependencies = {node: str(alias), library: "@loader_path/transitive.dylib",
+                                transitive: str(alias)}
+                output = (str(current) + ":\n\t" + dependencies[current]
+                          + " (compatibility version 1.0.0)\n") if command[1] == "-L" else ""
+                return subprocess.CompletedProcess(command, 0, stdout=output.encode())
+            with mock.patch.object(sandbox.sys, "platform", "darwin"), \
+                    mock.patch.object(sandbox, "CLT_OTOOL_PATH", str(node)), \
+                    mock.patch.object(sandbox.subprocess, "run", side_effect=otool):
+                self.assertEqual(sandbox._macos_node_runtime_read_files(node),
+                                 {node, library, transitive})
+
+    def test_runtime_file_grants_do_not_read_siblings_or_ancestors(self):
+        dependency = Path("/opt/dependency/lib/runtime.dylib")
+        with mock.patch.object(sandbox, "_macos_node_runtime_read_files", return_value={dependency}):
+            offline = sandbox.profile_text(
+                workspace=PRIVATE_RUN + "/workspace", prepared=PRIVATE_RUN + "/prepared",
+                scratch=PRIVATE_RUN + "/scratch", home=PRIVATE_RUN + "/worker-home",
+                control="/opt/control", node="/opt/toolcache/node/24/bin/node",
+                developer=sandbox.CLT_DEVELOPER_DIRECTORY, clang=sandbox.CLT_CLANG_PATH,
+            )
+            preparation = sandbox.preparation_profile_text(
+                project=PRIVATE_RUN + "/project", prepared=PRIVATE_RUN + "/prepared",
+                cache=PRIVATE_RUN + "/cache", home=PRIVATE_RUN + "/home",
+                temporary=PRIVATE_RUN + "/tmp", node="/opt/toolcache/node/24/bin/node",
+                npm_cli="/opt/npm/bin/npm-cli.js",
+            )
+        for text in (offline, preparation):
+            with self.subTest(profile=text):
+                self.assertIn('(allow file-read* (literal "/opt/dependency/lib/runtime.dylib"))', text)
+                self.assertIn('(allow file-read-metadata (literal "/opt/dependency/lib"))', text)
+                grants = re.findall(r'\(allow file-read\* \((literal|subpath) "([^"]+)"\)\)', text)
+                def readable(path):
+                    return any(path == base or (kind == "subpath" and path.startswith(base + "/"))
+                               for kind, base in grants)
+                self.assertTrue(readable(str(dependency)))
+                for path in ("/opt/dependency/lib/private-sibling", "/opt/dependency/private-sibling",
+                             "/opt/toolcache/node/24/private-sibling", "/opt/dependency/lib"):
+                    self.assertFalse(readable(path), path)
+        self.assertIn('(sysctl-name "hw.memsize")', offline)
+        self.assertIn('(deny network*)', offline)
+        self.assertIn('(deny mach-lookup)', offline)
+        self.assertNotIn('(allow sysctl-read)', offline)
+
+    @unittest.skipUnless(_hosted_profile_probe_available(), "requires the pinned macOS 15 hosted toolchain")
+    def test_native_runtime_literal_read_denies_sibling_files(self):
+        with tempfile.TemporaryDirectory(prefix="devlane-runtime-") as temporary:
+            root = Path(temporary).resolve(strict=True)
+            dependency = root / "dependency/lib/runtime.dylib"
+            sibling = dependency.with_name("private-sibling")
+            dependency.parent.mkdir(parents=True)
+            dependency.write_bytes(b"runtime-canary")
+            sibling.write_bytes(b"private-canary")
+            with mock.patch.object(sandbox, "_macos_node_runtime_read_files", return_value={dependency}):
+                profile = sandbox.profile_text(
+                    workspace=root / "workspace", prepared=root / "prepared", scratch=root / "scratch",
+                    home=root / "home", control=sandbox.CONTROL_ROOT, node="/bin/cat",
+                    developer=sandbox.CLT_DEVELOPER_DIRECTORY, clang=sandbox.CLT_CLANG_PATH,
+                )
+            for path, allowed in ((dependency, True), (sibling, False)):
+                result = subprocess.run(
+                    ["/usr/bin/sandbox-exec", "-p", profile, "/bin/cat", str(path)],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    timeout=10, check=False,
+                )
+                self.assertEqual(result.returncode == 0, allowed)
+                self.assertEqual(result.stdout, b"runtime-canary" if allowed else b"")
+
+    def test_selected_node_alias_is_canonicalized_then_trust_checked(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            node = root / "node-real"
+            node.write_bytes(b"node fixture")
+            node.chmod(0o755)
+            alias = root / "node"
+            alias.symlink_to(node)
+            npm = root / "control-npm/lib/node_modules/npm/bin/npm-cli.js"
+            npm.parent.mkdir(parents=True)
+            npm.write_bytes(b"npm fixture")
+            with mock.patch.object(sandbox.shutil, "which", side_effect=[str(alias), str(npm)]), \
+                    mock.patch.object(sandbox, "_trusted_worker_readonly_tree"), \
+                    mock.patch.object(sandbox, "_command_output", side_effect=["v24.22.1", "11.19.1"]):
+                self.assertEqual(sandbox._find_node_tools(), (node, npm))
+            node.chmod(0o777)
+            with mock.patch.object(sandbox.shutil, "which", side_effect=[str(alias), str(npm)]), \
+                    self.assertRaisesRegex(sandbox.Refusal, "tool-mode-invalid"):
+                sandbox._find_node_tools()
+
+    def test_state_paths_require_existing_canonical_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True) / "devlane-123"
+            root.mkdir(mode=0o700)
+            state = root / "state"
+            with self.assertRaises(sandbox.Refusal):
+                sandbox._state_paths(state)
+            state.mkdir(mode=0o700)
+            self.assertEqual(sandbox._state_paths(state), (state, root))
+            alias = root / "alias"
+            alias.symlink_to(state, target_is_directory=True)
+            with self.assertRaises(sandbox.Refusal):
+                sandbox._state_paths(alias)
+            with self.assertRaises(sandbox.Refusal):
+                sandbox._state_paths(root / ".." / root.name / "state")
+
+    def test_shred_sealed_tree_zeroes_files_and_never_follows_links(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve(strict=True)
+            root = parent / "devlane-123"
+            nested = root / "sealed"
+            nested.mkdir(parents=True)
+            artifact = nested / "artifact"
+            artifact.write_bytes(b"secret" * 20000)
+            artifact.chmod(0o444)
+            protected = parent / "outside"
+            protected.write_bytes(b"keep")
+            (nested / "alias").symlink_to(protected)
+            (root / "directory-alias").symlink_to(parent, target_is_directory=True)
+            nested.chmod(0o555)
+            root.chmod(0o555)
+            synced = []
+            real_fsync = os.fsync
+
+            def fsync(descriptor):
+                synced.append(artifact.read_bytes())
+                real_fsync(descriptor)
+
+            with mock.patch.object(sandbox.os, "fsync", side_effect=fsync):
+                sandbox._clean_tree(root)
+            self.assertEqual(synced, [bytes(120000)])
+            self.assertFalse(root.exists())
+            self.assertEqual(protected.read_bytes(), b"keep")
+
+    def test_shred_refuses_hardlinked_file_without_touching_external_alias(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve(strict=True)
+            root = parent / "devlane-123"
+            root.mkdir()
+            protected = parent / "outside"
+            protected.write_bytes(b"keep")
+            os.link(protected, root / "hardlink")
+            with self.assertRaisesRegex(sandbox.Refusal, "cleanup-incomplete"):
+                sandbox._clean_tree(root)
+            self.assertEqual(protected.read_bytes(), b"keep")
 
     def test_prepare_output_path_distinguishes_bad_shape_from_noncanonical_path(self):
         with tempfile.TemporaryDirectory(prefix="devlane-prepare-output-") as temporary:
