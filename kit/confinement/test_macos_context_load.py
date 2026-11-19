@@ -263,12 +263,13 @@ class ApprovedHostReleaseTableTests(unittest.TestCase):
         deny = load_module("macos_deny_default")
         audit = load_module("macos_public_audit")
         expected = (("15.7.9", "20260907.0337.1"), ("15.8.2", "20261104.0514.1"),
-                    ("15.8.2", "20261112.0539.3"))
+                    ("15.8.2", "20261112.0539.3"), ("15.8.2", "20261118.0550.1"))
         self.assertEqual(boundary.APPROVED_HOST_RELEASES, expected)
         self.assertEqual(deny.APPROVED_HOST_RELEASES, expected)
         self.assertEqual(audit.APPROVED_HOST_RELEASES, expected)
-        self.assertLessEqual(len(expected), 3)
+        self.assertLessEqual(len(expected), 4)
         observed = {
+            ("15.8.2", "20261118.0550.1"): "44570727211",
             ("15.8.2", "20261112.0539.3"): "44446755296",
             ("15.8.2", "20261104.0514.1"): "43275774178",
         }

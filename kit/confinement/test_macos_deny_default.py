@@ -412,7 +412,7 @@ class DenyDefaultPolicyTests(unittest.TestCase):
         self.assertEqual(
             deny.APPROVED_HOST_RELEASES,
             (("15.7.9", "20260907.0337.1"), ("15.8.2", "20261104.0514.1"),
-             ("15.8.2", "20261112.0539.3")),
+             ("15.8.2", "20261112.0539.3"), ("15.8.2", "20261118.0550.1")),
         )
         for product, image_version in deny.APPROVED_HOST_RELEASES:
             with self.subTest(product=product):
@@ -421,7 +421,8 @@ class DenyDefaultPolicyTests(unittest.TestCase):
                 self.assertEqual(receipt["macos_product_version"], product)
                 self.assertEqual(receipt["runner_image_version"], image_version)
         for product, image_version in (("15.8.2", "20260907.0337.1"), ("15.7.9", "20261112.0539.3"),
-                                       ("15.7.9", "20261104.0514.1")):
+                                       ("15.7.9", "20261104.0514.1"), ("15.7.9", "20261118.0550.1"),
+                                       ("15.8.2", "20261118.0550"), ("15.8.2", "20261118.0550.2")):
             with self.subTest(mixed=(product, image_version)):
                 identity = dict(IDENTITY, product_version=product, image_version=image_version)
                 with self.assertRaises(deny.Refusal):
