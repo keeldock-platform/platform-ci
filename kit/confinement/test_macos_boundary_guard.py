@@ -132,8 +132,8 @@ class PlatformGuardTests(unittest.TestCase):
     def test_every_approved_host_release_returns_its_canonical_identity(self):
         self.assertEqual(
             boundary.APPROVED_HOST_RELEASES,
-            (("15.7.9", "20260907.0337.1"), ("15.8.2", "20261028.0489.1"),
-             ("15.8.2", "20261104.0514.1")),
+            (("15.7.9", "20260907.0337.1"), ("15.8.2", "20261104.0514.1"),
+             ("15.8.2", "20261112.0539.3")),
         )
         for product, image_version in boundary.APPROVED_HOST_RELEASES:
             with self.subTest(product=product):
@@ -151,10 +151,12 @@ class PlatformGuardTests(unittest.TestCase):
     def test_product_and_image_versions_must_come_from_the_same_release(self):
         for values in (
             {"product": "15.8.2"},
-            {"image_version": "20261028.0489.1"},
+            {"image_version": "20261112.0539.3"},
             {"product": "15.8.2", "image_version": "20260907.0337.1"},
-            {"product": "15.7.9", "image_version": "20261028.0489.1"},
+            {"product": "15.7.9", "image_version": "20261112.0539.3"},
             {"image_version": "20261104.0514.2"},
+            {"product": "15.8.2", "image_version": "20261112.0539.4"},
+            {"product": "15.8.2", "image_version": "20261028.0489.1"},
             {"product": "15.7.9", "image_version": "20261104.0514.1"},
         ):
             with self.subTest(values=values):

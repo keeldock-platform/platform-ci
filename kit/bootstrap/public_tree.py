@@ -419,6 +419,7 @@ ALLOWED_FILES = {
     "data": CONSUMER_FILES,
 }
 MAX_FILE_BYTES = 262144
+FILE_SIZE_LIMITS = {"kit/devlane/test_audit_contracts.py": 266240}
 SYNTHETIC_NPM_LOCK_PATH = "kit/confinement/synthetic_project/package-lock.json"
 SYNTHETIC_NPM_LOCK_PATHS = frozenset((
     SYNTHETIC_NPM_LOCK_PATH,
@@ -480,7 +481,7 @@ PINNED_FILE_SHA256 = {
     'kit/bootstrap/policy_linux.py': '0b314a645e43f2aaec58ca23150386b5865e8a27c3101459d00d42370e7d5a5f',
     'kit/bootstrap/policy_npm.py': 'b110b4573b2919003792e05bdcec60a0108f9e2ea1ebc1ce820ff77216271794',
     'kit/bootstrap/policy_rust.py': '4306a55701a5a04c884b2b21091a6d06307134e3570f0d5d65cb103ff84023ec',
-    'kit/bootstrap/public_tree.py': '36ecf7d6ad0e2445f9cbfd95ff39032a3295981a855bdd46d3b7d19ea1cb82f2',
+    'kit/bootstrap/public_tree.py': '7fd26b3f7ae6f40e87a1eaca849969c0afdce4750bac49787ef7ad21553532ef',
     'kit/bootstrap/test_policy_baselines.py': '690980cc3a140970d2b813d854823e3e9f32d8b09db9e25c0ca143140c3af627',
     'kit/bootstrap/test_policy_handoff.py': '3cf707fec6cc1a62e49a948b496fe00765a04ec171fd4cdc57b07d214d3100a2',
     'kit/bootstrap/test_policy_linux.py': 'f1c62480d608d680e73cdbf0ca8b7c83552919bd5de4caa095d5e04e8c3e5f8c',
@@ -533,15 +534,15 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/linux_source_build.py': '02430a54cc3429c8919cbea30bb5996ffeb48cc7c346d78ef870387f22975a1f',
     'kit/confinement/macos_core_bootstrap.py': 'e7850a53709609dc6ce2ea0c817454694f95f7cd913c44da102b1448321ef4ac',
     'kit/confinement/macos_core_contract.py': 'af3aec230452009799f80de2491b16b73e6609687399c8230bbdd8c8b88a2c9d',
-    'kit/confinement/macos_deny_default.py': '266970473298d83d8d1022dfd3b942ff79b7a264c154871eabb80ee5bcb74b89',
+    'kit/confinement/macos_deny_default.py': 'd09c134b6e2f1ba57096941a26317471d46f3630e12e3a11a093ea40c32a9542',
     'kit/confinement/macos_feedback_producer.py': '957573a464bcaa8229d02833102f4ddbceae51e70c8b7e514ca21f3afeaaf361',
     'kit/confinement/macos_network_observer.py': 'a7cf6cb16e68f00513e9f8ee08d52511619b18bb8edd37205faf907dcf0a98d9',
     'kit/confinement/macos_private_validation.py': 'c8ae1c308ba25ac18fe8f7d01793013300575d6feadb04516ae4f58ac67a3c5d',
-    'kit/confinement/macos_public_audit.py': '155b23fc5d88f123309ed5068ebf4aeb4739f1634eecf803145271cc9b4a976e',
-    'kit/confinement/macos_boundary_guard.py': '84148ba4211f020e742eff5d1fe4abad5e0eca6f4b78944b936215abf0c9c7ad',
-    'kit/confinement/test_macos_boundary_guard.py': '732b92f8e38ded2d59be5d6f8555c2a31df37844ba9c99d4a362818122777175',
-    'kit/confinement/test_macos_context_load.py': 'e01a9e3eaa328c2d1216c4a2316eae3a76ff628910dfed176a18078beadc6e4d',
-    'kit/confinement/test_macos_deny_default.py': '101fd6c41abc8269f673f7b3d391686499f654d38f03a82c58d645eb33ac1419',
+    'kit/confinement/macos_public_audit.py': '49555be2ae8cab382f65c2ad109354d419bd978251689be0015b3ee484b12316',
+    'kit/confinement/macos_boundary_guard.py': 'f6d2a62c457bbc5156095698793c40f1bd4226f36bc37d89ba5c3746e2837744',
+    'kit/confinement/test_macos_boundary_guard.py': '78a4c166af5ee576ed76cecd58ccc2a7e7aef8a73a249fcdb283a3ea79abc3b3',
+    'kit/confinement/test_macos_context_load.py': '2e9bafa6fdb81a2487249bb939c26f7b05595f7ffdf965231bb866e525833e62',
+    'kit/confinement/test_macos_deny_default.py': '6ad5b7f85f0c40e4fd57a28f7551c404ecee2bc25893d78d93456d44f43107db',
     'kit/confinement/test_macos_public_audit.py': 'c02c0c6370cd8254efe509a22d9e32515985554d531e1373068c01e62d8a70f8',
     'kit/devlane/sandbox_macos.py': '909a52f9871e89413d40e3d5eecc46b3826cc055e88f2a49df65873d3a69e5f1',
     'kit/devlane/control-crypto-requirements.txt': '3d1b66ef228e4034282166fa8c333b1b41836aaaf0f803bc3ef655f594a6c25b',
@@ -677,7 +678,7 @@ PINNED_FILE_SHA256 = {
     'kit/devlane/permit.py': 'd82256237f812343a74eadb1802f41c725fffbe5237d6a563b46a2efdc2b0817',
     'kit/devlane/prepare.py': 'f44b732fd4e0906442959fecbcd990c37ba08ed80c93c6f97dc02d44cd6eb830',
     'kit/devlane/project.py': '3c86f89e65676646d2b02eca0993b3745f9d7c2fc567d421c5728cb6951e5727',
-    'kit/devlane/public_audit.py': '549e8916cca84888caf80d261df1197253d4a672de3d3b285d2861f36f68f520',
+    'kit/devlane/public_audit.py': 'e9c97b3678b66480b54fe43bb789b301729f6707f4d1fc89e52f4f499603fb20',
     'kit/devlane/macos_denial_paths.py': '2bb2684ca53cc99e262146786c65f8b47eef66d018ae0b0e99752f1dcd591099',
     'kit/devlane/rust_test_runner.py': '1b0b655d8f89eba1a251b25c93c3df48e9376b5694e1cc19a6b0c4f1b7667a68',
     'kit/devlane/safe_json.mjs': '17d44acd9970efeea8b9b2c80d746efc940460008287f75e7dc2a749239ee169',
@@ -685,7 +686,7 @@ PINNED_FILE_SHA256 = {
     'kit/devlane/test_acceptance.py': '09d3c5b5afbb048eea6437ed100f947e1293cdbbcb278f2dfeaf7923d8b0086d',
     'kit/devlane/test_worker_control_imports.py': '127c3580c30e24744e9ef7a24f338a5a96765a14073252f0c746507c8a38923f',
     'kit/devlane/test_adapters.mjs': '8347496bbad7dba397ff583359dc205a7035c19b9b5ece4641bcba625ff2486a',
-    'kit/devlane/test_audit_contracts.py': '925d6a84747ea30f9301ba20444c3f2c7a9f684213359f0a0134a63ee20e0381',
+    'kit/devlane/test_audit_contracts.py': '344856353c0065fef718f430c092573c49d959ab7af2ec2c213f85b9e03a0f5f',
     'kit/devlane/test_control_python.py': '040d7f94c584de2d6de13b26a4506f1085d118b9bf2e223aa1211be628b59e18',
     'kit/devlane/fixtures/encrypted-audit-43284558151.log.hex': '6c795bf0e798e9fd07eeac786aedcf082af192a8749d56b4afbdab03ede3d3f8',
     'kit/devlane/fixtures/encrypted-run-43284558151-identity.json': 'd2d6fcc8e3f22bb177af015828940abeed97590e6ae8b3c2b764222d53024f9a',
@@ -1057,10 +1058,10 @@ def scan_tree(root, pool):
         item = root / relative
         try:
             with item.open("rb") as source:
-                payload = source.read(MAX_FILE_BYTES + 1)
+                payload = source.read(FILE_SIZE_LIMITS.get(relative, MAX_FILE_BYTES) + 1)
         except OSError:
             raise PublicTreeError("file-unreadable")
-        if len(payload) > MAX_FILE_BYTES:
+        if len(payload) > FILE_SIZE_LIMITS.get(relative, MAX_FILE_BYTES):
             raise PublicTreeError("file-too-large")
         expected_hash = PINNED_FILE_SHA256.get((pool, relative), PINNED_FILE_SHA256.get(relative))
         if relative in BINARY_FIXTURE_FILES:

@@ -3773,6 +3773,115 @@ class EncryptedAuditorMutationTests(unittest.TestCase):
             audit.validate_terminal_job_contract(jobs, IDENTITY, "core-node")
 
 
+class AuditInternalDiagnosticTests(unittest.TestCase):
+    accepted = "devlane_audit=accepted jobs=4 artifacts=0 cache=unchanged cleanup=confirmed"
+    refused = "devlane_audit=refused code=audit-internal"
+    diagnostic = "devlane_audit_diagnostic class=builtins.RuntimeError message=runtime-error"
+
+    def run_error(self, error):
+        output, stderr = io.StringIO(), io.StringIO()
+        with patch.object(audit, "audit_environment", return_value=IDENTITY), \
+                patch.dict(audit.os.environ, {"GITHUB_TOKEN": "SECRET_TOKEN"}), \
+                patch.object(audit, "GitHubAPI"), \
+                patch.object(audit, "run_audit", side_effect=error), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(stderr):
+            self.assertEqual(audit.main(), 1)
+        self.assertEqual(stderr.getvalue(), "")
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[1], self.refused)
+        self.assertLessEqual(len(lines[0]), 160)
+        return lines[0]
+
+    def log(self, lines):
+        log = _render_real_runner_encrypted_log(IDENTITY, job_key=audit.AUDIT_JOB)
+        for line in lines:
+            log = _insert_output_before(log, self.accepted, line)
+        return _replace_output_line(log, self.accepted, "")
+
+    def test_api_refusal_uses_qualified_class_and_allowlisted_reason(self):
+        self.assertIsNot(audit.APIAuditRefusal, audit.AuditRefusal)
+        for reason in sorted(audit.API_AUDIT_REASONS):
+            with self.subTest(reason=reason):
+                error = audit.APIAuditRefusal(reason)
+                self.assertEqual(str(error), "")
+                line = self.run_error(error)
+                self.assertEqual(line, "devlane_audit_diagnostic class=macos_public_audit.AuditRefusal message=" + reason)
+                audit.validate_job_log_surface(self.log([line, self.refused]), audit.AUDIT_JOB, IDENTITY)
+        error.reason = "SECRET_TOKEN\nhttps://private.example"
+        self.assertTrue(self.run_error(error).endswith("message=internal_error"))
+
+    def test_unexpected_exceptions_use_explicit_safe_mappings(self):
+        for error_type, (class_name, message) in audit.AUDIT_EXCEPTION_DIAGNOSTICS.items():
+            with self.subTest(error_type=error_type):
+                self.assertEqual(self.run_error(error_type("private detail")),
+                                 "devlane_audit_diagnostic class=" + class_name + " message=" + message)
+
+    def test_secret_multiline_and_large_messages_are_never_rendered(self):
+        for message in ("Authorization: Bearer SECRET_TOKEN", "https://private.example?token=SECRET_TOKEN",
+                        "SECRET_TOKEN\n" + self.accepted + "\r\x1b[31m", "SECRET_TOKEN" * 100000):
+            with self.subTest(message_length=len(message)):
+                self.assertEqual(self.run_error(RuntimeError(message)), self.diagnostic)
+
+    def test_unknown_class_and_hostile_string_use_redacted_fallback(self):
+        class SecretException(RuntimeError):
+            def __str__(self):
+                raise AssertionError("must not stringify exceptions")
+
+        SecretException.__module__ = "SECRET_TOKEN"
+        self.assertEqual(self.run_error(SecretException("SECRET_TOKEN")),
+                         "devlane_audit_diagnostic class=redacted.Exception message=redacted")
+        self.assertEqual(self.run_error(audit.AuditRefusal("audit-internal")),
+                         "devlane_audit_diagnostic class=public_audit.AuditRefusal message=audit-internal-check")
+
+    def test_grammar_requires_one_diagnostic_only_with_internal_refusal(self):
+        for lines in ([self.diagnostic, self.refused], [self.refused, self.diagnostic]):
+            audit.validate_job_log_surface(self.log(lines), audit.AUDIT_JOB, IDENTITY)
+        for lines in ([self.refused], [self.diagnostic], [self.diagnostic, self.diagnostic, self.refused],
+                      [self.diagnostic, self.refused, self.refused], [self.diagnostic, self.accepted],
+                      [self.diagnostic, "devlane_audit=refused code=audit-contract reason=audit-environment"]):
+            with self.subTest(lines=lines), self.assertRaises(audit.AuditRefusal):
+                audit.validate_job_log_surface(self.log(lines), audit.AUDIT_JOB, IDENTITY)
+
+    def test_grammar_rejects_malformed_or_misplaced_diagnostics(self):
+        for line in (self.diagnostic + " extra=secret", self.diagnostic + " ",
+                     self.diagnostic.replace("runtime-error", "SECRET_TOKEN"),
+                     self.diagnostic.replace("builtins.RuntimeError", "private.Exception"),
+                     self.diagnostic.replace("builtins.RuntimeError", "builtins.KeyError"),
+                     "devlane_audit_diagnostic", self.diagnostic + "\nSECRET_TOKEN"):
+            with self.subTest(line=line), self.assertRaises(audit.AuditRefusal):
+                audit.validate_job_log_surface(self.log([line, self.refused]), audit.AUDIT_JOB, IDENTITY)
+        grammar = audit._Grammar(Path(__file__).resolve().parents[2] / ".github/workflows/devlane-encrypted.yml",
+                                 audit.RUN_JOB, IDENTITY, "encrypted")
+        self.assertFalse(grammar.step_output_ok("Fetch public control and validate dispatch", self.diagnostic, {}))
+
+    def test_final_validation_still_rejects_internal_refusal_even_with_success_metadata(self):
+        jobs = _encrypted_jobs()
+        audit_job = next(job for job in jobs if job["name"] == audit.AUDIT_JOB)
+        audit_job.update(status="completed", conclusion="success")
+        for step in audit_job["steps"]:
+            step.update(status="completed", conclusion="success")
+        run_job = next(job for job in jobs if job["name"] == audit.RUN_JOB)
+        logs = {run_job["id"]: _render_real_runner_encrypted_log(IDENTITY),
+                audit_job["id"]: self.log([self.diagnostic, self.refused])}
+
+        class API:
+            def log_text(self, identifier):
+                return logs[identifier]
+
+            def json(self, endpoint):
+                return {}, {}
+
+        with patch.object(audit, "_read_annotations", return_value=[]), \
+                patch.object(audit, "validate_check_output"), self.assertRaises(audit.AuditRefusal) as caught:
+            audit.validate_final_public_surfaces(API(), jobs, IDENTITY, "core-node")
+        self.assertEqual(caught.exception.reason, "public-surface")
+        audit_job["conclusion"] = "failure"
+        self.assertFalse(audit.validate_terminal_job_contract(jobs, IDENTITY, "core-node")[1])
+        with patch.object(audit, "_read_annotations", return_value=[]), self.assertRaises(audit.AuditRefusal):
+            audit.validate_final_public_surfaces(API(), jobs, IDENTITY, "core-node")
+
+
 class ControlAuditorMutationTests(unittest.TestCase):
     def setUp(self):
         self.identity = {

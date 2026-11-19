@@ -12,7 +12,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from macos_public_audit import (
     API_ORIGIN,
+    AuditRefusal as APIAuditRefusal,
     MAX_LOG_BYTES,
+    REASONS as API_AUDIT_REASONS,
     GitHubAPI,
     _fetch_artifacts,
     _fetch_cache_entries,
@@ -179,6 +181,28 @@ DECRYPT_CHILD_ERROR_CODES = frozenset((
     "MemoryError", "PanicException", "SystemError", "UnicodeDecodeError", "other",
 ))
 AUDIT_REFUSAL_CODES = frozenset(("audit-contract", "audit-internal"))
+
+AUDIT_EXCEPTION_DIAGNOSTICS = {
+    RuntimeError: ("builtins.RuntimeError", "runtime-error"),
+    ValueError: ("builtins.ValueError", "invalid-value"),
+    TypeError: ("builtins.TypeError", "invalid-type"),
+    KeyError: ("builtins.KeyError", "missing-key"),
+    OSError: ("builtins.OSError", "os-error"),
+    TimeoutError: ("builtins.TimeoutError", "timeout"),
+}
+AUDIT_DIAGNOSTIC_FALLBACK = ("redacted.Exception", "redacted")
+
+
+def _audit_diagnostic_line(exception_class, message):
+    return "devlane_audit_diagnostic class=" + exception_class + " message=" + message
+
+
+AUDIT_DIAGNOSTIC_LINES = frozenset(
+    _audit_diagnostic_line(*pair)
+    for pair in (*AUDIT_EXCEPTION_DIAGNOSTICS.values(), AUDIT_DIAGNOSTIC_FALLBACK,
+                 ("public_audit.AuditRefusal", "audit-internal-check"),
+                 *(("macos_public_audit.AuditRefusal", reason) for reason in API_AUDIT_REASONS))
+)
 WINDOWS_BOOTSTRAP_REFUSAL_CODES = frozenset((
     "deadline-start-invalid", "deadline-file-invalid", "deadline-budget-invalid", "deadline-failed",
     "crypto-dependency-install-failed", "crypto-dependency-verification-failed",
@@ -1292,6 +1316,12 @@ class _Grammar:
             "Probe the loopback-only Linux network boundary": {"devlane_linux_probe=pass"},
         }.get(step_name, set())
         if step_name == "Audit exact four-job graph and public surfaces":
+            if line.startswith("devlane_audit_diagnostic"):
+                if line not in AUDIT_DIAGNOSTIC_LINES:
+                    return False
+                public_counts["devlane_audit_diagnostic"] = public_counts.get(
+                    "devlane_audit_diagnostic", 0) + 1
+                return public_counts["devlane_audit_diagnostic"] == 1
             refusal_prefix = "devlane_audit=refused code="
             if line.startswith(refusal_prefix):
                 match = re.fullmatch(
@@ -1308,6 +1338,7 @@ class _Grammar:
                 public_counts["devlane_audit_refusal"] = public_counts.get(
                     "devlane_audit_refusal", 0,
                 ) + 1
+                public_counts["devlane_audit_refusal_code"] = code
                 return public_counts["devlane_audit_refusal"] == 1
             if line in AUDIT_OUTCOME_LINES:
                 public_counts["devlane_audit_outcome"] = public_counts.get("devlane_audit_outcome", 0) + 1
@@ -2098,6 +2129,10 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
         text = text[1:]
     if any(ord(char) < 32 and char != "\n" or 127 <= ord(char) <= 159 for char in text):
         _refuse()
+    for raw_line in text.splitlines():
+        diagnostic = TIME_PREFIX.sub("", raw_line, count=1)
+        if diagnostic.startswith("devlane_audit_diagnostic") and diagnostic not in AUDIT_DIAGNOSTIC_LINES:
+            _refuse()
     kind = "synthetic" if workflow == "synthetic" else "encrypted"
     legacy_workflow = (_legacy_encrypted_workflow_path(identity) if kind == "encrypted"
                        else _legacy_synthetic_workflow_path(identity))
@@ -2479,6 +2514,10 @@ def validate_job_log_surface(log, job_name, identity, *, completed=True, workflo
             _refuse()
         audit_outcome_count = counts.get("devlane_audit_outcome", 0) + counts.get("devlane_audit_refusal", 0)
         if ((completed and audit_outcome_count != 1) or audit_outcome_count > 1):
+            _refuse()
+        diagnostic_count = counts.get("devlane_audit_diagnostic", 0)
+        internal_refusal = counts.get("devlane_audit_refusal_code") == "audit-internal"
+        if (diagnostic_count and not internal_refusal) or (internal_refusal and diagnostic_count != 1):
             _refuse()
     else:
         cache_markers = ("devlane_cache_permit=claimed", "devlane_cache_permit=restored-and-single-use")
@@ -3211,9 +3250,17 @@ def main():
             reason = (error.reason if error.reason in AUDIT_SUBREASONS else "audit-internal-check")
             print("devlane_audit=refused code=audit-contract reason=" + reason)
         else:
+            print(_audit_diagnostic_line("public_audit.AuditRefusal", "audit-internal-check"))
             print("devlane_audit=refused code=audit-internal")
         return 1
-    except Exception:
+    except APIAuditRefusal as error:
+        reason = error.reason
+        reason = reason if type(reason) is str and reason in API_AUDIT_REASONS else "internal_error"
+        print(_audit_diagnostic_line("macos_public_audit.AuditRefusal", reason))
+        print("devlane_audit=refused code=audit-internal")
+        return 1
+    except Exception as error:
+        print(_audit_diagnostic_line(*AUDIT_EXCEPTION_DIAGNOSTICS.get(type(error), AUDIT_DIAGNOSTIC_FALLBACK)))
         print("devlane_audit=refused code=audit-internal")
         return 1
 

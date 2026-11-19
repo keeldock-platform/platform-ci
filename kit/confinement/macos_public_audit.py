@@ -12,11 +12,11 @@ import urllib.request
 REPOSITORY = "keeldock-platform/platform-ci"
 APPROVED_HOST_RELEASES = (
     ("15.7.9", "20260907.0337.1"),
-    ("15.8.2", "20261028.0489.1"),
     ("15.8.2", "20261104.0514.1"),
+    ("15.8.2", "20261112.0539.3"),
 )
 APPROVED_HOST_RELEASE_FIRST_RUNS = {
-    ("15.8.2", "20261028.0489.1"): "40941660825",
+    ("15.8.2", "20261112.0539.3"): "44446755296",
     ("15.8.2", "20261104.0514.1"): "43275774178",
 }
 WORKFLOW_PATH = ".github/workflows/macos-capability.yml"
