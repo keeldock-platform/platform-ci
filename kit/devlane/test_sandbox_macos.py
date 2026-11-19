@@ -1956,5 +1956,41 @@ class WaveDiagnosticTests(unittest.TestCase):
                         self.assertEqual(events, ["worker", "holders", "account", "shred"])
 
 
+class NodeManifestInventoryRegression(unittest.TestCase):
+    def test_authenticated_file_rows_reach_node_binding_check(self):
+        from contextlib import ExitStack
+        for include_package in (True, False):
+            with self.subTest(include_package=include_package), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'workspace').mkdir()
+                ciphertext = root / 'bundle.enc'
+                ciphertext.write_bytes(b'fixture')
+                worker = {'probe_complete': True, 'decrypted': False, 'execution_complete': False,
+                          'source': str(root / 'workspace' / 'source')}
+                manifest = {'original_lockfiles': {'package-lock.json': 'f' * 64},
+                            'files': ([{'path': 'package.json', 'size': 2, 'sha256': 'a' * 64}]
+                                      if include_package else [])}
+                sentinel = RuntimeError('reached-manifest-binding')
+                with ExitStack() as stack:
+                    for name, value in [('_identity', {'uid': 123}), ('_worker_state', worker),
+                                        ('_validate_context', {'profile': 'core-node', 'control_sha': 'a'*40,
+                                                               'bundle_sha256': 'b'*64}),
+                                        ('_check_public_control', None), ('_probe_pf', None),
+                                        ('_terminate_worker_processes', None), ('_sha256_file', 'b'*64),
+                                        ('_validate_projection_file', {'npm_package': {}}),
+                                        ('_expected_envelope', {})]:
+                        stack.enter_context(mock.patch.object(sandbox, name, return_value=value))
+                    stack.enter_context(mock.patch.object(sandbox.os, 'geteuid', return_value=0))
+                    stack.enter_context(mock.patch.dict(sandbox.os.environ, {'DEVLANE_DECRYPT_KEY': '0'*64}))
+                    stack.enter_context(mock.patch.object(sandbox.deadline_budget, 'remaining', return_value=100))
+                    stack.enter_context(mock.patch.object(sandbox.bundle, 'parse_envelope', return_value=b'archive'))
+                    stack.enter_context(mock.patch.object(sandbox.bundle, 'extract_authenticated_archive', return_value=manifest))
+                    stack.enter_context(mock.patch.object(Path, 'read_bytes', return_value=b'fixture'))
+                    stack.enter_context(mock.patch.object(sandbox.fetch, 'validate_npm_manifest_binding', side_effect=sentinel))
+                    expected = RuntimeError if include_package else sandbox.Refusal
+                    message = 'reached-manifest-binding' if include_package else 'decrypt-rejected'
+                    with self.assertRaisesRegex(expected, message):
+                        sandbox._decrypt(root / 'state', root / 'context', ciphertext, root / 'projection', root / 'deadline')
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

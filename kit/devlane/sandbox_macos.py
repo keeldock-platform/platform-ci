@@ -1837,7 +1837,7 @@ def _decrypt(state, context_path, bundle_path, projection_path, deadline_file):
     finally:
         for index in range(len(key)):
             key[index] = 0
-    if ("package-lock.json" not in manifest["original_lockfiles"] or "package.json" not in manifest["files"]):
+    if ("package-lock.json" not in manifest["original_lockfiles"] or not any(item["path"] == "package.json" for item in manifest["files"])):
         _refuse("decrypt-rejected", decrypt_refusal="archive-invalid")
     try:
         package_path = source / "package.json"
