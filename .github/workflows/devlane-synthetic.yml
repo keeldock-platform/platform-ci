@@ -7,11 +7,11 @@ jobs:
   matrix:
     permissions:
       contents: read
-    uses: keeldock-platform/ci-kit/.github/workflows/experiment-matrix.yml@0c0f7121b68d53ab7dbfd0e39487c2f46ac1da2b
+    uses: keeldock-platform/ci-kit/.github/workflows/experiment-matrix.yml@f16f2a442e90c8301cc99ed20152b1f3aabb1a64
     with:
-      kit_sha: 0c0f7121b68d53ab7dbfd0e39487c2f46ac1da2b
+      kit_sha: f16f2a442e90c8301cc99ed20152b1f3aabb1a64
       experiment_policy: ${{ vars.CI_B07B_EXPERIMENT_POLICY }}
-      request: "{\"concern\":\"canary\",\"source_sha\":\"af4fc6057f0ccdca5486de9e6ed0197acf3f95d2\",\"base_sha\":\"af4fc6057f0ccdca5486de9e6ed0197acf3f95d2\",\"mode\":\"full\",\"purpose\":\"feedback\",\"platforms\":\"all\",\"selector\":\"all\",\"request_id\":\"037aee33-c9b1-4935-bbbb-e8bf64600973\",\"kit_api\":\"1\",\"request_digest\":\"2405fdff772f2724515527466a5c661968411a8a58d0ac0cd103ba8fc56024e7\"}"
+      request: "{\"concern\":\"canary\",\"source_sha\":\"3a297f352c40837d56fddeb6569682bb73453bf2\",\"base_sha\":\"3a297f352c40837d56fddeb6569682bb73453bf2\",\"mode\":\"full\",\"purpose\":\"feedback\",\"platforms\":\"all\",\"selector\":\"all\",\"request_id\":\"b7483fd2-7593-4d57-aca1-fb7fd5ebbfb2\",\"kit_api\":\"1\",\"request_digest\":\"8a81a60fa61682594ad6089a6d9c219d6c1ea51e84cda4de959101103abe8db7\"}"
     secrets:
       CI_SYNTHETIC_SOURCE_MAP: ${{ secrets.CI_SYNTHETIC_SOURCE_MAP }}
       SYNTHETIC_SOURCE_TOKEN: ${{ secrets.SYNTHETIC_SOURCE_TOKEN }}
