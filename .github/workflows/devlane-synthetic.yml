@@ -1,0 +1,13 @@
+name: Synthetic experiment
+on:
+  workflow_dispatch:
+permissions: {}
+cache-mode: none
+jobs:
+  matrix:
+    permissions:
+      contents: read
+    uses: keeldock-platform/ci-kit/.github/workflows/experiment-matrix.yml@dfd283ec78bbbcf3872dbe19894c0be2f148043d
+    with:
+      kit_sha: dfd283ec78bbbcf3872dbe19894c0be2f148043d
+      request: "{\"concern\":\"canary\",\"source_sha\":\"6b5faa545757eb6233bd96882d37dea8872ef784\",\"base_sha\":\"6b5faa545757eb6233bd96882d37dea8872ef784\",\"mode\":\"full\",\"purpose\":\"feedback\",\"platforms\":\"all\",\"selector\":\"all\",\"request_id\":\"6e56bea3-9c7b-404f-84e2-c7ac593513c3\",\"kit_api\":\"1\",\"request_digest\":\"7737f529be12acaaa49ee675587599b4c9518a0444297ec34c487375cc36fc91\"}"
