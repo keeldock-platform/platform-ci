@@ -7,11 +7,11 @@ jobs:
   matrix:
     permissions:
       contents: read
-    uses: keeldock-platform/ci-kit/.github/workflows/experiment-matrix.yml@9cb95f96776f55761c07665c5c4266650b3d6e49
+    uses: keeldock-platform/ci-kit/.github/workflows/experiment-matrix.yml@4c24efd487fc1db8d0ec9c48e2a6c3f03321255f
     with:
-      kit_sha: 9cb95f96776f55761c07665c5c4266650b3d6e49
+      kit_sha: 4c24efd487fc1db8d0ec9c48e2a6c3f03321255f
       experiment_policy: ${{ vars.CI_B07E_EXPERIMENT_POLICY }}
-      request: "{\"concern\":\"canary\",\"source_sha\":\"8e181907f47a0d97e61692f7e519bd42b9a51020\",\"base_sha\":\"978898d711401ecad46ff61c3755f8fa1cfc7a6a\",\"mode\":\"full\",\"purpose\":\"feedback\",\"platforms\":\"android-emulator,ios-simulator,windows-arm64,windows-x64\",\"selector\":\"all\",\"request_id\":\"cfaad578-b3c8-457a-83d5-76b71636608b\",\"kit_api\":\"1\",\"request_digest\":\"bfbdb0ccd290f6deb92ad32c122a6ea776584bb696ce695d46f980aa233043c3\"}"
+      request: "{\"concern\":\"canary\",\"source_sha\":\"8e181907f47a0d97e61692f7e519bd42b9a51020\",\"base_sha\":\"978898d711401ecad46ff61c3755f8fa1cfc7a6a\",\"mode\":\"full\",\"purpose\":\"feedback\",\"platforms\":\"android-emulator,ios-simulator,windows-arm64,windows-x64\",\"selector\":\"all\",\"request_id\":\"4a88faf1-eafb-49c5-a449-1f59bee8b48a\",\"kit_api\":\"1\",\"request_digest\":\"2240d536431dcdb90408afce3c305f939301240bb761c51825ecfb4faf90ae37\"}"
     secrets:
       CI_SYNTHETIC_SOURCE_MAP: ${{ secrets.CI_SYNTHETIC_SOURCE_MAP }}
       SYNTHETIC_SOURCE_TOKEN: ${{ secrets.SYNTHETIC_SOURCE_TOKEN }}
