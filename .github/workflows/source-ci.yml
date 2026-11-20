@@ -1,0 +1,101 @@
+name: Source CI
+run-name: kd/${{ inputs.concern }}/${{ inputs.purpose }}/${{ inputs.request_id }}/${{ inputs.request_digest }}
+on:
+  workflow_dispatch:
+    inputs:
+      concern:
+        required: true
+        type: string
+        description: Bounded request field
+      source_sha:
+        required: true
+        type: string
+        description: Bounded request field
+      base_sha:
+        required: true
+        type: string
+        description: Bounded request field
+      mode:
+        required: true
+        type: string
+        description: Bounded request field
+      purpose:
+        required: true
+        type: string
+        description: Bounded request field
+      platforms:
+        required: true
+        type: string
+        description: Bounded request field
+      selector:
+        required: true
+        type: string
+        description: Bounded request field
+      request_id:
+        required: true
+        type: string
+        description: Bounded request field
+      kit_api:
+        required: true
+        type: string
+        description: Bounded request field
+      request_digest:
+        required: true
+        type: string
+        description: Bounded request field
+permissions: {}
+cache-mode: none
+concurrency:
+  group: kd-${{ inputs.concern }}-${{ inputs.purpose }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    permissions:
+      actions: read
+    uses: keeldock-platform/ci-kit/.github/workflows/validate.yml@b2aa3f69e9f27c915a7d983cc0ff5b5afe7fcbb7
+    with:
+      concern: ${{ inputs.concern }}
+      source_sha: ${{ inputs.source_sha }}
+      base_sha: ${{ inputs.base_sha }}
+      mode: ${{ inputs.mode }}
+      purpose: ${{ inputs.purpose }}
+      platforms: ${{ inputs.platforms }}
+      selector: ${{ inputs.selector }}
+      request_id: ${{ inputs.request_id }}
+      kit_api: ${{ inputs.kit_api }}
+      request_digest: ${{ inputs.request_digest }}
+      kit_sha: b2aa3f69e9f27c915a7d983cc0ff5b5afe7fcbb7
+    secrets:
+      SOURCE_MAP: ${{ secrets.SOURCE_MAP }}
+      SOURCE_READ_01: ${{ secrets.SOURCE_READ_01 }}
+      SOURCE_READ_02: ${{ secrets.SOURCE_READ_02 }}
+      SOURCE_READ_03: ${{ secrets.SOURCE_READ_03 }}
+      SOURCE_READ_04: ${{ secrets.SOURCE_READ_04 }}
+      SOURCE_READ_05: ${{ secrets.SOURCE_READ_05 }}
+      SOURCE_READ_06: ${{ secrets.SOURCE_READ_06 }}
+      SOURCE_READ_07: ${{ secrets.SOURCE_READ_07 }}
+      SOURCE_READ_08: ${{ secrets.SOURCE_READ_08 }}
+      SOURCE_READ_09: ${{ secrets.SOURCE_READ_09 }}
+      SOURCE_READ_10: ${{ secrets.SOURCE_READ_10 }}
+      SOURCE_READ_11: ${{ secrets.SOURCE_READ_11 }}
+      SOURCE_READ_12: ${{ secrets.SOURCE_READ_12 }}
+      SOURCE_READ_13: ${{ secrets.SOURCE_READ_13 }}
+      SOURCE_READ_14: ${{ secrets.SOURCE_READ_14 }}
+      SOURCE_READ_15: ${{ secrets.SOURCE_READ_15 }}
+      SOURCE_READ_16: ${{ secrets.SOURCE_READ_16 }}
+      SOURCE_READ_17: ${{ secrets.SOURCE_READ_17 }}
+      SOURCE_READ_18: ${{ secrets.SOURCE_READ_18 }}
+      SOURCE_READ_19: ${{ secrets.SOURCE_READ_19 }}
+      SOURCE_READ_20: ${{ secrets.SOURCE_READ_20 }}
+      SOURCE_READ_21: ${{ secrets.SOURCE_READ_21 }}
+      SOURCE_READ_22: ${{ secrets.SOURCE_READ_22 }}
+      SOURCE_READ_23: ${{ secrets.SOURCE_READ_23 }}
+      SOURCE_READ_24: ${{ secrets.SOURCE_READ_24 }}
+      SOURCE_READ_25: ${{ secrets.SOURCE_READ_25 }}
+      SOURCE_READ_26: ${{ secrets.SOURCE_READ_26 }}
+      SOURCE_READ_27: ${{ secrets.SOURCE_READ_27 }}
+      SOURCE_READ_28: ${{ secrets.SOURCE_READ_28 }}
+      SOURCE_READ_29: ${{ secrets.SOURCE_READ_29 }}
+      SOURCE_READ_30: ${{ secrets.SOURCE_READ_30 }}
+      SOURCE_READ_31: ${{ secrets.SOURCE_READ_31 }}
+      SOURCE_READ_32: ${{ secrets.SOURCE_READ_32 }}
