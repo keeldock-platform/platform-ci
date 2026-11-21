@@ -52,7 +52,7 @@ jobs:
   validate:
     permissions:
       actions: read
-    uses: keeldock-platform/ci-kit/.github/workflows/validate.yml@a8896ee586d78978dc73119184c6a716939d584e
+    uses: keeldock-platform/ci-kit/.github/workflows/validate.yml@bfcafe83499947c130fe2f5edd841cc21a743bdd
     with:
       concern: ${{ inputs.concern }}
       source_sha: ${{ inputs.source_sha }}
@@ -64,7 +64,7 @@ jobs:
       request_id: ${{ inputs.request_id }}
       kit_api: ${{ inputs.kit_api }}
       request_digest: ${{ inputs.request_digest }}
-      kit_sha: a8896ee586d78978dc73119184c6a716939d584e
+      kit_sha: bfcafe83499947c130fe2f5edd841cc21a743bdd
     secrets:
       SOURCE_MAP: ${{ secrets.SOURCE_MAP }}
       SOURCE_READ_01: ${{ secrets.SOURCE_READ_01 }}
