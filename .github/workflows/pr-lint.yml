@@ -1,0 +1,13 @@
+name: CI policy
+on:
+  pull_request:
+  workflow_dispatch:
+permissions: {}
+cache-mode: none
+jobs:
+  policy:
+    permissions:
+      contents: read
+    uses: keeldock-platform/ci-kit/.github/workflows/ci-policy.yml@b59374a9976d240b03387eaac7d91ca4a5697ef5
+    with:
+      kit_sha: b59374a9976d240b03387eaac7d91ca4a5697ef5

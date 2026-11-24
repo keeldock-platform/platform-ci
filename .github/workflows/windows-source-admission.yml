@@ -100,7 +100,7 @@ jobs:
     needs:
       - settings
     if: ${{ needs.settings.result == 'success' && github.event_name == 'workflow_dispatch' && ((inputs.mode == 'synthetic' && github.ref == 'refs/heads/main') || (inputs.mode == 'source' && github.ref == 'refs/heads/untrusted')) }}
-    uses: ./.github/workflows/lane-h-windows-receiver.yml
+    uses: ./.github/workflows/lane-h-windows-receiver.yml # zizmor: ignore[self-repository] -- Relative dependency binds to the same reviewed control commit.
     with:
       profile: candidate
       role: producer
@@ -118,7 +118,7 @@ jobs:
     needs:
       - settings
     if: ${{ needs.settings.result == 'success' && github.event_name == 'workflow_dispatch' && ((inputs.mode == 'synthetic' && github.ref == 'refs/heads/main') || (inputs.mode == 'source' && github.ref == 'refs/heads/untrusted')) }}
-    uses: ./.github/workflows/lane-h-windows-receiver.yml
+    uses: ./.github/workflows/lane-h-windows-receiver.yml # zizmor: ignore[self-repository] -- Relative dependency binds to the same reviewed control commit.
     with:
       profile: candidate
       role: verifier
@@ -136,7 +136,7 @@ jobs:
     needs:
       - settings
     if: ${{ needs.settings.result == 'success' && github.event_name == 'workflow_dispatch' && ((inputs.mode == 'synthetic' && github.ref == 'refs/heads/main') || (inputs.mode == 'source' && github.ref == 'refs/heads/untrusted')) }}
-    uses: ./.github/workflows/lane-h-linux-fetch-encrypt.yml
+    uses: ./.github/workflows/lane-h-linux-fetch-encrypt.yml # zizmor: ignore[self-repository] -- Relative dependency binds to the same reviewed control commit.
     with:
       profile: candidate
       mode: ${{ inputs.mode }}
@@ -160,7 +160,7 @@ jobs:
       - settings
       - linux-fetch-encrypt
     if: ${{ needs.settings.result == 'success' && needs.linux-fetch-encrypt.result == 'success' && github.event_name == 'workflow_dispatch' && ((inputs.mode == 'synthetic' && github.ref == 'refs/heads/main') || (inputs.mode == 'source' && github.ref == 'refs/heads/untrusted')) }}
-    uses: ./.github/workflows/lane-h-capsule-attester.yml
+    uses: ./.github/workflows/lane-h-capsule-attester.yml # zizmor: ignore[self-repository] -- Relative dependency binds to the same reviewed control commit.
     with:
       profile: candidate
       mode: ${{ inputs.mode }}

@@ -1,7 +1,0 @@
-{
-  "pool": "platform",
-  "schema_version": 2,
-  "workflow_allowlist": [
-    ".github/workflows/desktop-tauri-smoke.yml"
-  ]
-}

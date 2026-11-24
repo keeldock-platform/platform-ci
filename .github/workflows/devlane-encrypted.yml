@@ -768,7 +768,7 @@ jobs:
           check-latest: false
           cache: ""
           package-manager-cache: false
-      - name: Prepare hosted runner isolation state
+      - name: Prepare hosted runner isolation state # zizmor: ignore[adhoc-packages] -- Exact npm archive SHA512 is verified before offline installation with scripts disabled.
         timeout-minutes: 2
         run: |
           set -euo pipefail
@@ -783,7 +783,13 @@ jobs:
             [[ "$(node --version 2>/dev/null)" == "v24.22.1" ]] || macos_preflight_refuse node-runtime-version-invalid
             npm_prefix="$RUN_ROOT/control-npm"
             mkdir -m 755 "$npm_prefix" || macos_preflight_refuse npm-runtime-install-failed
-            if ! npm install --global --prefix "$npm_prefix" --ignore-scripts --no-audit --no-fund --silent npm@11.19.1 \
+            npm_tarball="$RUN_ROOT/npm-11.19.1.tgz"
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 90 \
+              --output "$npm_tarball" https://registry.npmjs.org/npm/-/npm-11.19.1.tgz \
+              || macos_preflight_refuse npm-runtime-download-failed
+            printf '%s  %s\n' 'cedb312b1b7f92421a02cfb68b4194e88f8346651dacd6acc5364a25ef5309d4a32b19616a1ff8aff865e7280c0fa5c0835a99f5cd93368991e2a80ec9da75d2' "$npm_tarball" | shasum -a 512 --check --status \
+              || macos_preflight_refuse npm-runtime-integrity-invalid
+            if ! npm install --global --prefix "$npm_prefix" --offline --ignore-scripts --no-audit --no-fund --silent "$npm_tarball" \
               >/dev/null 2>&1; then
               macos_preflight_refuse npm-runtime-install-failed
             fi
@@ -1481,7 +1487,7 @@ jobs:
           node-version: "24.22.1"
           check-latest: false
           package-manager-cache: false
-      - name: Prepare hosted Windows isolation state
+      - name: Prepare hosted Windows isolation state # zizmor: ignore[adhoc-packages] -- Exact npm archive SHA512 is verified before offline installation with scripts disabled.
         timeout-minutes: 2
         run: |
           $ErrorActionPreference = 'Stop'
@@ -1522,7 +1528,15 @@ jobs:
           $npmPrefix = Join-Path $env:RUN_ROOT 'control-npm'
           try { New-Item -ItemType Directory -Path $npmPrefix | Out-Null }
           catch { Refuse-Preflight 'windows-npm-runtime-install-failed' }
-          npm install --global --prefix $npmPrefix --ignore-scripts --no-audit --no-fund --silent npm@11.19.1 *> $null
+          $npmTarball = Join-Path $env:RUN_ROOT 'npm-11.19.1.tgz'
+          try {
+            Invoke-WebRequest -Uri 'https://registry.npmjs.org/npm/-/npm-11.19.1.tgz' -OutFile $npmTarball -TimeoutSec 90 -MaximumRedirection 0
+            $npmDigest = (Get-FileHash -LiteralPath $npmTarball -Algorithm SHA512).Hash.ToLowerInvariant()
+          } catch { Refuse-Preflight 'windows-npm-runtime-download-failed' }
+          if ($npmDigest -ne 'cedb312b1b7f92421a02cfb68b4194e88f8346651dacd6acc5364a25ef5309d4a32b19616a1ff8aff865e7280c0fa5c0835a99f5cd93368991e2a80ec9da75d2') {
+            Refuse-Preflight 'windows-npm-runtime-integrity-invalid'
+          }
+          npm install --global --prefix $npmPrefix --offline --ignore-scripts --no-audit --no-fund --silent $npmTarball *> $null
           if ($LASTEXITCODE -ne 0) { Refuse-Preflight 'windows-npm-runtime-install-failed' }
           $env:PATH = $npmPrefix + [IO.Path]::PathSeparator + $env:PATH
           try { Add-Content -LiteralPath $env:GITHUB_PATH -Value $npmPrefix -Encoding utf8 }

@@ -184,7 +184,7 @@ jobs:
           owner: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
           repositories: ${{ secrets.SOURCE_REPOSITORY_NAME }}
           permission-contents: read
-          skip-token-revoke: true
+          skip-token-revoke: true # zizmor: ignore[github-app] -- Always-run explicit early revocation is followed by a 401 rejection check.
       - name: Verify selected installation identity
         if: ${{ inputs.mode == 'source' }}
         env:

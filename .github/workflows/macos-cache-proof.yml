@@ -229,7 +229,7 @@ jobs:
           fi
       - name: Request the known fixture through the pinned cache client
         id: denied-restore
-        uses: ./kit/confinement/macos_cache_client
+        uses: $/kit/confinement/macos_cache_client # zizmor: ignore[self-repository] -- Relative dependency binds to the same reviewed control commit.
         with:
           mode: read
           path: ${{ runner.temp }}/macos-public-cache/fixture.txt
@@ -251,7 +251,7 @@ jobs:
           printf '%s\n' 'Public macOS cache write probe v1' > "$fixture_dir/fixture.txt"
       - name: Request a save through the pinned cache client
         id: denied-save
-        uses: ./kit/confinement/macos_cache_client
+        uses: $/kit/confinement/macos_cache_client # zizmor: ignore[self-repository] -- Relative dependency binds to the same reviewed control commit.
         with:
           mode: write
           path: ${{ runner.temp }}/macos-public-cache-write/fixture.txt

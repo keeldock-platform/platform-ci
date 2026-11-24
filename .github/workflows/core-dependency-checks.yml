@@ -24,10 +24,10 @@ on:
 permissions: {}
 jobs:
   dependency-preflight:
-    if: ${{ (github.event_name == 'workflow_dispatch' && github.repository == 'keeldock-platform/platform-ci' && github.server_url == 'https://github.com' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted')) || (github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') && github.server_url == 'https://github.com' && ((github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/main')) || (github.event_name == 'pull_request' && (github.base_ref == 'develop' || github.base_ref == 'uat' || github.base_ref == 'main') && startsWith(github.ref, 'refs/pull/') && endsWith(github.ref, '/merge')))) }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && github.repository == 'keeldock-platform/platform-ci' && github.server_url == 'https://github.com' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted')) || (github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') && github.server_url == 'https://github.com' && ((github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/main')) || (github.event_name == 'pull_request' && (github.base_ref == 'develop' || github.base_ref == 'uat' || github.base_ref == 'main') && startsWith(github.ref, 'refs/pull/') && endsWith(github.ref, '/merge')))) }} # zizmor: ignore[obfuscation] -- Static repository comparison; no untrusted expression input.
     runs-on: ubuntu-24.04
     environment:
-      name: ${{ github.event_name == 'pull_request' && github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') && 'linux-source-read-untrusted' || 'linux-source-read' }}
+      name: ${{ github.event_name == 'pull_request' && github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') && 'linux-source-read-untrusted' || 'linux-source-read' }} # zizmor: ignore[obfuscation] -- Static repository comparison; no untrusted expression input.
     timeout-minutes: 15
     permissions:
       actions: read
@@ -41,7 +41,7 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
           CONTROL_SHA: ${{ inputs.control_sha }}
           CONTROL_REF_SHA: ${{ github.sha }}
-          REUSABLE_CALL: ${{ github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') }}
+          REUSABLE_CALL: ${{ github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') }} # zizmor: ignore[obfuscation] -- Static repository comparison; no untrusted expression input.
         run: |
           set -euo pipefail
           [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
@@ -68,7 +68,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
           CI_SERVER_URL: ${{ github.server_url }}
           CI_EVENT_NAME: ${{ github.event_name }}
-          CI_REUSABLE_CALL: ${{ github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') && 'true' || 'false' }}
+          CI_REUSABLE_CALL: ${{ github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') && 'true' || 'false' }} # zizmor: ignore[obfuscation] -- Static repository comparison; no untrusted expression input.
           CONTROL_SHA: ${{ inputs.control_sha }}
           REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
           CACHE_MODE: none
@@ -82,10 +82,10 @@ jobs:
     if: ${{ always() && needs.dependency-preflight.result == 'success' }}
     runs-on: ubuntu-24.04
     environment:
-      name: ${{ github.event_name == 'pull_request' && github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') && 'linux-source-read-untrusted' || github.repository == 'keeldock-platform/platform-ci' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && 'linux-source-read-main' || 'linux-source-read' }}
+      name: ${{ github.event_name == 'pull_request' && github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') && 'linux-source-read-untrusted' || github.repository == 'keeldock-platform/platform-ci' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && 'linux-source-read-main' || 'linux-source-read' }} # zizmor: ignore[obfuscation] -- Static repository comparison; no untrusted expression input.
     timeout-minutes: 240
     env:
-      KD_REUSABLE_CALL: ${{ github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') }}
+      KD_REUSABLE_CALL: ${{ github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') }} # zizmor: ignore[obfuscation] -- Static repository comparison; no untrusted expression input.
       KD_RUST_CACHE_ENABLED: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'keeldock-platform/platform-ci' && github.ref == 'refs/heads/main' }}
     permissions:
       contents: read
@@ -98,7 +98,7 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
           CONTROL_SHA: ${{ inputs.control_sha }}
           CONTROL_REF_SHA: ${{ github.sha }}
-          REUSABLE_CALL: ${{ github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') }}
+          REUSABLE_CALL: ${{ github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') }} # zizmor: ignore[obfuscation] -- Static repository comparison; no untrusted expression input.
         run: |
           set -euo pipefail
           [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
@@ -141,7 +141,7 @@ jobs:
           owner: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
           repositories: ${{ secrets.SOURCE_REPOSITORY_NAME }}
           permission-contents: read
-          skip-token-revoke: true
+          skip-token-revoke: true # zizmor: ignore[github-app] -- Always-run explicit early revocation is followed by a 401 rejection check.
       - name: Verify the source-reader installation identity
         if: ${{ github.event_name != 'pull_request' }}
         env:
@@ -207,7 +207,7 @@ jobs:
         working-directory: source
         env:
           CONTROL_SHA: ${{ inputs.control_sha }}
-          REUSABLE_CALL: ${{ github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') }}
+          REUSABLE_CALL: ${{ github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') }} # zizmor: ignore[obfuscation] -- Static repository comparison; no untrusted expression input.
         run: |
           python3 -B - <<'PY'
           import os
@@ -616,10 +616,10 @@ jobs:
     if: ${{ always() && needs.dependency-preflight.result == 'success' }}
     runs-on: ubuntu-24.04
     environment:
-      name: ${{ github.event_name == 'pull_request' && github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') && 'linux-source-read-untrusted' || github.repository == 'keeldock-platform/platform-ci' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && 'linux-source-read-main' || 'linux-source-read' }}
+      name: ${{ github.event_name == 'pull_request' && github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') && 'linux-source-read-untrusted' || github.repository == 'keeldock-platform/platform-ci' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && 'linux-source-read-main' || 'linux-source-read' }} # zizmor: ignore[obfuscation] -- Static repository comparison; no untrusted expression input.
     timeout-minutes: 180
     env:
-      KD_REUSABLE_CALL: ${{ github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') }}
+      KD_REUSABLE_CALL: ${{ github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') }} # zizmor: ignore[obfuscation] -- Static repository comparison; no untrusted expression input.
       KD_RUST_CACHE_ENABLED: ${{ github.event_name == 'workflow_dispatch' && github.repository == 'keeldock-platform/platform-ci' && github.ref == 'refs/heads/main' }}
     permissions:
       contents: read
@@ -632,7 +632,7 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
           CONTROL_SHA: ${{ inputs.control_sha }}
           CONTROL_REF_SHA: ${{ github.sha }}
-          REUSABLE_CALL: ${{ github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') }}
+          REUSABLE_CALL: ${{ github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') }} # zizmor: ignore[obfuscation] -- Static repository comparison; no untrusted expression input.
         run: |
           set -euo pipefail
           [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
@@ -675,7 +675,7 @@ jobs:
           owner: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
           repositories: ${{ secrets.SOURCE_REPOSITORY_NAME }}
           permission-contents: read
-          skip-token-revoke: true
+          skip-token-revoke: true # zizmor: ignore[github-app] -- Always-run explicit early revocation is followed by a 401 rejection check.
       - name: Verify the source-reader installation identity
         if: ${{ github.event_name != 'pull_request' }}
         env:
@@ -741,7 +741,7 @@ jobs:
         working-directory: source
         env:
           CONTROL_SHA: ${{ inputs.control_sha }}
-          REUSABLE_CALL: ${{ github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') }}
+          REUSABLE_CALL: ${{ github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') }} # zizmor: ignore[obfuscation] -- Static repository comparison; no untrusted expression input.
         run: |
           python3 -B - <<'PY'
           import os
@@ -1101,7 +1101,7 @@ jobs:
     if: ${{ needs.dependency-preflight.result == 'success' }}
     runs-on: ubuntu-24.04
     environment:
-      name: ${{ github.event_name == 'pull_request' && github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') && 'linux-source-read-untrusted' || github.repository == 'keeldock-platform/platform-ci' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && 'linux-source-read-main' || 'linux-source-read' }}
+      name: ${{ github.event_name == 'pull_request' && github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') && 'linux-source-read-untrusted' || github.repository == 'keeldock-platform/platform-ci' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && 'linux-source-read-main' || 'linux-source-read' }} # zizmor: ignore[obfuscation] -- Static repository comparison; no untrusted expression input.
     timeout-minutes: 150
     permissions:
       contents: read
@@ -1111,7 +1111,7 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
           CONTROL_SHA: ${{ inputs.control_sha }}
           CONTROL_REF_SHA: ${{ github.sha }}
-          REUSABLE_CALL: ${{ github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') }}
+          REUSABLE_CALL: ${{ github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') }} # zizmor: ignore[obfuscation] -- Static repository comparison; no untrusted expression input.
         run: |
           set -euo pipefail
           [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
@@ -1146,7 +1146,7 @@ jobs:
           owner: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
           repositories: ${{ secrets.SOURCE_REPOSITORY_NAME }}
           permission-contents: read
-          skip-token-revoke: true
+          skip-token-revoke: true # zizmor: ignore[github-app] -- Always-run explicit early revocation is followed by a 401 rejection check.
       - name: Verify the source-reader installation identity
         if: ${{ github.event_name != 'pull_request' }}
         env:
@@ -1212,7 +1212,7 @@ jobs:
         working-directory: source
         env:
           CONTROL_SHA: ${{ inputs.control_sha }}
-          REUSABLE_CALL: ${{ github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') }}
+          REUSABLE_CALL: ${{ github.repository == format('{0}/{1}-{2}', 'Moh-Bakr', 'keeldock', 'core') }} # zizmor: ignore[obfuscation] -- Static repository comparison; no untrusted expression input.
         run: |
           python3 -B - <<'PY'
           import os
