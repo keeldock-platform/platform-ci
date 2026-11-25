@@ -402,8 +402,10 @@ jobs:
             || "$(wc -c < "$stdout_file")" -gt 16384 || "$(wc -c < "$stderr_file")" -gt 65536 ]]; then
             exit 1
           fi
+          # The runner user opens the request; root only receives it on stdin.
+          exec 3<"$stdout_file"
           set +e
-          cat "$stdout_file" | sudo -n -- /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/root LANG=C LC_ALL=C \
+          <&3 sudo -n -- /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/root LANG=C LC_ALL=C \
             PYTHONDONTWRITEBYTECODE=1 CI_SHA="$CI_SHA" GITHUB_SHA="$GITHUB_SHA" \
             GITHUB_REPOSITORY="$CI_REPOSITORY" GITHUB_REPOSITORY_ID="$GITHUB_REPOSITORY_ID" \
             GITHUB_EVENT_NAME="$CI_EVENT_NAME" GITHUB_REF="$CI_REF" \
@@ -424,6 +426,7 @@ jobs:
             2>"$publish_stderr" | tee "$publish_file" >/dev/null
           publish_status=$?
           set -e
+          exec 3<&-
           if [[ "$publish_status" -ne 0 || "$(wc -l < "$publish_file")" -ne 1 \
             || "$(wc -c < "$publish_file")" -gt 4096 || "$(wc -c < "$publish_stderr")" -gt 65536 ]]; then
             exit 1
