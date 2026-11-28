@@ -8,6 +8,6 @@ jobs:
   policy:
     permissions:
       contents: read
-    uses: keeldock-platform/ci-kit/.github/workflows/ci-policy.yml@b59374a9976d240b03387eaac7d91ca4a5697ef5
+    uses: keeldock-platform/ci-kit/.github/workflows/ci-policy.yml@0d5b59ec236ac00aff2f173657adaa1e3c73ceb7
     with:
-      kit_sha: b59374a9976d240b03387eaac7d91ca4a5697ef5
+      kit_sha: 0d5b59ec236ac00aff2f173657adaa1e3c73ceb7
